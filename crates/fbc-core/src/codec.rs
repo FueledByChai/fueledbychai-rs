@@ -750,9 +750,48 @@ impl EncodeReceipt {
 pub trait NonceSource: Send {
     /// Reserves `len` nonces, one per item of a command, as the venue's scope needs: for a
     /// monotonic scope each above every nonce reserved before and increasing in item order;
-    /// for a random scope each drawn independently.
+    /// for a random scope each drawn independently. A source that cannot give them returns
+    /// fewer (an empty block for none), which the runtime treats as a defect.
     fn reserve(&mut self, len: u16) -> NonceBlock;
+
+    /// Reserves `len` nonces as [`reserve`](NonceSource::reserve) does, or refuses, reserving
+    /// none, when it cannot give nonces the venue would take (FBC-3bq4, decision 0114): a source
+    /// over a wall clock fallen too far behind its last nonce. The runtime reserves through this
+    /// call and surfaces a refusal as its error, so no nonce outside what the source allows is
+    /// ever sent. By default it never refuses.
+    fn try_reserve(&mut self, len: u16) -> Result<NonceBlock, NonceRefused> {
+        Ok(self.reserve(len))
+    }
 }
+
+/// Why a [`NonceSource`] gave no nonces: what was wrong, with the figures a log needs and no
+/// nonce.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum NonceRefused {
+    /// The block's last nonce would lie `ahead` of the source's clock, further than the
+    /// `window` its caller allows: the clock stalled or stepped back behind the last nonce, or
+    /// the source resumed past it.
+    OutsideWindow { ahead: Duration, window: Duration },
+    /// The source's clock reads before the Unix epoch.
+    ClockBeforeEpoch,
+    /// The block would pass `u64::MAX`.
+    Exhausted,
+}
+
+impl fmt::Display for NonceRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NonceRefused::OutsideWindow { ahead, window } => write!(
+                f,
+                "the next nonce would lie {ahead:?} ahead of the clock, past the {window:?} window"
+            ),
+            NonceRefused::ClockBeforeEpoch => f.write_str("the clock reads before the Unix epoch"),
+            NonceRefused::Exhausted => f.write_str("no nonce is left below u64::MAX"),
+        }
+    }
+}
+
+impl std::error::Error for NonceRefused {}
 
 /// Receives the market-data events a codec decodes; the runtime stamps each one into an
 /// [`Envelope`](crate::Envelope).

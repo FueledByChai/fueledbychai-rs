@@ -204,9 +204,10 @@ use std::task::Poll;
 use fbc_core::{
     AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx,
     EncodeReceipt, Envelope, ExecCodec, ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs,
-    MonoNs, Namespace, NonceBlock, NonceSource, NotSentReason, PathStamps, RpcCall, RpcId, Secrets,
-    SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps, VenueCommand,
-    VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs, dispatch,
+    MonoNs, Namespace, NonceBlock, NonceRefused, NonceSource, NotSentReason, PathStamps, RpcCall,
+    RpcId, Secrets, SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps,
+    VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs,
+    dispatch,
 };
 use fbc_journal::{ControlEvent, NonceSourceId, Record};
 use futures_util::{FutureExt, StreamExt};
@@ -372,6 +373,10 @@ pub enum ExecSessionError {
     /// The consumer's nonce source reserved another number of nonces than were asked for, for
     /// `on_open`, `on_timer` or an encode.
     Nonces { asked: u16, reserved: usize },
+    /// The consumer's nonce source refused a reservation for `on_open`, `on_timer`, the
+    /// resync or an encode, reserving none (FBC-3bq4): a wall-clock source whose clock fell
+    /// too far behind its last nonce (decision 0114). Nothing of the call was made or written.
+    NonceRefused(NonceRefused),
     /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
     /// ever admit, so no epoch could open.
     OpenNeverFits,
@@ -403,6 +408,9 @@ impl fmt::Display for ExecSessionError {
                 f,
                 "the nonce source reserved {reserved} nonces when {asked} were asked for"
             ),
+            ExecSessionError::NonceRefused(why) => {
+                write!(f, "the nonce source refused a reservation: {why}")
+            }
             ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
             ExecSessionError::OpenNeverFits => f.write_str(
                 "the frames on_open asks for weigh more together than the buckets ever admit",
@@ -1625,7 +1633,8 @@ fn context(
 /// Exactly `asked` nonces from `nonces` (none reserved when `asked` is 0) with the time `now`
 /// gives once they are reserved, or why not. What the source reserved is journaled through
 /// `rec`, filed under that time, even when it is not what was asked for: those values are
-/// spent all the same (0006).
+/// spent all the same (0006). A source that refuses ([`NonceSource::try_reserve`]) reserved
+/// none, so nothing is journaled for it (FBC-3bq4, decision 0114).
 fn reserve(
     nonces: &mut dyn NonceSource,
     asked: u16,
@@ -1634,7 +1643,9 @@ fn reserve(
 ) -> Result<(NonceBlock, (MonoNs, WallNs)), ExecSessionError> {
     let block = match asked {
         0 => NonceBlock::EMPTY,
-        n => nonces.reserve(n),
+        n => nonces
+            .try_reserve(n)
+            .map_err(ExecSessionError::NonceRefused)?,
     };
     let at = now();
     rec.nonces(at.1, &block);
@@ -1997,6 +2008,10 @@ mod tests {
                     reserved: 1,
                 },
                 "the nonce source reserved 1 nonces when 2 were asked for",
+            ),
+            (
+                ExecSessionError::NonceRefused(NonceRefused::Exhausted),
+                "the nonce source refused a reservation: no nonce is left below u64::MAX",
             ),
         ];
         for (err, text) in cases {
