@@ -219,9 +219,11 @@
 //! answer to its arm, the end of its resync or what it shows of the orders held unprotected, but
 //! authenticates nothing; an outage of another endpoint holds no place yet (FBC-rta5 decides
 //! that per connection). The session's one thread reads no other endpoint while one write waits
-//! on a peer, within the write-stall window. A stop closes every endpoint's epoch; an error, a
-//! dropped run or the session's drop ends each as it does the order connection's. An in-process
-//! stream stands in for exactly one connection.
+//! on a peer, within the write-stall window. A stop closes every endpoint's epoch, a frame
+//! already waiting on one stamped behind its close (once stopped, no other endpoint is read; one
+//! that woke as the control dropped from another thread is not stamped); an error, a dropped run
+//! or the session's drop ends each as it does the order connection's. An in-process stream
+//! stands in for exactly one connection.
 //!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
@@ -617,7 +619,7 @@ impl<H: ExecHandler> Drop for ExecSession<H> {
                     self.core.closed_unwinding(key);
                 }
             }
-            self.legs.left(|_| {}, true);
+            self.legs.left(None);
         } else {
             self.end_left_epoch();
         }
@@ -730,104 +732,43 @@ impl<H: ExecHandler> ExecSession<H> {
         entry: Entry,
         handler: H,
     ) -> Result<(ExecSession<H>, ExecControl), ExecSessionError> {
-        let (venue, cfg) = (config.venue, &config.cfg);
-        let caps = venue.caps(cfg).map_err(SessionError::Config)?;
-        let Some(exec) = &caps.exec else {
-            return Err(ExecSessionError::NoOrderEntry);
-        };
-        let (rearm, covers_open) = match exec.order.cancel_on_disconnect {
-            CancelOnDisconnect::PerConnection {
-                rearm_on_reconnect,
-                covers_open_orders,
-            } => (rearm_on_reconnect, covers_open_orders),
-            other => return Err(ExecSessionError::CancelOnDisconnect(other)),
-        };
-        // Our client id names one venue order where amends keep the venue id (decision 0080).
-        let one_id = exec.order.amend.is_none_or(|amend| amend.keeps_venue_id);
-        config.limiter.check(&caps.limits)?;
-        let plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
-        // The first endpoint carries the orders; an in-process stream stands in for exactly one
-        // (decisions 0104, 0115).
-        let one = matches!(entry, Entry::Socket) || plan.len() == 1;
-        let Some(endpoint) = plan.first().cloned().filter(|_| one) else {
-            return Err(ExecSessionError::Endpoints(plan.len()));
-        };
-        let streams: Vec<StreamId> = plan.iter().map(|ep| ep.stream).collect();
-        if let Some(at) = (1..streams.len()).find(|&i| streams[..i].contains(&streams[i])) {
-            return Err(ExecSessionError::SharedStream(streams[at]));
-        }
-        let siblings = |own: StreamId| streams.iter().copied().filter(|s| *s != own).collect();
-        let (codec, in_process) = match entry {
-            Entry::Socket => {
-                for ep in &plan {
-                    ws::check_url(ep.url.as_str()).map_err(SessionError::Url)?;
-                }
-                let codec = venue.exec_codec(cfg, config.creds);
-                let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
-                (codec.map_err(ExecSessionError::Venue)?, None)
-            }
-            Entry::InProcess(codec, stream) => (codec, Some(stream)),
-        };
-        let (stop_tx, stop) = watch::channel(());
-        let clock = config.clock.clone();
-        // Endpoint `i` is stamped connection `conn + i`, each with epochs, pacing, timers and
-        // requests of its own (decision 0115).
-        let core_of = |i: usize, own: StreamId| {
-            let conn = u16::try_from(i)
-                .ok()
-                .and_then(|i| config.conn.checked_add(i));
-            let mut core = Core::new(CoreConfig {
-                own,
-                connector: config.connector.clone(),
-                clock: config.clock.clone(),
-                pacing: config.pacing,
-                write_stall: config.write_stall.window(),
-                conn: conn.ok_or(SessionError::NoConnectionLeft)?,
-                stop: stop.clone(),
-                http_max_body: config.http_max_body,
-                rates: config.limiter.clone(),
-            });
-            // What an order-entry stream brings carries acks and fills (decision 0078).
-            core.inbound = TrafficClass::Safety;
-            core.siblings = siblings(own);
-            Ok::<_, ExecSessionError>(core)
-        };
-        let core = core_of(0, endpoint.stream)?;
-        let mut legs = Vec::new();
-        for (i, ep) in plan.iter().enumerate().skip(1) {
-            let core = core_of(i, ep.stream)?;
-            legs.push(Leg::new(core, ep.stream, ep.url.as_str().to_owned()));
-        }
-        let rec = Recorder {
-            journal: None,
-            source: config.nonce_source,
-        };
+        let Parts {
+            core,
+            codec,
+            stream,
+            url,
+            in_process,
+            caps,
+            ns,
+            specs,
+            nonces,
+            rec,
+            orders,
+            rpcs,
+            clock,
+            stop,
+            conn,
+            legs,
+            control,
+        } = parts(config, entry)?;
         let session = ExecSession {
             core,
             codec,
-            stream: endpoint.stream,
-            url: endpoint.url.as_str().to_owned(),
+            stream,
+            url,
             in_process,
             caps,
-            ns: config.ns,
-            specs: config.specs,
-            nonces: config.nonces,
+            ns,
+            specs,
+            nonces,
             rec,
             decode_errors: 0,
             arm_failures: 0,
             unready_refusals: 0,
             unprotected_refusals: 0,
             in_flight_refusals: 0,
-            orders: Shared::new(
-                config.acct,
-                config.rpc_ids,
-                rearm,
-                covers_open,
-                one_id,
-                clock.clone(),
-                config.outbound,
-            ),
-            rpcs: Rpcs::new(config.in_flight),
+            orders,
+            rpcs,
             clock,
             stop,
             fault: None,
@@ -835,12 +776,12 @@ impl<H: ExecHandler> ExecSession<H> {
             closed_early: None,
             ran: false,
             turn: 0,
-            conn: config.conn,
-            legs: Legs::new(legs),
+            conn,
+            legs,
             handler,
         };
         session.orders.set_conn(session.core.current());
-        Ok((session, ExecControl { _stop: stop_tx }))
+        Ok((session, control))
     }
 
     /// The current connection epoch of the order connection, the first planned endpoint.
@@ -874,9 +815,7 @@ impl<H: ExecHandler> ExecSession<H> {
         }
         // A submission refused for want of room is journaled where it is refused (0105).
         self.orders.set_journal(journal.clone());
-        for leg in self.legs.iter_mut() {
-            leg.core.journal = Some(journal.clone());
-        }
+        self.legs.set_journal(&journal);
         self.core.journal = Some(journal);
     }
 
@@ -945,19 +884,9 @@ impl<H: ExecHandler> ExecSession<H> {
             let ran = self.run_epochs().await;
             // The other endpoints' epochs end with the run: closed on a stop, retired on an
             // error, the handler told (decision 0115).
-            let stopped = self.stopped();
-            let finished = if stopped {
-                self.legs.stop(None, &*self.codec)
-            } else {
-                Ok(())
-            };
-            let finished = finished.and_then(|()| self.legs.finish(&mut feed!(self), stopped));
-            ran.and(finished)
+            ran.and(self.legs.finish(&mut feed!(self)))
         };
         self.core.http.clear();
-        for leg in self.legs.iter_mut() {
-            leg.core.http.clear();
-        }
         self.orders.end();
         // Nothing more is reported: the requests still in flight give back their places in the
         // consumer's table (decision 0105).
@@ -1032,8 +961,7 @@ impl<H: ExecHandler> ExecSession<H> {
             }
             self.handler.on_epoch_end(key);
         }
-        let handler = &mut self.handler;
-        self.legs.left(|key| handler.on_epoch_end(key), false);
+        self.legs.left(Some(&mut self.handler));
     }
 
     /// Whether epoch `key` was journaled closed as the control dropped; forgets it either way.
@@ -1105,6 +1033,9 @@ impl<H: ExecHandler> ExecSession<H> {
             let wakes = WAKES + u8::from(!self.legs.is_empty());
             let first = self.turn % wakes;
             self.turn = (first + 1) % wakes;
+            // Once stopped, no other endpoint is read: what waits on it is stamped as the run
+            // ends (decision 0115).
+            let stopped = self.core.stop.clone();
             let wake = {
                 let timer_at = self.core.next_deadline();
                 let mut frame = pin!(next_frame(&mut ws));
@@ -1132,6 +1063,7 @@ impl<H: ExecHandler> ExecSession<H> {
                             3 => orders.as_mut().poll(cx).map(|()| Wake::Orders),
                             4 => rpc.as_mut().poll(cx).map(|()| Wake::Rpc),
                             5 => stop.as_mut().poll(cx).map(|_| Wake::Stop),
+                            6 if stopped.has_changed().is_err() => Poll::Pending,
                             6 => legs.as_mut().poll(cx).map(|(i, w)| Wake::Leg(i, w)),
                             _ => Poll::Pending,
                         };
@@ -1172,14 +1104,7 @@ impl<H: ExecHandler> ExecSession<H> {
                     self.time_out(key);
                     true
                 }
-                Wake::Leg(i, wake) => {
-                    let primary = Primary {
-                        core: &mut self.core,
-                        ws: &mut ws,
-                        open: true,
-                    };
-                    legs::take(&mut feed!(self), Some(primary), &mut self.legs, i, wake).await?
-                }
+                Wake::Leg(i, wake) => self.take_leg(&mut ws, i, wake).await?,
             };
             // An epoch just authenticated arms its protection and resyncs, before what waits.
             if open {
@@ -1309,13 +1234,26 @@ impl<H: ExecHandler> ExecSession<H> {
         self.route(ws, open).await
     }
 
+    /// Takes what woke the other endpoint `i` while the order connection's epoch is open on `ws`
+    /// ([`legs::take`]); whether that epoch is still open.
+    async fn take_leg(
+        &mut self,
+        ws: &mut Option<Link>,
+        i: usize,
+        wake: LegWake,
+    ) -> Result<bool, ExecSessionError> {
+        let primary = Primary {
+            core: &mut self.core,
+            ws,
+            open: true,
+        };
+        legs::take(&mut feed!(self), Some(primary), &mut self.legs, i, wake).await
+    }
+
     /// Executes what the order connection's core handed back for another endpoint's stream on
     /// that endpoint ([`legs::route`]), once its own effects ran (decision 0115); whether the
     /// order connection's epoch is still open, `open` as it was.
     async fn route(&mut self, ws: &mut Option<Link>, open: bool) -> Result<bool, ExecSessionError> {
-        if self.legs.is_empty() {
-            return Ok(open);
-        }
         let primary = Primary {
             core: &mut self.core,
             ws,
@@ -1367,7 +1305,6 @@ impl<H: ExecHandler> ExecSession<H> {
     ) -> Result<(), ExecSessionError> {
         let codec = &self.codec;
         let redact = |input: Inbound<'_>| codec.redact_inbound(input);
-        let mut leg = None;
         let waiting = match wake {
             Wake::Frame(frame) => Some(frame),
             Wake::Timer => {
@@ -1378,18 +1315,15 @@ impl<H: ExecHandler> ExecSession<H> {
                 let _ = self.core.stamp_http(Some(&redact), done);
                 next_frame(ws).now_or_never()
             }
-            Wake::Leg(i, wake) => {
-                leg = Some((i, wake));
-                next_frame(ws).now_or_never()
-            }
-            Wake::Orders | Wake::Rpc | Wake::Stop => next_frame(ws).now_or_never(),
+            // Another endpoint is not read once stopped; one that woke as the control dropped
+            // from another thread is not stamped, and the run's end stamps what waits on it
+            // (decision 0115).
+            Wake::Orders | Wake::Rpc | Wake::Stop | Wake::Leg(..) => next_frame(ws).now_or_never(),
         };
         if let Some(Some(Ok(message))) = waiting {
             let _ = self.core.take_in(&redact, key, rx, &message);
         }
-        // The other endpoints' epochs close with it, and what woke one, or a frame waiting on
-        // each, keeps its place too (decision 0115).
-        self.legs.stop(leg, &**codec)
+        Ok(())
     }
 
     /// The session's error when a timer firing the core took ended it.
@@ -1673,6 +1607,133 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 }
 
+/// What a session is built from, whatever its handler: its order connection's core, its codec
+/// and the venue's caps, the other endpoints' legs and its control. Built in one function for
+/// every handler type, so its checks are one code path (decision 0115).
+struct Parts {
+    core: Core,
+    codec: Box<dyn ExecCodec>,
+    stream: StreamId,
+    url: String,
+    in_process: Option<InProcessStream>,
+    caps: VenueCaps,
+    ns: Namespace,
+    specs: SpecTable,
+    nonces: Box<dyn NonceSource>,
+    rec: Recorder,
+    orders: Rc<Shared>,
+    rpcs: Rpcs,
+    clock: IngestClock,
+    stop: watch::Receiver<()>,
+    conn: u16,
+    legs: Legs,
+    control: ExecControl,
+}
+
+/// The parts of a session for the account `config.creds` reach, over `entry`, or why there is
+/// none ([`ExecSession::new`] and [`ExecSession::in_process`] say which).
+fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionError> {
+    let (venue, cfg) = (config.venue, &config.cfg);
+    let caps = venue.caps(cfg).map_err(SessionError::Config)?;
+    let Some(exec) = &caps.exec else {
+        return Err(ExecSessionError::NoOrderEntry);
+    };
+    let (rearm, covers_open) = match exec.order.cancel_on_disconnect {
+        CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect,
+            covers_open_orders,
+        } => (rearm_on_reconnect, covers_open_orders),
+        other => return Err(ExecSessionError::CancelOnDisconnect(other)),
+    };
+    // Our client id names one venue order where amends keep the venue id (decision 0080).
+    let one_id = exec.order.amend.is_none_or(|amend| amend.keeps_venue_id);
+    config.limiter.check(&caps.limits)?;
+    let plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
+    // The first endpoint carries the orders; an in-process stream stands in for exactly one
+    // (decisions 0104, 0115).
+    let one = matches!(entry, Entry::Socket) || plan.len() == 1;
+    let Some(endpoint) = plan.first().cloned().filter(|_| one) else {
+        return Err(ExecSessionError::Endpoints(plan.len()));
+    };
+    let streams: Vec<StreamId> = plan.iter().map(|ep| ep.stream).collect();
+    if let Some(at) = (1..streams.len()).find(|&i| streams[..i].contains(&streams[i])) {
+        return Err(ExecSessionError::SharedStream(streams[at]));
+    }
+    let siblings = |own: StreamId| streams.iter().copied().filter(|s| *s != own).collect();
+    let (codec, in_process) = match entry {
+        Entry::Socket => {
+            for ep in &plan {
+                ws::check_url(ep.url.as_str()).map_err(SessionError::Url)?;
+            }
+            let codec = venue.exec_codec(cfg, config.creds);
+            let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
+            (codec.map_err(ExecSessionError::Venue)?, None)
+        }
+        Entry::InProcess(codec, stream) => (codec, Some(stream)),
+    };
+    let (stop_tx, stop) = watch::channel(());
+    let clock = config.clock.clone();
+    // Endpoint `i` is stamped connection `conn + i`, each with epochs, pacing, timers and
+    // requests of its own (decision 0115).
+    let core_of = |i: usize, own: StreamId| {
+        let conn = u16::try_from(i)
+            .ok()
+            .and_then(|i| config.conn.checked_add(i));
+        let mut core = Core::new(CoreConfig {
+            own,
+            connector: config.connector.clone(),
+            clock: config.clock.clone(),
+            pacing: config.pacing,
+            write_stall: config.write_stall.window(),
+            conn: conn.ok_or(SessionError::NoConnectionLeft)?,
+            stop: stop.clone(),
+            http_max_body: config.http_max_body,
+            rates: config.limiter.clone(),
+        });
+        // What an order-entry stream brings carries acks and fills (decision 0078).
+        core.inbound = TrafficClass::Safety;
+        core.siblings = siblings(own);
+        Ok::<_, ExecSessionError>(core)
+    };
+    let core = core_of(0, endpoint.stream)?;
+    let mut legs = Vec::new();
+    for (i, ep) in plan.iter().enumerate().skip(1) {
+        let core = core_of(i, ep.stream)?;
+        legs.push(Leg::new(core, ep.stream, ep.url.as_str().to_owned()));
+    }
+    let rec = Recorder {
+        journal: None,
+        source: config.nonce_source,
+    };
+    Ok(Parts {
+        core,
+        codec,
+        stream: endpoint.stream,
+        url: endpoint.url.as_str().to_owned(),
+        in_process,
+        caps,
+        ns: config.ns,
+        specs: config.specs,
+        nonces: config.nonces,
+        rec,
+        orders: Shared::new(
+            config.acct,
+            config.rpc_ids,
+            rearm,
+            covers_open,
+            one_id,
+            clock.clone(),
+            config.outbound,
+        ),
+        rpcs: Rpcs::new(config.in_flight),
+        clock,
+        stop,
+        conn: config.conn,
+        legs: Legs::new(legs),
+        control: ExecControl { _stop: stop_tx },
+    })
+}
+
 /// Executes what `on_open` or the codec's resync asked for on epoch `key` of the connection
 /// `core` drives, on `ws`. Its frames on that connection and its HTTP requests, each request
 /// with the connection it opens, are charged together first, so all of them go or none does
@@ -1684,9 +1745,9 @@ impl<H: ExecHandler> ExecSession<H> {
 /// the clock, or one the runtime cannot make) stays charged. A frame or reconnect for another
 /// planned endpoint's stream is handed back ([`Core::spilled`]), charged there as its turn
 /// comes (decision 0115). False when the epoch ended.
-async fn together<H: ExecHandler>(
+async fn together(
     core: &mut Core,
-    feed: &mut Feed<'_, H>,
+    feed: &mut Feed<'_>,
     ws: &mut Option<Link>,
     key: ConnKey,
     mut fx: Effects,
@@ -1915,9 +1976,40 @@ struct Between<'a, H> {
     after_leg: bool,
 }
 
-impl<H> Between<'_, H> {
+impl<H: ExecHandler> Between<'_, H> {
     fn stopped(&self) -> bool {
         self.stop.has_changed().is_err()
+    }
+
+    /// Leg `woke.0` woke: kept for `apply`, the next wait yielding first.
+    fn woke(&mut self, woke: (usize, LegWake)) -> bool {
+        (self.pending, self.after_leg) = (Some(woke), true);
+        true
+    }
+
+    /// Takes what woke a leg while the order connection waits to connect ([`legs::take`]);
+    /// false when an error ended the session, left in `fault`.
+    async fn take_leg(&mut self, (i, wake): (usize, LegWake)) -> bool {
+        let mut feed = Feed {
+            codec: &mut *self.codec,
+            handler: &mut *self.handler,
+            nonces: &mut *self.nonces,
+            rec: self.rec,
+            clock: self.clock,
+            caps: self.caps,
+            ns: self.ns,
+            specs: self.specs,
+            stop: &self.stop,
+            decode_errors: &mut *self.decode_errors,
+            fault: &mut *self.fault,
+            rpcs: &mut *self.rpcs,
+            orders: self.orders,
+            own: self.own,
+            conn: self.key.conn,
+        };
+        let taken = legs::take(&mut feed, None, self.legs, i, wake).await;
+        *self.fault = taken.err();
+        self.fault.is_none()
     }
 }
 
@@ -1939,42 +2031,17 @@ impl<H: ExecHandler> Control for Between<'_, H> {
             _ = self.orders.wake.notified(), if !waiting => true,
             _ = sleep_or_never(due) => true,
             woke = next_leg(self.legs, std::mem::take(&mut self.after_leg)), if legs => {
-                (self.pending, self.after_leg) = (Some(woke), true);
-                true
+                self.woke(woke)
             }
         }
     }
 
     async fn apply(&mut self) {
-        if let Some((i, wake)) = self.pending.take() {
-            let taken = if self.stopped() {
-                self.legs.stop(Some((i, wake)), &*self.codec)
-            } else {
-                let mut feed = Feed {
-                    codec: &mut *self.codec,
-                    handler: &mut *self.handler,
-                    nonces: &mut *self.nonces,
-                    rec: self.rec,
-                    clock: self.clock,
-                    caps: self.caps,
-                    ns: self.ns,
-                    specs: self.specs,
-                    stop: &self.stop,
-                    decode_errors: &mut *self.decode_errors,
-                    fault: &mut *self.fault,
-                    rpcs: &mut *self.rpcs,
-                    orders: self.orders,
-                    own: self.own,
-                    conn: self.key.conn,
-                };
-                legs::take(&mut feed, None, self.legs, i, wake)
-                    .await
-                    .map(drop)
-            };
-            if let Err(e) = taken {
-                *self.fault = Some(e);
-                return;
-            }
+        // A leg's error ends the session with nothing more reported.
+        if let Some(woke) = self.pending.take()
+            && !self.take_leg(woke).await
+        {
+            return;
         }
         // Only what waited as the turn began: what the handler submits meanwhile is the next
         // turn's.
@@ -2038,9 +2105,11 @@ impl<H: ExecHandler> ExecSink for Late<'_, H> {
 /// redacts it, and replay, which feeds an open epoch's inputs, feeds the codec what it was
 /// handed live (Codex P1 r4215753453 on PR #115). Its effects are not executed after the stop,
 /// nor its events handed on. A Safety write's tick-to-wire reaches the handler (FBC-qfm).
-struct Feed<'a, H> {
+struct Feed<'a> {
     codec: &'a mut dyn ExecCodec,
-    handler: &'a mut H,
+    /// The consumer's handler, behind `dyn`, so the code that hands it inputs is one function
+    /// whatever the handler's type.
+    handler: &'a mut dyn ExecHandler,
     nonces: &'a mut dyn NonceSource,
     rec: &'a Recorder,
     clock: &'a IngestClock,
@@ -2058,14 +2127,14 @@ struct Feed<'a, H> {
     conn: u16,
 }
 
-impl<H> Feed<'_, H> {
+impl Feed<'_> {
     /// Whether an input may still reach the codec: no timer's nonces were mis-reserved.
     fn live(&self) -> bool {
         self.fault.is_none()
     }
 }
 
-impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
+impl EpochInputs for Feed<'_> {
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
         self.codec.redact_inbound(input)
     }
@@ -2146,8 +2215,8 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
 /// of another endpoint's input counts for the order connection's authenticated epoch, if one
 /// is, as the answer to its arm, the end of its resync or what it shows of the orders held
 /// unprotected (decisions 0058, 0080, 0115).
-struct Sink<'a, H> {
-    handler: &'a mut H,
+struct Sink<'a> {
+    handler: &'a mut dyn ExecHandler,
     epochs: &'a mut Epochs,
     stop: &'a watch::Receiver<()>,
     stamp: Stamp,
@@ -2157,7 +2226,7 @@ struct Sink<'a, H> {
     conn: u16,
 }
 
-impl<H: ExecHandler> ExecSink for Sink<'_, H> {
+impl ExecSink for Sink<'_> {
     fn push(&mut self, meta: VenueMeta, ev: ExecEvent) {
         // A provisional acceptance of the arm answers nothing yet: the venue may still reject
         // it, so its deadline stands (PR #90 Reviewer A A2).

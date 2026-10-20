@@ -65,10 +65,12 @@ deferred. This record decides how one session drives several connections.
    another endpoint holds no place: no venue that plans more than one endpoint places orders
    yet (Hibachi is refused by 0058 until a record based on the cancel-on-disconnect probe lifts
    that).
-8. **Stops, errors and drops.** A stop journals every open epoch closed (each frame already
-   waiting stamped behind its close, reaching no codec), closes each connection and tells the
-   handler; an error, a dropped run and the session's drop end each endpoint's epoch as they
-   do the order connection's (0053), the handler not called while a panic unwinds.
+8. **Stops, errors and drops.** Once the session has stopped, no other endpoint is read. As
+   the run ends, a stop journals every open epoch closed (each frame already waiting stamped
+   behind its close, reaching no codec), closes each connection and tells the handler; what
+   woke another endpoint as the control dropped from another thread reaches no codec and is
+   not stamped. An error, a dropped run and the session's drop end each endpoint's epoch as
+   they do the order connection's (0053), the handler not called while a panic unwinds.
 9. **One thread.** The session's one thread reads no other endpoint while a write waits on a
    peer, within the consumer's write-stall window (0036).
 
