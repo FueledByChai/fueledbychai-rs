@@ -149,10 +149,12 @@ impl VenueFactory for Two {
             ExecEndpoint {
                 stream: EXEC_STREAM,
                 url: url(TRADE),
+                handshake: Vec::new(),
             },
             ExecEndpoint {
                 stream: second,
                 url: url(ACCOUNT_URL),
+                handshake: Vec::new(),
             },
         ])
     }

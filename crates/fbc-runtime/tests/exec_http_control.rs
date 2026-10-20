@@ -168,6 +168,7 @@ impl VenueFactory for RestToy {
         Ok(vec![ExecEndpoint {
             stream: EXEC_STREAM,
             url: WireUrl::plain(cfg.get(URL).unwrap()),
+            handshake: Vec::new(),
         }])
     }
 

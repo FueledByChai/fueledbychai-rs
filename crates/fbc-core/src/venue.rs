@@ -20,7 +20,7 @@
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::auth::Secrets;
+use crate::auth::{HandshakeHeader, Secrets};
 use crate::caps::VenueCaps;
 use crate::codec::{
     DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, HttpFailure, HttpResponse,
@@ -244,6 +244,10 @@ pub enum MdTransport {
 pub struct ExecEndpoint {
     pub stream: StreamId,
     pub url: WireUrl,
+    /// The headers whose values are credentials, which the runtime adds to every opening
+    /// handshake of this connection (decision 0116): empty for a connection that authenticates
+    /// in its frames (Paradex), or takes none.
+    pub handshake: Vec<HandshakeHeader>,
 }
 
 /// What a venue says about the account a set of credentials reaches, for the consumer's Test
@@ -686,6 +690,7 @@ mod tests {
         let exec = ExecEndpoint {
             stream: StreamId(1),
             url: spanned.clone(),
+            handshake: Vec::new(),
         };
         let md = EndpointPlan {
             stream: StreamId(0),

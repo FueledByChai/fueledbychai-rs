@@ -301,6 +301,7 @@ impl VenueFactory for ParadexFactory {
         Ok(vec![ExecEndpoint {
             stream: EXEC_STREAM,
             url,
+            handshake: Vec::new(),
         }])
     }
 

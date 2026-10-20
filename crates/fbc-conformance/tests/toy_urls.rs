@@ -100,6 +100,7 @@ fn configured_urls_keep_the_spans_their_configuration_marks() {
     let want = ExecEndpoint {
         stream: EXEC_STREAM,
         url: url("wss://toy.invalid/exec/", ""),
+        handshake: Vec::new(),
     };
     assert_eq!(exec, [want]);
     hidden(format!("{exec:?}"));

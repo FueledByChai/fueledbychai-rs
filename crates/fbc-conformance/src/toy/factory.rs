@@ -201,6 +201,7 @@ impl VenueFactory for ToyFactory {
         Ok(vec![ExecEndpoint {
             stream: EXEC_STREAM,
             url,
+            handshake: Vec::new(),
         }])
     }
 

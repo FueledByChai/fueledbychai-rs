@@ -118,6 +118,22 @@ impl fmt::Display for Secrets {
     }
 }
 
+/// One header an order-entry connection's opening handshake carries whose value is a credential
+/// (decision 0116): the header's `name`, and the configuration key, `secret`, of the
+/// [`Secrets`] value it carries, as it is, with nothing added before or after it (Hibachi's
+/// `Authorization: <key>`, no `Bearer`). A venue names these in its
+/// [`ExecEndpoint`](crate::ExecEndpoint)s; the runtime reads the values from the credentials
+/// the consumer hands the session, never from configuration or a URL, and sends them on every
+/// connection to that endpoint, a reconnect's and one through a proxy included. Naming only: it
+/// holds no value, so its `Debug` shows nothing secret.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct HandshakeHeader {
+    /// The header's name, as the request spells it.
+    pub name: &'static str,
+    /// The [`Secrets`] key whose value the header carries.
+    pub secret: &'static str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
