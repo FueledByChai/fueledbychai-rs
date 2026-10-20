@@ -27,7 +27,8 @@ answer supersedes the 2026-10-18 one for the two cap ceilings only.
    lines come before the first request.
 3. **A cap past a lot count is the largest lot count.** A cap converted to lots that is past
    what a lot count holds (or what a decimal holds after the division) becomes `i64::MAX` lots
-   (`testnet::cap_lots`). It is never zero and never a panic. fbc-oms's checked arithmetic then
+   (`testnet::cap_lots`). It is never zero and never a panic. A lot whose own cost does not
+   fit a decimal costs more than any cap, so it gives no lot. fbc-oms's checked arithmetic then
    bounds every order as it would at any other large cap. This does not apply to an order's or a
    quote's size: a size that does not fit a lot count is still refused.
 4. **The other mainnet limits stay in code.** The 20 bps minimum offset, the 3600 s maximum

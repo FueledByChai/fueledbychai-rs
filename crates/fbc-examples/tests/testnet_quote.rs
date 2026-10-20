@@ -3069,9 +3069,9 @@ impl VenueFactory for Declared {
     }
 }
 
-/// A mainnet run on the stub: `--mainnet`, caps of $11 resting per side and $50 inventory, quotes of $11 (17 lots at the first touch's ask quote, 62186.6) 30 bps behind the
-/// touch, the BTC market's $10 minimum notional, `--duration 60`, at most `cycles` cycles 100 ms
-/// apart.
+/// A mainnet run on the stub: `--mainnet`, caps of $11 resting per side and $50 inventory, quotes
+/// of $11 (17 lots at the first touch's ask quote, 62186.6) 30 bps behind the touch, the BTC
+/// market's $10 minimum notional, `--duration 60`, at most `cycles` cycles 100 ms apart.
 fn mainnet_options(stub: &StubServer, cycles: u64) -> Options {
     let mut opts = options(stub, cycles);
     opts.mainnet = true;

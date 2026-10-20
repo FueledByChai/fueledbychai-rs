@@ -1,13 +1,13 @@
 //! testnet_quote: a PLUMBING TEST, NOT A STRATEGY. On one Paradex TESTNET market it keeps one
-//! post-only order of a fixed size on each side, a fixed offset behind the touch, and requotes
-//! them by cancel-and-replace as the touch moves, through fbc-oms's ExecutionPlanner, its caps
-//! and authorizations, and fbc-runtime's order-entry session, until Ctrl-C, `--duration` or
-//! `--cycles`; then Stops (kill switch + cancel all) and prints a summary. TESTNET ONLY without
-//! `--mainnet`: a mainnet URL or chain id is refused before anything connects. With `--mainnet`
-//! (and `--sole-trader`, FBC-tyft) the same loop on Paradex MAINNET, real money: a short
-//! session the owner runs and watches, on the separate mainnet account, within the owner's
-//! limits (offsets of at least 20 bps, at most an hour; the caps are the operator's own,
-//! positive, with no ceiling), never seeded by hand. An owner-run sample: CI builds it, and its wiring is tested against the
+//! post-only order of a fixed size on each side, a fixed offset behind the touch, and requotes them
+//! by cancel-and-replace as the touch moves, through fbc-oms's ExecutionPlanner, its caps and
+//! authorizations, and fbc-runtime's order-entry session, until Ctrl-C, `--duration` or `--cycles`;
+//! then Stops (kill switch + cancel all) and prints a summary. TESTNET ONLY without `--mainnet`: a
+//! mainnet URL or chain id is refused before anything connects. With `--mainnet` (and
+//! `--sole-trader`, FBC-tyft) the same loop on Paradex MAINNET, real money: a short session the
+//! owner runs and watches, on the separate mainnet account, within the owner's limits (offsets of
+//! at least 20 bps, at most an hour; the caps are the operator's own, positive, with no ceiling),
+//! never seeded by hand. An owner-run sample: CI builds it, and its wiring is tested against the
 //! conformance stub (`tests/testnet_quote.rs`), but nothing runs it against a venue.
 //!
 //! ```text
