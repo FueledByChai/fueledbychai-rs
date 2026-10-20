@@ -1935,3 +1935,272 @@ async fn deadline_fired(name: &str, connected: bool) -> Run {
     run.ended.as_ref().unwrap();
     run
 }
+
+// ---------------------------------------------------------------------------------------------
+// FBC-3bq4: the production wall-clock nonce source in a session.
+// ---------------------------------------------------------------------------------------------
+
+/// A wall time, in microseconds since the Unix epoch, near 2026-10-19.
+const WALL_US: u64 = 1_792_000_000_000_000;
+/// Hibachi's documented nonce window, as a consumer would pass it.
+const NONCE_WINDOW: Duration = Duration::from_secs(15);
+
+/// The wall clock a `WallClockNonces` reads, set by the test: a read of a cleared clock panics,
+/// so a replay run with it cleared proves it read no clock.
+#[derive(Clone, Default)]
+struct StubWall(Arc<std::sync::Mutex<Option<i64>>>);
+
+impl StubWall {
+    fn at_us(us: u64) -> StubWall {
+        let wall = StubWall::default();
+        wall.set_us(us);
+        wall
+    }
+
+    fn set_us(&self, us: u64) {
+        *self.0.lock().unwrap() = Some(i64::try_from(us).unwrap() * 1_000);
+    }
+
+    fn clear(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
+impl fbc_runtime::WallClock for StubWall {
+    fn now(&self) -> WallNs {
+        WallNs(
+            self.0
+                .lock()
+                .unwrap()
+                .expect("the wall clock was read while cleared"),
+        )
+    }
+}
+
+/// The toy's session over `server`, its nonces from a `WallClockNonces` reading `wall`
+/// (resumed after `last` when given), journaled as [`SOURCE`].
+fn wall_config(server: &ScriptedWs, wall: &StubWall, last: Option<u64>) -> ExecSessionConfig {
+    let reserved = armed_oms::Reserved::default();
+    let mut config = armed_oms::session_config(&server.url(), &reserved);
+    let nonces = match last {
+        None => fbc_runtime::WallClockNonces::new(wall.clone(), NONCE_WINDOW),
+        Some(last) => fbc_runtime::WallClockNonces::resuming(wall.clone(), NONCE_WINDOW, last),
+    };
+    config.nonces = Box::new(nonces.unwrap());
+    config.nonce_source = SOURCE;
+    config
+}
+
+/// Takes the toy's authentication, cancel-on-disconnect arm and resync on `peer` until the
+/// session may place.
+async fn armed_and_resynced(peer: &mut Peer, orders: &ExecOrders, heard: &Heard) {
+    assert!(recv_text(peer).await.starts_with("auth|ts="));
+    peer.send(AUTH_ACK);
+    assert!(recv_text(peer).await.starts_with("cod|rpc="));
+    let wm = armed_oms::watermark(&recv_text(peer).await);
+    peer.send("item|rpc=1|i=0|res=ok");
+    peer.send_all([format!("rsbegin|wm={wm}"), "rsend".to_owned()]);
+    until(|| is_resync_end(heard)).await;
+    assert!(orders.may_place());
+}
+
+/// The `nonce=` field of each line of a frame that carries one.
+fn frame_nonces(frame: &str) -> Vec<u64> {
+    let field = |line: &str| {
+        let nonce = line.split('|').find_map(|f| f.strip_prefix("nonce="));
+        nonce.map(|n| n.parse().unwrap())
+    };
+    frame.lines().filter_map(field).collect()
+}
+
+/// FBC-3bq4's done line, the session's half: a session whose nonces come from a
+/// `WallClockNonces` over a stalled clock journals each one it reserves (the arm's, a place's
+/// and a batch's three, increasing in item order, every one above every earlier one), the
+/// frames carry them, and each encode replays from its journaled context alone, with the clock
+/// cleared, to the bytes journaled as written. A source then resumed from the journal's last
+/// nonce, its clock stepped back a second, never reissues one.
+#[tokio::test]
+async fn a_wall_clock_sources_nonces_are_journaled_and_each_encode_replays_byte_identically_without_the_clock()
+ {
+    let mut server = ScriptedWs::start().await;
+    let wall = StubWall::at_us(WALL_US);
+    let config = wall_config(&server, &wall, None);
+    let mut oms = armed_oms::Oms::armed();
+    let (place, batch) = (oms.place(), oms.batch(3));
+    let commands = [place.command().clone(), batch.command().clone()];
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let keep = Rc::clone(&sent);
+    let run = journaled(
+        "exec_journal_wall_nonces",
+        config,
+        |orders, control, heard| async move {
+            let mut peer = server.accept().await;
+            armed_and_resynced(&mut peer, &orders, &heard).await;
+            for auth in [place, batch] {
+                let rpc = orders.submit(auth).unwrap();
+                let written = recv_text(&mut peer).await;
+                keep.borrow_mut().push((rpc, frame_nonces(&written)));
+            }
+            drop(control);
+            while peer.next().await.is_some() {}
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+
+    // Every nonce reserved is journaled, under Safety: the arm's at the clock's microsecond,
+    // then, the clock stalled, one above the last each, in item order.
+    let nonce = |r: &Record| matches!(r, Record::Nonce { .. });
+    let journaled: Vec<u64> = run
+        .entries
+        .iter()
+        .filter_map(|e| match e.record {
+            Record::Nonce { source, value } if source == SOURCE => Some(value),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<u64> = (0..5).map(|i| WALL_US + i).collect();
+    assert_eq!(journaled, expected);
+    assert_eq!(run.classes(nonce), [TrafficClass::Safety; 5]);
+    // The frames carry them: the place's one, the batch's three item by item.
+    let sent = sent.take();
+    let carried: Vec<Vec<u64>> = sent.iter().map(|(_, n)| n.clone()).collect();
+    assert_eq!(carried, [expected[1..2].to_vec(), expected[2..5].to_vec()]);
+
+    // Replay: the clock cleared, a fresh codec encodes each command from its journaled context
+    // alone, to the bytes journaled as written for its request.
+    wall.clear();
+    let specs = exec_toy::specs();
+    for ((rpc, _), cmd) in sent.iter().zip(&commands) {
+        let ctx = run.entries.iter().find_map(|e| match &e.record {
+            Record::EncodeCtx { rpc: Some(id), ctx } if id == rpc => Some(ctx.clone()),
+            _ => None,
+        });
+        let ctx = ctx.unwrap();
+        let written = run.entries.iter().find_map(|e| match &e.record {
+            Record::Outbound {
+                rpc: Some(id),
+                frame,
+                ..
+            } if id == rpc => Some(frame.bytes().to_vec()),
+            _ => None,
+        });
+        let mut codec = exec_toy::ToyExec::new(Box::new(exec_toy::ToySigner));
+        let mut fx = Effects::new();
+        let mut t = PathStamps::off();
+        let receipt = codec.encode(cmd, *rpc, &specs, &ctx, &mut t, &mut fx);
+        let replayed: Vec<Vec<u8>> = fx
+            .as_slice()
+            .iter()
+            .filter_map(|e| match e {
+                Effect::Send { frame, .. } => Some(frame.bytes().to_vec()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replayed, [written.unwrap()], "rpc {rpc:?}");
+        let used: Vec<u64> = receipt.unwrap().nonces().iter().map(|(_, n)| *n).collect();
+        assert_eq!(used, ctx.nonces.as_slice());
+    }
+
+    // A restart: a source resumed from the journal's last nonce, its clock a second behind it,
+    // issues only nonces above every one journaled.
+    let records: Vec<Record> = run.entries.iter().map(|e| e.record.clone()).collect();
+    let last = fbc_runtime::last_nonce(&records, SOURCE).unwrap();
+    assert_eq!(last, WALL_US + 4);
+    let behind = StubWall::at_us(WALL_US - 1_000_000);
+    let mut resumed = fbc_runtime::WallClockNonces::resuming(behind, NONCE_WINDOW, last).unwrap();
+    let next = resumed.try_reserve(2).unwrap();
+    assert_eq!(next.as_slice(), [WALL_US + 5, WALL_US + 6]);
+    assert!(
+        next.as_slice()
+            .iter()
+            .all(|n| journaled.iter().all(|j| n > j))
+    );
+}
+
+/// A clock stepped back further than the window behind the source's last nonce refuses the
+/// next place's nonce: the session ends with the refusal, the place unwritten, and the journal
+/// holds no nonce for it and no context, since none was reserved.
+#[tokio::test]
+async fn a_nonce_the_wall_clock_source_refuses_ends_the_session_with_the_place_unwritten() {
+    let mut server = ScriptedWs::start().await;
+    let wall = StubWall::at_us(WALL_US);
+    let config = wall_config(&server, &wall, None);
+    let place = armed_oms::Oms::armed().place();
+    let stepped = wall.clone();
+    let run = journaled(
+        "exec_journal_wall_nonce_refused",
+        config,
+        |orders, control, heard| async move {
+            let mut peer = server.accept().await;
+            armed_and_resynced(&mut peer, &orders, &heard).await;
+            // 20 s back: the place's nonce would lie 20 s ahead of the clock, past the 15 s
+            // window.
+            stepped.set_us(WALL_US - 20_000_000);
+            orders.submit(place).unwrap();
+            // The session ends, closing the connection having written nothing more.
+            assert_eq!(peer.next().await, None);
+            drop(control);
+        },
+    )
+    .await;
+    let refused = fbc_core::NonceRefused::OutsideWindow {
+        ahead: Duration::from_micros(20_000_001),
+        window: NONCE_WINDOW,
+    };
+    assert_eq!(run.ended, Err(ExecSessionError::NonceRefused(refused)));
+    assert_eq!(
+        ExecSessionError::NonceRefused(refused).to_string(),
+        "the nonce source refused a reservation: the next nonce would lie 20.000001s ahead of \
+         the clock, past the 15s window"
+    );
+    // Only the arm's nonce, and no context but the arm's.
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    let nonces: Vec<&Seen> = read
+        .iter()
+        .filter(|s| matches!(s, Seen::Nonce(_)))
+        .collect();
+    assert_eq!(nonces, [&Seen::Nonce(WALL_US)]);
+    let encodes = read.iter().filter(|s| matches!(s, Seen::Ctx(Some(_), _)));
+    assert_eq!(encodes.count(), 1, "{read:#?}");
+    let places = |s: &&Seen| matches!(s, Seen::Out(text, ..) if text.starts_with("place|"));
+    assert_eq!(read.iter().filter(places).count(), 0);
+}
+
+/// A source resumed past its clock by more than the window, as after a restart whose clock is
+/// behind the journal, refuses the session's first reservation, its cancel-on-disconnect arm:
+/// the session ends before it may place, nothing reserved or journaled for it.
+#[tokio::test]
+async fn a_source_resumed_past_its_clock_by_more_than_the_window_refuses_the_arm() {
+    let mut server = ScriptedWs::start().await;
+    let wall = StubWall::at_us(WALL_US);
+    let last = WALL_US + 16_000_000;
+    let config = wall_config(&server, &wall, Some(last));
+    let run = journaled(
+        "exec_journal_wall_nonce_resumed_ahead",
+        config,
+        |orders, control, _| async move {
+            let mut peer = server.accept().await;
+            assert!(recv_text(&mut peer).await.starts_with("auth|ts="));
+            peer.send(AUTH_ACK);
+            assert_eq!(peer.next().await, None);
+            assert!(!orders.may_place());
+            drop(control);
+        },
+    )
+    .await;
+    let refused = fbc_core::NonceRefused::OutsideWindow {
+        ahead: Duration::from_micros(16_000_001),
+        window: NONCE_WINDOW,
+    };
+    assert_eq!(run.ended, Err(ExecSessionError::NonceRefused(refused)));
+    let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
+    assert!(
+        !read.iter().any(|s| matches!(s, Seen::Nonce(_))),
+        "{read:#?}"
+    );
+    assert!(
+        !read.iter().any(|s| matches!(s, Seen::Ctx(Some(_), _))),
+        "{read:#?}"
+    );
+}
