@@ -1,12 +1,13 @@
 //! mainnet_smoke: the owner's first Paradex MAINNET order (FBC-p0aa, owner answer "Library smoke
-//! first"). testnet_trade's round trip on a SEPARATE small mainnet account: one post-only order
-//! of `--order-usd` (the operator's) well away from the touch through fbc-oms, its
-//! acknowledgement, its cancel, the cancel's acknowledgement, then Stop (kill switch + cancel all), each step timed out and
-//! printed. Refused without both `--mainnet` and `--sole-trader`, with any URL or chain id but
-//! mainnet's, with a missing or non-positive cap (the caps are yours: no ceiling), with a
-//! testnet credential variable set, or on a venue whose snapshot source is not trustworthy (Paradex's is, decision
-//! 0094; no hand seed on mainnet), before anything connects. An owner-run sample: CI builds it,
-//! and its wiring is tested against the conformance stub (`tests/mainnet_smoke.rs`).
+//! first"). testnet_trade's round trip on a SEPARATE small mainnet account: one post-only order of
+//! `--order-usd` (the operator's) well away from the touch through fbc-oms, its acknowledgement,
+//! its cancel, the cancel's acknowledgement, then Stop (kill switch + cancel all), each step timed
+//! out and printed. Refused without both `--mainnet` and `--sole-trader`, with any URL or chain id
+//! but mainnet's, with a missing or non-positive cap (the caps are yours: no ceiling), with a
+//! testnet credential variable set, or on a venue whose snapshot source is not trustworthy
+//! (Paradex's is, decision 0094; no hand seed on mainnet), before anything connects. An owner-run
+//! sample: CI builds it, and its wiring is tested against the conformance stub
+//! (`tests/mainnet_smoke.rs`).
 //!
 //! ```text
 //! unset PARADEX_ACCOUNT_ADDRESS PARADEX_PRIVATE_KEY   # the testnet samples' variables

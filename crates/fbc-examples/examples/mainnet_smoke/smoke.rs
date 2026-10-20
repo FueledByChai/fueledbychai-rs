@@ -4,11 +4,11 @@
 //! **Before anything connects** ([`run`]): both confirmations (`--mainnet`, `--sole-trader`) and
 //! the smoke's caps (yours, positive, with no ceiling, [`crate::smoke_args::confirmed`]; both
 //! printed, the `CAPS` line, before the first request); the URLs exactly mainnet's
-//! ([`MAINNET_REST`], [`MAINNET_WS`]) or both a loopback stub's; `PARADEX_CHAIN_ID`, when set, mainnet's; and the
-//! venue's declared snapshot source trustworthy ([`trusted`]). Paradex's adapter declares it
-//! trustworthy (decision 0094, accepted by the owner 2026-10-16); a venue declaring otherwise
-//! stops here: a mainnet market is armed only after a trustworthy resync (owner answer C to
-//! RB-olg-3), and hand-seeding is for an owner-assisted testnet run only (decision 0067).
+//! ([`MAINNET_REST`], [`MAINNET_WS`]) or both a loopback stub's; `PARADEX_CHAIN_ID`, when set,
+//! mainnet's; and the venue's declared snapshot source trustworthy ([`trusted`]). Paradex's adapter
+//! declares it trustworthy (decision 0094, accepted by the owner 2026-10-16); a venue declaring
+//! otherwise stops here: a mainnet market is armed only after a trustworthy resync (owner answer C
+//! to RB-olg-3), and hand-seeding is for an owner-assisted testnet run only (decision 0067).
 //!
 //! **Then, each step timed out**: `GET /system/config` must name [`MAINNET_CHAIN`], the chain the
 //! login signs for ([`decode_chain`]); `GET /markets/summary` gives the market's mark price

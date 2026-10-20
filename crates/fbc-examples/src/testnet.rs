@@ -787,14 +787,15 @@ pub fn inventory_price(px: Decimal, bid: Option<Decimal>, ask: Option<Decimal>) 
 /// A cap of `usd` in lots of `step` at `price`, floored. The caps are the operator's own, with
 /// no ceiling (FBC-thks, decision 0113), so a cap past what a lot count holds (or a decimal
 /// holds, once divided) is the largest lot count, never zero and never a panic (Codex
-/// r4320205456 on PR #184); fbc-oms's checked arithmetic then bounds every order as at any large cap. A price or
-/// step that is not positive, or a cap that is not, gives no lot.
+/// r4320205456 on PR #184); fbc-oms's checked arithmetic then bounds every order as at any
+/// large cap. A lot whose own cost does not fit a decimal costs more than any cap, so it gives
+/// no lot (Codex r4320317907), and a re-check at such a price never admits an order; so does a
+/// price, a step or a cap that is not positive.
 pub fn cap_lots(usd: Decimal, price: Decimal, step: Decimal) -> Lots {
     use rust_decimal::prelude::ToPrimitive;
     let per_lot = match price.checked_mul(step) {
         Some(per) if per > Decimal::ZERO => per,
-        Some(_) => return Lots::ZERO,
-        None => return Lots::new(i64::MAX).unwrap_or(Lots::ZERO),
+        _ => return Lots::ZERO,
     };
     if usd <= Decimal::ZERO {
         return Lots::ZERO;

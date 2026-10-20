@@ -35,12 +35,12 @@
 //!   (`src/auth_mainnet.rs`), the operator's own positive caps (required, no default, no
 //!   ceiling), offsets of at least 20 bps, at most an hour, never seeded by hand.
 //! - `mainnet_smoke` (`examples/mainnet_smoke/`, FBC-p0aa): Paradex MAINNET, the owner's first
-//!   prod order: testnet_trade's round trip (its `trade.rs`, by path), never seeded by hand,
-//!   behind `--mainnet` and `--sole-trader`, the operator's own positive caps (required, no
-//!   default, no ceiling), mainnet's URLs and chain id (checked against `GET /system/config`),
-//!   the order sized to the minimum notional at the mark price. Its credentials come from mainnet-only
-//!   variables (`src/auth_mainnet.rs`, a review path). It Starts only after a trustworthy
-//!   resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094).
+//!   prod order: testnet_trade's round trip (its `trade.rs`, by path), never seeded by hand, behind
+//!   `--mainnet` and `--sole-trader`, the operator's own positive caps (required, no default, no
+//!   ceiling), mainnet's URLs and chain id (checked against `GET /system/config`), the order sized
+//!   to the minimum notional at the mark price. Its credentials come from mainnet-only variables
+//!   (`src/auth_mainnet.rs`, a review path). It Starts only after a trustworthy resync seeded the
+//!   market (Paradex's snapshot source is trustworthy, decision 0094).
 //!
 //! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
 //! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the

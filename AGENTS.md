@@ -465,9 +465,9 @@ rather than guess.
     `--mainnet` (FBC-tyft) a supervised Paradex MAINNET session behind `--mainnet` and
     `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, the operator's own
     positive caps (required, no defaults, no ceiling: FBC-thks), offsets of at least 20 bps,
-    `--duration` of at most an hour, never seeded by hand. The samples that trade share `src/link.rs` (the glue) and
-    `src/testnet.rs` (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet
-    guard), included by path.
+    `--duration` of at most an hour, never seeded by hand. The samples that trade share
+    `src/link.rs` (the glue) and `src/testnet.rs` (guard and wiring), and the mainnet ones
+    `src/mainnet.rs` (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
