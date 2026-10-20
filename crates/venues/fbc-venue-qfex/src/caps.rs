@@ -23,9 +23,8 @@ pub(crate) fn caps() -> VenueCaps {
             encoding: Encoding::Json,
             touch_sources: vec![TouchSourceCaps {
                 channel: "bbo",
-                // The BBO page calls the stream pulsed but does not state its interval;
-                // the book page states 500 ms. This is provisional pending a capture.
-                cadence: Cadence::Pulsed(Duration::from_millis(500)),
+                // The BBO page calls the stream pulsed but does not state its interval.
+                cadence: Cadence::Unknown,
                 // Published examples have a sequence, but do not promise cross-feed ordering.
                 seq_domain: SeqDomain::Own,
                 ts_kind: ExchTsKind::Unknown,

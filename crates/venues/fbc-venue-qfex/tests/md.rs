@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use fbc_core::{
-    Aggressor, AssetSym, BookSide, DecodeError, Effect, Effects, ExchNs, ExchTsKind, Feed,
+    Aggressor, AssetSym, BookSide, Cadence, DecodeError, Effect, Effects, ExchNs, ExchTsKind, Feed,
     FeedHealth, FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId,
     InstrumentKind, InstrumentSpec, Lots, Lvl, MdCodec, MdEvent, MdSink, MdTransport, MonoNs,
     PriceGrid, RawFrame, Readiness, Secrets, SizeStep, SpecTable, Subscription, SymbolError, Ticks,
@@ -13,6 +13,16 @@ use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 const AAPL: InstrumentId = InstrumentId::new(1);
+
+#[test]
+fn bbo_cadence_remains_unknown_until_measured() {
+    let caps = Qfex.caps(&cfg()).unwrap();
+    assert_eq!(caps.md.touch_sources[0].cadence, Cadence::Unknown);
+    assert_eq!(
+        caps.md.books[0].cadence,
+        Cadence::Pulsed(std::time::Duration::from_millis(500))
+    );
+}
 
 fn cfg() -> VenueConfig {
     let mut cfg = VenueConfig::new();
