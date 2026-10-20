@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 
 pub use tungstenite::Message;
 
+use crate::auth::HandshakeHeaders;
 use crate::connector::Connector;
 use crate::error::{Cause, NetError, Step};
 use crate::http::{Bytes, host_header};
@@ -40,12 +41,24 @@ impl Connector {
     /// WebSocket upgrade. The request goes in origin form (path and query) with a Host header
     /// from the URL; user information in the URL is never sent.
     pub async fn websocket(&self, url: &str) -> Result<WebSocket, NetError> {
+        self.websocket_with(url, &HandshakeHeaders::none()).await
+    }
+
+    /// [`websocket`](Connector::websocket), the upgrade request also carrying `headers`, an
+    /// order-entry endpoint's credential headers (decision 0116), on every attempt, through a
+    /// proxy as well. A failure names no header value.
+    pub(crate) async fn websocket_with(
+        &self,
+        url: &str,
+        headers: &HandshakeHeaders,
+    ) -> Result<WebSocket, NetError> {
         let uri = target::parse(url)?;
         let to = target::target(&uri, "ws", "wss")?;
         let host = host_header(&uri)?;
         let path = uri.path_and_query().map_or("/", |p| p.as_str());
         let key = generate_key();
-        let request = Request::get(path)
+        let request = headers
+            .add_to(Request::get(path))
             .header(HOST, host)
             .header(CONNECTION, "Upgrade")
             .header(UPGRADE, "websocket")

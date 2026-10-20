@@ -578,6 +578,8 @@ async fn the_key_and_the_account_id_are_in_no_journal_byte_log_line_or_error() {
         "the account id is in the journal"
     );
     let logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // The logger is live: tungstenite's handshakes are heard at DEBUG.
+    assert!(!logged.is_empty());
     for line in &logged {
         assert!(!line.contains(&synthetic_key()), "logged: {line}");
         assert!(!line.contains(&synthetic_account()), "logged: {line}");
