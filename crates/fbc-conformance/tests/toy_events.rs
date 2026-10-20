@@ -15,9 +15,9 @@ use fbc_conformance::toy::{
 use fbc_core::{
     AccountKey, AmendAck, AssetSym, CancelReason, CidMatch, CidMint, ClientOrderId, DecodeError,
     Effects, ExchNs, ExchTsKind, ExecCodec, ExecEvent, ExecSink, FeeError, FillEvent, FillIdent,
-    FillKey, IdError, Liquidity3, Lots, ModeScope, Money, NamespaceLease, OrderUpdate, RawFrame,
-    Reject, RejectKind, RpcId, Side, SubmitOutcome, TerminalReject, Ticks, VenueMeta, VenueMode,
-    VenueOrderId, VenueOrderState, WallNs, encode_cid,
+    FillKey, FillOrigin, IdError, Liquidity3, Lots, ModeScope, Money, NamespaceLease, OrderUpdate,
+    RawFrame, Reject, RejectKind, RpcId, Side, SubmitOutcome, TerminalReject, Ticks, VenueMeta,
+    VenueMode, VenueOrderId, VenueOrderState, WallNs, encode_cid,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -157,10 +157,12 @@ fn fill(ident: FillIdent, replay: bool) -> FillEvent {
     let fee = toy::with_scope(|scope| scope.fee(-150_000, AssetSym::new("USDC").unwrap()));
     FillEvent {
         ident,
-        cid: Some(CidMatch::Ours(cid(1))),
+        origin: FillOrigin::Order {
+            cid: Some(CidMatch::Ours(cid(1))),
+            px: Ticks(130_870),
+        },
         inst: INST_B,
         side: Side::Sell,
-        px: Ticks(130_870),
         qty: lots(3),
         liquidity: Liquidity3::Maker,
         fee: fee.unwrap(),

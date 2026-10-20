@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountKey, CidMatch, ClientOrderId, InstrumentId, ItemRef, Lots, MonoNs, Namespace, NewOrder,
-    NotSentReason, OrderCaps, OrderUpdate, RpcId, Side, SignedLots, SubmitOutcome, Ticks,
-    VenueCommand, VenueOrderId,
+    AccountKey, CidMatch, ClientOrderId, FillOrigin, InstrumentId, ItemRef, Lots, MonoNs,
+    Namespace, NewOrder, NotSentReason, OrderCaps, OrderUpdate, RpcId, Side, SignedLots,
+    SubmitOutcome, Ticks, VenueCommand, VenueFillKind, VenueOrderId,
 };
 
 use crate::audit::{Audit, AuditSink};
@@ -27,7 +27,7 @@ use crate::permit::{
 };
 use crate::planner::PlanRefusal;
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
-use crate::resync::{MarketState, Placed, Placement, Seed};
+use crate::resync::{MarketState, Placed, Placement, Placing, Seed, VenuePlaced};
 use crate::sweep::ForeignView;
 
 /// Our orders, by client id, with an index of every venue id they were known by, the
@@ -127,6 +127,13 @@ pub enum FillRouted {
     /// holds, so nothing shows it is ours (another namespace's order on a venue that echoes no
     /// client id looks the same; decision 0005, I4).
     Unattributed,
+    /// A change the venue made itself to the position (a liquidation, a transfer, a settlement
+    /// or a block trade; decision 0120), counted on no order: the inventory moved, unless
+    /// `in_snapshot`, when the position the market's resync seeded already holds it.
+    Venue {
+        kind: VenueFillKind,
+        in_snapshot: bool,
+    },
 }
 
 /// Where [`Registry::apply_update`] sent an update.
@@ -772,12 +779,19 @@ impl Registry {
     /// accepted fill is applied once: the only path by which the inventory and an order's fill
     /// sum move (decision 0005, I3).
     ///
-    /// Routed as [`Registry::apply_update`] routes an order update. A fill of our order counts
+    /// Routed first by its origin. A change the venue made itself (a liquidation, a transfer, a
+    /// settlement or a block trade; decision 0120) moves the inventory only, on no order, even
+    /// one its venue id names: it indexes no venue id, puts nothing in view, and is reported by
+    /// its kind ([`FillRouted::Venue`]), placed against the market's seed by its arrival and
+    /// time alone ([`Registry::resync`]). An order's execution is routed as
+    /// [`Registry::apply_update`] routes an order update. A fill of our order counts
     /// on it ([`FillApplied`]), moves the inventory and indexes the venue id it names; one under our namespace's client id
     /// for no order the registry holds moves the inventory only; another namespace's, a
     /// non-canonical or an unattributed one, one whose client id and venue id name different
     /// orders, or one whose instrument or side is not its order's, moves nothing and is
-    /// flagged; the first three put their order in view ([`Registry::foreign_in_view`]). None
+    /// flagged; the first three put their order in view ([`Registry::foreign_in_view`]). Only
+    /// the origin the codec declares exempts a fill naming no client id from that flag, never
+    /// the absence of one (decision 0005, I4). None
     /// of this depends on the market's state: a fill in Killed or Cancel-only counts as in
     /// any other (decision 0012). The ledger records
     /// only a fill that counted, once it is applied: a flagged fill is not kept, so it never
@@ -794,8 +808,12 @@ impl Registry {
         }
         self.ledger = Some(ledger);
         let fill = accepted.fill();
+        let named = match fill.origin {
+            FillOrigin::Venue { kind, .. } => return self.apply_venue_fill(accepted, kind),
+            FillOrigin::Order { cid, .. } => cid,
+        };
         let by_vid = fill.vid().and_then(|v| self.cid_of(v));
-        let (cid, ours) = match fill.cid {
+        let (cid, ours) = match named {
             Some(CidMatch::Foreign(ns)) => {
                 self.foreign.open(fill.inst, fill.vid());
                 return Ok(FillRouted::Foreign(ns));
@@ -856,7 +874,13 @@ impl Registry {
             // Counted on the inventory if a later snapshot shows its order open (0108).
             self.untracked_in_snapshot(fill.inst, &placed, signed);
         }
-        self.fill_counted(fill.inst, fill.key(), placed, signed, placement);
+        self.fill_counted(
+            fill.inst,
+            fill.key(),
+            Placing::Order(placed),
+            signed,
+            placement,
+        );
         let routed = match (cid, cum) {
             (Some(cid), Some(cum)) => {
                 let applied =
@@ -880,6 +904,42 @@ impl Registry {
             Placement::InSnapshot { .. } => FillRouted::InSnapshot(ours),
             Placement::Unsettled => FillRouted::Unsettled(ours),
         })
+    }
+
+    /// Applies `accepted`, a change the venue made itself of `kind` (decision 0120), through
+    /// the fill path every fill takes: the inventory moves by its signed size unless the
+    /// market's seed holds it ([`Registry::venue_placement`]), the ledger records it, and the
+    /// market's position revision advances when the inventory moved. It counts on no order,
+    /// even one its venue id names, so no order's fill count, lattice or venue ids move, it
+    /// puts nothing in view and it is no orphan's sighting. Refused, nothing counted or
+    /// recorded, when the inventory would overflow.
+    fn apply_venue_fill(
+        &mut self,
+        accepted: AcceptedFill<'_, '_>,
+        kind: VenueFillKind,
+    ) -> Result<FillRouted, OmsError> {
+        let fill = accepted.fill();
+        let placed = VenuePlaced::of(accepted.time(), accepted.arrived());
+        let placement = self.venue_placement(fill.inst, &placed);
+        let signed = SignedLots::of(fill.side, fill.qty);
+        let in_snapshot = matches!(placement, Placement::InSnapshot { .. });
+        let inventory = if in_snapshot {
+            self.inventory(fill.inst)
+        } else {
+            self.inventory(fill.inst)
+                .checked_add(signed)
+                .ok_or(OmsError::FillOverflow(fill.inst))?
+        };
+        accepted.commit();
+        self.set_inventory(fill.inst, inventory);
+        self.fill_counted(
+            fill.inst,
+            fill.key(),
+            Placing::Venue(placed),
+            signed,
+            placement,
+        );
+        Ok(FillRouted::Venue { kind, in_snapshot })
     }
 
     /// Applies the outcome of one command item to the order `cid` it was sent for

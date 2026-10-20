@@ -998,7 +998,7 @@ impl Run {
         self.exec(i)
             .into_iter()
             .filter_map(|(at, ev)| match ev {
-                ExecEvent::Fill(f) => Some((at, f.px.0, f.qty.get())),
+                ExecEvent::Fill(f) => Some((at, f.order_px().unwrap().0, f.qty.get())),
                 _ => None,
             })
             .collect()

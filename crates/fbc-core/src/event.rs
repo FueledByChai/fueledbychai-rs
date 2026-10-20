@@ -350,6 +350,30 @@ pub enum FillIdent {
     Derived { vid: VenueOrderId, cum_after: Lots },
 }
 
+/// A change the venue made to the account's position with no order of the account's
+/// (decision 0120).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum VenueFillKind {
+    Liquidation,
+    Transfer,
+    Settlement,
+    BlockTrade,
+}
+
+/// What made a fill, and its price as that maker states it, each stated once (decisions 0014
+/// and 0120).
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum FillOrigin {
+    /// An execution of an order on the account: ours, another namespace's, another system's,
+    /// or one whose fill echoes no client id (`cid` `None`; decision 0014). Its price is on the
+    /// grid.
+    Order { cid: Option<CidMatch>, px: Ticks },
+    /// A change the venue made itself (liquidation, transfer, settlement, block trade): it
+    /// names no client id, and its price is exactly what the venue states, on or off the grid,
+    /// never rounded (decision 0004).
+    Venue { kind: VenueFillKind, px: PxExact },
+}
+
 /// Whether a fill made or took liquidity, or the venue does not say.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Liquidity3 {
@@ -370,18 +394,21 @@ impl Liquidity3 {
     }
 }
 
-/// One fill of one of the account's orders.
+/// One change to the account's position: an execution of an order, or one the venue made
+/// itself (decision 0120).
 #[derive(Clone, PartialEq, Debug)]
 pub struct FillEvent {
     /// The fill id or, without one, the order id and cumulative quantity that key the fill;
     /// read through [`key`](FillEvent::key), [`vid`](FillEvent::vid) and
     /// [`cum_after`](FillEvent::cum_after).
     pub ident: FillIdent,
-    /// The client id read off the wire; `None` when the fill carries none.
-    pub cid: Option<CidMatch>,
+    /// An order's execution, with the client id read off the wire and its price on the grid, or
+    /// the venue's own change, with its kind and exact price; read through
+    /// [`cid`](FillEvent::cid), [`venue_kind`](FillEvent::venue_kind) and
+    /// [`order_px`](FillEvent::order_px).
+    pub origin: FillOrigin,
     pub inst: InstrumentId,
     pub side: Side,
-    pub px: Ticks,
     /// The quantity of THIS fill (incremental).
     pub qty: Lots,
     pub liquidity: Liquidity3,
@@ -423,6 +450,33 @@ impl FillEvent {
         match &self.ident {
             FillIdent::Venue { cum_after, .. } => *cum_after,
             FillIdent::Derived { cum_after, .. } => Some(*cum_after),
+        }
+    }
+
+    /// The client id read off the wire; `None` when the fill carries none, and always for a
+    /// fill the venue made itself.
+    pub fn cid(&self) -> Option<CidMatch> {
+        match self.origin {
+            FillOrigin::Order { cid, .. } => cid,
+            FillOrigin::Venue { .. } => None,
+        }
+    }
+
+    /// What the venue did, when the fill is one it made itself; `None` for an order's
+    /// execution.
+    pub fn venue_kind(&self) -> Option<VenueFillKind> {
+        match self.origin {
+            FillOrigin::Order { .. } => None,
+            FillOrigin::Venue { kind, .. } => Some(kind),
+        }
+    }
+
+    /// The price on the grid of an order's execution; `None` for a fill the venue made itself,
+    /// whose exact price is in [`origin`](FillEvent::origin).
+    pub fn order_px(&self) -> Option<Ticks> {
+        match self.origin {
+            FillOrigin::Order { px, .. } => Some(px),
+            FillOrigin::Venue { .. } => None,
         }
     }
 }
@@ -749,10 +803,12 @@ mod tests {
         let lots = |n| Lots::new(n).unwrap();
         let fill = |ident| FillEvent {
             ident,
-            cid: None,
+            origin: FillOrigin::Order {
+                cid: None,
+                px: Ticks(5),
+            },
             inst: InstrumentId::new(1),
             side: Side::Sell,
-            px: Ticks(5),
             qty: lots(1),
             liquidity: Liquidity3::Unknown,
             fee,
@@ -787,6 +843,84 @@ mod tests {
         });
         assert_eq!(bare.key(), FillKey::Venue(fid));
         assert_eq!((bare.vid(), bare.cum_after()), (None, None));
+    }
+
+    #[test]
+    fn a_fills_origin_states_its_client_id_kind_and_price_once() {
+        // An order's execution answers its client id and grid price and names no venue kind; a
+        // fill the venue made itself names no client id and no grid price, only its kind, and
+        // keeps its exact price (decision 0120). The key, venue id and cumulative quantity read
+        // the same for both.
+        let (vid, fid, fee) = crate::scope::dispatch(
+            &crate::caps::testing::caps(),
+            crate::ids::Namespace::new(1),
+            |scope| {
+                let usd = crate::units::AssetSym::new("USD").unwrap();
+                (
+                    scope.venue_order_id("V-1").unwrap(),
+                    scope.fill_id("LIQUIDATION:F-1").unwrap(),
+                    scope.fee(0, usd).unwrap(),
+                )
+            },
+        );
+        let fill = |origin| FillEvent {
+            ident: FillIdent::Venue {
+                fill: fid.clone(),
+                vid: Some(vid.clone()),
+                cum_after: None,
+            },
+            origin,
+            inst: InstrumentId::new(1),
+            side: Side::Sell,
+            qty: Lots::new(1).unwrap(),
+            liquidity: Liquidity3::Taker,
+            fee,
+            realized_pnl: None,
+            realized_funding: None,
+            replay: false,
+        };
+        let cid = CidMatch::Unparseable;
+        let own = fill(FillOrigin::Order {
+            cid: Some(cid),
+            px: Ticks(7),
+        });
+        assert_eq!(
+            (own.cid(), own.venue_kind(), own.order_px()),
+            (Some(cid), None, Some(Ticks(7)))
+        );
+        let nameless = fill(FillOrigin::Order {
+            cid: None,
+            px: Ticks(8),
+        });
+        assert_eq!(
+            (nameless.cid(), nameless.venue_kind(), nameless.order_px()),
+            (None, None, Some(Ticks(8)))
+        );
+        for kind in [
+            VenueFillKind::Liquidation,
+            VenueFillKind::Transfer,
+            VenueFillKind::Settlement,
+            VenueFillKind::BlockTrade,
+        ] {
+            let px = PxExact::new(6_123_456_789_012, -8);
+            let venue = fill(FillOrigin::Venue { kind, px });
+            assert_eq!(
+                (venue.cid(), venue.venue_kind(), venue.order_px()),
+                (None, Some(kind), None)
+            );
+            assert_eq!(venue.origin, FillOrigin::Venue { kind, px });
+            assert_eq!(
+                (venue.key(), venue.vid(), venue.cum_after()),
+                (FillKey::Venue(fid.clone()), Some(&vid), None)
+            );
+        }
+        // The exact price compares by value: 1.0 is 10e-1.
+        let one = |px| FillOrigin::Venue {
+            kind: VenueFillKind::Settlement,
+            px,
+        };
+        assert_eq!(one(PxExact::new(1, 0)), one(PxExact::new(10, -1)));
+        assert_ne!(one(PxExact::new(1, 0)), one(PxExact::new(11, -1)));
     }
 
     #[test]

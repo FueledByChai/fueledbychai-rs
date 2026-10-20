@@ -16,18 +16,20 @@
 //! (by age or count) and that is then replayed never moves the inventory a second time. Each
 //! case generates distinct fills with venue times around the watermark, a ledger that holds
 //! one to four fills for a short age, and a shuffled delivery in which each fill's first
-//! arrival may be live and every later one is a replay.
+//! arrival may be live and every later one is a replay. Some of the fills are venue-initiated
+//! (decision 0120), naming the venue id of the order on their side: they move the inventory as
+//! any other does, and no order's fill count, which holds only the order's own fills.
 
 mod common;
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use common::{cid, fill, fill_id, lots, placement, rejected, update};
+use common::{cid, fill, fill_id, lots, no_fee, placement, rejected, update, venue_fill};
 use fbc_core::{
     AckLevel, CancelReason, ClientOrderId, ExchNs, ExchTsKind, FillEvent, FillIdent, FillKey,
-    InstrumentId, ItemRef, Lots, MonoNs, OrderUpdate, RejectKind, Side, SignedLots, SubmitOutcome,
-    VenueOrderId, VenueOrderState, WallNs,
+    InstrumentId, ItemRef, Lots, MonoNs, OrderUpdate, PxExact, RejectKind, Side, SignedLots,
+    SubmitOutcome, VenueFillKind, VenueOrderId, VenueOrderState, WallNs,
 };
 use fbc_oms::{
     Admission, FillLedger, FillRouted, FillTime, Horizon, LedgerConfig, OrdState, OrderKey,
@@ -374,6 +376,8 @@ struct Spec {
     timed: Timed,
     live: bool,
     replays: usize,
+    /// A venue-initiated fill (decision 0120) rather than an order's.
+    venue: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -401,14 +405,16 @@ fn spec() -> impl Strategy<Value = Spec> {
         timed,
         any::<bool>(),
         0usize..=3,
+        prop::bool::weighted(0.3),
     )
-        .prop_map(|(qty, side, exch, timed, live, replays)| Spec {
+        .prop_map(|(qty, side, exch, timed, live, replays, venue)| Spec {
             qty,
             side,
             exch,
             timed,
             live,
             replays,
+            venue,
         })
 }
 
@@ -459,8 +465,9 @@ fn time_of(s: &Spec, skew: i64) -> Option<FillTime> {
 proptest! {
     #![proptest_config(config(4096, 0x0005_0004))]
 
-    /// I3: inventory only through deduplicated fills; replays applied only when absent and
-    /// newer than the watermark; a forgotten fill replayed never moves inventory twice.
+    /// I3: inventory only through deduplicated fills, an order's or the venue's own; replays
+    /// applied only when absent and newer than the watermark; a forgotten fill replayed never
+    /// moves inventory twice; each order's fill count holds only its own fills.
     #[test]
     fn i3_a_replayed_fill_moves_inventory_only_when_absent_newer_and_vouched_for(
         s in session()
@@ -480,6 +487,13 @@ proptest! {
         let mut selling = placement(sell, 100, 1_000_000);
         selling.side = Side::Sell;
         reg.insert(selling).unwrap();
+        // Each acknowledged under a venue id the venue's own fills on its side name.
+        let accepted = SubmitOutcome::Accepted { ack: AckLevel::Final };
+        for (c, v) in [(buy, "vb"), (sell, "vs")] {
+            let item = ItemRef { idx: 0, cid: None, vid: Some(common::vid(v)) };
+            reg.on_outcome(c, OrderOp::Place, &item, &accepted, MonoNs(0)).unwrap();
+        }
+        let mut own = [Lots::ZERO, Lots::ZERO];
 
         let mut applied: HashMap<FillKey, u32> = HashMap::new();
         let mut expected = SignedLots(0);
@@ -492,8 +506,23 @@ proptest! {
             let replay = seen[i] || !spec.live;
             seen[i] = true;
             replayed += u64::from(replay);
-            let cid = if spec.side == Side::Buy { buy } else { sell };
-            let f = fill(Some(cid), common::ident(&format!("f{i}")), spec.side, spec.qty, replay);
+            let (cid, v, at) = if spec.side == Side::Buy { (buy, "vb", 0) } else { (sell, "vs", 1) };
+            let f = if spec.venue {
+                FillEvent {
+                    replay,
+                    ..venue_fill(
+                        VenueFillKind::Liquidation,
+                        &format!("f{i}"),
+                        Some(v),
+                        spec.side,
+                        spec.qty,
+                        PxExact::new(100, 0),
+                        no_fee(),
+                    )
+                }
+            } else {
+                fill(Some(cid), common::ident(&format!("f{i}")), spec.side, spec.qty, replay)
+            };
             let time = time_of(spec, skew);
             let key = f.key();
             let before = applied.get(&key).copied().unwrap_or(0);
@@ -518,7 +547,18 @@ proptest! {
                         );
                     }
                     let routed = reg.apply_fill(accepted).unwrap();
-                    prop_assert!(matches!(routed, FillRouted::Ours(c, _) if c == cid));
+                    if spec.venue {
+                        prop_assert_eq!(
+                            routed,
+                            FillRouted::Venue {
+                                kind: VenueFillKind::Liquidation,
+                                in_snapshot: false,
+                            }
+                        );
+                    } else {
+                        prop_assert!(matches!(routed, FillRouted::Ours(c, _) if c == cid));
+                        own[at] = own[at].checked_add(lots(spec.qty)).unwrap();
+                    }
                     applied.insert(key, before + 1);
                     expected = expected.checked_add(signed(spec.side, lots(spec.qty))).unwrap();
                     None
@@ -537,6 +577,8 @@ proptest! {
                 );
             }
             prop_assert_eq!(reg.inventory(INST), expected);
+            prop_assert_eq!(reg.get(buy).unwrap().cum_fills(), own[0]);
+            prop_assert_eq!(reg.get(sell).unwrap().cum_fills(), own[1]);
             prop_assert!(ledger.len() <= s.max_entries);
         }
         let counts = ledger.replays();

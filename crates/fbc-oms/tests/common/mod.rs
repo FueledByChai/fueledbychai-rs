@@ -11,12 +11,12 @@ use std::time::Duration;
 use fbc_core::{
     AccountKey, AckModel, AssetSym, CancelOnDisconnect, CancelReason, Channel, CidMatch, CidMint,
     ClientIdFormat, ClientOrderId, ConnTopology, Encoding, ExecCaps, Fee, FeedSource, FillCaps,
-    FillEvent, FillId, FillIdent, FillSource, FundingCaps, InstrumentId, Liquidity3, Lots,
-    MatchingCaps, MdCaps, Namespace, NamespaceLease, NewOrder, NonceScope, OrderCaps, OrderKind,
-    OrderKindTag, OrderUpdate, OrderingKey, Readiness, RefKind, RejectKind, Side, SnapshotReads,
-    SnapshotSource, StpScope, Support, TagSet, TerminalReject, Ticks, Tif, TifTag, TradeCaps,
-    VenueCaps, VenueFeeSign, VenueOrderId, VenueOrderState, VenueSymbol, WallNs,
-    dispatch_market_data,
+    FillEvent, FillId, FillIdent, FillOrigin, FillSource, FundingCaps, InstrumentId, Liquidity3,
+    Lots, MatchingCaps, MdCaps, Namespace, NamespaceLease, NewOrder, NonceScope, OrderCaps,
+    OrderKind, OrderKindTag, OrderUpdate, OrderingKey, PxExact, Readiness, RefKind, RejectKind,
+    Side, SnapshotReads, SnapshotSource, StpScope, Support, TagSet, TerminalReject, Ticks, Tif,
+    TifTag, TradeCaps, VenueCaps, VenueFeeSign, VenueFillKind, VenueOrderId, VenueOrderState,
+    VenueSymbol, WallNs, dispatch_market_data,
 };
 
 /// The namespace every test client id is minted in.
@@ -74,16 +74,59 @@ pub fn fill(
 ) -> FillEvent {
     FillEvent {
         ident,
-        cid: cid.map(CidMatch::Ours),
+        origin: FillOrigin::Order {
+            cid: cid.map(CidMatch::Ours),
+            px: Ticks(100),
+        },
         inst: InstrumentId::new(1),
         side,
-        px: Ticks(100),
         qty: lots(qty),
         liquidity: Liquidity3::Maker,
         fee: no_fee(),
         realized_pnl: None,
         realized_funding: None,
         replay,
+    }
+}
+
+/// A fee of `nanos` in `asset`, decoded under the synthetic venue's declared sign: positive is
+/// paid (decision 0004).
+pub fn fee_paid(nanos: i128, asset: &str) -> Fee {
+    dispatch_market_data(&decode_caps(), |scope| {
+        scope.fee(nanos, AssetSym::new(asset).unwrap())
+    })
+    .unwrap()
+}
+
+/// A change the venue made itself to the position on instrument 1 (decision 0120): `kind`,
+/// named by the fill id `fid` and, when given, the venue order id `vid`, of `qty` on `side` at
+/// the exact price `px`, costing `fee`. It names no client id; it is a live delivery whose
+/// liquidity the venue does not say, with no realized P&L or funding. Every id and the fee are
+/// built through the decode scope (decision 0004).
+pub fn venue_fill(
+    kind: VenueFillKind,
+    fid: &str,
+    vid: Option<&str>,
+    side: Side,
+    qty: i64,
+    px: PxExact,
+    fee: Fee,
+) -> FillEvent {
+    FillEvent {
+        ident: FillIdent::Venue {
+            fill: fill_id(fid),
+            vid: vid.map(self::vid),
+            cum_after: None,
+        },
+        origin: FillOrigin::Venue { kind, px },
+        inst: InstrumentId::new(1),
+        side,
+        qty: lots(qty),
+        liquidity: Liquidity3::Unknown,
+        fee,
+        realized_pnl: None,
+        realized_funding: None,
+        replay: false,
     }
 }
 

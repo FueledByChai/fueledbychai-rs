@@ -4079,3 +4079,45 @@ fn only_p1s_amend_admits_an_order_that_filled_in_part() {
     without.amend = None;
     assert!(accept::partial_amend_caps(&without).amend.is_none());
 }
+
+#[test]
+fn a_venue_fill_is_labelled_by_its_kind_and_priced_exactly_as_the_venue_states_it() {
+    use fbc_core::{CidMatch, FillOrigin, PxExact, Ticks, VenueFillKind};
+    // FBC-5uk, decision 0120: a change the venue made itself is told apart from an order fill
+    // not ours in the evidence, by its kind.
+    assert_eq!(
+        accept::venue_fill_label(VenueFillKind::Liquidation),
+        "venue: Liquidation"
+    );
+    assert_eq!(
+        accept::venue_fill_label(VenueFillKind::Transfer),
+        "venue: Transfer"
+    );
+    assert_eq!(
+        accept::venue_fill_label(VenueFillKind::Settlement),
+        "venue: Settlement"
+    );
+    assert_eq!(
+        accept::venue_fill_label(VenueFillKind::BlockTrade),
+        "venue: BlockTrade"
+    );
+    let tick = Decimal::from_str("0.1").unwrap();
+    // Its price exactly as the venue states it, off a 0.1 tick too (decision 0004), and trailing
+    // zeros dropped.
+    let settlement = FillOrigin::Venue {
+        kind: VenueFillKind::Settlement,
+        px: PxExact::new(6_123_456_789_012, -8),
+    };
+    assert_eq!(accept::fill_price(&settlement, tick), "61234.56789012");
+    let liquidation = FillOrigin::Venue {
+        kind: VenueFillKind::Liquidation,
+        px: PxExact::new(6_100_000_000_000, -8),
+    };
+    assert_eq!(accept::fill_price(&liquidation, tick), "61000");
+    // An order fill's price is its ticks at the market's tick.
+    let order = FillOrigin::Order {
+        cid: Some(CidMatch::Unparseable),
+        px: Ticks(610_005),
+    };
+    assert_eq!(accept::fill_price(&order, tick), "61000.5");
+}

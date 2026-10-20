@@ -462,7 +462,7 @@ fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) ->
                 breaches.push(Breach::new("OrderUpdate", what));
             }
             // A fill moves the order's filled count and the inventory (Codex r4224199063).
-            ExecEvent::Fill(fill) if ours(fill.cid) || by_vid(fill.vid()) => {
+            ExecEvent::Fill(fill) if ours(fill.cid()) || by_vid(fill.vid()) => {
                 let what = format!(
                     "a fill {fill:?} of the order the stub amended was reported; the stub filled \
                      nothing"
@@ -479,7 +479,7 @@ fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) ->
 /// stub rested and filled nothing of, by its client id or the venue id it was placed under.
 fn filled(events: &[ExecEvent], asked: &Asked) -> Vec<Breach> {
     let names = |fill: &FillEvent| {
-        fill.cid == Some(CidMatch::Ours(asked.cid))
+        fill.cid() == Some(CidMatch::Ours(asked.cid))
             || (asked.placed.is_some() && fill.vid() == asked.placed.as_ref())
     };
     let fills = events.iter().filter_map(|event| match event {

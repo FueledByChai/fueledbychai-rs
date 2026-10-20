@@ -29,7 +29,11 @@
 //! be cloned, and a registry takes fills from one ledger only. A fill under another
 //! namespace's or a non-canonical client id, or naming neither our client id nor a venue id
 //! the registry knows, is flagged and not counted (decision 0005, I4); a fill's reported
-//! cumulative quantity raises the order's `cum_venue`. An order's filled quantity is
+//! cumulative quantity raises the order's `cum_venue`. A change the venue made itself to the
+//! position (a liquidation, a transfer, a settlement or a block trade; decision 0120) states
+//! that origin, names no client id, and counts once on the inventory through the same ledger
+//! and path, on no order, even one its venue id names, and puts nothing in view
+//! ([`FillRouted::Venue`]). An order's filled quantity is
 //! the larger of the venue's cumulative count (`cum_venue`) and `cum_fills`, never their sum;
 //! a fill promotes a PendingNew or Unknown order, and the order is Filled only when its fills
 //! alone cover every total the venue may hold, which is checked again whenever the total or
@@ -105,7 +109,9 @@
 //! the answer counts exactly once, wherever it arrives: the snapshot holds it when it arrived
 //! before the request, its order shows the cumulative fill it brought, or (its order not shown)
 //! it executed by the watermark or its order was at the venue before the request; a fill
-//! nothing places leaves the market unknown. Later resyncs compare each position with the
+//! nothing places leaves the market unknown. A change the venue made itself is placed by its
+//! arrival before the request or its time by the watermark alone, and after the seed counts on
+//! the inventory otherwise (decision 0120). Later resyncs compare each position with the
 //! inventory as of the watermark and report a desync, never overwriting it ([`PositionCheck`]).
 //!
 //! Market states and arming (decision 0012; 0013 rules 1 and 3; `tests/states.rs`): each
@@ -139,8 +145,9 @@
 //! foreign-namespace order is ever cancelled. Each resync names the Killed markets, whose
 //! cancel everything goes out again ([`ResyncReport::cancel_everything`]). No account cancel-all
 //! is ever built, and an instrument one is authorized only as built here. An own-namespace
-//! fill moves the inventory once in every state, Killed included; a foreign one is flagged and
-//! moves nothing.
+//! fill moves the inventory once in every state, Killed included, as does a change the venue
+//! made itself (decision 0120, `tests/venue_fills.rs`); a foreign one is flagged and moves
+//! nothing.
 //!
 //! Orphans (0005's I7, decision 0108; `tests/orphans.rs`): open orders under our namespace that
 //! the registry does not hold, which a resync finds on a market seeded before it, are

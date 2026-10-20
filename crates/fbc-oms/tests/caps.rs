@@ -1508,20 +1508,17 @@ fn a_fill_named_by_venue_id_reduces_the_remainder_it_counts() {
     let mut reg = registry(CAP, WIDE);
     let mut l = ledger();
     let a = open(&mut reg, buy(30), "a");
-    let f = fbc_core::FillEvent {
-        cid: None,
-        ..fill(
-            None,
-            FillIdent::Venue {
-                fill: common::fill_id("fv"),
-                vid: Some(vid("a")),
-                cum_after: None,
-            },
-            Side::Buy,
-            30,
-            false,
-        )
-    };
+    let f = fill(
+        None,
+        FillIdent::Venue {
+            fill: common::fill_id("fv"),
+            vid: Some(vid("a")),
+            cum_after: None,
+        },
+        Side::Buy,
+        30,
+        false,
+    );
     match l.admit(&f, None, MonoNs(0)) {
         fbc_oms::Admission::Apply(acc) => {
             assert!(matches!(reg.apply_fill(acc), Ok(FillRouted::Ours(c, _)) if c == a));
