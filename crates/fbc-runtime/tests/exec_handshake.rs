@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use common::tls::TestCa;
 use common::toy::{self, ToyVenue};
 use common::{Answer, ScriptedWs, Socks5Stub, Upgrade};
 use exec_toy::{EXEC_STREAM, OWN_NS, ToyExec, ToySigner};
@@ -309,19 +310,24 @@ async fn each_planned_endpoint_sends_the_header_on_its_first_connection_and_on_a
 
 #[tokio::test]
 async fn the_header_goes_through_a_socks5_proxy_on_the_first_connection_and_a_reconnect() {
-    let (mut trade, mut account) = (ScriptedWs::start().await, ScriptedWs::start().await);
+    // Over TLS, by name: a credential header crosses the network only inside wss://.
+    let ca = TestCa::new();
+    let (mut trade, mut account) = (
+        ScriptedWs::start_tls(ca.server(&["trade.invalid"])).await,
+        ScriptedWs::start_tls(ca.server(&["account.invalid"])).await,
+    );
     let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
     let names = [("trade.invalid", local), ("account.invalid", local)];
     let proxy = Socks5Stub::start(&names, Answer::Relay).await;
-    let socks = Connector::new(ProxyConfig::Socks5 {
+    let mut socks = Connector::new(ProxyConfig::Socks5 {
         host: proxy.addr.ip().to_string(),
         port: proxy.addr.port(),
     });
-    let named = |url: String, host: &str| url.replacen("127.0.0.1", host, 1);
+    socks.add_trust_anchor(&ca.der()).unwrap();
     let config = setup(
         Authed::leak(),
-        &named(trade.url(), "trade.invalid"),
-        &named(account.url(), "account.invalid"),
+        &trade.wss_url("trade.invalid"),
+        &account.wss_url("account.invalid"),
         socks,
         creds(Some(synthetic_key())),
         &[],
@@ -652,4 +658,55 @@ async fn a_header_the_runtime_sets_itself_or_one_named_twice_is_refused_as_a_ven
         );
         assert!(!format!("{err} {err:?}").contains(&synthetic_key()));
     }
+}
+
+#[tokio::test]
+async fn a_credential_header_over_plain_ws_to_a_host_not_loopback_is_refused_before_anything_opens()
+{
+    let local = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let proxy = Socks5Stub::start(&[("trade.invalid", local)], Answer::Relay).await;
+    let socks = || {
+        Connector::new(ProxyConfig::Socks5 {
+            host: proxy.addr.ip().to_string(),
+            port: proxy.addr.port(),
+        })
+    };
+    // Either endpoint, directly or through the proxy: the key would cross the wire in the clear.
+    for (trade, account, connector, stream) in [
+        (
+            "ws://trade.invalid:9/a",
+            "ws://127.0.0.1:9/b",
+            direct(),
+            EXEC_STREAM,
+        ),
+        ("ws://127.0.0.1:9/a", "ws://10.0.0.1:9/b", direct(), ACCOUNT),
+        (
+            "ws://trade.invalid:9/a",
+            "wss://account.invalid:9/b",
+            socks(),
+            EXEC_STREAM,
+        ),
+    ] {
+        let config = setup(
+            Authed::leak(),
+            trade,
+            account,
+            connector,
+            creds(Some(synthetic_key())),
+            &[],
+        );
+        let err = ExecSession::new(config, ignore).err().unwrap();
+        assert_eq!(
+            err,
+            ExecSessionError::CleartextHandshake { stream },
+            "{trade} {account}"
+        );
+        let shown = format!("{err} {err:?}");
+        assert!(!shown.contains(&synthetic_key()), "{shown}");
+        assert!(
+            !shown.contains(".invalid") && !shown.contains(&synthetic_account()),
+            "{shown}"
+        );
+    }
+    assert_eq!(proxy.connections(), 0, "nothing was opened");
 }

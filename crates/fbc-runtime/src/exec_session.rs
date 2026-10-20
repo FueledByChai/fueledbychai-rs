@@ -441,6 +441,11 @@ pub enum ExecSessionError {
         stream: StreamId,
         name: &'static str,
     },
+    /// The planned endpoint of `stream` names a credential header but its URL is plain `ws://`
+    /// to a host other than this machine's loopback (`127.0.0.0/8`, `::1`, `localhost`), so the
+    /// key would cross the network in cleartext (decision 0116). Nothing is opened; the URL is
+    /// not shown.
+    CleartextHandshake { stream: StreamId },
     /// The session has run: it runs once, and a new one is built to run again.
     Ended,
 }
@@ -472,6 +477,12 @@ impl fmt::Display for ExecSessionError {
                 f,
                 "the venue named header {name} for the opening handshake on stream {}, which \
                  the handshake cannot carry",
+                stream.0
+            ),
+            ExecSessionError::CleartextHandshake { stream } => write!(
+                f,
+                "the planned endpoint on stream {} carries a credential header over plain ws:// \
+                 to a host that is not loopback; give a wss:// URL",
                 stream.0
             ),
             ExecSessionError::Ended => f.write_str("the session has run; it runs once"),
