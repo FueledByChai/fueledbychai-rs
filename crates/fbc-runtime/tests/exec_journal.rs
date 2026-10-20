@@ -2169,7 +2169,9 @@ async fn a_nonce_the_wall_clock_source_refuses_ends_the_session_with_the_place_u
 
 /// A source resumed past its clock by more than the window, as after a restart whose clock is
 /// behind the journal, refuses the session's first reservation, its cancel-on-disconnect arm:
-/// the session ends before it may place, nothing reserved or journaled for it.
+/// the session ends before it may place, nothing reserved for it. The journal still names the
+/// nonce the source resumed after, so a restart from it resumes above that one, whatever its
+/// clock reads, though this process issued none (Reviewer B, RB187-1 on PR #187).
 #[tokio::test]
 async fn a_source_resumed_past_its_clock_by_more_than_the_window_refuses_the_arm() {
     let mut server = ScriptedWs::start().await;
@@ -2195,12 +2197,63 @@ async fn a_source_resumed_past_its_clock_by_more_than_the_window_refuses_the_arm
     };
     assert_eq!(run.ended, Err(ExecSessionError::NonceRefused(refused)));
     let read: Vec<Seen> = run.entries.iter().map(|e| seen(&e.record)).collect();
-    assert!(
-        !read.iter().any(|s| matches!(s, Seen::Nonce(_))),
-        "{read:#?}"
-    );
+    // The one nonce journaled is the one the source resumed after, under Safety; none reserved.
+    let nonces: Vec<&Seen> = read
+        .iter()
+        .filter(|s| matches!(s, Seen::Nonce(_)))
+        .collect();
+    assert_eq!(nonces, [&Seen::Nonce(last)], "{read:#?}");
+    let nonce = |r: &Record| matches!(r, Record::Nonce { .. });
+    assert_eq!(run.classes(nonce), [TrafficClass::Safety]);
     assert!(
         !read.iter().any(|s| matches!(s, Seen::Ctx(Some(_), _))),
         "{read:#?}"
     );
+
+    // The next restart reads it as the last nonce: a source resumed after it, its clock where
+    // this one's was or back within the window of it, issues only above it.
+    let records: Vec<Record> = run.entries.iter().map(|e| e.record.clone()).collect();
+    assert_eq!(fbc_runtime::last_nonce(&records, SOURCE), Ok(Some(last)));
+    let near = StubWall::at_us(last - 1_000_000);
+    let mut next = fbc_runtime::WallClockNonces::resuming(near, NONCE_WINDOW, last).unwrap();
+    assert_eq!(next.try_reserve(1).unwrap().as_slice(), [last + 1]);
+    let behind = fbc_runtime::WallClockNonces::resuming(wall, NONCE_WINDOW, last);
+    assert!(behind.unwrap().try_reserve(1).is_err());
+}
+
+/// A session whose source already issued nonces before its journal was set, as when a
+/// consumer starts a new journal, writes the source's last nonce first, so the new journal
+/// alone names it for a restart (RB187-1 on PR #187). A source that names none (the test
+/// counters, `high_water` defaulting to `None`) writes nothing.
+#[tokio::test]
+async fn a_journal_set_after_the_source_issued_names_its_last_nonce_first() {
+    let mut server = ScriptedWs::start().await;
+    let wall = StubWall::at_us(WALL_US);
+    let mut config = wall_config(&server, &wall, None);
+    let issued = config.nonces.try_reserve(3).unwrap();
+    assert_eq!(config.nonces.high_water(), Some(WALL_US + 2));
+    assert_eq!(issued.as_slice().last(), Some(&(WALL_US + 2)));
+    let run = journaled(
+        "exec_journal_wall_nonce_high_water",
+        config,
+        |orders, control, heard| async move {
+            let mut peer = server.accept().await;
+            armed_and_resynced(&mut peer, &orders, &heard).await;
+            drop(control);
+            while peer.next().await.is_some() {}
+        },
+    )
+    .await;
+    run.ended.as_ref().unwrap();
+    let journaled: Vec<u64> = run
+        .entries
+        .iter()
+        .filter_map(|e| match e.record {
+            Record::Nonce { source, value } if source == SOURCE => Some(value),
+            _ => None,
+        })
+        .collect();
+    // The high-water first, then the arm's, above it.
+    assert_eq!(journaled, [WALL_US + 2, WALL_US + 3]);
+    assert!(matches!(run.entries[0].record, Record::Nonce { .. }));
 }

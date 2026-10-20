@@ -347,3 +347,24 @@ fn a_journal_that_dropped_records_names_no_last_nonce() {
     clock.set_us(T_US + 1);
     assert_eq!(ok(resumed.try_reserve(1)), [bound + 1]);
 }
+
+/// The source names the nonce every later one lies above, for the session to journal when a
+/// journal is set (RB187-1 on PR #187): none before the first, the last issued, or the one it
+/// resumed after; a source that names none by default, as the test counters do.
+#[test]
+fn the_source_names_its_high_water() {
+    let clock = Stub::at_us(T_US);
+    let mut fresh = source(&clock);
+    assert_eq!(fresh.high_water(), None);
+    ok(fresh.try_reserve(2));
+    assert_eq!(fresh.high_water(), Some(T_US + 1));
+    let resumed = WallClockNonces::resuming(clock, WINDOW, T_US + 9).unwrap();
+    assert_eq!(resumed.high_water(), Some(T_US + 9));
+    struct Plain;
+    impl NonceSource for Plain {
+        fn reserve(&mut self, _: u16) -> NonceBlock {
+            NonceBlock::EMPTY
+        }
+    }
+    assert_eq!(Plain.high_water(), None);
+}
