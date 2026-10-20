@@ -65,7 +65,10 @@ over one needs the new arms.
   quote becomes on a venue that refuses the two flags together. Each fallback the planner
   applies is reported in `Planned::downgrades` (`Downgrade`). New:
   `ExecutionPlanner::on_fill(reg, caps, acct, market)` re-checks emulated reduce-only orders
-  after a fill and cancels any that would overshoot.
+  after a fill and cancels any that would overshoot. With `EmulateReduceOnly` on a venue
+  that refuses the pair, call it after every fill on the market and every order update that
+  reports one, and submit the `Plan` it returns as you do a pass's; otherwise a fill between
+  passes can leave an emulated order able to take the position past zero (decision 0106).
 - **Removal reasons** (FBC-s6fp, decision 0098): `DesiredBook::with_removal`, `set_removal`
   and `removal` give each side an optional reason. A cancel of a level the book no longer
   wants carries its side's reason (`Planned::removal`, `OrderRecord::removal`).
@@ -99,8 +102,9 @@ over one needs the new arms.
   suppressed until the consumer calls `Registry::cancel_orphans(market, &OrphanConfig, caps,
   now)` and the cooldown that call starts runs out (`Registry::end_orphan_cooldowns(now)`).
   A consumer that never calls `cancel_orphans` never adds on that market again.
-  `OrphanConfig::new(cooldown, level_limit)` has no default. The cancels go by explicit
-  reference in a cancel-many (`OrphanPlan`, `OrphanCancels`). They escalate to an instrument
+  `OrphanConfig::new(cooldown, level_limit)` has no default and returns
+  `Result<_, OrphanConfigError>`: it refuses a zero cooldown or level limit. The cancels go
+  by explicit reference in a cancel-many (`OrphanPlan`, `OrphanCancels`). They escalate to an instrument
   cancel-all only under the kill switch's guard, and never to an account cancel-all.
 - **Changed signature: `Registry::authorize(&mut self, acct, cmd)`** takes `&mut self` where
   it took `&self` (FBC-0d9k, PR #133, decision 0082): authorizing judges the command against
@@ -131,7 +135,8 @@ over one needs the new arms.
   0078). This names the nonce source the session's journal records each reservation against.
 - **Required: `ExecSessionConfig::outbound: ReservedBound` and `ExecSessionConfig::in_flight:
   InFlight`** (FBC-hwn, PR #174, decision 0105). `ReservedBound::new(normal, reserve)` sets a
-  Normal bound plus a Safety reserve and has no default. `InFlight::new(bound)` can be shared
+  Normal bound plus a Safety reserve and has no default; it returns `Result<_, BoundError>`
+  and refuses a zero Normal bound or a sum that overflows. `InFlight::new(bound)` can be shared
   by every session of a venue. A submission past the bound is refused
   `SubmitRefusal::Backpressure { .. }` (new variant), which journals as
   `NotSent(Backpressure)`. Past the in-flight bound it is `NotSent(RateBudget)`. The consumer
@@ -187,7 +192,9 @@ over one needs the new arms.
   `Record::RpcTimeout { stamp, rpc }` (FBC-0hfl, decision 0090). Version 8 adds
   `Record::Consumer { at, kind, input, ingest_seq, bytes }`, the consumer's opaque records,
   written through the `JournalSink` in the shard's total order (FBC-hxkm, PR #170, decision
-  0101). Version 9 adds the consumer input's `ingest_seq` (FBC-hvqi, decision 0103). A
+  0101). Its `ingest_seq: Option<u64>` is set only from version 9, which adds an input
+  record's ingest sequence (FBC-hvqi, decision 0103); a version 8 record, and any record that
+  is not an input, reads as `None`. A
   v0.0.6 reader refuses these journals and names the version, so tools that read v0.0.7
   journals must move their pin too. A `match` over `Record` needs the two new arms. Decoder
   replay skips consumer records whose `input` flag is false.
@@ -258,6 +265,11 @@ over one needs the new arms.
   is reported with its HTTP status and Paradex's error code and message, never the token,
   signature or key. An auth or subscribe reply that cannot be read closes the stream and
   asks for a reconnect.
+- **Placement final phase** (FBC-6oj, PR #145, decision 0092): a Paradex placement's
+  provisional acceptance is now followed by `Accepted { ack: Final }` once its order shows
+  OPEN (or closed with a fill), or by an `ExecEvent::AsyncReject` of the place
+  (`PostOnlyWouldCross` or `Other`) once it closes unfilled for any reason but a user cancel.
+  A consumer on Paradex now meets both events.
 - **Conformance:** the crate passes the named conformance suite (FBC-6oj, PR #145, decision
   0092), and a clustered-move benchmark measures the protective-cancel p99 on Linux
   (FBC-vgm, PR #179).
