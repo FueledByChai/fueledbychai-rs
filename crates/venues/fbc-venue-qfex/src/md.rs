@@ -33,10 +33,20 @@ pub(crate) fn channel(
     Ok((name, spec.venue_symbol.as_wire().to_owned()))
 }
 
+#[derive(Clone)]
 pub(crate) struct QfexMd {
     stream: StreamId,
     active: BTreeSet<Subscription>,
     epochs: BTreeMap<InstrumentId, u32>,
+}
+
+#[derive(Default)]
+struct BufferedEvents(Vec<(VenueMeta, MdEvent)>);
+
+impl MdSink for BufferedEvents {
+    fn push(&mut self, meta: VenueMeta, event: MdEvent) {
+        self.0.push((meta, event));
+    }
 }
 
 impl QfexMd {
@@ -45,6 +55,42 @@ impl QfexMd {
             stream,
             active: BTreeSet::new(),
             epochs: BTreeMap::new(),
+        }
+    }
+
+    fn decode_item(
+        &mut self,
+        value: &Value,
+        specs: &SpecTable,
+        sink: &mut dyn MdSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let data = value.as_object().ok_or(DecodeError::Malformed("object"))?;
+        if data.contains_key("err") {
+            return self.on_error(data, specs, sink, fx);
+        }
+        if let Some(contents) = data.get("contents") {
+            let items = contents
+                .as_array()
+                .ok_or(DecodeError::Malformed("contents"))?;
+            for item in items {
+                let mut nested = item
+                    .as_object()
+                    .ok_or(DecodeError::Malformed("contents"))?
+                    .clone();
+                if !nested.contains_key("type")
+                    && let Some(kind) = data.get("type")
+                {
+                    nested.insert("type".to_owned(), kind.clone());
+                }
+                if nested.contains_key("contents") {
+                    return Err(DecodeError::Malformed("contents"));
+                }
+                self.decode(&nested, specs, sink)?;
+            }
+            Ok(())
+        } else {
+            self.decode(data, specs, sink)
         }
     }
 
@@ -307,12 +353,31 @@ impl MdCodec for QfexMd {
         };
         let value: Value =
             serde_json::from_str(text).map_err(|_| DecodeError::Malformed("JSON"))?;
-        let data = value.as_object().ok_or(DecodeError::Malformed("object"))?;
-        if data.contains_key("err") {
-            self.on_error(data, specs, sink, fx)
-        } else {
-            self.decode(data, specs, sink)
+        if value
+            .as_object()
+            .is_some_and(|data| !data.contains_key("contents"))
+        {
+            return self.decode_item(&value, specs, sink, fx);
         }
+        // A malformed member invalidates the whole frame, including earlier members.
+        let mut staged = self.clone();
+        let mut events = BufferedEvents::default();
+        let mut effects = Effects::new();
+        let result = match &value {
+            Value::Array(items) => items
+                .iter()
+                .try_for_each(|item| staged.decode_item(item, specs, &mut events, &mut effects)),
+            _ => staged.decode_item(&value, specs, &mut events, &mut effects),
+        };
+        for effect in effects.take() {
+            fx.push(effect);
+        }
+        result?;
+        *self = staged;
+        for (meta, event) in events.0 {
+            sink.push(meta, event);
+        }
+        Ok(())
     }
 
     fn on_http(

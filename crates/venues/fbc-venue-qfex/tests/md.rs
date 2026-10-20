@@ -120,8 +120,54 @@ fn frame(name: &str) -> &'static str {
         "bbo" => include_str!("../../../../fixtures/qfex/md/bbo.json"),
         "level2" => include_str!("../../../../fixtures/qfex/md/level2.json"),
         "trade" => include_str!("../../../../fixtures/qfex/md/trade.json"),
+        "array" => include_str!("../../../../fixtures/qfex/md/array.json"),
+        "contents" => include_str!("../../../../fixtures/qfex/md/contents.json"),
         _ => unreachable!(),
     }
+}
+
+#[test]
+fn array_and_contents_envelopes_decode_in_order_and_reject_partial_frames() {
+    let mut singles = subscribed();
+    let mut expected = Vec::new();
+    for name in ["bbo", "level2", "trade"] {
+        let (result, events) = decode(singles.as_mut(), frame(name));
+        result.unwrap();
+        expected.extend(events.0);
+    }
+    let (result, events) = decode(subscribed().as_mut(), frame("array"));
+    result.unwrap();
+    assert_eq!(events.0, expected);
+
+    let mut singles = subscribed();
+    let mut expected = Vec::new();
+    for name in ["bbo", "trade"] {
+        let (result, events) = decode(singles.as_mut(), frame(name));
+        result.unwrap();
+        expected.extend(events.0);
+    }
+    let (result, events) = decode(subscribed().as_mut(), frame("contents"));
+    result.unwrap();
+    assert_eq!(events.0, expected);
+
+    let mut bad_contents: Value = serde_json::from_str(frame("contents")).unwrap();
+    bad_contents["contents"][1]["size"] = json!("0.000000001");
+    let (result, events) = decode(subscribed().as_mut(), &bad_contents.to_string());
+    assert_eq!(result, Err(DecodeError::Malformed("size")));
+    assert!(events.0.is_empty());
+
+    let mut bad_trade: Value = serde_json::from_str(frame("trade")).unwrap();
+    bad_trade["size"] = json!("0.000000001");
+    let level2: Value = serde_json::from_str(frame("level2")).unwrap();
+    let mut codec = subscribed();
+    let (result, events) = decode(codec.as_mut(), &json!([level2, bad_trade]).to_string());
+    assert_eq!(result, Err(DecodeError::Malformed("size")));
+    assert!(events.0.is_empty());
+    let (result, after) = decode(codec.as_mut(), frame("level2"));
+    result.unwrap();
+    let (result, fresh) = decode(subscribed().as_mut(), frame("level2"));
+    result.unwrap();
+    assert_eq!(after.0, fresh.0);
 }
 
 #[test]
@@ -425,6 +471,12 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
         "wss://mds.qfex.com:0",
         "wss://mds.qfex.com:",
         "ws://::1",
+        "wss://-bad.example",
+        "wss://bad-.example",
+        "wss://bad..example",
+        "wss://bad.example.",
+        "wss://999.999.999.999",
+        "wss://zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz.example",
     ] {
         let mut bad = cfg();
         bad.insert(KEY_MDS_URL, url);
@@ -440,6 +492,8 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
     );
     let mut local = cfg();
     local.insert(KEY_MDS_URL, "ws://[::1]:9000");
+    assert!(Qfex.caps(&local).is_ok());
+    local.insert(KEY_MDS_URL, "ws://127.0.0.1:9000");
     assert!(Qfex.caps(&local).is_ok());
     let unknown = Subscription {
         inst: InstrumentId::new(99),

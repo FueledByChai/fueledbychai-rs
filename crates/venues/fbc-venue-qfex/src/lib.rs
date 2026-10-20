@@ -7,7 +7,7 @@ mod caps;
 mod md;
 
 use std::collections::BTreeSet;
-use std::net::Ipv6Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fbc_core::{
     AccountSummary, AssetKey, BookId, ConfigError, ConfigScope, EndpointPlan, ExecCodec,
@@ -69,8 +69,27 @@ fn valid_host_port(authority: &str) -> bool {
                 Some((host, port)) => (host, Some(port)),
                 None => (authority, None),
             };
-            let name = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '-';
-            (!host.is_empty() && host.chars().all(name), port)
+            let dns_label = |label: &str| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            };
+            let valid = if host.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                host.parse::<Ipv4Addr>().is_ok()
+            } else {
+                host.len() <= 253 && host.split('.').all(dns_label)
+            };
+            (valid, port)
         }
     };
     host_ok
