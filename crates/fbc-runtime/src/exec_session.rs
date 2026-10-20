@@ -42,7 +42,10 @@
 //! 0036), every HTTP request with its request id, and every codec timer that fires. It also records
 //! each nonce it reserves from the consumer's [`NonceSource`], one `Nonce` record per value under
 //! the number the consumer gives that source ([`ExecSessionConfig::nonce_source`]), as it is
-//! reserved (a short reservation's values included), and the [`EncodeCtx`] it then hands `on_open`,
+//! reserved (a short reservation's values included), first, when the journal is set, the one
+//! the source names as its high-water ([`NonceSource::high_water`]: the nonce a resumed source
+//! resumed after, so a restart stays above it though this process reserves none; RB187-1 on
+//! PR #187), and the [`EncodeCtx`] it then hands `on_open`,
 //! `on_timer`, the resync or an `encode`, the encode's with its request id, just before the call.
 //! An inbound frame or HTTP result is journaled under Safety, since an order-entry stream carries
 //! acks and fills that cannot be told apart before they are decoded, and so are each epoch's
@@ -775,6 +778,12 @@ impl<H: ExecHandler> ExecSession<H> {
     pub fn set_journal(&mut self, journal: Journal) {
         self.end_left_epoch();
         self.rec.journal = Some(journal.clone());
+        // The nonce the source resumed after, or last reserved, first, under Safety: a journal
+        // then names it for a restart though this process reserves none (RB187-1 on PR #187).
+        if let Some(value) = self.nonces.high_water() {
+            let block = NonceBlock::new(vec![value]);
+            self.rec.nonces(self.clock.now().1, &block);
+        }
         // A submission refused for want of room is journaled where it is refused (0105).
         self.orders.set_journal(journal.clone());
         self.core.journal = Some(journal);

@@ -5,7 +5,9 @@
 //! unique per account; it states no monotonic rule. Issuing monotonic wall-clock microseconds,
 //! each `max(clock, last + 1)`, as the venue's `NonceScope::PerAccountMonotonic` declares,
 //! satisfies that rule conservatively: two nonces never repeat within a process, nor across a
-//! restart once the source is resumed from the last nonce its journal holds ([`last_nonce`]).
+//! restart once the source is resumed from the last nonce its journal holds ([`last_nonce`]),
+//! as far as the journal holds every nonce sent: one still queued, not yet written, when the
+//! process dies is FBC-ak22's.
 //! A nonce outside the window would be refused by the venue, so the source refuses first: a
 //! block whose last nonce would lie further ahead of its clock than the caller's window is
 //! [`NonceRefused::OutsideWindow`], nothing reserved, and the order-entry session ends with
@@ -13,8 +15,10 @@
 //! of its own.
 //!
 //! The source reads its clock through [`WallClock`], injected, so tests drive it with a stub.
-//! It is not journaled itself: the order-entry session journals every nonce it reserves and
-//! every context it gives its codec, and replay reads them back without consulting any clock.
+//! It is not journaled itself: the order-entry session journals every nonce it reserves, the
+//! nonce it was resumed after or last issued when a journal is set
+//! ([`NonceSource::high_water`]), and every context it gives its codec, and replay reads the
+//! contexts back without consulting any clock.
 //! A clock running ahead of server time cannot be seen from here; a consumer that measures its
 //! skew against the venue's time is beyond this source.
 
@@ -139,6 +143,13 @@ impl<C: WallClock> NonceSource for WallClockNonces<C> {
         self.last = Some(block_last);
         Ok(block)
     }
+
+    /// [`last`](WallClockNonces::last): the session journals it when a journal is set, so a
+    /// resumed source that issues nothing still leaves its journal naming the nonce it resumed
+    /// after (RB187-1 on PR #187).
+    fn high_water(&self) -> Option<u64> {
+        self.last
+    }
 }
 
 /// The last nonce `records`, an earlier journal's records in journal order, hold for source
@@ -150,9 +161,11 @@ impl<C: WallClock> NonceSource for WallClockNonces<C> {
 /// refused, [`JournalGap`], naming the first gap, rather than answered with the largest that
 /// survived (Codex P2 r4321805846 on PR #187). A consumer then resumes after a bound of its
 /// own: its clock plus the window is past every nonce a source within the window issued, and
-/// the resumed source refuses until the clock has moved a window on. Records queued but never
-/// written when a process dies leave no marker; a source's nonces track its clock, so a restart
-/// whose clock has moved on past them is unaffected.
+/// the resumed source refuses until the clock has moved a window on. A session journals the
+/// nonce its source was resumed after when its journal is set, so a process that reserved none
+/// still leaves its journal naming it (RB187-1 on PR #187). Records queued but never written
+/// when a process dies leave no marker, so a nonce sent with its record unwritten is not
+/// covered here: that is FBC-ak22.
 pub fn last_nonce<'a>(
     records: impl IntoIterator<Item = &'a Record>,
     source: NonceSourceId,

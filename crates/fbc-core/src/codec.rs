@@ -762,6 +762,14 @@ pub trait NonceSource: Send {
     fn try_reserve(&mut self, len: u16) -> Result<NonceBlock, NonceRefused> {
         Ok(self.reserve(len))
     }
+
+    /// The nonce every later one this source gives lies above, when it keeps one: the last it
+    /// reserved, or the one it was resumed after. The runtime journals it when a journal is set
+    /// (FBC-3bq4, Reviewer B RB187-1 on PR #187), so a journal names it for a restart even when
+    /// the process reserves nothing. By default it names none.
+    fn high_water(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Why a [`NonceSource`] gave no nonces: what was wrong, with the figures a log needs and no

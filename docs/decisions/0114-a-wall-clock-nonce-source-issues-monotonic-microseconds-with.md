@@ -25,7 +25,12 @@ return a short block, which the session reports as a defect.
    Hibachi's rule conservatively, as the venue's `NonceScope::PerAccountMonotonic` declares.
 2. **Restart.** A source is built with no history (`new`) or resumed after the last nonce an
    earlier journal holds for its source number (`resuming`, with `last_nonce` reading it from
-   the records), so a restart never reissues a nonce, whatever its clock reads. Nothing else is
+   the records), so a restart never reissues a nonce the journal holds, whatever its clock
+   reads. A nonce sent while its record was still queued, unwritten when the process died,
+   leaves no trace and is not covered here (FBC-ak22). When a journal is set, the session
+   writes first the nonce its source resumed after or last reserved
+   (`NonceSource::high_water`, `None` by default), so a resumed process that reserves none
+   still leaves its journal naming it for the next restart. Nothing else is
    persisted: the session's journal is the record. Records holding a gap (a `Degraded`
    marker) may have lost the last nonce sent, so `last_nonce` refuses them (`JournalGap`), and
    the consumer resumes after a bound of its own, such as its clock plus the window, which the
@@ -55,6 +60,7 @@ return a short block, which the session reports as a defect.
 
 ## Consequences
 
+`NonceSource` gains `high_water`, defaulting to `None`, so every existing source is unchanged.
 `ExecSessionError` and `fbc_core` gain a variant and a type (`NonceRefused`), which a consumer
 matching them exhaustively must handle. A consumer resuming after a restart reads its last
 journal's records for the source number it gives `ExecSessionConfig::nonce_source`. The source
