@@ -154,7 +154,7 @@ over one needs the new arms.
   runs a session over an `InProcessStream` whose peer (`OrderEntryPeer`, `PeerFeed`) sees
   the codec's frames and the shard's market data in ingest order. SimVenue is that peer.
 - **Closed-loop replay** (FBC-066n, PR #178, decision 0107): `ClosedLoop { clock, records,
-  settle, stops }` and `ReplayFailure::{LiveClock, Journal}`. `IngestClock::replayed(wall)`
+  settle, stops }` and `ReplayFailure::{LiveClock, Journal(String), NotUtf8 { ingest_seq }}`. `IngestClock::replayed(wall)`
   and `IngestClock::is_replayed()` are new.
 - **Tick-to-wire on order entry** (FBC-qfm, PR #177): `ExecHandler::on_tick_to_wire` (default
   method) reports each Safety write. A cancel that a market-data handler submits on a frame
@@ -207,6 +207,9 @@ over one needs the new arms.
   0089). An adapter's `suite!` invocation runs them all.
 - **New export:** `ConnectionsView` (`StubServer::connections_view`); `ConnRecord` gains
   `client_closed`.
+- **New variants:** the fault script's `Step::{Barrier, CloseWith}` (FBC-3il, FBC-xx0).
+- **Removed:** the conformance toy's `NoMd` (FBC-u1d, PR #95), now that the toy serves
+  market data.
 - **New fault scripts:** the 340-reconnect storm against an order-entry session (FBC-e5p),
   the order-lattice faults (FBC-6to) and id-less errors, an idle close and a journal-consumer
   stall (FBC-xx0).
