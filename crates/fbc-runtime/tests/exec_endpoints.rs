@@ -1004,8 +1004,9 @@ async fn account_on_open_frames_that_can_never_fit_together_end_the_session() {
     };
     let (run, ()) = tokio::join!(session.run(), script);
     assert_eq!(run.err(), Some(ExecSessionError::OpenNeverFits));
-    // The epoch it opened is ended, the handler told.
+    // The epoch it opened is ended, the handler told, and retired as a drop.
     assert_eq!(ends(&log), [(0, acct(0))]);
+    assert_eq!(session.current_on(ACCOUNT), Some(acct(1)));
 }
 
 #[tokio::test]

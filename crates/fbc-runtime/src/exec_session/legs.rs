@@ -358,7 +358,8 @@ impl Legs {
     }
 
     /// The run ended: each open leg's epoch ends, its socket closed when the session stopped
-    /// (a close frame, if the buckets admit one), the handler told; no leg connects again.
+    /// (a close frame, if the buckets admit one) and retired as a drop when it failed, as the
+    /// order connection's (0053), the handler told; no leg connects again.
     pub(super) fn finish<H: ExecHandler>(
         &mut self,
         feed: &mut Feed<'_, H>,
@@ -369,7 +370,7 @@ impl Legs {
                 if let Some(socket) = leg.ws.as_mut().filter(|_| stopped) {
                     close(socket, &leg.core.rates, key);
                 }
-                leg.end(feed, key, false)?;
+                leg.end(feed, key, !stopped)?;
             }
             leg.state = State::Waiting(None);
         }
