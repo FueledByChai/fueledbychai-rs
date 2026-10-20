@@ -11,8 +11,9 @@
 //!   ([`MAINNET_CHAIN`], by name or as its felt in decimal or hex); and at start
 //!   `GET /system/config` must name it ([`decode_chain`], [`chain_refusal`]), the chain the
 //!   login signs for.
-//! - **The caps** ([`within_mainnet_caps`]): at most $11 resting per side and $50 inventory (the
-//!   owner's caps; smaller are taken).
+//! - **The caps** ([`mainnet_caps`]): the operator's own, required with no default and no
+//!   ceiling (owner 2026-10-19, FBC-thks), and positive; each run prints both before anything
+//!   connects.
 //! - **The snapshot** ([`trusted`]): the venue must declare its open-order snapshot
 //!   trustworthy, so a resync seeds the market's position: a mainnet market is armed only after
 //!   a trustworthy resync and never seeded by hand (owner answer C to RB-olg-3; hand-seeding is
@@ -52,11 +53,6 @@ pub const LABEL: &str = "mainnet";
 /// the client-id high-water mark: `mainnet_smoke`'s, where the owner's first mainnet order left
 /// its mark, shared by `testnet_quote --mainnet`.
 pub const LEASE_DIR_NAME: &str = "mainnet_smoke";
-
-/// The largest resting cap per side and inventory cap, in USD, a mainnet run takes (the
-/// owner's caps); smaller ones are taken.
-pub const RESTING_CAP_MAX: Decimal = Decimal::from_parts(11, 0, 0, false, 0);
-pub const INVENTORY_CAP_MAX: Decimal = Decimal::from_parts(50, 0, 0, false, 0);
 
 /// The usual causes of a refused mainnet login, printed with the refusal.
 pub const REFUSAL_CAUSES: &str = "the usual causes: a testnet key on mainnet (Paradex derives the \
@@ -99,20 +95,21 @@ pub fn mainnet_guard(
     }
 }
 
-/// Refuses caps above the owner's mainnet caps ([`RESTING_CAP_MAX`] per side,
-/// [`INVENTORY_CAP_MAX`]); smaller ones are taken.
-pub fn within_mainnet_caps(resting: Decimal, inventory: Decimal) -> Result<(), String> {
-    if resting > RESTING_CAP_MAX {
-        return Err(format!(
-            "--resting-cap-usd {resting} is above the mainnet cap: at most ${RESTING_CAP_MAX} \
-             per side"
-        ));
-    }
-    if inventory > INVENTORY_CAP_MAX {
-        return Err(format!(
-            "--inventory-cap-usd {inventory} is above the mainnet cap: at most \
-             ${INVENTORY_CAP_MAX}"
-        ));
+/// Refuses a resting cap per side or an inventory cap, in USD, that is not positive. The caps
+/// are the operator's own, required with no default and no ceiling (owner 2026-10-19,
+/// FBC-thks): any positive ones are taken. The command line refuses a non-positive one as it
+/// parses; this checks options built some other way again, before anything connects.
+pub fn mainnet_caps(resting: Decimal, inventory: Decimal) -> Result<(), String> {
+    for (flag, cap) in [
+        ("--resting-cap-usd", resting),
+        ("--inventory-cap-usd", inventory),
+    ] {
+        if cap <= Decimal::ZERO {
+            return Err(format!(
+                "{flag} {cap} is not positive: the caps are yours, required, with no default \
+                 and no ceiling"
+            ));
+        }
     }
     Ok(())
 }

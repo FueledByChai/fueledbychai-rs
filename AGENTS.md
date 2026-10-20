@@ -463,9 +463,9 @@ rather than guess.
     order, a refused login or a permanent refusal of a place or cancel, every touch read with
     the mark price and charged to the session's rate limiter (`tests/testnet_quote.rs`); with
     `--mainnet` (FBC-tyft) a supervised Paradex MAINNET session behind `--mainnet` and
-    `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, caps of at most $11
-    resting per side and $50 inventory, offsets of at least 20 bps, `--duration` of at most an
-    hour, never seeded by hand. The samples that trade share `src/link.rs` (the glue) and
+    `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, the operator's own
+    positive caps (required, no defaults, no ceiling: FBC-thks), offsets of at least 20 bps,
+    `--duration` of at most an hour, never seeded by hand. The samples that trade share `src/link.rs` (the glue) and
     `src/testnet.rs` (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet
     guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a

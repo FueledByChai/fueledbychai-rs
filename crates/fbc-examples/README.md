@@ -48,16 +48,18 @@ export PARADEX_MAINNET_ACCOUNT_ADDRESS=...   # the separate mainnet account
 export PARADEX_MAINNET_PRIVATE_KEY=...       # its main L2 key
 cargo run -p fbc-examples --example mainnet_smoke -- --mainnet --sole-trader --namespace <N> \
     --market BTC-USD-PERP --tick <price_tick_size> --step <order_size_increment> \
-    --min-notional <min_notional> --resting-cap-usd 11 --inventory-cap-usd 50 --order-usd 11 \
-    --side buy --away-bps 300
+    --min-notional <min_notional> --resting-cap-usd <USD> --inventory-cap-usd <USD> \
+    --order-usd <USD> --side buy --away-bps 300
 ```
 
 Read the market's `price_tick_size`, `order_size_increment` and `min_notional` from
 `GET https://api.prod.paradex.trade/v1/markets`. The program checks that `GET /system/config`
 names `PRIVATE_SN_PARACLEAR_MAINNET`, reads the mark price from `GET /markets/summary`, and refuses
-an order whose size at the mark is below the minimum notional (Paradex judges it there). Caps above
-$11 resting per side or $50 inventory are refused. The $11 resting cap is judged at the order's own
-price (the notional a fill costs), not at the mark. `--help` lists every flag and output line.
+an order whose size at the mark is below the minimum notional (Paradex judges it there). The caps
+are yours: `--resting-cap-usd` and `--inventory-cap-usd` are required, with no defaults and no
+ceiling (owner 2026-10-19, FBC-thks), and each must be positive; the run prints both (the `CAPS`
+line) before anything connects. The resting cap is judged at the order's own price (the notional
+a fill costs), not at the mark. `--help` lists every flag and output line.
 
 **A cancel not ours** (FBC-aoh5). Paradex does not say who sent a user cancel. When the order
 ends cancelled by one that the program did not send (another program on the account, such as a
@@ -74,8 +76,10 @@ A plumbing test of requoting, reconnects and Stop on prod before any model; it p
 from a model.
 
 Refused before anything connects unless both `--mainnet` and `--sole-trader` are given, the URLs
-are exactly mainnet's, `PARADEX_CHAIN_ID` (when set) is mainnet's, the caps are at most $11
-resting per side and $50 inventory (smaller are taken), both `--bid-bps` and `--ask-bps` are at
+are exactly mainnet's, `PARADEX_CHAIN_ID` (when set) is mainnet's, both caps are given and positive
+(`--resting-cap-usd` and `--inventory-cap-usd` are yours: required, no defaults, no ceiling,
+owner 2026-10-19, FBC-thks; the `SUPERVISED` line prints them before anything connects), both
+`--bid-bps` and `--ask-bps` are at
 least 20, `--duration` is at most 3600 s (one hour; `MAINNET_DURATION_MAX` in
 `examples/testnet_quote/args.rs`), `--interval-ms` is at most 20000 (two thirds of the 30 s
 window for a cancel not ours, `mainnet_interval_max`: a conservative bound kept beside the
@@ -135,7 +139,8 @@ cargo run -p fbc-examples --example testnet_quote -- --mainnet --sole-trader --n
 
 Read the market's `price_tick_size`, `order_size_increment` and `min_notional` from
 `GET https://api.prod.paradex.trade/v1/markets`; the caps, the size, the offsets and the duration
-are yours, within the limits above. `--help` lists every flag and output line.
+are yours, within the limits above (the caps have none but being positive). `--help` lists every
+flag and output line.
 
 ## paradex_testnet_acceptance
 

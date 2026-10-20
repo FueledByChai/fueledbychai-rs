@@ -10,7 +10,7 @@ use std::time::Duration;
 use fbc_runtime::ProxyConfig;
 use rust_decimal::Decimal;
 
-use crate::mainnet::{LEASE_DIR_NAME, MAINNET_REST, MAINNET_WS, mainnet_urls, within_mainnet_caps};
+use crate::mainnet::{LEASE_DIR_NAME, MAINNET_REST, MAINNET_WS, mainnet_caps, mainnet_urls};
 pub use crate::testnet::{
     CHAIN_VAR, TESTNET_REST, TESTNET_WS, Target, direct_to_stub, hosts, testnet_guard,
 };
@@ -89,8 +89,9 @@ The market (required; read them from GET https://api.testnet.paradex.trade/v1/ma
   --min-notional <USD>      its min_notional, e.g. 10 (0 when it states none)
 
 The caps (required; your own limits, in USD, no defaults):
-  --resting-cap-usd <USD>   the resting cap per side (the owner's is 11)
-  --inventory-cap-usd <USD> the inventory cap (the owner's is 50)
+  --resting-cap-usd <USD>   the resting cap per side, positive (no ceiling, with --mainnet
+                            too)
+  --inventory-cap-usd <USD> the inventory cap, positive (no ceiling, with --mainnet too)
 
 The quotes (required; no defaults):
   --order-usd <USD>         each quote's size in USD, at the highest quote price of the first
@@ -141,7 +142,8 @@ same loop, with these limits, each checked before anything connects:
     (or both a loopback stub's), PARADEX_CHAIN_ID, when set, mainnet's, and at start GET
     /system/config must name PRIVATE_SN_PARACLEAR_MAINNET, the chain the login signs for;
   - the mainnet-only credential variables (above);
-  - --resting-cap-usd at most 11 and --inventory-cap-usd at most 50 (smaller are taken);
+  - --resting-cap-usd and --inventory-cap-usd given and positive: they are yours, with no
+    ceiling, printed on the SUPERVISED line before anything connects;
   - --bid-bps and --ask-bps at least 20;
   - --duration at most 3600 (one hour);
   - --interval-ms at most 20000, two thirds of the 30 s window for a cancel not ours (below):
@@ -416,8 +418,9 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
 
 /// Every check of `opts` made before anything connects, here and again by the run: the URLs
 /// (the testnet's, or with `--mainnet` mainnet's; or both a loopback stub's, then no SOCKS5
-/// proxy), `--sole-trader`, the quote within the resting cap, and with `--mainnet` its limits
-/// ([`mainnet_limits`]). Whether the URLs are a loopback stub's.
+/// proxy), `--sole-trader`, with `--mainnet` both caps positive ([`mainnet_caps`]), the quote
+/// within the resting cap, and with `--mainnet` its limits ([`mainnet_limits`]). Whether the
+/// URLs are a loopback stub's.
 pub fn confirmed(opts: &Options) -> Result<bool, String> {
     let stub = if opts.mainnet {
         mainnet_urls(&opts.rest_url, &opts.ws_url)?
@@ -431,13 +434,17 @@ pub fn confirmed(opts: &Options) -> Result<bool, String> {
     };
     direct_to_stub(target, &opts.proxy)?;
     sole(opts)?;
+    if opts.mainnet {
+        mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
+    }
     within_cap(opts)?;
     mainnet_limits(opts)?;
     Ok(stub)
 }
 
-/// With `--mainnet`, the owner's limits for a supervised mainnet session (FBC-tyft): caps of at
-/// most $11 resting per side and $50 inventory ([`within_mainnet_caps`]), offsets of at least
+/// With `--mainnet`, the owner's limits for a supervised mainnet session (FBC-tyft): both caps
+/// positive ([`mainnet_caps`]: the caps are yours, with no ceiling, owner 2026-10-19,
+/// FBC-thks), offsets of at least
 /// [`MAINNET_OFFSET_MIN`] basis points on both sides, an `--interval-ms` of at most
 /// [`mainnet_interval_max`] of the window, and a `--duration` of at most
 /// [`MAINNET_DURATION_MAX`] seconds. A testnet run has none of them.
@@ -445,7 +452,7 @@ pub fn mainnet_limits(opts: &Options) -> Result<(), String> {
     if !opts.mainnet {
         return Ok(());
     }
-    within_mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
+    mainnet_caps(opts.resting_cap_usd, opts.inventory_cap_usd)?;
     for (flag, bps) in [("--bid-bps", opts.bid_bps), ("--ask-bps", opts.ask_bps)] {
         if bps < MAINNET_OFFSET_MIN {
             return Err(format!(
