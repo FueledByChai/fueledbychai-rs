@@ -93,13 +93,21 @@ fn subscribed() -> Box<dyn MdCodec> {
 }
 
 fn decode(codec: &mut dyn MdCodec, frame: &str) -> (Result<(), DecodeError>, Sink) {
+    decode_with_specs(codec, frame, &specs())
+}
+
+fn decode_with_specs(
+    codec: &mut dyn MdCodec,
+    frame: &str,
+    specs: &SpecTable,
+) -> (Result<(), DecodeError>, Sink) {
     let mut sink = Sink::default();
     let caps = Qfex.caps(&cfg()).unwrap();
     let result = dispatch_market_data(&caps, |scope| {
         codec.on_frame(
             RawFrame::Text(frame),
             scope,
-            &specs(),
+            specs,
             &mut sink,
             &mut Effects::new(),
         )
@@ -558,6 +566,19 @@ fn malformed_public_messages_are_atomic_and_a_valid_empty_book_replaces_the_old_
     let (result, sink) = decode(codec.as_mut(), &no_sequence.to_string());
     assert_eq!(result, Ok(()));
     assert_eq!(sink.0[0].0.venue_seq, None);
+}
+
+#[test]
+fn off_step_quantity_that_division_rounds_to_whole_lots_is_rejected() {
+    let mut spec = specs().get(AAPL).unwrap().clone();
+    spec.size_step = SizeStep::new("0.00000003".parse().unwrap()).unwrap();
+    let mut table = SpecTable::new();
+    table.insert(spec);
+    let mut trade: Value = serde_json::from_str(frame("trade")).unwrap();
+    trade["size"] = json!("6.0000000000000000000000000001");
+    let (result, sink) = decode_with_specs(subscribed().as_mut(), &trade.to_string(), &table);
+    assert_eq!(result, Err(DecodeError::Malformed("size")));
+    assert!(sink.0.is_empty());
 }
 
 #[test]

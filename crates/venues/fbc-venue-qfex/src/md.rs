@@ -390,8 +390,9 @@ fn quantity(
     let bad = DecodeError::Malformed(key);
     let qty =
         Decimal::from_str_exact(value.and_then(Value::as_str).ok_or(bad)?).map_err(|_| bad)?;
-    let lots = qty.checked_div(spec.size_step.get()).ok_or(bad)?;
-    if !lots.fract().is_zero() {
+    let step = spec.size_step.get();
+    let lots = qty.checked_div(step).ok_or(bad)?;
+    if !lots.fract().is_zero() || lots.checked_mul(step) != Some(qty) {
         return Err(bad);
     }
     lots.to_i64().and_then(Lots::new).ok_or(bad)

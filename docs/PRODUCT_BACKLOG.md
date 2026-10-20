@@ -213,9 +213,9 @@ ordering fixes are proven against the failures that hurt the Java stack.
 - The toy venue from BT-102 passes the suite, and a deliberately broken toy (an absent
   capability that still sends bytes) fails `caps_truthful`.
 
-## Epic F: QFEX
+## Epic G: QFEX
 
-### BT-601 — QFEX public market data before order entry
+### BT-701 — QFEX public market data before order entry
 
 **Status:** Proposed  
 **User story:** As a trading program evaluating QFEX, I want its public touch, depth and

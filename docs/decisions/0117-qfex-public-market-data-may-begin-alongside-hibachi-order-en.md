@@ -6,7 +6,7 @@ Date: 2026-10-20
 ## Context
 
 Decision 0016 placed QFEX after Hibachi. The owner asked to start the Rust QFEX adapter while
-another agent develops Hibachi (FBC-j9xw, BT-601). QFEX publishes public market data on a
+another agent develops Hibachi (FBC-j9xw, BT-701). QFEX publishes public market data on a
 separate, unauthenticated WebSocket. Work on that feed does not require the trading credentials,
 the order-entry session, or a live order.
 
@@ -28,7 +28,7 @@ IBKR and Hyperliquid retain their later place in the roadmap.
 
 ## Consequences
 
-BT-601 names the QFEX public-feed story. QFEX's capability values are cited to its current
+BT-701 names the QFEX public-feed story. QFEX's capability values are cited to its current
 documentation and revisited when live observations contradict them. A later ticket must remove
 the read-only ceiling with independent private-path proof and a new decision if needed.
 

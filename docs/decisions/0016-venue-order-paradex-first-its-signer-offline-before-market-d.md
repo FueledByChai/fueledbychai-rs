@@ -1,6 +1,6 @@
 # 0016 — Venue order: Paradex first, its signer offline before market data, then order entry; then Hibachi; Binance USD-M as reference
 
-Status: superseded by 0117
+Status: accepted, supersedes 0007
 Date: 2026-10-03
 
 ## Context
