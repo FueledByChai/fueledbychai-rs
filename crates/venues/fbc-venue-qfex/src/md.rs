@@ -190,6 +190,15 @@ impl QfexMd {
             .and_then(Value::as_object)
             .ok_or(DecodeError::Malformed("err"))?;
         let code = string(err, "error_code")?;
+        if matches!(code, "RateLimited" | "ServerError") {
+            // QFEX permits an absent request echo. A fresh epoch resubscribes through
+            // the runtime's reconnect pacing, even when we cannot identify the feed.
+            fx.push(Effect::Reconnect {
+                stream: self.stream,
+                reason: "transient QFEX subscription error",
+            });
+            return Ok(());
+        }
         let request = err
             .get("incoming_message")
             .and_then(Value::as_object)
@@ -226,15 +235,6 @@ impl QfexMd {
         }
         if refused.is_empty() || refused.iter().any(|sub| !self.active.contains(sub)) {
             return Err(DecodeError::Malformed("incoming_message"));
-        }
-        if matches!(code, "RateLimited" | "ServerError") {
-            // A new epoch gets a fresh codec and resubscribes through the runtime's
-            // reconnect pacing. Retrying on this socket would need an unknown backoff.
-            fx.push(Effect::Reconnect {
-                stream: self.stream,
-                reason: "transient QFEX subscription error",
-            });
-            return Ok(());
         }
         for sub in refused {
             self.active.remove(&sub);

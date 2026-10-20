@@ -321,35 +321,43 @@ fn a_rejected_subscription_reports_health_without_retry_or_duplicate_subscribe()
 #[test]
 fn transient_subscription_errors_reconnect_without_permanently_refusing_feed() {
     for code in ["RateLimited", "ServerError"] {
-        let mut codec = subscribed();
-        let error = json!({"err": {"error_code": code,
-            "incoming_message": {"type": "subscribe", "channels": ["trade"],
-                "symbols": ["AAPL-USD"]}}});
-        let mut sink = Sink::default();
-        let mut fx = Effects::new();
-        let caps = Qfex.caps(&cfg()).unwrap();
-        let result = dispatch_market_data(&caps, |scope| {
-            codec.on_frame(
-                RawFrame::Text(&error.to_string()),
-                scope,
-                &specs(),
-                &mut sink,
-                &mut fx,
-            )
-        });
-        assert_eq!(result, Ok(()), "{code}");
-        assert!(sink.0.is_empty(), "{code}");
-        assert_eq!(
-            fx.as_slice(),
-            &[Effect::Reconnect {
-                stream: fbc_core::StreamId(0),
-                reason: "transient QFEX subscription error",
-            }],
-            "{code}"
-        );
-        let (result, sink) = decode(codec.as_mut(), frame("trade"));
-        assert_eq!(result, Ok(()), "{code}");
-        assert_eq!(sink.0.len(), 1, "{code}");
+        for incoming in [
+            Some(json!({"type": "subscribe", "channels": ["trade"],
+                "symbols": ["AAPL-USD"]})),
+            Some(Value::Null),
+            None,
+        ] {
+            let mut codec = subscribed();
+            let mut error = json!({"err": {"error_code": code}});
+            if let Some(incoming) = incoming {
+                error["err"]["incoming_message"] = incoming;
+            }
+            let mut sink = Sink::default();
+            let mut fx = Effects::new();
+            let caps = Qfex.caps(&cfg()).unwrap();
+            let result = dispatch_market_data(&caps, |scope| {
+                codec.on_frame(
+                    RawFrame::Text(&error.to_string()),
+                    scope,
+                    &specs(),
+                    &mut sink,
+                    &mut fx,
+                )
+            });
+            assert_eq!(result, Ok(()), "{error}");
+            assert!(sink.0.is_empty(), "{error}");
+            assert_eq!(
+                fx.as_slice(),
+                &[Effect::Reconnect {
+                    stream: fbc_core::StreamId(0),
+                    reason: "transient QFEX subscription error",
+                }],
+                "{error}"
+            );
+            let (result, sink) = decode(codec.as_mut(), frame("trade"));
+            assert_eq!(result, Ok(()), "{error}");
+            assert_eq!(sink.0.len(), 1, "{error}");
+        }
     }
 }
 
