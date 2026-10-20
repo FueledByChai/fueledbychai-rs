@@ -106,10 +106,24 @@ pub const MIN_CREDENTIAL_LEN: usize = 16;
 
 /// How often a pinging order-entry codec sends its ping ([`ToyExec::pinging`]).
 pub const PING_EVERY: Duration = Duration::from_secs(15);
-/// The timer a pinging order-entry codec sends its ping on. A resync over REST's retry timer
-/// carries its request's [`HttpTag`](fbc_core::HttpTag), which starts at 1, so the two never
-/// meet.
+/// The timer a pinging order-entry codec sends its ping on [`EXEC_STREAM`] on. A resync over
+/// REST's retry timer carries its request's [`HttpTag`](fbc_core::HttpTag), which starts at 1,
+/// so the two never meet.
 pub const PING_TAG: TimerTag = TimerTag(0);
+/// Where the timers a pinging order-entry codec pings any other stream on start: each stream
+/// opened keeps a ping of its own ([`ping_tag`]; FBC-tnsf), above every tag a resync over REST
+/// gives its retry timer.
+pub const PING_TAGS: u64 = 1 << 32;
+
+/// The timer a pinging order-entry codec pings `stream` on: [`PING_TAG`] for [`EXEC_STREAM`],
+/// [`PING_TAGS`] plus the stream's number for any other.
+pub const fn ping_tag(stream: StreamId) -> TimerTag {
+    if stream.0 == EXEC_STREAM.0 {
+        PING_TAG
+    } else {
+        TimerTag(PING_TAGS + stream.0 as u64)
+    }
+}
 /// How long a resync over REST may take ([`ToyExec::rest_resync`]).
 pub const RESYNC_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long after a resync over REST that failed, or came back unreadable, it is asked again,

@@ -1,7 +1,9 @@
 //! An order-entry session (FBC-oaz, decision 0053): drives one account's order-entry
-//! connection, as [`VenueFactory::plan_exec`] plans it, through connection epochs on the shared
-//! session core (FBC-e73), with one [`ExecCodec`] for the session's life (decisions 0002, 0014,
-//! 0015, 0019, 0023).
+//! connections, as [`VenueFactory::plan_exec`] plans them, through connection epochs on the
+//! shared session core (FBC-e73), with one [`ExecCodec`] for the session's life (decisions 0002,
+//! 0014, 0015, 0019, 0023). The first planned connection carries the orders; what the module
+//! docs say of "the connection" is that one's, and the others' are driven beside it (FBC-tnsf,
+//! decision 0115; see the last section).
 //!
 //! The session opens the endpoint through the consumer's [`Connector`], so its SOCKS5 proxy
 //! applies (0019). Each epoch is one life of that connection; the codec is not rebuilt for it,
@@ -196,6 +198,31 @@
 //! stream in place of the planned URL, writes go to its peer, and the peer's answers are read
 //! at their due instants as frames off a socket are; everything above is unchanged.
 //!
+//! **Several connections (FBC-tnsf, decision 0115).** A venue whose order entry and account
+//! events arrive on separate connections (Hibachi's trade and account sockets) plans more than
+//! one. The first planned endpoint is the order connection: commands, the cancel-on-disconnect
+//! arm and the resync go on it, and only its epochs authenticate. Endpoint `i` of the plan is
+//! stamped connection `conn + i` ([`ExecSessionConfig::conn`]), each with epochs, reconnect pacing,
+//! timers and HTTP requests of its own (two endpoints on one stream are refused,
+//! [`ExecSessionError::SharedStream`]), and the one codec serves them all: each epoch of each
+//! endpoint calls `on_open` with its stream and exactly the nonces
+//! [`ExecCodec::nonces_for`] asks for, charged together as above; each frame is decoded with the
+//! stream it came on; a timer or HTTP request belongs to the epoch of the endpoint whose input
+//! asked for it. A frame or reconnect the codec asks for on another endpoint's stream is written
+//! on, or ends the epoch of, that endpoint, charged there as its turn comes, once the effects
+//! for the endpoint that asked have run; while that endpoint has no open epoch it is refused and
+//! counted. An endpoint that drops, asks to reconnect, or fails a write reconnects through its
+//! own pacing while every other endpoint's epoch stays open, and the order connection's other
+//! endpoints keep being read while it waits to reconnect. Every event is stamped from the one
+//! [`IngestClock`], so the endpoints' events share one ingest order. An event of another
+//! endpoint's input counts for the order connection's authenticated epoch, if one is, as the
+//! answer to its arm, the end of its resync or what it shows of the orders held unprotected, but
+//! authenticates nothing; an outage of another endpoint holds no place yet (FBC-rta5 decides
+//! that per connection). The session's one thread reads no other endpoint while one write waits
+//! on a peer, within the write-stall window. A stop closes every endpoint's epoch; an error, a
+//! dropped run or the session's drop ends each as it does the order connection's. An in-process
+//! stream stands in for exactly one connection.
+//!
 //! One thread drives a session (design §5.1): [`ExecSession::run`] spawns no task.
 
 use std::fmt;
@@ -216,6 +243,10 @@ use fbc_journal::{ControlEvent, NonceSourceId, Record};
 use futures_util::{FutureExt, StreamExt};
 use tokio::sync::watch;
 use tokio::time::Instant;
+
+mod legs;
+
+use legs::{Leg, LegWake, Legs, Primary};
 
 use crate::bounds::{InFlight, ReservedBound};
 use crate::connector::Connector;
@@ -338,7 +369,9 @@ pub struct ExecSessionConfig {
     /// session that shares that source's sequence, so a restart reads every value it spent
     /// (Codex P2 r4214053442 on PR #115).
     pub nonce_source: NonceSourceId,
-    /// The connection number stamped on this session's inputs, unique on its shard.
+    /// The connection number stamped on the inputs of the session's first planned endpoint, the
+    /// one that carries its orders; endpoint `i` of the plan is stamped `conn + i` (FBC-tnsf,
+    /// decision 0115). Every one is unique on its shard.
     pub conn: u16,
     /// The buckets of the venue's declared limits, shared with every session that counts
     /// against the same ones; built for exactly the venue's limits.
@@ -370,9 +403,13 @@ pub enum ExecSessionError {
     Venue(VenueError),
     /// The venue takes no orders: it declares no `exec` block, or builds no order-entry codec.
     NoOrderEntry,
-    /// The venue planned this many order-entry connections; a session drives exactly one
-    /// (decision 0053).
+    /// The venue planned this many order-entry connections: none, which leaves no connection to
+    /// carry orders, or more than one for a session over an in-process stream, which stands in
+    /// for exactly one (decisions 0053, 0104, 0115).
     Endpoints(usize),
+    /// The venue planned two order-entry connections on this stream, so a frame or reconnect
+    /// naming it could not be routed to one (decision 0115).
+    SharedStream(StreamId),
     /// The consumer's nonce source reserved another number of nonces than were asked for, for
     /// `on_open`, `on_timer` or an encode.
     Nonces { asked: u16, reserved: usize },
@@ -405,7 +442,13 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::NoOrderEntry => f.write_str("the venue takes no orders"),
             ExecSessionError::Endpoints(n) => write!(
                 f,
-                "the venue planned {n} order-entry connections; a session drives exactly one"
+                "the venue planned {n} order-entry connections; a session drives at least one, \
+                 and exactly one over an in-process stream"
+            ),
+            ExecSessionError::SharedStream(stream) => write!(
+                f,
+                "the venue planned two order-entry connections on stream {}",
+                stream.0
             ),
             ExecSessionError::Nonces { asked, reserved } => write!(
                 f,
@@ -549,8 +592,13 @@ pub struct ExecSession<H: ExecHandler> {
     closed_early: Option<ConnKey>,
     /// Whether [`ExecSession::run`] was called.
     ran: bool,
-    /// Which way an epoch's next turn polls first, of [`WAKES`].
+    /// Which way an epoch's next turn polls first, of [`WAKES`] (one more with legs).
     turn: u8,
+    /// The connection number of the order connection, whose events alone move its readiness
+    /// (decisions 0058, 0115).
+    conn: u16,
+    /// The endpoints planned after the first (FBC-tnsf, decision 0115).
+    legs: Legs,
     handler: H,
 }
 
@@ -569,6 +617,7 @@ impl<H: ExecHandler> Drop for ExecSession<H> {
                     self.core.closed_unwinding(key);
                 }
             }
+            self.legs.left(|_| {}, true);
         } else {
             self.end_left_epoch();
         }
@@ -620,6 +669,8 @@ enum Wake {
     /// A request's deadline fell due.
     Rpc,
     Stop,
+    /// One of the other endpoints woke (FBC-tnsf).
+    Leg(usize, LegWake),
 }
 
 /// The codec's inputs as the core hands them on ([`Feed`]), built from the session's fields
@@ -641,6 +692,7 @@ macro_rules! feed {
             rpcs: &mut $s.rpcs,
             orders: &$s.orders,
             own: $s.stream,
+            conn: $s.conn,
         }
     };
 }
@@ -693,14 +745,23 @@ impl<H: ExecHandler> ExecSession<H> {
         // Our client id names one venue order where amends keep the venue id (decision 0080).
         let one_id = exec.order.amend.is_none_or(|amend| amend.keeps_venue_id);
         config.limiter.check(&caps.limits)?;
-        let mut plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
-        let endpoint = match (plan.pop(), plan.len()) {
-            (Some(endpoint), 0) => endpoint,
-            (last, n) => return Err(ExecSessionError::Endpoints(n + usize::from(last.is_some()))),
+        let plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
+        // The first endpoint carries the orders; an in-process stream stands in for exactly one
+        // (decisions 0104, 0115).
+        let one = matches!(entry, Entry::Socket) || plan.len() == 1;
+        let Some(endpoint) = plan.first().cloned().filter(|_| one) else {
+            return Err(ExecSessionError::Endpoints(plan.len()));
         };
+        let streams: Vec<StreamId> = plan.iter().map(|ep| ep.stream).collect();
+        if let Some(at) = (1..streams.len()).find(|&i| streams[..i].contains(&streams[i])) {
+            return Err(ExecSessionError::SharedStream(streams[at]));
+        }
+        let siblings = |own: StreamId| streams.iter().copied().filter(|s| *s != own).collect();
         let (codec, in_process) = match entry {
             Entry::Socket => {
-                ws::check_url(endpoint.url.as_str()).map_err(SessionError::Url)?;
+                for ep in &plan {
+                    ws::check_url(ep.url.as_str()).map_err(SessionError::Url)?;
+                }
                 let codec = venue.exec_codec(cfg, config.creds);
                 let codec = codec.ok_or(ExecSessionError::NoOrderEntry)?;
                 (codec.map_err(ExecSessionError::Venue)?, None)
@@ -709,19 +770,34 @@ impl<H: ExecHandler> ExecSession<H> {
         };
         let (stop_tx, stop) = watch::channel(());
         let clock = config.clock.clone();
-        let mut core = Core::new(CoreConfig {
-            own: endpoint.stream,
-            connector: config.connector,
-            clock: config.clock,
-            pacing: config.pacing,
-            write_stall: config.write_stall.window(),
-            conn: config.conn,
-            stop: stop.clone(),
-            http_max_body: config.http_max_body,
-            rates: config.limiter,
-        });
-        // What an order-entry stream brings carries acks and fills (decision 0078).
-        core.inbound = TrafficClass::Safety;
+        // Endpoint `i` is stamped connection `conn + i`, each with epochs, pacing, timers and
+        // requests of its own (decision 0115).
+        let core_of = |i: usize, own: StreamId| {
+            let conn = u16::try_from(i)
+                .ok()
+                .and_then(|i| config.conn.checked_add(i));
+            let mut core = Core::new(CoreConfig {
+                own,
+                connector: config.connector.clone(),
+                clock: config.clock.clone(),
+                pacing: config.pacing,
+                write_stall: config.write_stall.window(),
+                conn: conn.ok_or(SessionError::NoConnectionLeft)?,
+                stop: stop.clone(),
+                http_max_body: config.http_max_body,
+                rates: config.limiter.clone(),
+            });
+            // What an order-entry stream brings carries acks and fills (decision 0078).
+            core.inbound = TrafficClass::Safety;
+            core.siblings = siblings(own);
+            Ok::<_, ExecSessionError>(core)
+        };
+        let core = core_of(0, endpoint.stream)?;
+        let mut legs = Vec::new();
+        for (i, ep) in plan.iter().enumerate().skip(1) {
+            let core = core_of(i, ep.stream)?;
+            legs.push(Leg::new(core, ep.stream, ep.url.as_str().to_owned()));
+        }
         let rec = Recorder {
             journal: None,
             source: config.nonce_source,
@@ -759,15 +835,27 @@ impl<H: ExecHandler> ExecSession<H> {
             closed_early: None,
             ran: false,
             turn: 0,
+            conn: config.conn,
+            legs: Legs::new(legs),
             handler,
         };
         session.orders.set_conn(session.core.current());
         Ok((session, ExecControl { _stop: stop_tx }))
     }
 
-    /// The current connection epoch.
+    /// The current connection epoch of the order connection, the first planned endpoint.
     pub fn current(&self) -> ConnKey {
         self.core.current()
+    }
+
+    /// The epoch the planned endpoint of stream `stream` is in, or waits to open; `None` for a
+    /// stream the venue planned no order-entry connection on (FBC-tnsf).
+    pub fn current_on(&self, stream: StreamId) -> Option<ConnKey> {
+        if stream == self.stream {
+            Some(self.core.current())
+        } else {
+            self.legs.current_on(stream)
+        }
     }
 
     /// Records everything the session sends and receives into `journal` from now on, with the
@@ -786,6 +874,9 @@ impl<H: ExecHandler> ExecSession<H> {
         }
         // A submission refused for want of room is journaled where it is refused (0105).
         self.orders.set_journal(journal.clone());
+        for leg in self.legs.iter_mut() {
+            leg.core.journal = Some(journal.clone());
+        }
         self.core.journal = Some(journal);
     }
 
@@ -797,13 +888,24 @@ impl<H: ExecHandler> ExecSession<H> {
         }
     }
 
-    /// Inputs of an ended epoch dropped, by kind.
+    /// Inputs of an ended epoch dropped, by kind, on every planned endpoint.
     pub fn stale(&self, input: Input) -> u64 {
-        self.core.epochs.stale(input)
+        let legs = self.legs.iter().map(|leg| leg.core.epochs.stale(input));
+        self.core.epochs.stale(input) + legs.sum::<u64>()
     }
 
+    /// What the session counted, on every planned endpoint together.
     pub fn counters(&self) -> ExecCounters {
-        let core = &self.core.counters;
+        let mut core = self.core.counters;
+        let mut refused_redactions = self.core.refused_redactions();
+        for leg in self.legs.iter() {
+            let c = &leg.core.counters;
+            core.attempts += c.attempts;
+            core.failed_attempts += c.failed_attempts;
+            core.refused_effects += c.refused_effects;
+            core.write_stalls += c.write_stalls;
+            refused_redactions += leg.core.refused_redactions();
+        }
         ExecCounters {
             attempts: core.attempts,
             failed_attempts: core.failed_attempts,
@@ -813,7 +915,7 @@ impl<H: ExecHandler> ExecSession<H> {
             arm_failures: self.arm_failures,
             unready_refusals: self.unready_refusals,
             unprotected_refusals: self.unprotected_refusals,
-            refused_redactions: self.core.refused_redactions(),
+            refused_redactions,
             backpressure_refusals: self.orders.backpressured(),
             in_flight_refusals: self.in_flight_refusals,
         }
@@ -840,9 +942,22 @@ impl<H: ExecHandler> ExecSession<H> {
             // its requests hold in the consumer's table, which the session, kept, never reports
             // again (decision 0105; Codex P1 r4312949559 on PR #174).
             let _give_back = self.rpcs.give_back_on_drop();
-            self.run_epochs().await
+            let ran = self.run_epochs().await;
+            // The other endpoints' epochs end with the run: closed on a stop, retired on an
+            // error, the handler told (decision 0115).
+            let stopped = self.stopped();
+            let finished = if stopped {
+                self.legs.stop(None, &*self.codec)
+            } else {
+                Ok(())
+            };
+            let finished = finished.and_then(|()| self.legs.finish(&mut feed!(self), stopped));
+            ran.and(finished)
         };
         self.core.http.clear();
+        for leg in self.legs.iter_mut() {
+            leg.core.http.clear();
+        }
         self.orders.end();
         // Nothing more is reported: the requests still in flight give back their places in the
         // consumer's table (decision 0105).
@@ -850,8 +965,10 @@ impl<H: ExecHandler> ExecSession<H> {
         ran
     }
 
-    /// Opens epoch after epoch, as paced, until the session stops or fails.
+    /// Opens epoch after epoch, as paced, until the session stops or fails, every other
+    /// endpoint connected beside the order connection as its own pacing allows.
     async fn run_epochs(&mut self) -> Result<(), ExecSessionError> {
+        self.legs.start();
         loop {
             // A submission refused for want of room is journaled under the epoch the session is
             // in, or waits to open (0105).
@@ -867,6 +984,16 @@ impl<H: ExecHandler> ExecSession<H> {
                 clock: &self.clock,
                 rec: &self.rec,
                 key: self.core.current(),
+                legs: &mut self.legs,
+                nonces: &mut *self.nonces,
+                caps: &self.caps,
+                ns: self.ns,
+                specs: &self.specs,
+                decode_errors: &mut self.decode_errors,
+                fault: &mut self.fault,
+                own: self.stream,
+                pending: None,
+                after_leg: false,
             };
             let mut dial = ExecDial {
                 url: &self.url,
@@ -874,7 +1001,8 @@ impl<H: ExecHandler> ExecSession<H> {
                 clock: &self.clock,
             };
             let Some(ws) = self.core.connect_with(&mut dial, &mut ctl).await? else {
-                return Ok(());
+                // A leg's input taken meanwhile may have ended the session (decision 0115).
+                return self.faulted();
             };
             let key = self.current();
             self.in_epoch = Some(key);
@@ -904,6 +1032,8 @@ impl<H: ExecHandler> ExecSession<H> {
             }
             self.handler.on_epoch_end(key);
         }
+        let handler = &mut self.handler;
+        self.legs.left(|key| handler.on_epoch_end(key), false);
     }
 
     /// Whether epoch `key` was journaled closed as the control dropped; forgets it either way.
@@ -933,7 +1063,7 @@ impl<H: ExecHandler> ExecSession<H> {
         let end = self.epoch(ws, key).await;
         self.orders.set_ready(None);
         // What the epoch asked over HTTP comes back to no codec now (decision 0081).
-        self.rpcs.ended(key.epoch);
+        self.rpcs.ended(key);
         // Cleared before the handler is called, so a handler that panics is never told twice
         // (Codex r4189618551).
         self.in_epoch = None;
@@ -971,8 +1101,10 @@ impl<H: ExecHandler> ExecSession<H> {
             // one journal take what is ready on one tick in the same order (decision 0107 item
             // 6; Reviewer B's RB-066n-1 on PR #178).
             let rpc_due = self.rpcs.next_deadline();
-            let first = self.turn;
-            self.turn = (first + 1) % WAKES;
+            // The other endpoints wake the turn too, when there are any (decision 0115).
+            let wakes = WAKES + u8::from(!self.legs.is_empty());
+            let first = self.turn % wakes;
+            self.turn = (first + 1) % wakes;
             let wake = {
                 let timer_at = self.core.next_deadline();
                 let mut frame = pin!(next_frame(&mut ws));
@@ -980,12 +1112,13 @@ impl<H: ExecHandler> ExecSession<H> {
                 let mut orders = pin!(self.orders.wake.notified());
                 let mut rpc = pin!(sleep_or_never(rpc_due));
                 let mut stop = pin!(self.core.stop.changed());
+                let mut legs = pin!(self.legs.next());
                 let http = &mut self.core.http;
                 // No result waits: none can be added while the turn waits.
                 let mut no_http = false;
                 poll_fn(|cx| {
-                    for n in 0..WAKES {
-                        let wake = match (first + n) % WAKES {
+                    for n in 0..wakes {
+                        let wake = match (first + n) % wakes {
                             0 => frame.as_mut().poll(cx).map(Wake::Frame),
                             1 => timer.as_mut().poll(cx).map(|()| Wake::Timer),
                             2 if !no_http => match http.poll_next_unpin(cx) {
@@ -999,6 +1132,7 @@ impl<H: ExecHandler> ExecSession<H> {
                             3 => orders.as_mut().poll(cx).map(|()| Wake::Orders),
                             4 => rpc.as_mut().poll(cx).map(|()| Wake::Rpc),
                             5 => stop.as_mut().poll(cx).map(|_| Wake::Stop),
+                            6 => legs.as_mut().poll(cx).map(|(i, w)| Wake::Leg(i, w)),
                             _ => Poll::Pending,
                         };
                         if wake.is_ready() {
@@ -1037,6 +1171,14 @@ impl<H: ExecHandler> ExecSession<H> {
                 Wake::Rpc => {
                     self.time_out(key);
                     true
+                }
+                Wake::Leg(i, wake) => {
+                    let primary = Primary {
+                        core: &mut self.core,
+                        ws: &mut ws,
+                        open: true,
+                    };
+                    legs::take(&mut feed!(self), Some(primary), &mut self.legs, i, wake).await?
                 }
             };
             // An epoch just authenticated arms its protection and resyncs, before what waits.
@@ -1097,6 +1239,7 @@ impl<H: ExecHandler> ExecSession<H> {
             rpcs: &mut self.rpcs,
             orders: &self.orders,
             own: self.stream,
+            conn: self.conn,
         };
         let (codec, stream, specs) = (&mut self.codec, self.stream, &self.specs);
         let decoded = dispatch(&self.caps, self.ns, |scope| {
@@ -1109,59 +1252,19 @@ impl<H: ExecHandler> ExecSession<H> {
         Some(stamp)
     }
 
-    /// Executes what `on_open` or the codec's resync asked for on epoch `key`. Its frames and
-    /// HTTP requests, each request with the connection it opens, are charged together first, so
-    /// all of them go or none does (Codex r4188802873; PR #90 Reviewer B B7): buckets that
-    /// refuse them for now end the epoch as a drop, which reconnects through the pacing, no
-    /// sooner than the buckets would admit them, and calls `on_open` (and the resync) again,
-    /// rather than leave the codec believing it sent what it never did, or waiting on a read
-    /// that never went; what can never fit together ends the session with `never`. A request
-    /// that then does not start (its timeout past the end of the clock, or one the runtime
-    /// cannot make) stays charged. False when the epoch ended.
+    /// Executes what `on_open` or the codec's resync asked for on the order connection's epoch
+    /// `key`, its own frames and HTTP requests charged together ([`together`]), then what it
+    /// asked for on another endpoint's stream there ([`Self::route`]). False when the epoch
+    /// ended.
     async fn execute_together(
         &mut self,
         ws: &mut Option<Link>,
         key: ConnKey,
-        mut fx: Effects,
+        fx: Effects,
         never: ExecSessionError,
     ) -> Result<bool, ExecSessionError> {
-        let mut effects = fx.take();
-        // Nothing behind a reconnect of the session's stream is ever reached, so nothing
-        // behind it is charged (Codex r4188995331).
-        let stream = self.stream;
-        let ends = |e: &Effect| matches!(e, Effect::Reconnect { stream: s, .. } if *s == stream);
-        if let Some(at) = effects.iter().position(ends) {
-            effects.truncate(at + 1);
-        }
-        let own = |e: &Effect| frame_of(e, stream, true);
-        let requests = |e: &Effect| {
-            own(e)
-                .map(|f| vec![f])
-                .or_else(|| http_of(e).map(Vec::from))
-        };
-        let all: Vec<Request> = effects.iter().filter_map(requests).flatten().collect();
-        // A stop that came while `on_open` ran charges nothing (Codex r4189174483).
-        let now = Instant::now();
-        let charged = (!self.stopped()).then(|| self.core.rates.charge(now, key, &all));
-        match charged {
-            Some(Ok(_)) => {}
-            None => return Ok(false),
-            // The next attempt waits for the buckets as well as the pacing, so a refused open
-            // does not reconnect at every floor, sending nothing, until they have room
-            // (Reviewer B, B1).
-            Some(Err(Refused { ready_at: Some(at) })) => {
-                self.core.pacer.hold_until(at);
-                return Ok(false);
-            }
-            Some(Err(Refused { ready_at: None })) => return Err(never),
-        }
-        effects.into_iter().for_each(|e| fx.push(e));
-        let open = self
-            .core
-            .execute_all_charged(ws, &mut feed!(self), fx, None)
-            .await?;
-        self.faulted()?;
-        Ok(open)
+        let open = together(&mut self.core, &mut feed!(self), ws, key, fx, never).await?;
+        self.route(ws, open).await
     }
 
     /// Executes `fx` in order ([`Core::execute`]), as one batch, attributed to the input
@@ -1185,7 +1288,7 @@ impl<H: ExecHandler> ExecSession<H> {
             .execute(ws, &mut feed!(self), fx, charged, origin)
             .await?;
         self.faulted()?;
-        Ok(open)
+        self.route(ws, open).await
     }
 
     /// Executes an encode's effects `fx`, every frame and HTTP request in them, with the
@@ -1203,7 +1306,22 @@ impl<H: ExecHandler> ExecSession<H> {
             .execute_all_charged(ws, &mut feed!(self), fx, origin)
             .await?;
         self.faulted()?;
-        Ok(open)
+        self.route(ws, open).await
+    }
+
+    /// Executes what the order connection's core handed back for another endpoint's stream on
+    /// that endpoint ([`legs::route`]), once its own effects ran (decision 0115); whether the
+    /// order connection's epoch is still open, `open` as it was.
+    async fn route(&mut self, ws: &mut Option<Link>, open: bool) -> Result<bool, ExecSessionError> {
+        if self.legs.is_empty() {
+            return Ok(open);
+        }
+        let primary = Primary {
+            core: &mut self.core,
+            ws,
+            open,
+        };
+        legs::route(&mut feed!(self), Some(primary), &mut self.legs).await
     }
 
     /// Fires the earliest timer, which is due: an ended epoch's into nothing (dropped and
@@ -1249,6 +1367,7 @@ impl<H: ExecHandler> ExecSession<H> {
     ) -> Result<(), ExecSessionError> {
         let codec = &self.codec;
         let redact = |input: Inbound<'_>| codec.redact_inbound(input);
+        let mut leg = None;
         let waiting = match wake {
             Wake::Frame(frame) => Some(frame),
             Wake::Timer => {
@@ -1259,12 +1378,18 @@ impl<H: ExecHandler> ExecSession<H> {
                 let _ = self.core.stamp_http(Some(&redact), done);
                 next_frame(ws).now_or_never()
             }
+            Wake::Leg(i, wake) => {
+                leg = Some((i, wake));
+                next_frame(ws).now_or_never()
+            }
             Wake::Orders | Wake::Rpc | Wake::Stop => next_frame(ws).now_or_never(),
         };
         if let Some(Some(Ok(message))) = waiting {
             let _ = self.core.take_in(&redact, key, rx, &message);
         }
-        Ok(())
+        // The other endpoints' epochs close with it, and what woke one, or a frame waiting on
+        // each, keeps its place too (decision 0115).
+        self.legs.stop(leg, &**codec)
     }
 
     /// The session's error when a timer firing the core took ended it.
@@ -1541,10 +1666,65 @@ impl<H: ExecHandler> ExecSession<H> {
                 rpcs: &mut self.rpcs,
                 orders: &self.orders,
                 own: self.stream,
+                conn: self.conn,
             };
             self.codec.on_rpc_timeout(rpc, &mut sink);
         }
     }
+}
+
+/// Executes what `on_open` or the codec's resync asked for on epoch `key` of the connection
+/// `core` drives, on `ws`. Its frames on that connection and its HTTP requests, each request
+/// with the connection it opens, are charged together first, so all of them go or none does
+/// (Codex r4188802873; PR #90 Reviewer B B7): buckets that refuse them for now end the epoch as
+/// a drop, which reconnects through the pacing, no sooner than the buckets would admit them,
+/// and calls `on_open` (and the resync) again, rather than leave the codec believing it sent
+/// what it never did, or waiting on a read that never went; what can never fit together ends
+/// the session with `never`. A request that then does not start (its timeout past the end of
+/// the clock, or one the runtime cannot make) stays charged. A frame or reconnect for another
+/// planned endpoint's stream is handed back ([`Core::spilled`]), charged there as its turn
+/// comes (decision 0115). False when the epoch ended.
+async fn together<H: ExecHandler>(
+    core: &mut Core,
+    feed: &mut Feed<'_, H>,
+    ws: &mut Option<Link>,
+    key: ConnKey,
+    mut fx: Effects,
+    never: ExecSessionError,
+) -> Result<bool, ExecSessionError> {
+    let mut effects = fx.take();
+    // Nothing behind a reconnect of the connection's stream is ever reached, so nothing behind
+    // it is charged (Codex r4188995331).
+    let stream = core.own;
+    let ends = |e: &Effect| matches!(e, Effect::Reconnect { stream: s, .. } if *s == stream);
+    if let Some(at) = effects.iter().position(ends) {
+        effects.truncate(at + 1);
+    }
+    let own = |e: &Effect| frame_of(e, stream, true);
+    let requests = |e: &Effect| {
+        own(e)
+            .map(|f| vec![f])
+            .or_else(|| http_of(e).map(Vec::from))
+    };
+    let all: Vec<Request> = effects.iter().filter_map(requests).flatten().collect();
+    // A stop that came while `on_open` ran charges nothing (Codex r4189174483).
+    let now = Instant::now();
+    let stopped = core.stop.has_changed().is_err();
+    let charged = (!stopped).then(|| core.rates.charge(now, key, &all));
+    match charged {
+        Some(Ok(_)) => {}
+        None => return Ok(false),
+        // The next attempt waits for the buckets as well as the pacing, so a refused open does
+        // not reconnect at every floor, sending nothing, until they have room (Reviewer B, B1).
+        Some(Err(Refused { ready_at: Some(at) })) => {
+            core.pacer.hold_until(at);
+            return Ok(false);
+        }
+        Some(Err(Refused { ready_at: None })) => return Err(never),
+    }
+    effects.into_iter().for_each(|e| fx.push(e));
+    let open = core.execute_all_charged(ws, feed, fx, None).await?;
+    feed.fault.take().map_or(Ok(open), Err)
 }
 
 /// Where an order-entry session journals the nonces it reserves and the contexts it gives its
@@ -1707,6 +1887,9 @@ fn carries(
 /// a request whose deadline falls due is handed to the codec's `on_rpc_timeout`, its events
 /// stamped under `key`, the epoch the session waits to open, and the firing journaled at that
 /// stamp first (decision 0090); once the control has dropped, the handler is told neither.
+/// The other endpoints keep going meanwhile (decision 0115): what wakes one is taken as on an
+/// open order connection, what it asks for on the order connection's stream refused and
+/// counted, and an error that ends the session left in `fault`, which stops the wait.
 struct Between<'a, H> {
     stop: watch::Receiver<()>,
     orders: &'a Shared,
@@ -1716,6 +1899,20 @@ struct Between<'a, H> {
     clock: &'a IngestClock,
     rec: &'a Recorder,
     key: ConnKey,
+    legs: &'a mut Legs,
+    nonces: &'a mut dyn NonceSource,
+    caps: &'a VenueCaps,
+    ns: Namespace,
+    specs: &'a SpecTable,
+    decode_errors: &'a mut u64,
+    fault: &'a mut Option<ExecSessionError>,
+    own: StreamId,
+    /// What woke a leg, waiting for `apply`.
+    pending: Option<(usize, LegWake)>,
+    /// Whether the last change was a leg's: the next wait yields before it polls the legs
+    /// again, so the order connection's attempt, dial and deadline, which the core polls only
+    /// once this wait is pending, are not starved by a leg's frames that keep arriving.
+    after_leg: bool,
 }
 
 impl<H> Between<'_, H> {
@@ -1725,10 +1922,14 @@ impl<H> Between<'_, H> {
 }
 
 impl<H: ExecHandler> Control for Between<'_, H> {
-    /// True when there is something to report (at once when it already waits), false once the
-    /// control dropped.
+    /// True when there is something to report (at once when it already waits), or a leg woke;
+    /// false once the control dropped or a leg's input ended the session.
     async fn changed(&mut self) -> bool {
+        if self.fault.is_some() {
+            return false;
+        }
         let (due, waiting) = (self.rpcs.next_deadline(), self.orders.waiting());
+        let legs = !self.legs.is_empty();
         // What waits is taken after a yield, so a handler that submits again from
         // `on_submitted` cannot hold the task (PR #87 Reviewer B B5).
         tokio::select! {
@@ -1737,10 +1938,44 @@ impl<H: ExecHandler> Control for Between<'_, H> {
             () = tokio::task::yield_now(), if waiting => true,
             _ = self.orders.wake.notified(), if !waiting => true,
             _ = sleep_or_never(due) => true,
+            woke = next_leg(self.legs, std::mem::take(&mut self.after_leg)), if legs => {
+                (self.pending, self.after_leg) = (Some(woke), true);
+                true
+            }
         }
     }
 
-    fn apply(&mut self) {
+    async fn apply(&mut self) {
+        if let Some((i, wake)) = self.pending.take() {
+            let taken = if self.stopped() {
+                self.legs.stop(Some((i, wake)), &*self.codec)
+            } else {
+                let mut feed = Feed {
+                    codec: &mut *self.codec,
+                    handler: &mut *self.handler,
+                    nonces: &mut *self.nonces,
+                    rec: self.rec,
+                    clock: self.clock,
+                    caps: self.caps,
+                    ns: self.ns,
+                    specs: self.specs,
+                    stop: &self.stop,
+                    decode_errors: &mut *self.decode_errors,
+                    fault: &mut *self.fault,
+                    rpcs: &mut *self.rpcs,
+                    orders: self.orders,
+                    own: self.own,
+                    conn: self.key.conn,
+                };
+                legs::take(&mut feed, None, self.legs, i, wake)
+                    .await
+                    .map(drop)
+            };
+            if let Err(e) = taken {
+                *self.fault = Some(e);
+                return;
+            }
+        }
         // Only what waited as the turn began: what the handler submits meanwhile is the next
         // turn's.
         let mut turn = self.orders.waiting_now();
@@ -1764,6 +1999,14 @@ impl<H: ExecHandler> Control for Between<'_, H> {
             self.codec.on_rpc_timeout(rpc, &mut sink);
         }
     }
+}
+
+/// What wakes a leg next ([`Legs::next`]), after a yield when `yield_first`.
+async fn next_leg(legs: &mut Legs, yield_first: bool) -> (usize, LegWake) {
+    if yield_first {
+        tokio::task::yield_now().await;
+    }
+    legs.next().await
 }
 
 /// Hands the events of a deadline that fell due while the session waits to connect to the
@@ -1809,7 +2052,10 @@ struct Feed<'a, H> {
     fault: &'a mut Option<ExecSessionError>,
     rpcs: &'a mut Rpcs,
     orders: &'a Shared,
+    /// The order connection's stream and connection number: only its events move the session's
+    /// readiness (decision 0115).
     own: StreamId,
+    conn: u16,
 }
 
 impl<H> Feed<'_, H> {
@@ -1859,6 +2105,7 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
             rpcs: &mut *self.rpcs,
             orders: self.orders,
             own: self.own,
+            conn: self.conn,
         };
         let (codec, specs) = (&mut *self.codec, self.specs);
         let decoded = dispatch(self.caps, self.ns, |scope| {
@@ -1881,8 +2128,8 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
         self.rpcs.sent(call, Instant::now());
     }
 
-    fn asked_rpc(&mut self, call: RpcCall, epoch: u32) {
-        self.rpcs.asked(call, epoch, Instant::now());
+    fn asked_rpc(&mut self, call: RpcCall, key: ConnKey) {
+        self.rpcs.asked(call, key, Instant::now());
     }
 
     /// A timer's mis-reserved nonces end the session before another effect is executed.
@@ -1894,7 +2141,11 @@ impl<H: ExecHandler> EpochInputs for Feed<'_, H> {
 /// Stamps each pushed event with its input's stamp and hands it to the handler at once (0014
 /// item 2); an event of an ended epoch, one pushed after the control dropped included, is
 /// dropped and counted. An event that answers a request clears its deadline (FBC-0ga), and the
-/// codec's report of the session's own stream says whether its epoch is authenticated.
+/// codec's report of the session's own stream says whether its epoch is authenticated. Only an
+/// event of an input of the order connection, connection `conn`, authenticates its epoch; one
+/// of another endpoint's input counts for the order connection's authenticated epoch, if one
+/// is, as the answer to its arm, the end of its resync or what it shows of the orders held
+/// unprotected (decisions 0058, 0080, 0115).
 struct Sink<'a, H> {
     handler: &'a mut H,
     epochs: &'a mut Epochs,
@@ -1903,6 +2154,7 @@ struct Sink<'a, H> {
     rpcs: &'a mut Rpcs,
     orders: &'a Shared,
     own: StreamId,
+    conn: u16,
 }
 
 impl<H: ExecHandler> ExecSink for Sink<'_, H> {
@@ -1917,27 +2169,38 @@ impl<H: ExecHandler> ExecSink for Sink<'_, H> {
         if self.stop.has_changed().is_err() {
             self.epochs.drop_ended(Input::Event);
         } else if let Ok(Admit::Current) = self.epochs.admit(Input::Event, self.stamp.conn) {
-            let epoch = self.stamp.conn.epoch;
-            if let ExecEvent::Conn { stream, state } = &ev
-                && *stream == self.own
-            {
-                let authenticated = *state == ConnState::Authenticated;
-                self.orders.set_ready(authenticated.then_some(epoch));
-                if authenticated {
-                    self.orders.gate.borrow_mut().authenticated(epoch);
+            // The order connection's epoch the event counts for: its own input's, whose report
+            // of the order stream says whether that epoch is authenticated; another endpoint's
+            // counts for the order connection's authenticated epoch, if one is, and readies
+            // nothing itself (decision 0115).
+            let epoch = if self.stamp.conn.conn == self.conn {
+                let epoch = self.stamp.conn.epoch;
+                if let ExecEvent::Conn { stream, state } = &ev
+                    && *stream == self.own
+                {
+                    let authenticated = *state == ConnState::Authenticated;
+                    self.orders.set_ready(authenticated.then_some(epoch));
+                    if authenticated {
+                        self.orders.gate.borrow_mut().authenticated(epoch);
+                    }
                 }
+                Some(epoch)
+            } else {
+                self.orders.ready()
+            };
+            if let Some(epoch) = epoch {
+                // The arm's answer and the resync's end count as the handler is handed the
+                // event, so the handler hearing the one that opens the epoch sees places taken
+                // (PR #90 Reviewer B B1). What it submits then still goes out only once it has
+                // returned, so after fbc-oms has applied the ResyncEnd.
+                let settled = self.orders.gate.borrow().settles(epoch, &ev);
+                if let Some(settled) = settled {
+                    self.orders.gate.borrow_mut().settle(epoch, settled);
+                }
+                // What the event shows of the orders resting from an earlier epoch counts as it
+                // is handed over too (FBC-nvxn).
+                self.orders.gate.borrow_mut().observe(epoch, &ev);
             }
-            // The arm's answer and the resync's end count as the handler is handed the event,
-            // so the handler hearing the one that opens the epoch sees places taken (PR #90
-            // Reviewer B B1). What it submits then still goes out only once it has returned,
-            // so after fbc-oms has applied the ResyncEnd.
-            let settled = self.orders.gate.borrow().settles(epoch, &ev);
-            if let Some(settled) = settled {
-                self.orders.gate.borrow_mut().settle(epoch, settled);
-            }
-            // What the event shows of the orders resting from an earlier epoch counts as it is
-            // handed over too (FBC-nvxn).
-            self.orders.gate.borrow_mut().observe(epoch, &ev);
             // While the handler hears the event, what it submits is attributed to its input
             // (decision 0100).
             let (stamp, orders, handler) = (self.stamp, self.orders, &mut *self.handler);
@@ -1945,7 +2208,7 @@ impl<H: ExecHandler> ExecSink for Sink<'_, H> {
             clock.attributing(stamp, || handler.on_exec(Envelope::new(stamp, meta, ev)));
             // The epoch just became placing with orders unprotected: the handler is told them
             // once, unless it stopped the session as it took the event.
-            let notice = orders.gate.borrow_mut().notice(epoch);
+            let notice = epoch.and_then(|epoch| orders.gate.borrow_mut().notice(epoch));
             if let Some(unprotected) = notice
                 && self.stop.has_changed().is_ok()
             {
@@ -2009,7 +2272,12 @@ mod tests {
             ),
             (
                 ExecSessionError::Endpoints(2),
-                "the venue planned 2 order-entry connections; a session drives exactly one",
+                "the venue planned 2 order-entry connections; a session drives at least one, and \
+                 exactly one over an in-process stream",
+            ),
+            (
+                ExecSessionError::SharedStream(StreamId(2)),
+                "the venue planned two order-entry connections on stream 2",
             ),
             (
                 ExecSessionError::Nonces {

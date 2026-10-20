@@ -16,8 +16,9 @@
 //! leaves nothing to rest. A signer that fails is `SignFailed`.
 //!
 //! As [`ToyExec::new`] builds it, it resyncs in frames on its stream and sets no timer; its
-//! factory builds it [`pinging`](ToyExec::pinging), a `ping|ts=<wall>` sent on the opened
-//! stream every [`PING_EVERY`] (Codex r4172835747), and, given a REST base, resyncing
+//! factory builds it [`pinging`](ToyExec::pinging), a `ping|ts=<wall>` sent on each opened
+//! stream every [`PING_EVERY`] (Codex r4172835747), each on a timer of its own
+//! ([`ping_tag`](super::ping_tag), FBC-tnsf), and, given a REST base, resyncing
 //! [over REST](ToyExec::rest_resync) (`session.rs`, Codex r4172917335).
 
 use fbc_core::{
@@ -32,7 +33,10 @@ use fbc_core::{
 
 use super::session::{self, Answers};
 use super::url::{echoed, occurrences, secrets};
-use super::{EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, RPC_TIMEOUT, caps_for, decode, weight};
+use super::{
+    EXEC_STREAM, FillIds, PING_EVERY, PING_TAG, PING_TAGS, RPC_TIMEOUT, caps_for, decode, ping_tag,
+    weight,
+};
 
 use NotSentReason::{FlagConflict, SignFailed, Unencodable, Unsupported};
 
@@ -47,8 +51,8 @@ pub struct ToyExec {
     rest: Option<WireUrl>,
     /// Whether `on_open` arms a ping.
     ping: bool,
-    /// The stream the last `on_open` opened, which the ping goes out on.
-    opened: Option<StreamId>,
+    /// The streams `on_open` opened, each pinged on its own timer.
+    opened: Vec<StreamId>,
     /// The credentials of the URLs it was given, named wherever a frame or response echoes
     /// them (Codex r4219753519, r4219929319).
     secrets: Vec<String>,
@@ -74,15 +78,15 @@ impl ToyExec {
             answers: Answers::default(),
             rest: None,
             ping: false,
-            opened: None,
+            opened: Vec::new(),
             secrets: Vec::new(),
         }
     }
 
-    /// This codec, keeping its order-entry connection alive (Codex r4172835747): `on_open`
-    /// arms [`PING_TAG`], and each firing sends `ping|ts=<wall>` on the opened stream (one
-    /// `Control` unit, safety traffic, answered by nothing) and arms it again, [`PING_EVERY`]
-    /// apart.
+    /// This codec, keeping its order-entry connections alive (Codex r4172835747): `on_open`
+    /// arms the opened stream's ping timer ([`ping_tag`](super::ping_tag): [`PING_TAG`] on
+    /// [`EXEC_STREAM`]), and each firing sends `ping|ts=<wall>` on that stream (one `Control`
+    /// unit, safety traffic, answered by nothing) and arms it again, [`PING_EVERY`] apart.
     pub fn pinging(self) -> ToyExec {
         ToyExec { ping: true, ..self }
     }
@@ -361,10 +365,10 @@ impl ToyExec {
     }
 }
 
-/// The ping's next firing.
-fn ping_timer() -> Effect {
+/// The next firing of `stream`'s ping.
+fn ping_timer(stream: StreamId) -> Effect {
     Effect::Timer {
-        tag: PING_TAG,
+        tag: ping_tag(stream),
         after: PING_EVERY,
     }
 }
@@ -441,13 +445,15 @@ impl ExecCodec for ToyExec {
     }
 
     /// Authenticates with the toy's token in a redaction span; Authenticated waits for the
-    /// venue's acknowledgement. A resync still being read or asked for was cut short by the
-    /// reconnect. A pinging codec arms its ping.
+    /// venue's acknowledgement. A resync still being read or asked for was cut short by a
+    /// reconnect of [`EXEC_STREAM`]. A pinging codec arms the stream's ping.
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.answers.ask_auth(stream, ctx, fx);
-        self.opened = Some(stream);
+        if !self.opened.contains(&stream) {
+            self.opened.push(stream);
+        }
         if self.ping {
-            fx.push(ping_timer());
+            fx.push(ping_timer(stream));
         }
     }
 
@@ -525,11 +531,13 @@ impl ExecCodec for ToyExec {
         self.answers.rest_answer(tag, resp, scope, specs, sink, fx)
     }
 
-    /// The ping, sent and armed again; a resync over REST asked again on the timer carrying its
-    /// failed request's tag. Any other tag asks nothing.
+    /// A stream's ping, sent and armed again; a resync over REST asked again on the timer
+    /// carrying its failed request's tag. Any other tag asks nothing.
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut Effects) {
-        match (tag, &self.rest, self.opened) {
-            (PING_TAG, _, Some(stream)) if self.ping => {
+        let pinged = self.opened.iter().copied().find(|s| ping_tag(*s) == tag);
+        let ping = tag == PING_TAG || tag.0 >= PING_TAGS;
+        match (pinged, &self.rest) {
+            (Some(stream), _) if self.ping => {
                 fx.push(Effect::Send {
                     stream,
                     frame: WireSlice::plain(format!("ping|ts={}", ctx.wall.0).into_bytes()),
@@ -537,10 +545,10 @@ impl ExecCodec for ToyExec {
                     class: TrafficClass::Safety,
                     charge: RateCharge::one(OpKind::Control, None),
                 });
-                fx.push(ping_timer());
+                fx.push(ping_timer(stream));
             }
-            (PING_TAG, ..) => {}
-            (_, Some(base), _) => self.answers.retry_rest(tag, base, ctx, fx),
+            _ if ping => {}
+            (_, Some(base)) => self.answers.retry_rest(tag, base, ctx, fx),
             _ => {}
         }
     }

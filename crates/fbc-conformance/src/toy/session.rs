@@ -26,8 +26,10 @@
 //!   already answered is ignored.
 //! - `auth|ok|token?|code?|msg?`: the answer to the authentication `on_open` sends, `ok` `1`
 //!   echoing the toy's token (whose span [`token_spans`] names, 0028) or `0` with the
-//!   venue's code. Only an acknowledgement of an authentication asked for reports the stream
-//!   [`ConnState::Authenticated`].
+//!   venue's code. Only an acknowledgement of an authentication asked for on its stream reports
+//!   that stream [`ConnState::Authenticated`]; each stream the codec opens authenticates on its
+//!   own (FBC-tnsf), and only a reopened [`EXEC_STREAM`](super::EXEC_STREAM), where the
+//!   resync is read, cuts a resync short.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -42,7 +44,7 @@ use fbc_core::{
 
 use super::decode::{self, Record};
 use super::url::join;
-use super::{RESYNC_RETRY, RESYNC_TIMEOUT, TOY_TOKEN};
+use super::{EXEC_STREAM, RESYNC_RETRY, RESYNC_TIMEOUT, TOY_TOKEN};
 
 use DecodeError::Malformed;
 
@@ -86,7 +88,8 @@ pub(super) struct Answers {
     rest: Option<RestResync>,
     /// The tag of the last HTTP request asked for.
     last_tag: u64,
-    auth_asked: bool,
+    /// The streams an authentication was asked on and not yet answered.
+    auth_asked: Vec<StreamId>,
 }
 
 impl Answers {
@@ -349,12 +352,16 @@ impl Answers {
         }
     }
 
-    /// Authenticates on `stream` with the toy's token, in a redaction span; a resync still
-    /// being read was cut short by the reconnect.
+    /// Authenticates on `stream` with the toy's token, in a redaction span; on [`EXEC_STREAM`],
+    /// a resync still being read was cut short by the reconnect.
     pub(super) fn ask_auth(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
-        self.auth_asked = true;
-        self.resync = None;
-        self.rest = None;
+        if !self.auth_asked.contains(&stream) {
+            self.auth_asked.push(stream);
+        }
+        if stream == EXEC_STREAM {
+            self.resync = None;
+            self.rest = None;
+        }
         let head = format!("auth|ts={}|{TOKEN_FIELD}", ctx.wall.0);
         let text = format!("{head}{TOY_TOKEN}");
         let span = span(head.len()..text.len()).expect("an authentication shorter than 4 GiB");
@@ -368,15 +375,15 @@ impl Answers {
         });
     }
 
-    /// An `auth` record: the stream authenticated, or the venue's refusal, once per
-    /// authentication asked for.
+    /// An `auth` record on `stream`: the stream authenticated, or the venue's refusal, once per
+    /// authentication asked for on it.
     pub(super) fn auth(
         &mut self,
         stream: StreamId,
         r: &Record<'_>,
         sink: &mut dyn ExecSink,
     ) -> Result<(), DecodeError> {
-        if !self.auth_asked {
+        if !self.auth_asked.contains(&stream) {
             return Err(Malformed("no authentication asked"));
         }
         let event = match r.get("ok")? {
@@ -392,7 +399,7 @@ impl Answers {
             _ => return Err(Malformed("ok")),
         };
         let meta = r.meta(false)?;
-        self.auth_asked = false;
+        self.auth_asked.retain(|asked| *asked != stream);
         sink.push(meta, event);
         Ok(())
     }
