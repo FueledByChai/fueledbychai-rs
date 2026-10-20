@@ -355,6 +355,8 @@ pub struct BookCaps {
 /// How often a feed updates.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum Cadence {
+    /// The feed's timing has not been established.
+    Unknown,
     /// On every change.
     Realtime,
     /// On a fixed pulse.
