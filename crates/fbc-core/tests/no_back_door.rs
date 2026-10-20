@@ -1,4 +1,4 @@
-//! Decision 0004: a `VenueOrderId`, a `FillId`, a `VenueSymbol` or a `Fee` is built only
+//! Decisions 0004 and 0119: a `VenueOrderId`, a `FillId`, a `TradeId`, a `VenueSymbol` or a `Fee` is built only
 //! through the `DecodeScope` the core's dispatch lends, and there is no back door for tests
 //! either. The crate-private constructors (`from_wire`, `Fee::from_declared`) are reachable
 //! from anywhere inside `fbc-core`, including its unit tests, so the compiler alone cannot
@@ -47,6 +47,8 @@ fn only_the_decode_scope_calls_the_venue_id_constructors() {
                 "VenueOrderId::from_wire(",
                 "FillId::from_wire(",
                 "VenueSymbol::from_wire(",
+                "TradeId::from_uuid_wire(",
+                "TradeId::from_numeric(",
             ]
             .iter()
             .any(|pat| line.contains(pat));

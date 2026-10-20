@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use fbc_book::{Books, Top};
 use fbc_core::{
     Aggressor, AssetSym, BookSide, Cadence, DecodeError, Effect, Effects, ExchNs, ExchTsKind, Feed,
     FeedHealth, FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId,
@@ -10,12 +11,14 @@ use fbc_core::{
 };
 use fbc_venue_qfex::{BOOK_LEVEL2, KEY_MDS_URL, Qfex, TOUCH_BBO};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const AAPL: InstrumentId = InstrumentId::new(1);
 
 #[test]
-fn bbo_cadence_remains_unknown_until_measured() {
+fn bbo_cadence_remains_unpromised_by_the_venue() {
     let caps = Qfex.caps(&cfg()).unwrap();
     assert_eq!(caps.md.touch_sources[0].cadence, Cadence::Unknown);
     assert_eq!(
@@ -31,8 +34,12 @@ fn cfg() -> VenueConfig {
 }
 
 fn specs() -> SpecTable {
+    specs_for("AAPL-USD")
+}
+
+fn specs_for(symbol: &str) -> SpecTable {
     let caps = Qfex.caps(&cfg()).unwrap();
-    let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol("AAPL-USD")).unwrap();
+    let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol(symbol)).unwrap();
     let usd = AssetSym::new("USD").unwrap();
     let mut specs = SpecTable::new();
     specs.insert(InstrumentSpec {
@@ -76,6 +83,10 @@ impl MdSink for Sink {
 }
 
 fn subscribed() -> Box<dyn MdCodec> {
+    subscribed_for(&specs())
+}
+
+fn subscribed_for(specs: &SpecTable) -> Box<dyn MdCodec> {
     let set: BTreeSet<_> = [
         Feed::Touch(TOUCH_BBO),
         Feed::Book(BOOK_LEVEL2),
@@ -84,10 +95,10 @@ fn subscribed() -> Box<dyn MdCodec> {
     .map(sub)
     .into_iter()
     .collect();
-    let ep = Qfex.plan_md(&cfg(), &specs(), &set).unwrap().remove(0);
+    let ep = Qfex.plan_md(&cfg(), specs, &set).unwrap().remove(0);
     let mut codec = Qfex.md_codec(&cfg(), &ep);
     codec
-        .subscribe(&ep.subs, &[], &specs(), &mut Effects::new())
+        .subscribe(&ep.subs, &[], specs, &mut Effects::new())
         .unwrap();
     codec
 }
@@ -300,11 +311,16 @@ fn documented_bbo_depth_and_trade_frames_decode_exactly() {
     );
     let (result, sink) = decode(codec.as_mut(), frame("trade"));
     assert_eq!(result, Ok(()));
+    let trade_id = dispatch_market_data(&Qfex.caps(&cfg()).unwrap(), |scope| {
+        scope
+            .trade_id_uuid("ac928c66-ca53-498f-9c13-a110027a60e8")
+            .unwrap()
+    });
     assert_eq!(
         sink.0[0].1,
         MdEvent::Trade {
             inst: AAPL,
-            id: None,
+            id: Some(trade_id),
             aggressor: Aggressor::Unknown,
             px: Ticks(40_023),
             qty: Lots::new(523_512_000).unwrap()
@@ -312,6 +328,170 @@ fn documented_bbo_depth_and_trade_frames_decode_exactly() {
     );
     assert_eq!(sink.0[0].0.venue_seq, Some(50));
     assert!(sink.0[0].0.exch_ts.is_some());
+}
+
+#[test]
+fn recorded_public_mds_establishes_cadence_sequence_replacement_and_trade_identity() {
+    let frames: Vec<Value> = include_str!("../../../../fixtures/qfex/live/nvda-2026-10-20.ndjson")
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let raw_frames: Vec<Value> =
+        include_str!("../../../../fixtures/qfex/live/nvda-2026-10-20.raw.ndjson")
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(frames.len(), raw_frames.len());
+    assert!(frames.len() >= 100);
+    for (projected, recorded) in frames.iter().zip(&raw_frames) {
+        assert_eq!(projected["recv_ms"], recorded["recv_ms"]);
+        let raw: Value = serde_json::from_str(recorded["raw"].as_str().unwrap()).unwrap();
+        let mut expected = projected.clone();
+        expected.as_object_mut().unwrap().remove("recv_ms");
+        assert_eq!(
+            raw, expected,
+            "projection must retain the public raw frame exactly"
+        );
+    }
+    let specs = specs_for("NVDA-USD");
+    let spec = specs.get(AAPL).unwrap();
+    let mut codec = subscribed_for(&specs);
+    let mut books = Books::new();
+    let mut bbo_times = Vec::new();
+    let mut depth_times = Vec::new();
+    let mut depth_count = 0;
+    let mut trade_count = 0;
+    let mut seen_trade_ids = Vec::new();
+    let mut removed_levels = false;
+    let mut prior_top: Option<Top> = None;
+    let mut last_bbo = None;
+
+    for (index, frame) in frames.iter().enumerate() {
+        let sequence = frame["sequence"].as_u64().unwrap();
+        // This capture's sequence is connection-wide: a trade consumes a number between
+        // BBO/depth pairs. A +1 rule on either individual channel would be wrong.
+        assert_eq!(sequence, index as u64 + 1);
+        let timestamp = OffsetDateTime::parse(frame["time"].as_str().unwrap(), &Rfc3339)
+            .unwrap()
+            .unix_timestamp_nanos();
+        let (result, sink) = decode_with_specs(codec.as_mut(), &frame.to_string(), &specs);
+        result.unwrap();
+        assert!(!sink.0.is_empty());
+        assert!(sink.0.iter().all(|(meta, _)| {
+            meta.venue_seq == Some(sequence)
+                && meta.exch_ts == Some(ExchNs(i64::try_from(timestamp).unwrap()))
+        }));
+
+        match frame["type"].as_str().unwrap() {
+            "bbo" => {
+                bbo_times.push(timestamp);
+                assert_eq!(sink.0.len(), 1);
+                let MdEvent::Touch { bid, ask, .. } = sink.0[0].1 else {
+                    panic!("BBO did not decode to a touch");
+                };
+                last_bbo = Some((timestamp, bid, ask));
+            }
+            "level2" => {
+                depth_times.push(timestamp);
+                depth_count += 1;
+                assert_eq!(
+                    sink.0.first().unwrap().1,
+                    MdEvent::BookSnapshotBegin {
+                        inst: AAPL,
+                        book: BOOK_LEVEL2,
+                        epoch: depth_count,
+                    }
+                );
+                assert_eq!(
+                    sink.0.last().unwrap().1,
+                    MdEvent::BookSnapshotEnd {
+                        inst: AAPL,
+                        book: BOOK_LEVEL2,
+                    }
+                );
+                let expected_bids = captured_levels(spec, &frame["bid"]);
+                let expected_asks = captured_levels(spec, &frame["ask"]);
+                assert_eq!(sink.0.len(), expected_bids.len() + expected_asks.len() + 3);
+                for (_, event) in sink.0 {
+                    books.apply(&event).unwrap();
+                }
+                let top = books.get(AAPL, BOOK_LEVEL2).unwrap().top(20).unwrap();
+                assert_eq!(top.bids, expected_bids);
+                assert_eq!(top.asks, expected_asks);
+                let (bbo_time, bid, ask) = last_bbo.unwrap();
+                assert_eq!(timestamp, bbo_time);
+                assert_eq!(top.bids.first().copied(), bid);
+                assert_eq!(top.asks.first().copied(), ask);
+                if let Some(old) = &prior_top {
+                    removed_levels |= old
+                        .bids
+                        .iter()
+                        .any(|level| !top.bids.iter().any(|new| new.px == level.px))
+                        || old
+                            .asks
+                            .iter()
+                            .any(|level| !top.asks.iter().any(|new| new.px == level.px));
+                }
+                prior_top = Some(top);
+            }
+            "trade" => {
+                trade_count += 1;
+                let expected = dispatch_market_data(&Qfex.caps(&cfg()).unwrap(), |scope| {
+                    scope
+                        .trade_id_uuid(frame["trade_id"].as_str().unwrap())
+                        .unwrap()
+                });
+                assert!(
+                    matches!(sink.0[0].1, MdEvent::Trade { id: Some(id), aggressor: Aggressor::Unknown, .. } if id == expected)
+                );
+                assert!(!seen_trade_ids.contains(&expected));
+                seen_trade_ids.push(expected);
+                assert_eq!(expected.to_string(), frame["trade_id"].as_str().unwrap());
+            }
+            other => panic!("unexpected captured feed: {other}"),
+        }
+    }
+    assert!(bbo_times.len() >= 50 && depth_times.len() >= 50 && trade_count >= 1);
+    assert!(
+        removed_levels,
+        "successive depth snapshots must replace changed levels"
+    );
+    for times in [&bbo_times, &depth_times] {
+        let mut gaps: Vec<_> = times
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]) / 1_000_000)
+            .collect();
+        gaps.sort_unstable();
+        assert_eq!(gaps[gaps.len() / 2], 500);
+        assert!(gaps[0] >= 450 && gaps[gaps.len() - 1] <= 550);
+    }
+    // A single short recording establishes observed cadence, not a venue guarantee.
+    assert_eq!(
+        Qfex.caps(&cfg()).unwrap().md.touch_sources[0].cadence,
+        Cadence::Unknown
+    );
+    assert!(Qfex.caps(&cfg()).unwrap().md.trades.trade_id);
+}
+
+fn captured_levels(spec: &InstrumentSpec, raw: &Value) -> Vec<Lvl> {
+    raw.as_array()
+        .unwrap()
+        .iter()
+        .map(|pair| {
+            let price = pair[0].as_str().unwrap().parse().unwrap();
+            let qty: Decimal = pair[1].as_str().unwrap().parse().unwrap();
+            Lvl {
+                px: spec.price_grid.ticks_exact(price).unwrap(),
+                qty: Lots::new(
+                    qty.checked_div(spec.size_step.get())
+                        .unwrap()
+                        .to_i64()
+                        .unwrap(),
+                )
+                .unwrap(),
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -329,6 +509,11 @@ fn malformed_or_unsubscribed_frames_never_emit_partial_events() {
         assert!(result.is_err());
         assert!(sink.0.is_empty());
     }
+    let mut bad_trade: Value = serde_json::from_str(frame("trade")).unwrap();
+    bad_trade["trade_id"] = json!("not-a-uuid");
+    let (result, sink) = decode(codec.as_mut(), &bad_trade.to_string());
+    assert_eq!(result, Err(DecodeError::Malformed("trade_id")));
+    assert!(sink.0.is_empty());
     // A failed snapshot did not consume an epoch.
     let (_, sink) = decode(codec.as_mut(), frame("level2"));
     assert!(matches!(

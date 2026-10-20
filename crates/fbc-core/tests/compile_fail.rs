@@ -24,7 +24,7 @@ fn unit_seals_do_not_compile() {
     cases.compile_fail("tests/ui_units/*.rs");
 }
 
-/// `ClientOrderId`, `VenueOrderId`, `FillId` and `DecodeScope` cannot be built outside
+/// `ClientOrderId`, `VenueOrderId`, `FillId`, `TradeId` and `DecodeScope` cannot be built outside
 /// `fbc-core`, a lent `DecodeScope` cannot escape the dispatch callback, and a `CidMint` cannot
 /// exist without a held `NamespaceLease`, which only `NamespaceLease::acquire` makes (decision
 /// 0004, design §4.3).
