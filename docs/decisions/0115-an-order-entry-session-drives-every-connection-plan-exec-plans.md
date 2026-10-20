@@ -47,7 +47,9 @@ deferred. This record decides how one session drives several connections.
    reconnect is reached" holds per batch, and a frame for the other endpoint asked before it
    goes out. One for an endpoint with no open epoch (the order connection while it waits to
    reconnect, or another between epochs) is refused and counted where it was asked for; one
-   for a stream no endpoint carries is a codec defect, as before.
+   for a stream no endpoint carries is a codec defect, as before. Once the order connection's
+   epoch has ended in such a batch, the session takes no place before it routes more, so no
+   input taken while a routed write waits finds it placing on a closed connection.
 5. **Reconnects alone.** An endpoint that drops, asks to reconnect (as for an expired
    listenKey) or fails a write ends its epoch and reconnects through its own pacing, while
    every other endpoint's epoch stays open; the handler is told each epoch's end, as 0039. While

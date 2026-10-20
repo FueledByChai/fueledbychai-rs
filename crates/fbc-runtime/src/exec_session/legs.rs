@@ -358,20 +358,21 @@ impl Legs {
         Ok(())
     }
 
-    /// The epochs a dropped run left open, ended: buckets forgotten, closes journaled and
-    /// `handler` told; with none, as a panic unwinds, the close is journaled only if the journal
-    /// is free (as the order connection's, Reviewer B B2). A run journals a leg closed as the
-    /// control drops only in [`Self::finish`], which ends it with no await between, so none
-    /// left here was.
+    /// The epochs a dropped run left open, ended: buckets forgotten, closes journaled (unless
+    /// [`Self::stop`] journaled one already, as the run's end panicked stamping a frame behind
+    /// it: Codex P2 r4323792811 on PR #188) and `handler` told; with none, as a panic unwinds,
+    /// the close is journaled only if the journal is free (as the order connection's, Reviewer
+    /// B B2).
     pub(super) fn left(&mut self, mut handler: Option<&mut dyn ExecHandler>) {
         let unwinding = handler.is_none();
         for leg in &mut self.legs {
             if let Some(key) = leg.open_key() {
                 (leg.state, leg.ws) = (State::Waiting(None), None);
                 leg.core.rates.closed(key);
-                if unwinding {
+                let journaled = leg.closed_early.take() == Some(key);
+                if !journaled && unwinding {
                     leg.core.closed_unwinding(key);
-                } else {
+                } else if !journaled {
                     leg.core.control(|| ControlEvent::Closed(key));
                 }
                 if let Some(handler) = handler.as_deref_mut() {
@@ -497,13 +498,19 @@ fn faulted(feed: &mut Feed<'_>) -> Result<(), ExecSessionError> {
 /// (the order connection while it waits to connect, `primary` `None`, or a leg between
 /// epochs) is refused and counted where it was asked for. A leg whose epoch it ends reconnects
 /// through its own pacing. Once the session has stopped, nothing more is executed. Whether the
-/// order connection's epoch is still open (false when it is not given).
+/// order connection's epoch is still open (false when it is not given). Once that epoch has
+/// ended, in the batch that handed these back or as one of them ends it, the session takes no
+/// place before anything more is awaited, so no input taken meanwhile finds it placing on a
+/// closed connection (Codex P2 r4323792819 on PR #188).
 pub(super) async fn route(
     feed: &mut Feed<'_>,
     mut primary: Option<Primary<'_>>,
     legs: &mut Legs,
 ) -> Result<bool, ExecSessionError> {
     loop {
+        if primary.as_ref().is_some_and(|p| !p.open) {
+            feed.orders.set_ready(None);
+        }
         if stopped(feed) {
             primary.iter_mut().for_each(|p| p.core.spilled.clear());
             legs.legs
