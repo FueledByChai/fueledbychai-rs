@@ -20,6 +20,7 @@ use tokio::time::Instant;
 
 use super::{ExecHandler, ExecSessionError, Feed, Sink, context, together};
 use crate::in_process::Link;
+use crate::journal::Journal;
 use crate::session_core::{
     Answered, Core, EpochInputs, Wire, WsError, close, next_frame, sleep_or_never, stream_of,
 };
@@ -174,9 +175,9 @@ impl Leg {
 
     /// Stamps one message of epoch `key` and decodes it inside the venue's decode scope, as
     /// the order connection's are; the codec's effects go in `fx`. The stamp of a data frame.
-    fn decode<H: ExecHandler>(
+    fn decode(
         &mut self,
-        feed: &mut Feed<'_, H>,
+        feed: &mut Feed<'_>,
         key: ConnKey,
         rx: Option<KernelRxNs>,
         message: &Message,
@@ -210,9 +211,9 @@ impl Leg {
     /// journaled (unless it was as the control dropped) and the handler told. A drop also tells
     /// the pacing and opens the next epoch, to be connected as the pacing allows; a stop or a
     /// session error leaves no attempt to come.
-    fn end<H: ExecHandler>(
+    fn end(
         &mut self,
-        feed: &mut Feed<'_, H>,
+        feed: &mut Feed<'_>,
         key: ConnKey,
         dropped: bool,
     ) -> Result<(), ExecSessionError> {
@@ -272,8 +273,11 @@ impl Legs {
         self.legs.iter()
     }
 
-    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut Leg> {
-        self.legs.iter_mut()
+    /// Every leg journals into `journal` from now on.
+    pub(super) fn set_journal(&mut self, journal: &Journal) {
+        for leg in &mut self.legs {
+            leg.core.journal = Some(journal.clone());
+        }
     }
 
     /// The epoch stream `stream`'s leg is in or waits to open, when one carries it.
@@ -313,59 +317,36 @@ impl Legs {
         .await
     }
 
-    /// As the control dropped: each open leg's epoch journaled closed, then what woke leg `i`
-    /// (`woke`), or else a frame already waiting on it, stamped and journaled in that closed
-    /// epoch so it keeps its place in ingest order, reaching no codec; a timer or a result
-    /// that woke it is stamped as it fell due (as the order connection does, Codex P1 on PR
-    /// #115). A leg already journaled closed is left as it is.
-    pub(super) fn stop(
-        &mut self,
-        mut woke: Option<(usize, LegWake)>,
-        codec: &dyn ExecCodec,
-    ) -> Result<(), ExecSessionError> {
+    /// As the control dropped: each open leg's epoch journaled closed, then a frame already
+    /// waiting on it stamped and journaled in that closed epoch, so it keeps its place in ingest
+    /// order and reaches no codec (as the order connection's, Codex P1 on PR #115).
+    fn stop(&mut self, codec: &dyn ExecCodec) {
         let redact = |input: Inbound<'_>| codec.redact_inbound(input);
-        for (i, leg) in self.legs.iter_mut().enumerate() {
-            let wake = woke.take_if(|(j, _)| *j == i).map(|(_, wake)| wake);
-            let key = leg.open_key().filter(|key| leg.closed_early != Some(*key));
-            if let Some(key) = key {
+        for leg in &mut self.legs {
+            if let Some(key) = leg.open_key() {
                 leg.core.control(|| ControlEvent::Closed(key));
                 leg.closed_early = Some(key);
-            }
-            let frame = match wake {
-                Some(LegWake::Timer) => {
-                    let _ = leg.core.take_timer()?;
-                    None
+                let frame = next_frame(&mut leg.ws).now_or_never();
+                let rx = leg.ws.as_ref().and_then(Wire::kernel_rx);
+                if let Some(Some(Ok(message))) = frame {
+                    let _ = leg.core.take_in(&redact, key, rx, &message);
                 }
-                Some(LegWake::Http(done)) => {
-                    let _ = leg.core.stamp_http(Some(&redact), done);
-                    None
-                }
-                Some(LegWake::Frame(frame, _, rx)) => Some((frame, rx)),
-                _ if key.is_some() => {
-                    let frame = next_frame(&mut leg.ws).now_or_never();
-                    let rx = leg.ws.as_ref().and_then(Wire::kernel_rx);
-                    frame.map(|frame| (frame, rx))
-                }
-                // A leg not connected, or closed already, has no frame waiting; an attempt that
-                // fell due, or opened, as the control dropped opens nothing now.
-                _ => None,
-            };
-            if let (Some((Some(Ok(message)), rx)), Some(key)) = (frame, key) {
-                let _ = leg.core.take_in(&redact, key, rx, &message);
             }
         }
-        Ok(())
     }
 
-    /// The run ended: each open leg's epoch ends, its socket closed when the session stopped
-    /// (a close frame, if the buckets admit one) and retired as a drop when it failed, as the
-    /// order connection's (0053), the handler told; no leg connects again.
-    pub(super) fn finish<H: ExecHandler>(
-        &mut self,
-        feed: &mut Feed<'_, H>,
-        stopped: bool,
-    ) -> Result<(), ExecSessionError> {
+    /// The run ended: each open leg's epoch ends, journaled closed with a frame waiting on it
+    /// stamped behind the close ([`Self::stop`]) and its socket closed (a close frame, if the
+    /// buckets admit one) when the session stopped, retired as a drop when it failed, as the
+    /// order connection's (0053), the handler told; no leg connects again, and the requests
+    /// still in flight are dropped.
+    pub(super) fn finish(&mut self, feed: &mut Feed<'_>) -> Result<(), ExecSessionError> {
+        let stopped = stopped(feed);
+        if stopped {
+            self.stop(&*feed.codec);
+        }
         for leg in &mut self.legs {
+            leg.core.http.clear();
             if let Some(key) = leg.open_key() {
                 if let Some(socket) = leg.ws.as_mut().filter(|_| stopped) {
                     close(socket, &leg.core.rates, key);
@@ -377,22 +358,24 @@ impl Legs {
         Ok(())
     }
 
-    /// The epochs a dropped run left open, ended: buckets forgotten, closes journaled (unless
-    /// journaled as the control dropped) and, unless a panic unwinds, the handler told (as the
-    /// order connection's, Reviewer B B2).
-    pub(super) fn left(&mut self, mut told: impl FnMut(ConnKey), unwinding: bool) {
+    /// The epochs a dropped run left open, ended: buckets forgotten, closes journaled and
+    /// `handler` told; with none, as a panic unwinds, the close is journaled only if the journal
+    /// is free (as the order connection's, Reviewer B B2). A run journals a leg closed as the
+    /// control drops only in [`Self::finish`], which ends it with no await between, so none
+    /// left here was.
+    pub(super) fn left(&mut self, mut handler: Option<&mut dyn ExecHandler>) {
+        let unwinding = handler.is_none();
         for leg in &mut self.legs {
             if let Some(key) = leg.open_key() {
                 (leg.state, leg.ws) = (State::Waiting(None), None);
                 leg.core.rates.closed(key);
-                let journaled = leg.closed_early.take() == Some(key);
-                if !journaled && unwinding {
+                if unwinding {
                     leg.core.closed_unwinding(key);
-                } else if !journaled {
+                } else {
                     leg.core.control(|| ControlEvent::Closed(key));
                 }
-                if !unwinding {
-                    told(key);
+                if let Some(handler) = handler.as_deref_mut() {
+                    handler.on_epoch_end(key);
                 }
             }
         }
@@ -407,13 +390,18 @@ impl Legs {
 /// it asked for or a failed write reconnects through its own pacing while every other
 /// connection's epoch stays open. What the codec asked for on another stream is then executed
 /// there ([`route`]). Whether the order connection's epoch is still open, when it is given.
-pub(super) async fn take<H: ExecHandler>(
-    feed: &mut Feed<'_, H>,
+pub(super) async fn take(
+    feed: &mut Feed<'_>,
     primary: Option<Primary<'_>>,
     legs: &mut Legs,
     i: usize,
     wake: LegWake,
 ) -> Result<bool, ExecSessionError> {
+    // What woke a leg as the control dropped from another thread reaches no codec, and is not
+    // stamped: the run's end stamps only what still waits (decision 0115).
+    if stopped(feed) {
+        return Ok(false);
+    }
     let leg = &mut legs.legs[i];
     let open = match wake {
         LegWake::Attempt => {
@@ -478,9 +466,9 @@ pub(super) async fn take<H: ExecHandler>(
 
 /// Executes `fx` on leg `leg`'s epoch, attributed to the input stamped `origin`; false when the
 /// epoch ended.
-async fn execute<H: ExecHandler>(
+async fn execute(
     leg: &mut Leg,
-    feed: &mut Feed<'_, H>,
+    feed: &mut Feed<'_>,
     fx: Effects,
     origin: Option<Stamp>,
 ) -> Result<bool, ExecSessionError> {
@@ -493,12 +481,12 @@ async fn execute<H: ExecHandler>(
 }
 
 /// Whether the control has dropped.
-fn stopped<H>(feed: &Feed<'_, H>) -> bool {
+fn stopped(feed: &Feed<'_>) -> bool {
     feed.stop.has_changed().is_err()
 }
 
 /// The session's error when a timer firing's nonces were mis-reserved.
-fn faulted<H>(feed: &mut Feed<'_, H>) -> Result<(), ExecSessionError> {
+fn faulted(feed: &mut Feed<'_>) -> Result<(), ExecSessionError> {
     feed.fault.take().map_or(Ok(()), Err)
 }
 
@@ -510,8 +498,8 @@ fn faulted<H>(feed: &mut Feed<'_, H>) -> Result<(), ExecSessionError> {
 /// epochs) is refused and counted where it was asked for. A leg whose epoch it ends reconnects
 /// through its own pacing. Once the session has stopped, nothing more is executed. Whether the
 /// order connection's epoch is still open (false when it is not given).
-pub(super) async fn route<H: ExecHandler>(
-    feed: &mut Feed<'_, H>,
+pub(super) async fn route(
+    feed: &mut Feed<'_>,
     mut primary: Option<Primary<'_>>,
     legs: &mut Legs,
 ) -> Result<bool, ExecSessionError> {

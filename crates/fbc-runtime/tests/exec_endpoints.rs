@@ -183,7 +183,8 @@ impl VenueFactory for Two {
 /// three on its second, and so on, so each reservation differs. Frames of the test's own, on
 /// either stream: `relay|to=<n>` asks to send `said|from=<stream>` on stream `n`; `bye|to=<n>`
 /// asks to reconnect stream `n`; `arm|ms=<t>` sets a timer, tagged with the stream it came
-/// on, which sends `rang|on=<stream>` there; `ask|path=<p>` asks for a GET of `p` under the
+/// on, which sends `rang|on=<stream>` there; `bin|to=<n>` asks to send the binary frame
+/// `ff <stream>` on stream `n`; `ask|path=<p>` asks for a GET of `p` under the
 /// configured base URL, tagged with its stream, whose result pushes an account `Halted` mode
 /// and sends `got|on=<stream>` there; `ready` pushes the order stream authenticated, wherever
 /// it is read.
@@ -273,6 +274,15 @@ impl ExecCodec for Split {
         match f {
             RawFrame::Text(text) if text.starts_with("relay|") => {
                 fx.push(send(to(text), format!("said|from={}", stream.0)));
+            }
+            RawFrame::Text(text) if text.starts_with("bin|") => {
+                fx.push(Effect::Send {
+                    stream: to(text),
+                    frame: WireSlice::plain(vec![0xff, stream.0 as u8]),
+                    rpc: None,
+                    class: TrafficClass::Normal,
+                    charge: RateCharge::one(OpKind::Control, None),
+                });
             }
             RawFrame::Text(text) if text.starts_with("bye|") => {
                 let reason = "bye";
@@ -551,6 +561,8 @@ async fn each_endpoint_opens_its_own_epochs_with_its_nonces_routes_frames_and_re
     let (config, reserved) = setup(venue, &trade.url(), &account.url(), floor(200));
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let kept = Rc::new(RefCell::new(Kept::default()));
+    session.set_journal(Journal::new(Rc::clone(&kept)));
     let orders = session.orders();
     let watch = Rc::clone(&log);
     let script = async move {
@@ -661,6 +673,20 @@ async fn each_endpoint_opens_its_own_epochs_with_its_nonces_routes_frames_and_re
     assert_eq!((counters.attempts, counters.failed_attempts), (3, 0));
     assert_eq!((counters.decode_errors, counters.refused_effects), (1, 0));
     assert_eq!(session.stale(Input::Event), 0);
+    // Each epoch of each endpoint journaled opened and closed under its own connection.
+    let controls: Vec<ControlEvent> = kept
+        .borrow()
+        .0
+        .iter()
+        .filter_map(|r| match r {
+            Record::Control { ev, .. } => Some(ev.clone()),
+            _ => None,
+        })
+        .collect();
+    for k in [key(0), acct(0), acct(1)] {
+        assert!(controls.contains(&ControlEvent::Opened(k)), "{k:?}");
+        assert!(controls.contains(&ControlEvent::Closed(k)), "{k:?}");
+    }
 }
 
 #[tokio::test]
@@ -768,10 +794,15 @@ async fn a_reconnect_one_endpoints_input_asks_for_ends_only_the_epoch_of_the_str
         t.send("bye|to=2");
         assert_eq!(a.next().await, None);
         t.send("relay|to=2");
+        // A stream no endpoint carries is a codec defect, refused and counted.
+        t.send("relay|to=9");
         t.send("mode|m=halted");
         let mut a2 = account.accept().await;
         let _ = a2.recv().await;
         assert_eq!(events(&watch).len(), 1);
+        // A binary frame goes on the endpoint it names as one.
+        t.send("bin|to=2");
+        assert_eq!(a2.recv().await, common::heard_binary(&[0xff, 1]));
         // The account stream's input reconnects the order connection.
         a2.send("bye|to=1");
         assert_eq!(t.next().await, None);
@@ -788,7 +819,7 @@ async fn a_reconnect_one_endpoints_input_asks_for_ends_only_the_epoch_of_the_str
         ends(&log),
         [(0, acct(0)), (1, key(0)), (1, key(1)), (1, acct(1))]
     );
-    assert_eq!(session.counters().refused_effects, 1);
+    assert_eq!(session.counters().refused_effects, 2);
     assert_eq!(venue.opens_on(EXEC_STREAM).len(), 2);
     assert_eq!(venue.opens_on(ACCOUNT).len(), 2);
 }
@@ -802,6 +833,8 @@ async fn each_endpoints_timers_and_http_results_reach_only_the_epoch_that_asked(
     config.cfg.insert(HTTP, &http.url(""));
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    let kept = Rc::new(RefCell::new(Kept::default()));
+    session.set_journal(Journal::new(Rc::clone(&kept)));
     let watch = Rc::clone(&log);
     let script = async move {
         let mut t = trade.accept().await;
@@ -839,6 +872,17 @@ async fn each_endpoints_timers_and_http_results_reach_only_the_epoch_that_asked(
     );
     assert_eq!(session.stale(Input::Timer), 1);
     assert_eq!(session.stale(Input::Http), 1);
+    // Both results journaled, each under the account stream's epoch that asked.
+    let answers: Vec<ConnKey> = kept
+        .borrow()
+        .0
+        .iter()
+        .filter_map(|r| match r {
+            Record::HttpResult { stamp, .. } => Some(stamp.conn),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(answers, [acct(0), acct(1)]);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -962,6 +1006,31 @@ async fn an_account_stream_that_never_opens_is_paced_while_the_order_connection_
     let counters = session.counters();
     assert!(counters.failed_attempts >= 2, "{counters:?}");
     assert_eq!(ends(&log), [(1, key(0))]);
+}
+
+#[tokio::test]
+async fn an_account_attempt_that_runs_out_its_deadline_fails_and_is_paced_again() {
+    let mut trade = ScriptedWs::start().await;
+    let (account, mut accepts) = hanging().await;
+    let account = format!("ws://{account}/account");
+    let pacing = ReconnectPacing::new(ms(10), ms(10), 100, Duration::from_secs(60), ms(50));
+    let (config, _) = setup(Two::leak(), &trade.url(), &account, pacing.unwrap());
+    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let script = async move {
+        let mut t = trade.accept().await;
+        let _ = t.recv().await;
+        // Each attempt is held unanswered past its deadline, and the next one comes.
+        for _ in 0..3 {
+            accepts.recv().await.unwrap();
+        }
+        drop(control);
+        assert_eq!(t.next().await, None);
+    };
+    let (run, ()) = tokio::join!(session.run(), script);
+    run.unwrap();
+    let counters = session.counters();
+    assert!(counters.failed_attempts >= 2, "{counters:?}");
+    assert_eq!(session.current_on(ACCOUNT), Some(acct(0)));
 }
 
 #[tokio::test]
