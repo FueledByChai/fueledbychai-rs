@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use fbc_conformance::toy::{
     self, EXEC_STREAM, FillIds, INST_A, INST_B, OWN_NS, PING_EVERY, PING_TAG, RESYNC_RETRY,
-    RESYNC_TIMEOUT, TOY_TOKEN, ToyExec, ToySigner,
+    RESYNC_TIMEOUT, TOY_TOKEN, ToyExec, ToySigner, ping_tag,
 };
 use fbc_core::{
     AccountKey, CidMatch, CidMint, ClientOrderId, DecodeError, Effect, Effects, EncodeCtx,
@@ -454,10 +454,28 @@ fn a_pinging_codec_arms_its_ping_on_open_and_again_on_each_firing() {
             [ping(EXEC_STREAM, wall), ping_timer()]
         );
     }
-    // A reconnect on another stream arms it again, and the ping goes out there.
+    // Another stream opened keeps a ping of its own, on its own timer, which goes out there
+    // (FBC-tnsf); the first stream's ping still goes out on it.
     let other = StreamId(4);
-    assert_eq!(rig.open(other).last(), Some(&ping_timer()));
-    assert_eq!(rig.timer(PING_TAG, WALL), [ping(other, WALL), ping_timer()]);
+    let other_timer = Effect::Timer {
+        tag: ping_tag(other),
+        after: PING_EVERY,
+    };
+    assert_ne!(ping_tag(other), PING_TAG);
+    assert_eq!(rig.open(other).last(), Some(&other_timer));
+    assert_eq!(
+        rig.timer(ping_tag(other), WALL),
+        [ping(other, WALL), other_timer.clone()]
+    );
+    assert_eq!(
+        rig.timer(PING_TAG, WALL),
+        [ping(EXEC_STREAM, WALL), ping_timer()]
+    );
+    // Reopened, a stream is pinged once still.
+    assert_eq!(rig.open(other).last(), Some(&other_timer));
+    assert_eq!(rig.timer(ping_tag(other), WALL).len(), 2);
+    // A ping timer of a stream never opened sends nothing.
+    assert!(rig.timer(ping_tag(StreamId(5)), WALL).is_empty());
     // Another tag is none of the ping's.
     assert!(rig.timer(TimerTag(99), WALL).is_empty());
     // The codec as built without it arms no ping and sends none.

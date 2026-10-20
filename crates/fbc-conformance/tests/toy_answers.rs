@@ -811,3 +811,58 @@ fn redact_inbound_names_the_toy_tokens_span_and_nothing_else() {
     let http = Inbound::Http(HttpTag(1), resp);
     assert_eq!(codec.redact_inbound(http), InboundSpans::NONE);
 }
+
+/// FBC-tnsf: a session over two planned endpoints opens each on the one codec, so each stream
+/// authenticates on its own, and only a reopened order stream, where the resync is read, cuts a
+/// resync short.
+#[test]
+fn each_stream_authenticates_on_its_own_and_only_the_order_streams_reopen_cuts_a_resync_short() {
+    let account = fbc_core::StreamId(2);
+    let ack = format!("auth|ok=1|token={TOY_TOKEN}");
+    let authenticated = |stream| ExecEvent::Conn {
+        stream,
+        state: ConnState::Authenticated,
+    };
+    let mut s = Session::new();
+    let on_account = |s: &mut Session, text: &str| {
+        let (mut fx, mut sink, specs) = (Effects::new(), Collect::default(), toy::specs());
+        let frame = RawFrame::Text(text);
+        let result = toy::with_scope(|scope| {
+            s.codec
+                .on_frame(account, frame, scope, &specs, &mut sink, &mut fx)
+        });
+        (result, sink.0)
+    };
+    // The account stream asked nothing yet.
+    let refused = Err(DecodeError::Malformed("no authentication asked"));
+    assert_eq!(on_account(&mut s, &ack), (refused, Vec::new()));
+    s.open();
+    let mut fx = Effects::new();
+    s.codec.on_open(account, &ctx(), &mut fx);
+    let asked = fx.take();
+    let [Effect::Send { stream, .. }] = asked.as_slice() else {
+        panic!("one authentication: {asked:?}");
+    };
+    assert_eq!(*stream, account);
+    // Each acknowledgement answers its own stream's, once.
+    let want = vec![none(authenticated(account))];
+    assert_eq!(on_account(&mut s, &ack), (Ok(()), want));
+    assert_eq!(on_account(&mut s, &ack), (refused, Vec::new()));
+    s.pushes(&ack, vec![none(authenticated(EXEC_STREAM))]);
+    s.refuses(&ack, "no authentication asked");
+    // The account stream reopening leaves a resync being read whole.
+    s.resync(WM);
+    let frames = resync_frames();
+    s.holds(&frames[0]);
+    s.codec.on_open(account, &ctx(), &mut Effects::new());
+    for frame in &frames[1..frames.len() - 1] {
+        s.holds(frame);
+    }
+    let (result, pushed) = s.feed(frames.last().unwrap());
+    assert_eq!((result, pushed.len()), (Ok(()), frames.len()));
+    // The order stream reopening cuts one short.
+    s.resync(WM);
+    s.holds(&frames[0]);
+    s.open();
+    s.refuses(&frames[1], "no resync begun");
+}
