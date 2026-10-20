@@ -129,9 +129,13 @@ mod tests {
     }
 
     fn endpoint(names: &[&'static str]) -> ExecEndpoint {
+        at("wss://toy.invalid/", names)
+    }
+
+    fn at(url: &str, names: &[&'static str]) -> ExecEndpoint {
         ExecEndpoint {
             stream: StreamId(3),
-            url: WireUrl::plain("ws://toy.invalid/"),
+            url: WireUrl::plain(url),
             handshake: names
                 .iter()
                 .map(|&name| HandshakeHeader { name, secret: KEY })
@@ -211,6 +215,45 @@ mod tests {
             );
             assert!(!format!("{err} {err:?}").contains(&value()));
         }
+    }
+
+    #[test]
+    fn a_credential_header_goes_only_over_tls_or_to_a_loopback_stub() {
+        for url in [
+            "ws://api.hibachi.xyz/ws/trade",
+            "ws://toy.invalid:9/",
+            "ws://10.0.0.1/",
+            "ws://[::ffff:127.0.0.1]/",
+            "ws://localhost.example/",
+            "ws://127.0.0.1@toy.invalid/",
+        ] {
+            let err = HandshakeHeaders::for_endpoint(&at(url, &["Authorization"]), &creds(value()));
+            let err = err.err();
+            let want = ExecSessionError::CleartextHandshake {
+                stream: StreamId(3),
+            };
+            assert_eq!(err, Some(want), "{url}");
+            let shown = format!("{} {:?}", err.as_ref().unwrap(), err.as_ref().unwrap());
+            assert!(
+                !shown.contains(&value()) && !shown.contains("toy.invalid"),
+                "{shown}"
+            );
+        }
+        for url in [
+            "wss://api.hibachi.xyz/ws/trade",
+            "ws://127.0.0.1:9/",
+            "ws://127.8.0.1/",
+            "ws://[::1]:9/",
+            "ws://localhost:9/",
+            "ws://LOCALHOST/",
+        ] {
+            let headers =
+                HandshakeHeaders::for_endpoint(&at(url, &["Authorization"]), &creds(value()));
+            assert!(headers.is_ok(), "{url}");
+        }
+        // An endpoint naming no header sends no credential, whatever its scheme.
+        let none = HandshakeHeaders::for_endpoint(&at("ws://toy.invalid/", &[]), &Secrets::new());
+        assert!(none.is_ok());
     }
 
     #[test]
