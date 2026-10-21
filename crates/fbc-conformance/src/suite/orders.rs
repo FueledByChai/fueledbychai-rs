@@ -18,8 +18,9 @@
 //!   `cid_echoed_on_events`, and nothing is written beyond the two requests. Where the amended order gets a new venue id
 //!   (`AmendCaps.keeps_venue_id` false), every update names the same one; where it keeps its id, the update
 //!   names no new one. The placement's acceptance is its one item's, or the whole request's,
-//!   once as `OrderCaps.ack` has it. Nothing fills the order (an `ExecEvent::Fill` naming it),
-//!   in the placement's answer or later; once the amend is sent, nothing refuses it (an
+//!   once as `OrderCaps.ack` has it. Nothing fills the order (an `ExecEvent::Fill` executing
+//!   it, `FillOrigin::Order` naming it; a fill the venue made itself is on no order, decision
+//!   0120), in the placement's answer or later; once the amend is sent, nothing refuses it (an
 //!   `AsyncReject` naming it) or ends it (a terminal `OrderUpdate`).
 //! - `mixed_batch`: a batch of three placements is answered item by item, the first accepted,
 //!   the second refused and the third, the last, never; once its deadline passes, the first is
@@ -40,8 +41,8 @@ use std::time::Duration;
 
 use fbc_core::{
     AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, FillEvent,
-    ItemRef, Lots, OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome, Ticks, TifTag,
-    VenueOrderId, VenueOrderState,
+    FillOrigin, ItemRef, Lots, OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome,
+    Ticks, TifTag, VenueOrderId, VenueOrderState,
 };
 
 use super::harness::{Harness, Shape};
@@ -435,8 +436,9 @@ fn judge_update(
 /// failed: a refusal naming the order, of any operation (Codex r4223435612); an update ending it
 /// (Reviewer B RB-3il-5), on a cancel-replace venue an end of the old order reported before its
 /// replacement, which fbc-oms takes as the order's end, releasing the cap it holds while it
-/// still rests under its new venue id; or a fill of it, the stub having filled nothing (Codex
-/// r4224199063). The order is named by its client id, the id it was placed under, or a new one
+/// still rests under its new venue id; or an execution of it, the stub having filled nothing
+/// (Codex r4224199063), a fill the venue made itself being of no order (decision 0120, Codex
+/// r4331552296). The order is named by its client id, the id it was placed under, or a new one
 /// an amended update of `updates` names.
 fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) -> Vec<Breach> {
     let vids = order_vids(asked, updates);
@@ -461,8 +463,10 @@ fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) ->
                 );
                 breaches.push(Breach::new("OrderUpdate", what));
             }
-            // A fill moves the order's filled count and the inventory (Codex r4224199063).
-            ExecEvent::Fill(fill) if ours(fill.cid()) || by_vid(fill.vid()) => {
+            // A fill moves the order's filled count and the inventory (Codex r4224199063); one
+            // the venue made itself moves the inventory but no order's count, whatever venue id
+            // it names, so it is no fill of the order (decision 0120, Codex r4331552296).
+            ExecEvent::Fill(fill) if executes(fill) && (ours(fill.cid()) || by_vid(fill.vid())) => {
                 let what = format!(
                     "a fill {fill:?} of the order the stub amended was reported; the stub filled \
                      nothing"
@@ -475,12 +479,14 @@ fn contradicted(events: &[ExecEvent], asked: &Asked, updates: &[OrderUpdate]) ->
     breaches
 }
 
-/// The fills, of `events` (those reported before the amend was sent), naming the order the
-/// stub rested and filled nothing of, by its client id or the venue id it was placed under.
+/// The fills, of `events` (those reported before the amend was sent), executing the order the
+/// stub rested and filled nothing of, named by its client id or the venue id it was placed
+/// under.
 fn filled(events: &[ExecEvent], asked: &Asked) -> Vec<Breach> {
     let names = |fill: &FillEvent| {
-        fill.cid() == Some(CidMatch::Ours(asked.cid))
-            || (asked.placed.is_some() && fill.vid() == asked.placed.as_ref())
+        executes(fill)
+            && (fill.cid() == Some(CidMatch::Ours(asked.cid))
+                || (asked.placed.is_some() && fill.vid() == asked.placed.as_ref()))
     };
     let fills = events.iter().filter_map(|event| match event {
         ExecEvent::Fill(fill) if names(fill) => Some(fill),
@@ -494,6 +500,14 @@ fn filled(events: &[ExecEvent], asked: &Asked) -> Vec<Breach> {
         Breach::new("ExecEvent::Fill", what)
     };
     fills.map(breach).collect()
+}
+
+/// Whether `fill` is an execution of an order, which alone may be of the order the check
+/// placed: a fill the venue made itself (a liquidation, transfer, settlement or block trade) is
+/// on no order of the account's, even one whose venue id its frame carries, and fbc-oms counts
+/// it on none (decision 0120, Codex r4331552296).
+fn executes(fill: &FillEvent) -> bool {
+    matches!(fill.origin, FillOrigin::Order { .. })
 }
 
 /// Whether `state` ends an order.
