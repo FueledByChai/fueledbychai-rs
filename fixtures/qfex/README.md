@@ -13,7 +13,9 @@ They are composition fixtures, not captured live frames.
 `live/nvda-2026-10-20.ndjson` are one 45-second, read-only public MDS capture of
 `NVDA-USD` on 2026-10-20, approximately 20:54:38–20:55:22 UTC. The capture
 subscribed to `bbo`, `level2`, and `trade` on `wss://mds.qfex.com/`. It contains
-89 BBO messages, 89 level2 messages and three public trades, with no feed errors.
+89 BBO messages, 89 level2 messages and three public trades. The original
+capture reported zero errors, but it classified error envelopes as other
+messages; absence of subscription errors cannot be established from that run.
 The server-time median gap was 500 ms on both pulsed feeds (observed range
 453–547 ms). Sequence numbers were consecutive from 1 through 181 across the
 three channels in this connection; the trades consumed 29, 126 and 155. The level2
@@ -21,9 +23,12 @@ book changed depth and prices between snapshots, giving a live replacement
 case. This observation does not turn BBO's undocumented interval or the
 sequence scope into a protocol guarantee.
 
-Each `raw.ndjson` line holds the exact received JSON payload string under `raw`,
-after the capture script accepted only expected public market-data fields. It
-omits subscription acknowledgments. The paired projection carries type, symbol,
+Each `raw.ndjson` line holds an accepted public JSON payload string under `raw`.
+For a single-item frame this is the exact received string; for an array or
+`contents` batch, the script serializes each flattened public item separately so
+every raw line has one paired projection line. It omits subscription
+acknowledgments and counts error envelopes without saving their contents. The
+paired projection carries type, symbol,
 sequence, venue time, public bid/ask levels and `sig_figs`, and for trades the
 public UUID, price, size, side and execution type. Both files carry the same
 `recv_ms`, a local monotonic offset from the start of capture rounded to
@@ -33,4 +38,11 @@ no orders, and writes no private frames. To repeat a capture with Node 24 or lat
 
 ```sh
 node fixtures/qfex/capture_public.mjs NVDA-USD 30000 /tmp/qfex-public.ndjson
+```
+
+The output path must end in `.ndjson`; the script writes the companion file with
+`.raw.ndjson`. Its offline capture tests run with:
+
+```sh
+node --test fixtures/qfex/capture_public.test.mjs
 ```
