@@ -97,7 +97,11 @@ fn plan_is_one_public_get_with_configured_origin_timeout_and_no_credentials() {
         panic!("one GET")
     };
     assert_eq!(req.url, WireUrl::plain("http://127.0.0.1:3456/refdata"));
-    for origin in ["http://localhost:3456", "http://[::1]:3456"] {
+    for origin in [
+        "http://localhost:3456",
+        "http://[::1]:3456",
+        "http://127.23.45.67:3456",
+    ] {
         let mut cfg = cfg();
         cfg.insert(KEY_REST_URL, origin);
         let plan = Qfex.discover(&cfg).unwrap();
@@ -349,6 +353,8 @@ fn discovery_refuses_invalid_configuration_and_http_failures() {
         "https://api.qfex.com?x=1",
         "https://bad..host",
         "http://192.168.1.2",
+        "http://127.example.com",
+        "http://127.0.0.1.example.com",
     ] {
         let mut bad = cfg();
         bad.insert(KEY_REST_URL, url);
