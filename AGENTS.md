@@ -238,6 +238,10 @@ rather than guess.
     brings under Safety (0078), and each request deadline it fires at its stamp (0090); it
     reserves through `NonceSource::try_reserve`, and a source's refusal ends it with
     `ExecSessionError::NonceRefused`, nothing reserved or written;
+    an account-wide cancel-on-disconnect cap requires explicit authority for that account
+    before a session plans or opens its endpoints; once armed, a disconnect cancels that
+    account's orders across connections, including orders placed after the arm, and each new
+    epoch must arm again (0121);
     `WallClockNonces` is the production nonce source for a venue whose nonce is a wall-clock
     timestamp (Hibachi): `max(clock, last + 1)` microseconds over an injected `WallClock`,
     resumed after a journal's `last_nonce` (refused, `JournalGap`, for records holding a gap), refusing a block further ahead of its clock than
