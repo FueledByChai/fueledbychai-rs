@@ -297,6 +297,10 @@ fn missing_and_malformed_required_values_refuse_the_whole_answer() {
         Err(PlanError::Decode(DecodeError::Malformed("type")))
     );
     assert_eq!(decode(&json!({"type":"refdata","data":[]})), Ok(Vec::new()));
+    assert_eq!(
+        decode(&json!({"type":"refdata","data":null})),
+        Ok(Vec::new())
+    );
     assert_eq!(decode(&json!({"data":[]})), Err(PlanError::Missing("type")));
     for (body, part) in [
         (b"not json".as_slice(), "refdata JSON"),
