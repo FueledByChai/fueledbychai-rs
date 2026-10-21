@@ -8,9 +8,9 @@ import { outputPaths, projectFrame, startCapture } from './capture_public.mjs';
 
 const bbo = {
   type: 'bbo', symbol: 'NVDA-USD', sequence: 1, time: '2026-10-20T20:54:38Z',
-  bid: [['100', '1']], ask: [['101', '2']], sig_figs: 5,
+  bid: [['100', '1']], ask: [['101', '2']],
 };
-const depth = { ...bbo, type: 'level2', sequence: 2 };
+const depth = { ...bbo, type: 'level2', sequence: 2, sig_figs: 5 };
 const trade = {
   type: 'trade', symbol: 'NVDA-USD', sequence: 3, time: bbo.time,
   trade_id: '12345678-1234-1234-1234-123456789abc', price: '100',
@@ -27,7 +27,10 @@ class FakeWebSocket extends EventTarget {
     FakeWebSocket.last = this;
   }
   send(frame) { this.sent.push(frame); }
-  close() { this.closed = true; }
+  close() {
+    this.closed = true;
+    this.dispatchEvent(new Event('close'));
+  }
   receive(value) {
     this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify(value) }));
   }
@@ -43,6 +46,23 @@ test('error envelopes are counted before filtering and never saved', () => {
   assert.equal(result.records.length, 1);
   assert.deepEqual(JSON.parse(result.records[0].raw.raw), bbo);
   assert.equal(result.records[0].projection.recv_ms, 1.25);
+});
+
+test('all saved live public frames remain capturable, including BBO without sig_figs', () => {
+  const lines = fs.readFileSync(new URL('./live/nvda-2026-10-20.raw.ndjson', import.meta.url),
+    'utf8').trim().split('\n');
+  const counts = { bbo: 0, level2: 0, trade: 0 };
+  for (const line of lines) {
+    const saved = JSON.parse(line);
+    const result = projectFrame(saved.raw, 'NVDA-USD', saved.recv_ms);
+    assert.equal(result.errors, 0);
+    assert.equal(result.records.length, 1);
+    const record = result.records[0];
+    assert.equal(record.raw.raw, saved.raw);
+    counts[record.type]++;
+    if (record.type === 'bbo') assert.equal(Object.hasOwn(record.projection, 'sig_figs'), false);
+  }
+  assert.deepEqual(counts, { bbo: 89, level2: 89, trade: 3 });
 });
 
 test('array and contents batches make one paired raw/projection row per public item', () => {
@@ -102,6 +122,28 @@ test('finish detaches message handling before both streams close', async () => {
       delete expected.recv_ms;
       assert.deepEqual(JSON.parse(raw[i].raw), expected);
     }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('unexpected early WebSocket close finishes with an error', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'qfex-capture-close-test-'));
+  try {
+    let complete;
+    const summary = new Promise(resolve => { complete = resolve; });
+    startCapture({
+      symbol: 'NVDA-USD', durationMs: 60000, out: path.join(dir, 'capture.ndjson'),
+      WebSocketImpl: FakeWebSocket, onSummary: complete,
+    });
+    const ws = FakeWebSocket.last;
+    ws.receive(bbo);
+    ws.dispatchEvent(new Event('close'));
+    const result = await summary;
+    assert.equal(result.counts.bbo, 1);
+    assert.equal(result.counts.errors, 1);
+    assert.equal(ws.closed, true);
+    assert.equal(fs.readFileSync(result.out, 'utf8').trim().split('\n').length, 1);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
