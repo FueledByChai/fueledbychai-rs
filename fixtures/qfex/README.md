@@ -23,6 +23,19 @@ book changed depth and prices between snapshots, giving a live replacement
 case. This observation does not turn BBO's undocumented interval or the
 sequence scope into a protocol guarantee.
 
+This capture was published on main through [PR #198](https://github.com/FueledByChai/fueledbychai-rs/pull/198)
+at commit `8faa0de324a93e5ab2eba2abf7f6835eb15cb64b`. SHA-256 digests of the
+committed fixture bytes are shown in two halves; concatenate each row's halves
+without a separator to obtain its 64-character digest:
+
+| File | First 32 hex characters | Last 32 hex characters |
+| --- | --- | --- |
+| `live/nvda-2026-10-20.raw.ndjson` | `1d7bece00f914beca69c69bc3c0ecf56` | `6d5c61100f3e06cd17b7fe29b0209239` |
+| `live/nvda-2026-10-20.ndjson` | `088645740e6439eb80e175f47f8392b1` | `68f177ede672e0dca6ea74fd2a1d19a5` |
+
+These hashes identify the bytes committed to this repository; they are not a
+server attestation of the captured frames.
+
 Each `raw.ndjson` line holds an accepted public JSON payload string under `raw`.
 For a single-item frame this is the exact received string; for an array or
 `contents` batch, the script serializes each flattened public item separately so
