@@ -160,8 +160,9 @@
 //! written, and for every request still in flight once the run ends or its future is dropped.
 //!
 //! **Cancel-on-disconnect and the resync, every epoch (FBC-w19, decision 0058).** A session
-//! takes only a venue whose cancel-on-disconnect is per connection: one declaring `None` or
-//! `DeadMan` is refused when it is built ([`ExecSessionError::CancelOnDisconnect`]). Once the
+//! takes a venue whose cancel-on-disconnect is per connection, or account-wide with explicit
+//! authority bound to its account (0120); one declaring `None` or `DeadMan` is refused when it
+//! is built ([`ExecSessionError::CancelOnDisconnect`]). Once the
 //! codec reports an epoch's stream authenticated, the session sends `ArmCancelOnDisconnect(true)`
 //! as a request of its own (its id from the account's [`RpcIds`], one nonce reserved, its frames
 //! charged together), on every epoch where the protection lapses with the connection and
@@ -192,6 +193,8 @@
 //! or an order query's answer shows each ended, a place, a batch with an item, or an amend on
 //! its market is `NotSent(Disconnected)`, counted ([`ExecCounters::unprotected_refusals`]), with
 //! no nonce reserved and nothing written ([`ExecOrders::may_place_on`]). Other markets place.
+//! An accepted account-wide arm covers existing orders and those opened on other connections
+//! afterward, so this quarantine does not apply to that cap (0120).
 //!
 //! **An in-process stream (FBC-6mf, decision 0104).** [`ExecSession::in_process`] builds the
 //! same session over an [`InProcessStream`] with a codec of the consumer's: each epoch opens the
@@ -347,6 +350,21 @@ impl<F: FnMut(Envelope<ExecEvent>)> ExecHandler for F {
     }
 }
 
+/// The consumer's explicit authority to arm an account-wide cancel-on-disconnect (0120).
+/// The consumer must obtain authorization from the account owner for the possibility of
+/// cancelling orders placed by other clients. A local lease alone does not establish that.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AccountWideCodAuthority {
+    account: AccountKey,
+}
+
+impl AccountWideCodAuthority {
+    /// Records the consumer's account-owner authorization for the named account.
+    pub fn new(account: AccountKey) -> Self {
+        Self { account }
+    }
+}
+
 /// What an order-entry session needs, all from the consumer.
 pub struct ExecSessionConfig {
     pub venue: &'static dyn VenueFactory,
@@ -355,6 +373,9 @@ pub struct ExecSessionConfig {
     pub creds: Secrets,
     /// The account they reach: [`ExecOrders::submit`] takes only its authorizations.
     pub acct: AccountKey,
+    /// Required when the venue declares account-wide cancel-on-disconnect. `None` by default
+    /// for other venues; this is never inferred from credentials or a local lease (0120).
+    pub account_wide_cod_authority: Option<AccountWideCodAuthority>,
     /// Where the session's request ids are given from: the account's one [`RpcIds`], a clone
     /// handed to every session built for it, so ids never repeat for the account (0057).
     pub rpc_ids: RpcIds,
@@ -423,10 +444,11 @@ pub enum ExecSessionError {
     /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
     /// ever admit, so no epoch could open.
     OpenNeverFits,
-    /// The venue's cancel-on-disconnect is not per connection: it declares none (`None`), or a
-    /// dead-man timer (`DeadMan`), which no planned venue needs. A session places orders only
-    /// behind per-connection protection (decision 0058).
+    /// The venue declares no supported cancel-on-disconnect protection (0058, 0120).
     CancelOnDisconnect(CancelOnDisconnect),
+    /// An account-wide arm would cancel orders placed by other clients, but the consumer did
+    /// not explicitly authorize this account (0120). Nothing was planned or opened.
+    AccountWideCodAuthority,
     /// The frames the codec's resync asks for weigh more together than the venue's buckets ever
     /// admit, so no epoch could take places.
     ResyncNeverFits,
@@ -493,14 +515,18 @@ impl fmt::Display for ExecSessionError {
                 let declared = match cod {
                     CancelOnDisconnect::None => "None",
                     CancelOnDisconnect::PerConnection { .. } => "PerConnection",
+                    CancelOnDisconnect::AccountWide => "AccountWide",
                     CancelOnDisconnect::DeadMan { .. } => "DeadMan",
                 };
                 write!(
                     f,
                     "the venue declares cancel-on-disconnect {declared}; a session places orders \
-                     only behind per-connection protection"
+                     only behind supported protection"
                 )
             }
+            ExecSessionError::AccountWideCodAuthority => f.write_str(
+                "account-wide cancel-on-disconnect requires explicit authority for this account",
+            ),
             ExecSessionError::ResyncNeverFits => f.write_str(
                 "the frames the resync asks for weigh more together than the buckets ever admit",
             ),
@@ -1680,6 +1706,12 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
             rearm_on_reconnect,
             covers_open_orders,
         } => (rearm_on_reconnect, covers_open_orders),
+        CancelOnDisconnect::AccountWide => {
+            if config.account_wide_cod_authority.map(|a| a.account) != Some(config.acct) {
+                return Err(ExecSessionError::AccountWideCodAuthority);
+            }
+            (true, true)
+        }
         other => return Err(ExecSessionError::CancelOnDisconnect(other)),
     };
     // Our client id names one venue order where amends keep the venue id (decision 0080).
@@ -2356,7 +2388,7 @@ mod tests {
             (
                 ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::None),
                 "the venue declares cancel-on-disconnect None; a session places orders only \
-                 behind per-connection protection",
+                 behind supported protection",
             ),
             (
                 ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::PerConnection {
@@ -2364,14 +2396,18 @@ mod tests {
                     covers_open_orders: false,
                 }),
                 "the venue declares cancel-on-disconnect PerConnection; a session places orders \
-                 only behind per-connection protection",
+                 only behind supported protection",
             ),
             (
                 ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::DeadMan {
                     max_ttl: std::time::Duration::from_secs(1),
                 }),
                 "the venue declares cancel-on-disconnect DeadMan; a session places orders only \
-                 behind per-connection protection",
+                 behind supported protection",
+            ),
+            (
+                ExecSessionError::AccountWideCodAuthority,
+                "account-wide cancel-on-disconnect requires explicit authority for this account",
             ),
             (
                 ExecSessionError::ResyncNeverFits,

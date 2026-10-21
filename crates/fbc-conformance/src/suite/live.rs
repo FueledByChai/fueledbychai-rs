@@ -233,6 +233,7 @@ impl<'s> Live<'s> {
                 cfg,
                 creds,
                 acct: ACCT,
+                account_wide_cod_authority: None,
                 rpc_ids: RpcIds::default(),
                 ns: NAMESPACE,
                 specs: self.h.specs().clone(),

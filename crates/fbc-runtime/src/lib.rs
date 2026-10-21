@@ -81,9 +81,10 @@
 //! 0053): one [`ExecCodec`](fbc_core::ExecCodec) for the session's life, its `on_open` called on
 //! each new epoch with exactly the nonces it asks for, frames decoded inside the venue's decode
 //! scope, every event stamped and handed to the consumer's [`ExecHandler`] inline, and reconnects
-//! paced by the consumer's [`ReconnectPacing`]. It takes only a venue whose cancel-on-disconnect
-//! is per connection, and on every epoch arms it and resyncs before it places or amends
-//! (FBC-w19, decision 0058). Its journal comes with a later ticket.
+//! paced by the consumer's [`ReconnectPacing`]. It takes a venue whose cancel-on-disconnect
+//! is per connection (0058), or an account-wide venue only with explicit account-bound
+//! authority (0120), and arms it and resyncs before it places or amends.
+//! Its journal comes with a later ticket.
 //!
 //! [`ShardHost`] is the shard host (FBC-ct0, decisions 0002, 0100): one loop over a shard's
 //! sessions, run as its [`Member`]s on one task, that drains every input they have ready, journals
@@ -169,7 +170,8 @@ pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
 pub use exec_orders::{ExecOrders, RpcIds, SubmitRefusal};
 pub use exec_session::{
-    ExecControl, ExecCounters, ExecHandler, ExecSession, ExecSessionConfig, ExecSessionError,
+    AccountWideCodAuthority, ExecControl, ExecCounters, ExecHandler, ExecSession,
+    ExecSessionConfig, ExecSessionError,
 };
 pub use in_process::{InProcessStream, OrderEntryPeer, PeerFeed};
 pub use inputs::{

@@ -282,6 +282,7 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
         cfg,
         creds: secrets(),
         acct: ACCT,
+        account_wide_cod_authority: None,
         rpc_ids: RpcIds::default(),
         ns: NS,
         specs: specs(),

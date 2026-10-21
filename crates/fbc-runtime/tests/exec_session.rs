@@ -581,6 +581,7 @@ fn setup(
         cfg,
         creds: Secrets::new(),
         acct: fbc_core::AccountKey::new(1),
+        account_wide_cod_authority: None,
         rpc_ids: fbc_runtime::RpcIds::default(),
         ns: OWN_NS,
         specs: exec_toy::specs(),

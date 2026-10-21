@@ -139,6 +139,11 @@ pub enum CancelOnDisconnect {
         /// shows resting before it places or amends on their markets (FBC-nvxn).
         covers_open_orders: bool,
     },
+    /// An armed connection's drop cancels every order on the account, including orders
+    /// opened through other connections after the arm. The arm lapses on disconnect and
+    /// must be accepted again on every new connection (0120). A consumer must explicitly
+    /// authorize this account-wide effect before an execution session starts.
+    AccountWide,
     /// Everything, unless a dead-man timer of at most `max_ttl` is refreshed in time.
     DeadMan {
         /// The longest timer the venue accepts.
@@ -796,6 +801,19 @@ cap_tags!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_wide_cod_is_a_distinct_scope_from_coverage_at_arm_time() {
+        let at_arm = CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect: true,
+            covers_open_orders: true,
+        };
+        assert_ne!(CancelOnDisconnect::AccountWide, at_arm);
+        assert_eq!(
+            CancelOnDisconnect::AccountWide,
+            CancelOnDisconnect::AccountWide
+        );
+    }
 
     fn declared_in_order<T: CapTag>() {
         for (n, tag) in T::ALL.iter().enumerate() {
