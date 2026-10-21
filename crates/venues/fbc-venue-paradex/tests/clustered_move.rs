@@ -250,6 +250,7 @@ fn exec_config(cfg: &VenueConfig, clock: &IngestClock) -> ExecSessionConfig {
         cfg: cfg.clone(),
         creds: secrets(),
         acct: ACCT,
+        account_wide_cod_authority: None,
         rpc_ids: RpcIds::default(),
         ns: NS,
         specs: specs(),

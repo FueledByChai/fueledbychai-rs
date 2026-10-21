@@ -324,6 +324,7 @@ fn exec_config(i: usize, url: &str, clock: &IngestClock, conn: u16) -> ExecSessi
         cfg,
         creds: Secrets::new(),
         acct: account(i),
+        account_wide_cod_authority: None,
         rpc_ids: RpcIds::default(),
         ns: NS,
         specs: toy::specs(),

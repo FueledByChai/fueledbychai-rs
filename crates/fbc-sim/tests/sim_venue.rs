@@ -372,6 +372,17 @@ impl Venue {
         }
     }
 
+    /// Encodes a placement from a second connection of the same account (0121).
+    fn send_other(&mut self, cmd: VenueCommand, rpc: u64, mono: u64) {
+        let fx = self.encode(&cmd, rpc, mono).unwrap();
+        for effect in fx.as_slice() {
+            let Effect::Send { frame, .. } = effect else {
+                panic!("the codec only writes frames: {effect:?}");
+            };
+            self.engine.on_other_order_frame(frame.bytes()).unwrap();
+        }
+    }
+
     fn md(&mut self, mono: u64, body: MdEvent) -> Result<(), SimError> {
         let stamp = Stamp {
             ingest_seq: self.ingest,
@@ -2400,6 +2411,10 @@ fn per_connection(rearm_on_reconnect: bool, covers_open_orders: bool) -> Venue {
     })
 }
 
+fn account_wide() -> Venue {
+    protected(CancelOnDisconnect::AccountWide)
+}
+
 /// The dead-man venue's longest timer, which SimVenue's timer runs from each arm or refresh.
 const TTL: u64 = 100 * MS;
 
@@ -2496,6 +2511,62 @@ fn a_per_connection_venue_cancels_what_was_placed_on_its_connection_when_the_str
         Some(RejectKind::AlreadyTerminal(TerminalHint::Canceled)),
         "{got:?}"
     );
+}
+
+#[test]
+fn account_wide_arm_cancels_a_later_order_from_another_connection_and_rearms() {
+    for account_wide_scope in [false, true] {
+        let mut v = if account_wide_scope {
+            account_wide()
+        } else {
+            per_connection(true, true)
+        };
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        v.protect(ARM, 1, T0);
+        let other = cid();
+        v.send_other(limit(other, Side::Buy, 199, 1), 2, T0 + 10 * MS);
+        v.tick(T0 + 15 * MS);
+        let got = v.events();
+        let ExecEvent::Outcome {
+            item:
+                Some(ItemRef {
+                    vid: Some(other_vid),
+                    ..
+                }),
+            outcome: SubmitOutcome::Accepted { .. },
+            ..
+        } = &got[0].1
+        else {
+            panic!("{got:?}")
+        };
+        let other_vid = other_vid.clone();
+        v.close(T0 + 20 * MS);
+        let ended = venue_canceled(&v.events());
+        assert_eq!(ended.len(), usize::from(account_wide_scope), "{ended:?}");
+        assert_eq!(
+            v.engine.queue_position(&other_vid).is_none(),
+            account_wide_scope
+        );
+
+        // The arm lapsed. An order arriving over the other connection after reconnect
+        // survives the primary connection's next close until a new arm is accepted.
+        v.open(T0 + 30 * MS);
+        let bare = cid();
+        v.send_other(limit(bare, Side::Buy, 199, 1), 3, T0 + 31 * MS);
+        v.tick(T0 + 36 * MS);
+        v.events();
+        v.close(T0 + 40 * MS);
+        assert!(venue_canceled(&v.events()).is_empty());
+        v.open(T0 + 50 * MS);
+        v.protect(ARM, 4, T0 + 51 * MS);
+        v.close(T0 + 60 * MS);
+        let ended = venue_canceled(&v.events());
+        assert_eq!(
+            ended.len(),
+            if account_wide_scope { 1 } else { 2 },
+            "{ended:?}"
+        );
+    }
 }
 
 #[test]

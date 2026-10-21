@@ -843,6 +843,7 @@ pub fn session_config(
         cfg,
         creds,
         acct: ACCT,
+        account_wide_cod_authority: None,
         rpc_ids: RpcIds::default(),
         ns: Namespace::new(namespace),
         specs,

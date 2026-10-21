@@ -1271,6 +1271,7 @@ impl Run {
             cfg: self.cfg.clone(),
             creds,
             acct: ACCT,
+            account_wide_cod_authority: None,
             rpc_ids: self.rpc_ids.clone(),
             ns: fbc_core::Namespace::new(self.t().namespace),
             specs: self.specs.clone(),

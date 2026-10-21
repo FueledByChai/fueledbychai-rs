@@ -42,9 +42,9 @@ use fbc_core::{
 };
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
-    Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, ExecSessionError,
-    IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, ScopeCounts,
-    WriteStall,
+    AccountWideCodAuthority, Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig,
+    ExecSessionError, IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds,
+    SafetyReserve, ScopeCounts, WriteStall,
 };
 use tokio::time::advance;
 
@@ -54,7 +54,7 @@ use tokio::time::advance;
 
 /// The endpoint's URL; required.
 const URL: &str = "exec.url";
-/// `none`, `deadman`, or `once` (per connection, not re-armed on reconnect); by default the
+/// `none`, `deadman`, `account`, or `once` (per connection, not re-armed on reconnect); by default the
 /// toy's own declaration, per connection and re-armed on reconnect.
 const COD: &str = "ready.cod";
 /// A number: the toy's account limit admits this many units a second, not 50.
@@ -133,6 +133,7 @@ impl VenueFactory for ReadyToy {
         let order = &mut caps.exec.as_mut().unwrap().order;
         match cfg.get(COD) {
             Some("none") => order.cancel_on_disconnect = CancelOnDisconnect::None,
+            Some("account") => order.cancel_on_disconnect = CancelOnDisconnect::AccountWide,
             Some("deadman") => {
                 let max_ttl = Duration::from_secs(10);
                 order.cancel_on_disconnect = CancelOnDisconnect::DeadMan { max_ttl };
@@ -429,6 +430,7 @@ fn setup(
         cfg: venue_cfg,
         creds: Secrets::new(),
         acct: ACCT,
+        account_wide_cod_authority: None,
         rpc_ids: RpcIds::default(),
         ns: OWN_NS,
         specs: exec_toy::specs(),
@@ -1389,6 +1391,76 @@ fn a_venue_without_per_connection_protection_is_refused_at_start_naming_it() {
     );
     assert!(dead_man.to_string().contains("DeadMan"), "{dead_man}");
     assert!(venue.calls().is_empty());
+}
+
+#[test]
+fn account_wide_protection_requires_explicit_authority_for_the_same_account() {
+    let venue = ReadyToy::leak();
+    let (config, _) = setup(venue, "ws://127.0.0.1:1/exec", &[(COD, "account")]);
+    assert_eq!(
+        ExecSession::new(config, |_: Envelope<ExecEvent>| {}).err(),
+        Some(ExecSessionError::AccountWideCodAuthority)
+    );
+    let (mut config, _) = setup(venue, "ws://127.0.0.1:1/exec", &[(COD, "account")]);
+    config.account_wide_cod_authority = Some(AccountWideCodAuthority::new(AccountKey::new(9)));
+    assert_eq!(
+        ExecSession::new(config, |_: Envelope<ExecEvent>| {}).err(),
+        Some(ExecSessionError::AccountWideCodAuthority)
+    );
+    let (mut config, _) = setup(venue, "ws://127.0.0.1:1/exec", &[(COD, "account")]);
+    config.account_wide_cod_authority = Some(AccountWideCodAuthority::new(ACCT));
+    let (session, _) = ExecSession::new(config, |_: Envelope<ExecEvent>| {}).unwrap();
+    assert!(!session.orders().may_place());
+    assert!(venue.calls().is_empty(), "construction sent no auth or arm");
+}
+
+#[tokio::test(start_paused = true)]
+async fn account_wide_protection_requires_a_new_accepted_arm_after_reconnect() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let (mut config, _) = setup(venue, &server.url(), &[(COD, "account")]);
+    config.account_wide_cod_authority = Some(AccountWideCodAuthority::new(ACCT));
+    let slot = Orders::default();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log, &slot)).unwrap();
+    let orders = session.orders();
+    *slot.borrow_mut() = Some(orders.clone());
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert!(peer.recv().await.starts_with("auth|ts="));
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let resync = peer.recv().await;
+        peer.send(&accepted(1));
+        peer.send_all(resynced(watermark(&resync)));
+        settle(|| resync_ends(&watch) == 1).await;
+        assert!(orders.may_place());
+        peer.drop_conn();
+        settle(|| ends(&watch).len() == 1).await;
+        assert!(!orders.may_place());
+        advance(ms(10)).await;
+        let mut next = server.accept().await;
+        assert!(next.recv().await.starts_with("auth|ts="));
+        next.send(AUTH_ACK);
+        assert_eq!(next.recv().await, arm(2));
+        let resync = next.recv().await;
+        assert!(!orders.may_place());
+        next.send_all(resynced(watermark(&resync)));
+        settle(|| resync_ends(&watch) == 2).await;
+        assert!(!orders.may_place(), "resync alone cannot replace the arm");
+        next.send(&accepted(2));
+        settle(|| orders.may_place()).await;
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+    assert_eq!(
+        venue.encoded(),
+        [(arm_cmd(), RpcId(1)), (arm_cmd(), RpcId(2))]
+    );
 }
 
 /// A session that never connected takes no places.
