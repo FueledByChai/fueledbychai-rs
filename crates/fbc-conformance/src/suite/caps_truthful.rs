@@ -572,6 +572,7 @@ fn operations(h: &Harness<'_>, o: &OrderCaps, push: Push<'_>) {
     let (protection, dead_man) = match o.cancel_on_disconnect {
         CancelOnDisconnect::None => (false, false),
         CancelOnDisconnect::PerConnection { .. } => (true, false),
+        CancelOnDisconnect::AccountWide => (true, false),
         CancelOnDisconnect::DeadMan { .. } => (true, true),
     };
     let expect = |declared| if declared { Expect::Sent } else { refused };

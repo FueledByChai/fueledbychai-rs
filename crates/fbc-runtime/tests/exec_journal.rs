@@ -607,6 +607,7 @@ fn config(
         cfg: venue_cfg,
         creds: Secrets::new(),
         acct: ACCT,
+        account_wide_cod_authority: None,
         rpc_ids: RpcIds::default(),
         ns: exec_toy::OWN_NS,
         specs: exec_toy::specs(),

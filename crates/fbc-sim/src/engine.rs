@@ -333,21 +333,26 @@ impl Item {
 ///   instead, and the trade's size it would have taken goes to the orders behind it. An
 ///   injected order's fills need no fee.
 /// - The simulated stream is closed until the host [opens](SimEngine::open) it, and takes no
-///   frame while closed. A [close](SimEngine::close) loses every frame still in flight on it:
-///   it never reaches the venue and is never answered. Where the stood-in venue cancels per
+///   frame while closed. A [close](SimEngine::close) loses every primary-stream frame still
+///   in flight on it; a secondary same-account connection's placement still arrives. Where
+///   the stood-in venue cancels per
 ///   connection, an accepted `ArmCancelOnDisconnect(true)` protects the orders placed after it
 ///   (and, where the venue says an arm covers the orders already open, those open then), and
 ///   the close cancels each of them (`Venue`), answered `to_client` after it; turning it off
 ///   leaves every order resting. Where the protection lapses with the connection
 ///   (`rearm_on_reconnect`), nothing placed on the next is protected until it is asked for
-///   again; otherwise it covers every later connection until turned off. A dead-man venue's
+///   again; otherwise it covers every later connection until turned off.
+///   An account-wide venue's accepted arm covers every resting order on this account, including
+///   a placement sent from another connection after the arm; the armed connection's close
+///   cancels all of them and requires a new arm on reconnect (0121). A dead-man venue's
 ///   arm starts a timer of its `max_ttl` (the longest it accepts, since `RefreshDeadMan` names
 ///   no length), each `RefreshDeadMan` restarts it, and turning it off stops it; unrefreshed
 ///   for that long it lapses, after every command that arrived by then and before anything
 ///   stamped after it, and the venue cancels every order SimVenue holds (`Venue`). A close
 ///   alone cancels nothing there. A protection command the venue does not take, or a refresh
-///   with no timer running, is refused (`no_protection`). Injected orders are another
-///   process's, and never end on SimVenue's protection.
+///   with no timer running, is refused (`no_protection`). Injected public orders are outside
+///   this simulated account and never end on its protection; same-account placements from
+///   another connection enter through [`SimEngine::on_other_order_frame`].
 #[derive(Clone, Debug)]
 pub struct SimEngine {
     fee_sign: VenueFeeSign,
@@ -365,7 +370,8 @@ pub struct SimEngine {
     by_cid: BTreeMap<String, u64>,
     injected: BTreeMap<u64, Injected>,
     injected_fills: Vec<SimFill>,
-    in_flight: BTreeMap<(MonoNs, u64), (WallNs, Command)>,
+    /// The final flag marks a command from another connection on the same account (0121).
+    in_flight: BTreeMap<(MonoNs, u64), (WallNs, Command, bool)>,
     /// A two-phase venue's `risk_reject_window`; `None` for a venue that acknowledges in one
     /// phase.
     risk_window: Option<Duration>,
@@ -386,6 +392,8 @@ pub struct SimEngine {
     open: bool,
     /// Whether a per-connection venue protects the orders placed now.
     protected: bool,
+    /// The command currently acting came from another connection of this account.
+    placing_other: bool,
     /// When a dead-man venue's timer lapses, while it runs.
     dead_man: Option<At>,
     /// Public size a level lost to trades printed at it, and to injected orders withdrawn from
@@ -446,6 +454,7 @@ impl SimEngine {
             cancel_on_disconnect: config.exec.order.cancel_on_disconnect,
             open: false,
             protected: false,
+            placing_other: false,
             dead_man: None,
             traded: BTreeMap::new(),
             depleted: BTreeMap::new(),
@@ -473,7 +482,28 @@ impl SimEngine {
         let sent = command.sent();
         let mono = sent.mono + self.latency.to_venue;
         let wall = after(sent.wall, self.latency.to_venue);
-        self.in_flight.insert((mono, self.frames), (wall, command));
+        self.in_flight
+            .insert((mono, self.frames), (wall, command, false));
+        self.frames += 1;
+        Ok(())
+    }
+
+    /// A placement frame from another connection of the same account (0121). It can place
+    /// while this engine's primary stream is closed, and its in-flight request survives that
+    /// stream's close. Only placements are accepted on this synthetic secondary connection.
+    pub fn on_other_order_frame(&mut self, frame: &[u8]) -> Result<(), SimError> {
+        let command =
+            Command::decode(frame).map_err(|WireError(what)| SimError::Malformed(what))?;
+        if !matches!(command, Command::Place(_) | Command::Batch(_, _)) {
+            return Err(SimError::Malformed(
+                "other connection accepts only placements",
+            ));
+        }
+        let sent = command.sent();
+        let mono = sent.mono + self.latency.to_venue;
+        let wall = after(sent.wall, self.latency.to_venue);
+        self.in_flight
+            .insert((mono, self.frames), (wall, command, true));
         self.frames += 1;
         Ok(())
     }
@@ -531,8 +561,10 @@ impl SimEngine {
                 break;
             };
             if command == Some(first) {
-                if let Some(((mono, _), (wall, command))) = self.in_flight.pop_first() {
+                if let Some(((mono, _), (wall, command, other))) = self.in_flight.pop_first() {
+                    self.placing_other = other;
                     self.act(command, At { mono, wall });
+                    self.placing_other = false;
                 }
             } else if settle == Some(first) {
                 if let Some(((mono, _), s)) = self.settles.pop_first() {
@@ -650,7 +682,9 @@ impl SimEngine {
     /// The simulated stream closes at `now` (`wall` on the host's wall clock): the commands
     /// that arrived by then act first, and every frame still in flight on it is lost. Where
     /// the stood-in venue cancels per connection, every order its protection covers is
-    /// cancelled by the venue, and a protection that lapses with the connection ends. Refused
+    /// cancelled by the venue; account-wide protection cancels all this account's orders.
+    /// The primary stream's in-flight frames are lost, but those of the synthetic secondary
+    /// connection are retained. A protection that lapses with the connection ends. Refused
     /// while it is closed.
     pub fn close(&mut self, now: MonoNs, wall: WallNs) -> Result<(), SimError> {
         if !self.open {
@@ -658,18 +692,26 @@ impl SimEngine {
         }
         self.advance(now);
         self.open = false;
-        // Every frame in flight was written on this connection: the engine takes none while
-        // the stream is closed, and the last close lost those of the connection before.
-        self.in_flight.clear();
-        if let CancelOnDisconnect::PerConnection {
-            rearm_on_reconnect, ..
-        } = self.cancel_on_disconnect
-        {
-            let at = At { mono: now, wall };
-            self.end_all(at, SimState::Canceled(CancelReason::Venue), |o| o.guarded);
-            if rearm_on_reconnect {
+        // The primary stream takes none while closed; another connection's frames survive.
+        self.in_flight.retain(|_, (_, _, other)| *other);
+        match self.cancel_on_disconnect {
+            CancelOnDisconnect::PerConnection {
+                rearm_on_reconnect, ..
+            } => {
+                let at = At { mono: now, wall };
+                self.end_all(at, SimState::Canceled(CancelReason::Venue), |o| o.guarded);
+                if rearm_on_reconnect {
+                    self.protected = false;
+                }
+            }
+            CancelOnDisconnect::AccountWide => {
+                if self.protected {
+                    let at = At { mono: now, wall };
+                    self.end_all(at, SimState::Canceled(CancelReason::Venue), |_| true);
+                }
                 self.protected = false;
             }
+            _ => {}
         }
         Ok(())
     }
@@ -729,6 +771,10 @@ impl SimEngine {
                     // says an arm covers them.
                     order.guarded = on && (order.guarded || covers_open_orders);
                 }
+                Reply::Done { rpc }
+            }
+            CancelOnDisconnect::AccountWide => {
+                self.protected = on;
                 Reply::Done { rpc }
             }
             CancelOnDisconnect::DeadMan { max_ttl } => {
@@ -1127,7 +1173,9 @@ impl SimEngine {
             cum: Lots::ZERO,
             post_only: p.post_only,
             reduce_only: p.reduce_only,
-            guarded: self.protected,
+            guarded: self.protected
+                && (!self.placing_other
+                    || self.cancel_on_disconnect == CancelOnDisconnect::AccountWide),
         }
     }
 

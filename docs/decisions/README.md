@@ -123,3 +123,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0118](0118-asset-symbols-hold-sixteen-printable-ascii-bytes-for-qfex-in.md) Asset symbols hold sixteen printable ASCII bytes for QFEX instrument discovery — accepted
 - [0119](0119-public-trade-ids-keep-numeric-and-uuid-identities-in-a-copya.md) Public trade IDs keep numeric and UUID identities in a copyable generic value — accepted
 - [0120](0120-venue-initiated-fills-carry-their-origin-and-exact-price-and.md) Venue-initiated fills carry their origin and exact price and reach the inventory once through the fill ledger on no order, counting after a snapshot seed unless their arrival or time places them in it, augmenting 0005, 0014, 0055 and 0095 — accepted
+- [0121](0121-account-wide-cancel-on-disconnect-needs-explicit-account-aut.md) Account-wide cancel-on-disconnect needs explicit account authority and rearms each connection — accepted

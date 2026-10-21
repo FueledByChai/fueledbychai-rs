@@ -32,7 +32,7 @@
 //!   through the queue model and answers with frames ([`Answer`]) due after the configured
 //!   [`SimLatency`]. It reads no clock. An amend resets the order's queue position unless the
 //!   stood-in venue's caps declare `keeps_priority: Some(true)` (design §4.5). Orders the
-//!   consumer injects ([`SimEngine::inject`]: another process's, design §10.2 step 2) queue and
+//!   consumer injects ([`SimEngine::inject`]: outside this simulated account, design §10.2 step 2) queue and
 //!   fill as modelled orders, so they are never size ahead of a later order, and are never
 //!   answered as the consumer's own. A resync (0049) is answered in one frame: the resting
 //!   orders, the position the fills imply in each instrument, and the request's wall time as
@@ -46,7 +46,9 @@
 //!   The host opens and closes the simulated stream ([`SimEngine::open`],
 //!   [`SimEngine::close`]); a close loses the frames in flight on it, and the engine cancels
 //!   what the stood-in venue cancels when the connection drops (per connection, behind an
-//!   accepted arm) or its dead-man timer lapses unrefreshed (0097).
+//!   accepted arm, or account-wide after explicit arming, including same-account placements
+//!   from [`SimEngine::on_other_order_frame`]) or its dead-man timer lapses unrefreshed
+//!   (0097, 0121).
 //!   A venue that acknowledges in two phases gets each placement accepted provisionally, then
 //!   final once its `risk_reject_window` passes, or refused by a risk reject the consumer
 //!   configures inside it ([`SimEngine::risk_reject`], [`RiskRefusal`]; 0099). Its amends

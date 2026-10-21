@@ -84,6 +84,8 @@ enum Twist {
     Mislabelled,
     /// Every command is refused `Unsupported`.
     RefusesAll,
+    /// An account-wide protection arm is refused despite the declared cap.
+    RefusesArm,
     /// Every placement is refused `Unsupported`.
     RefusesPlacements,
     /// A placement's frames name no rpc.
@@ -279,6 +281,10 @@ impl ExecCodec for Twisted {
                 Err(NotSentReason::Unsupported)
             }
             (Twist::RefusesAll, _) => {
+                fx.take();
+                Err(NotSentReason::Unsupported)
+            }
+            (Twist::RefusesArm, _) if matches!(cmd, VenueCommand::ArmCancelOnDisconnect(_)) => {
                 fx.take();
                 Err(NotSentReason::Unsupported)
             }
@@ -954,6 +960,20 @@ fn operations_the_caps_declare_are_controls_the_codec_must_send() {
     assert!(refresh.starts_with(refused), "{failure}");
     // The toy arms and disarms its protection, and refuses nothing else declared.
     assert_eq!(failure.breaches.len(), 2, "{failure}");
+}
+
+#[test]
+fn account_wide_cod_declaration_requires_an_arm_and_disarm_the_codec_sends() {
+    let broken = Broken {
+        caps: Some(|caps| {
+            order(caps).cancel_on_disconnect = CancelOnDisconnect::AccountWide;
+        }),
+        builds: Builds::Codec(Twist::RefusesArm),
+    };
+    let failure = failed(broken.caps_truthful());
+    let refused = "refused as NotSent(Unsupported) though the caps declare it";
+    assert!(said(&failure, "control: protection (arm)").starts_with(refused));
+    assert!(said(&failure, "control: protection (disarm)").starts_with(refused));
 }
 
 #[test]

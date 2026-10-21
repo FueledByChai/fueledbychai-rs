@@ -587,6 +587,7 @@ pub fn play_journaled<T>(
             cfg,
             creds: Secrets::new(),
             acct: ACCT,
+            account_wide_cod_authority: None,
             rpc_ids: RpcIds::default(),
             ns: OWN_NS,
             specs: toy::specs(),
