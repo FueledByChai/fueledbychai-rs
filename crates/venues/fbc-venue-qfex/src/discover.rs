@@ -12,6 +12,7 @@
 //! draft key keeps the venue's stated quote asset. The resolver's explicit alias table may
 //! subsequently equate USD, USDT and USDC.
 
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use fbc_core::{
@@ -81,7 +82,11 @@ pub fn refdata_url(cfg: &VenueConfig) -> Result<WireUrl, ConfigError> {
         .strip_prefix('[')
         .and_then(|rest| rest.split_once(']').map(|(host, _)| host))
         .unwrap_or_else(|| authority.split(':').next().unwrap_or(""));
-    if plain && host != "localhost" && host != "::1" && !host.starts_with("127.") {
+    if plain
+        && host != "localhost"
+        && host != "::1"
+        && !host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+    {
         return Err(bad());
     }
     Ok(WireUrl::plain(format!("{origin}{REFDATA_PATH}")))
