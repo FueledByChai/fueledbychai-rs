@@ -131,6 +131,13 @@ enum Twist {
     FillsOnAmend,
     /// A placement's acceptance is followed by a fill of a lot of the order.
     FillsOnPlacement,
+    /// An amended order's update is followed by a liquidation naming the order's new venue id:
+    /// a change the venue made with no order of the account's (decision 0120, Codex
+    /// r4331552296).
+    LiquidatesOnAmend,
+    /// A placement's acceptance is followed by a liquidation naming the venue id the order was
+    /// placed under (decision 0120, Codex r4331552296).
+    LiquidatesOnPlacement,
     /// An amended order's update is followed by another naming another new venue id.
     RenamedTwice,
     /// Every acceptance naming no venue id (the arm's, the amend's) names a stranger's.
@@ -412,6 +419,14 @@ static FILLS_ON_AMEND: Variant = Variant {
 static FILLS_ON_PLACEMENT: Variant = Variant {
     caps: |_| {},
     twist: Twist::FillsOnPlacement,
+};
+static LIQUIDATES_ON_AMEND: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::LiquidatesOnAmend,
+};
+static LIQUIDATES_ON_PLACEMENT: Variant = Variant {
+    caps: |_| {},
+    twist: Twist::LiquidatesOnPlacement,
 };
 /// The toy declaring that an amended order keeps its venue id, which its events still replace.
 static KEEPS_VID: Variant = Variant {
@@ -1009,19 +1024,53 @@ fn open_agrees_after_amend(ev: ExecEvent) -> Vec<ExecEvent> {
 
 /// An amended order's update, then a fill of a lot of the order under its new venue id.
 fn fills_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    fill_on_amend(ev, |u| fbc_core::FillOrigin::Order {
+        cid: u.cid,
+        px: u.px.unwrap_or(fbc_core::Ticks(1)),
+    })
+}
+
+/// An amended order's update, then a liquidation of a lot naming the order's new venue id.
+fn liquidates_on_amend(ev: ExecEvent) -> Vec<ExecEvent> {
+    fill_on_amend(ev, |_| liquidation())
+}
+
+/// An amended order's update, then a fill of a lot under its new venue id, made as `origin`
+/// says from the update.
+fn fill_on_amend(
+    ev: ExecEvent,
+    origin: fn(&fbc_core::OrderUpdate) -> fbc_core::FillOrigin,
+) -> Vec<ExecEvent> {
     let ExecEvent::Order(u) = &ev else {
         return vec![ev];
     };
     let VenueOrderState::Amended { new_vid } = &u.state else {
         return vec![ev];
     };
-    let fill = fill_of(new_vid.clone(), u.cid, u.px.unwrap_or(fbc_core::Ticks(1)));
+    let fill = fill_of(new_vid.clone(), origin(u));
     vec![ev, fill]
 }
 
 /// A placement's acceptance naming its venue id, then a fill of a lot of the order under it,
 /// naming no client id.
 fn fills_on_placement(ev: ExecEvent) -> Vec<ExecEvent> {
+    fill_on_placement(
+        ev,
+        fbc_core::FillOrigin::Order {
+            cid: None,
+            px: fbc_core::Ticks(1),
+        },
+    )
+}
+
+/// A placement's acceptance naming its venue id, then a liquidation of a lot naming it.
+fn liquidates_on_placement(ev: ExecEvent) -> Vec<ExecEvent> {
+    fill_on_placement(ev, liquidation())
+}
+
+/// A placement's acceptance naming its venue id, then a fill of a lot under it, made as
+/// `origin` says.
+fn fill_on_placement(ev: ExecEvent, origin: fbc_core::FillOrigin) -> Vec<ExecEvent> {
     let ExecEvent::Outcome {
         item: Some(ItemRef { vid: Some(vid), .. }),
         outcome: SubmitOutcome::Accepted { .. },
@@ -1030,17 +1079,22 @@ fn fills_on_placement(ev: ExecEvent) -> Vec<ExecEvent> {
     else {
         return vec![ev];
     };
-    let fill = fill_of(Some(vid.clone()), None, fbc_core::Ticks(1));
+    let fill = fill_of(Some(vid.clone()), origin);
     vec![ev, fill]
 }
 
-/// A maker fill of a lot of the toy's buy on its first instrument, naming the order by `vid`
-/// and `cid`, at `px`.
-fn fill_of(
-    vid: Option<fbc_core::VenueOrderId>,
-    cid: Option<fbc_core::CidMatch>,
-    px: fbc_core::Ticks,
-) -> ExecEvent {
+/// A liquidation the venue made, at its exact price: no order of the account's, whatever venue
+/// id its frame carries (decision 0120).
+fn liquidation() -> fbc_core::FillOrigin {
+    fbc_core::FillOrigin::Venue {
+        kind: fbc_core::VenueFillKind::Liquidation,
+        px: fbc_core::PxExact::new(15, -1),
+    }
+}
+
+/// A maker fill of a lot of the toy's buy on its first instrument, naming the order by `vid`,
+/// made as `origin` says.
+fn fill_of(vid: Option<fbc_core::VenueOrderId>, origin: fbc_core::FillOrigin) -> ExecEvent {
     let usdc = fbc_core::AssetSym::new("USDC").unwrap();
     let fee = toy::with_scope(|scope| scope.fee(0, usdc)).unwrap();
     let fill_id = toy::with_scope(|scope| scope.fill_id("toy-fill")).unwrap();
@@ -1050,7 +1104,7 @@ fn fill_of(
             vid,
             cum_after: None,
         },
-        origin: fbc_core::FillOrigin::Order { cid, px },
+        origin,
         inst: toy::INST_A,
         side: fbc_core::Side::Buy,
         qty: fbc_core::Lots::new(1).unwrap(),
@@ -1513,6 +1567,8 @@ impl ExecCodec for Twisted {
             Twist::OpenAgreesAfterAmend => open_agrees_after_amend,
             Twist::FillsOnAmend => fills_on_amend,
             Twist::FillsOnPlacement => fills_on_placement,
+            Twist::LiquidatesOnAmend => liquidates_on_amend,
+            Twist::LiquidatesOnPlacement => liquidates_on_placement,
             Twist::RenamedTwice => renamed_twice,
             Twist::StrangerVidOnAck => stranger_vid_on_ack,
             Twist::MisreadsRejects => misread_rejects,
@@ -2585,6 +2641,24 @@ fn amend_ack_fails_a_toy_that_reports_a_fill_of_the_order_it_places() {
         says(&failure, "ExecEvent::Fill", "the stub filled nothing"),
         "{failure}"
     );
+}
+
+/// A liquidation, transfer, settlement or block trade is a change the venue made with no order
+/// of the account's, which fbc-oms counts on no order even where its frame carries one of our
+/// orders' venue ids (decision 0120): naming the amended order's venue id, it fills nothing of
+/// it (Codex r4331552296).
+#[test]
+fn amend_ack_passes_a_toy_that_reports_a_liquidation_naming_the_order_it_amends() {
+    let passed = suite::amend_ack(&LIQUIDATES_ON_AMEND.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+}
+
+/// As above, before the amend: a liquidation naming the venue id the order was placed under
+/// fills nothing of it (decision 0120, Codex r4331552296).
+#[test]
+fn amend_ack_passes_a_toy_that_reports_a_liquidation_naming_the_order_it_places() {
+    let passed = suite::amend_ack(&LIQUIDATES_ON_PLACEMENT.subject(assumed));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
 }
 
 #[test]
