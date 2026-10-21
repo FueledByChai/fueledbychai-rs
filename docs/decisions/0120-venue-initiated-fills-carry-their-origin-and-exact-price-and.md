@@ -107,7 +107,16 @@ to market states. It supersedes nothing.
      read: these are the fills in flight while a market's seed is taken, and a market is seeded
      once per process (0055). The double count is never silent: the next resync's comparison
      reports it as `PositionCheck::Desync`, on which 0094's stop rule acts. Until then, the
-     inventory cap (I6) is judged against a position off by those fills.
+     inventory cap (I6) and Exit's admission (0063) are judged against a position off by those
+     fills: a liquidation counted twice can make an order look reducing that in fact grows the
+     position. A consumer told `FillRouted::Venue { in_snapshot: false }` after a seed may
+     request a resync at once to bring that comparison forward. The owner confirmed this
+     residual, so stated, on 2026-10-20.
+   - A venue fill's time is the venue's, aligned to the local wall clock (0014). An alignment
+     error misplaces a venue fill against the watermark in either direction (one executed after
+     the read held, or one the read held counted), and either shows as a `Desync` at the next
+     resync. Order fills are placed by matching-engine times only, so this applies to venue
+     fills placed by a publish time.
    - On a market seeded by hand (`Registry::seed_position`), a venue fill counts. On a market
      whose position is already unknown, it moves the inventory and the position stays unknown.
    - Later resyncs compare as 0055 has it, taking a venue fill by its arrival and its time.
