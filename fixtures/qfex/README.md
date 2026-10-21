@@ -27,9 +27,10 @@ Each `raw.ndjson` line holds an accepted public JSON payload string under `raw`.
 For a single-item frame this is the exact received string; for an array or
 `contents` batch, the script serializes each flattened public item separately so
 every raw line has one paired projection line. It omits subscription
-acknowledgments and counts error envelopes without saving their contents. The
-paired projection carries type, symbol,
-sequence, venue time, public bid/ask levels and `sig_figs`, and for trades the
+acknowledgments and counts error envelopes without saving their contents. An
+unexpected early WebSocket close also increments the error count and ends the
+capture. The paired projection carries type, symbol,
+sequence, venue time, public bid/ask levels and `sig_figs` when present, and for trades the
 public UUID, price, size, side and execution type. Both files carry the same
 `recv_ms`, a local monotonic offset from the start of capture rounded to
 milliseconds. The fixture test checks that parsing each saved raw payload gives

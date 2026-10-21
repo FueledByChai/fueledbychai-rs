@@ -42,13 +42,15 @@ export function projectFrame(raw, symbol, recvMs) {
     }
     const keys = fields[item.type];
     if (!keys || item.symbol !== symbol) { other++; return; }
-    if (!keys.every(key => Object.hasOwn(item, key)) ||
+    // QFEX BBO omits sig_figs in both documented and recorded live frames.
+    const required = item.type === 'bbo' ? keys.filter(key => key !== 'sig_figs') : keys;
+    if (!required.every(key => Object.hasOwn(item, key)) ||
         Object.keys(item).some(key => !keys.includes(key))) {
       errors++;
       return;
     }
     const projection = { recv_ms: received };
-    for (const key of keys) projection[key] = item[key];
+    for (const key of keys) if (Object.hasOwn(item, key)) projection[key] = item[key];
     records.push({
       raw: { recv_ms: received, raw: rawItem },
       projection,
@@ -98,6 +100,11 @@ export function startCapture({
   });
   ws.addEventListener('message', onMessage);
   ws.addEventListener('error', () => { if (!finished) counts.errors++; });
+  ws.addEventListener('close', () => {
+    if (finished) return;
+    counts.errors++;
+    finish();
+  });
   const timeout = setTimeout(finish, durationMs);
 
   function finish() {
