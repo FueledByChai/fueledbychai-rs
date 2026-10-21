@@ -1,0 +1,3 @@
+These trade WebSocket frames are hand-built from QFEX's public AsyncAPI schema.
+Every order id and client id is synthetic; no funded or UAT account was used.
+They prove parser behavior only and do not establish venue acceptance.

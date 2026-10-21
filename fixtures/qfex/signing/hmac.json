@@ -1,0 +1,7 @@
+{
+  "secret": "synthetic-qfex-secret",
+  "nonce": [49406, 47806],
+  "nonce_hex": "000000000000c0fe000000000000babe",
+  "unix_ts": 1760545414,
+  "signature": "033152e3043d78a446123426f5dcc48ed9c73413c11e1306af4a0ee6241d7d67"
+}
