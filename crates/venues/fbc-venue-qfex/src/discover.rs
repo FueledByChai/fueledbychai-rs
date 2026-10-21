@@ -127,8 +127,8 @@ pub fn parse_fbc_common_symbol(s: &str) -> Result<AssetKey, SymbolError> {
     })
 }
 
-/// Decode all listed perpetuals in response order. A malformed item refuses the entire
-/// response; omission of a required field is named precisely.
+/// Decode all listed perpetuals in response order. The documented nullable `data` field
+/// yields no drafts when null; a missing field or malformed item still refuses the response.
 pub fn decode_refdata(
     body: &[u8],
     scope: &DecodeScope<'_>,
@@ -138,7 +138,11 @@ pub fn decode_refdata(
     if text(doc, "type")? != "refdata" {
         return Err(malformed("type").into());
     }
-    let data = required(doc, "data")?.as_array().ok_or(malformed("data"))?;
+    let data = match doc.get("data").ok_or(PlanError::Missing("data"))? {
+        Value::Null => return Ok(Vec::new()),
+        Value::Array(data) => data,
+        _ => return Err(malformed("data").into()),
+    };
     let mut drafts = Vec::with_capacity(data.len());
     for entry in data {
         let entry = entry.as_object().ok_or(malformed("data item"))?;
