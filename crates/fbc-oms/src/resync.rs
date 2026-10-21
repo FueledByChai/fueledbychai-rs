@@ -315,8 +315,9 @@ pub(crate) struct Seed {
     base: i128,
     /// Every fill counted on the inventory since then arrived after it.
     folded_to: MonoNs,
-    /// The fills counted on the inventory since `folded_to`: when each arrived, its
-    /// matching-engine time and what it moved.
+    /// The fills counted on the inventory since `folded_to`: when each arrived, the time that
+    /// places it (an order fill's matching-engine time, or a venue fill's matching-engine or
+    /// publish time, decision 0120) and what it moved.
     log: Vec<(MonoNs, Option<WallNs>, i128)>,
 }
 
@@ -384,6 +385,8 @@ impl SeedRef {
     /// at or before the request, or its time (a matching-engine time, or a publish time
     /// bounding its execution from above) is at or before the watermark. Only those place it,
     /// on either read mode: no order the snapshot shows, or leaves out, says anything of it.
+    /// The time is the venue's aligned to the local wall clock (decision 0014), so an alignment
+    /// error misplaces `v` in either direction, which the next resync reports as a `Desync`.
     fn holds_venue(&self, v: &VenuePlaced) -> bool {
         v.arrived <= self.requested_at || v.by.is_some_and(|t| t <= self.watermark)
     }
@@ -1042,11 +1045,11 @@ impl Registry {
             return PositionCheck::Stale(inst);
         }
         let mut kept = Vec::new();
-        for (arrived, exec, signed) in seed.log.drain(..) {
+        for (arrived, by, signed) in seed.log.drain(..) {
             if arrived <= snap.requested_at {
                 seed.base += signed;
             } else {
-                kept.push((arrived, exec, signed));
+                kept.push((arrived, by, signed));
             }
         }
         seed.log = kept;
@@ -1055,7 +1058,7 @@ impl Registry {
             + seed
                 .log
                 .iter()
-                .filter(|(_, exec, _)| exec.is_some_and(|t| t <= snap.watermark))
+                .filter(|(_, by, _)| by.is_some_and(|t| t <= snap.watermark))
                 .map(|(_, _, signed)| signed)
                 .sum::<i128>();
         if as_of == i128::from(venue.0) {
