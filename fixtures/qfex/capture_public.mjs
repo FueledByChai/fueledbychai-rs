@@ -1,88 +1,121 @@
 import fs from 'node:fs';
+import { resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { pathToFileURL } from 'node:url';
 
-const symbol = process.argv[2] ?? 'AAPL-USD';
-const durationMs = Number(process.argv[3] ?? 30000);
-const out = process.argv[4] ?? '/tmp/qfex-e3jy-live.ndjson';
-const rawOut = out.replace(/\.ndjson$/, '.raw.ndjson');
-const ws = new WebSocket('wss://mds.qfex.com/');
-const file = fs.createWriteStream(out, { flags: 'w' });
-const rawFile = fs.createWriteStream(rawOut, { flags: 'w' });
-const start = performance.now();
-const counts = { bbo: 0, level2: 0, trade: 0, errors: 0, other: 0 };
-let finished = false;
+const fields = {
+  bbo: ['type', 'symbol', 'sequence', 'time', 'bid', 'ask', 'sig_figs'],
+  level2: ['type', 'symbol', 'sequence', 'time', 'bid', 'ask', 'sig_figs'],
+  trade: ['type', 'symbol', 'sequence', 'time', 'trade_id', 'price', 'size', 'side', 'execution_type'],
+};
 
-const publicFields = new Set([
-  'type', 'symbol', 'sequence', 'time', 'bid', 'ask', 'trade_id',
-  'price', 'size', 'side', 'execution_type', 'sig_figs', 'contents',
-]);
-
-function publicItems(item) {
-  if (Array.isArray(item)) return item.flatMap(publicItems);
-  if (!item || typeof item !== 'object') return [];
-  if (Array.isArray(item.contents))
-    return item.contents.flatMap(x => publicItems({ type: item.type, ...x }));
-  if (['bbo', 'level2', 'trade'].includes(item.type) && item.symbol === symbol)
-    return [item];
-  return [];
+export function outputPaths(out) {
+  if (!out.endsWith('.ndjson')) throw new Error('capture output must end in .ndjson');
+  return { out, rawOut: out.replace(/\.ndjson$/, '.raw.ndjson') };
 }
 
-function scrubbedPublicFrame(item) {
-  if (Array.isArray(item)) return item.length > 0 && item.every(scrubbedPublicFrame);
-  if (!item || typeof item !== 'object') return false;
-  if (!Object.keys(item).every(key => publicFields.has(key))) return false;
-  if (Array.isArray(item.contents))
-    return item.contents.length > 0 && item.contents.every(x =>
-      scrubbedPublicFrame({ type: item.type, ...x })
-    );
-  return ['bbo', 'level2', 'trade'].includes(item.type) && item.symbol === symbol;
-}
+// Only these whitelisted public fields may reach either file. Each member of a
+// QFEX array or contents envelope gets its own raw/projection pair.
+export function projectFrame(raw, symbol, recvMs) {
+  const records = [];
+  let errors = 0;
+  let other = 0;
+  const received = Math.round(recvMs * 1000) / 1000;
 
-function record(item, recvMs) {
-  if (!item || typeof item !== 'object') return;
-  if (Array.isArray(item)) { for (const x of item) record(x, recvMs); return; }
-  if (Array.isArray(item.contents)) {
-    for (const x of item.contents) record({ type: item.type, ...x }, recvMs);
-    return;
+  function visit(item, rawItem) {
+    if (Array.isArray(item)) {
+      for (const member of item) visit(member, JSON.stringify(member));
+      return;
+    }
+    if (!item || typeof item !== 'object') { other++; return; }
+    if (Object.hasOwn(item, 'err')) { errors++; return; }
+    if (Array.isArray(item.contents)) {
+      if (Object.keys(item).some(key => !['type', 'contents'].includes(key))) {
+        errors++;
+        return;
+      }
+      for (const member of item.contents) {
+        const flattened = { type: item.type, ...member };
+        visit(flattened, JSON.stringify(flattened));
+      }
+      return;
+    }
+    const keys = fields[item.type];
+    if (!keys || item.symbol !== symbol) { other++; return; }
+    if (!keys.every(key => Object.hasOwn(item, key)) ||
+        Object.keys(item).some(key => !keys.includes(key))) {
+      errors++;
+      return;
+    }
+    const projection = { recv_ms: received };
+    for (const key of keys) projection[key] = item[key];
+    records.push({
+      raw: { recv_ms: received, raw: rawItem },
+      projection,
+      type: item.type,
+    });
   }
-  const type = item.type;
-  if (item.err) { counts.errors++; return; }
-  if (!['bbo', 'level2', 'trade'].includes(type) || item.symbol !== symbol) {
-    counts.other++;
-    return;
-  }
-  const keys = type === 'trade'
-    ? ['type', 'symbol', 'sequence', 'time', 'trade_id', 'price', 'size', 'side', 'execution_type']
-    : ['type', 'symbol', 'sequence', 'time', 'bid', 'ask', 'sig_figs'];
-  const clean = { recv_ms: Math.round(recvMs * 1000) / 1000 };
-  for (const key of keys) if (Object.hasOwn(item, key)) clean[key] = item[key];
-  file.write(JSON.stringify(clean) + '\n');
-  counts[type]++;
+
+  visit(JSON.parse(raw), raw);
+  return { records, errors, other };
 }
 
-function finish() {
-  if (finished) return;
-  finished = true;
-  ws.close();
-  file.end(() => rawFile.end(() => {
-    process.stdout.write(JSON.stringify({ symbol, durationMs, counts, out, rawOut }) + '\n');
-  }));
+export function startCapture({
+  symbol = 'AAPL-USD',
+  durationMs = 30000,
+  out = '/tmp/qfex-e3jy-live.ndjson',
+  WebSocketImpl = WebSocket,
+  onSummary = summary => process.stdout.write(JSON.stringify(summary) + '\n'),
+} = {}) {
+  const { rawOut } = outputPaths(out);
+  const ws = new WebSocketImpl('wss://mds.qfex.com/');
+  const file = fs.createWriteStream(out, { flags: 'w' });
+  const rawFile = fs.createWriteStream(rawOut, { flags: 'w' });
+  const start = performance.now();
+  const counts = { bbo: 0, level2: 0, trade: 0, errors: 0, other: 0 };
+  let finished = false;
+
+  function onMessage(event) {
+    if (finished) return;
+    try {
+      const { records, errors, other } = projectFrame(event.data, symbol, performance.now() - start);
+      counts.errors += errors;
+      counts.other += other;
+      for (const record of records) {
+        rawFile.write(JSON.stringify(record.raw) + '\n');
+        file.write(JSON.stringify(record.projection) + '\n');
+        counts[record.type]++;
+      }
+    } catch {
+      counts.errors++;
+    }
+  }
+
+  ws.addEventListener('open', () => {
+    if (finished) return;
+    for (const channel of ['bbo', 'level2', 'trade'])
+      ws.send(JSON.stringify({ type: 'subscribe', channels: [channel], symbols: [symbol] }));
+  });
+  ws.addEventListener('message', onMessage);
+  ws.addEventListener('error', () => { if (!finished) counts.errors++; });
+  const timeout = setTimeout(finish, durationMs);
+
+  function finish() {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timeout);
+    ws.removeEventListener('message', onMessage);
+    ws.close();
+    file.end(() => rawFile.end(() => onSummary({ symbol, durationMs, counts, out, rawOut })));
+  }
+
+  return { finish };
 }
 
-ws.addEventListener('open', () => {
-  for (const channel of ['bbo', 'level2', 'trade'])
-    ws.send(JSON.stringify({ type: 'subscribe', channels: [channel], symbols: [symbol] }));
-});
-ws.addEventListener('message', (event) => {
-  try {
-    const item = JSON.parse(event.data);
-    const recvMs = performance.now() - start;
-    if (publicItems(item).length === 0) { counts.other++; return; }
-    if (!scrubbedPublicFrame(item)) { counts.errors++; return; }
-    rawFile.write(JSON.stringify({ recv_ms: Math.round(recvMs * 1000) / 1000, raw: event.data }) + '\n');
-    record(item, recvMs);
-  }
-  catch { counts.errors++; }
-});
-ws.addEventListener('error', () => { counts.errors++; });
-setTimeout(finish, durationMs);
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  startCapture({
+    symbol: process.argv[2] ?? 'AAPL-USD',
+    durationMs: Number(process.argv[3] ?? 30000),
+    out: process.argv[4] ?? '/tmp/qfex-e3jy-live.ndjson',
+  });
+}
