@@ -109,14 +109,16 @@ to market states. It supersedes nothing.
      reports it as `PositionCheck::Desync`, on which 0094's stop rule acts. Until then, the
      inventory cap (I6) and Exit's admission (0063) are judged against a position off by those
      fills: a liquidation counted twice can make an order look reducing that in fact grows the
-     position. A consumer told `FillRouted::Venue { in_snapshot: false }` after a seed may
-     request a resync at once to bring that comparison forward. The owner confirmed this
-     residual, so stated, on 2026-10-20.
-   - A venue fill's time is the venue's, aligned to the local wall clock (0014). An alignment
-     error misplaces a venue fill against the watermark in either direction (one executed after
-     the read held, or one the read held counted), and either shows as a `Desync` at the next
-     resync. Order fills are placed by matching-engine times only, so this applies to venue
-     fills placed by a publish time.
+     position. A consumer told `FillRouted::Venue { in_snapshot: false }` after a seed can bring
+     that comparison forward only by ending the session, so the next epoch resyncs (0058), or by
+     passing `Registry::resync` a snapshot it reads itself; a resync it can ask an order-entry
+     session for on demand is FBC-prw8. The owner confirmed this residual, so stated, on
+     2026-10-20.
+   - Every fill placed by its time is placed by the venue's time aligned to the local wall clock
+     (0014), so an alignment error misplaces it against the watermark in either direction (one
+     executed after the read held, or one the read held counted), and either shows as a `Desync`
+     at the next resync. What this record adds to that exposure is venue fills placed by a
+     publish time, which is all a Paradex fill carries (FBC-ij33).
    - On a market seeded by hand (`Registry::seed_position`), a venue fill counts. On a market
      whose position is already unknown, it moves the inventory and the position stays unknown.
    - Later resyncs compare as 0055 has it, taking a venue fill by its arrival and its time.
