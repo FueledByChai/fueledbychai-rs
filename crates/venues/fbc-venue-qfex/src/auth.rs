@@ -3,7 +3,10 @@
 
 use core::fmt;
 
-use fbc_core::{ConfigError, EncodeCtx, Secret, SignError, VenueConfig, WireSlice, WireUrl};
+use fbc_core::{
+    AccountKey, ConfigError, EncodeCtx, InboundSpans, Secret, SignError, VenueConfig, WireSlice,
+    WireUrl,
+};
 
 use crate::sign;
 
@@ -19,11 +22,35 @@ pub fn valid_public_key(key: &str) -> bool {
 
 /// The account-identifying key required in QFEX's opening URL and auth frame.
 pub const PUBLIC_KEY: &str = "qfex.public_key";
+/// HMAC secret, carried only in `Secrets`.
+pub const SECRET_KEY: &str = "qfex.secret_key";
 /// The trade WebSocket origin. `wss://` is required outside a loopback test.
 pub const TRADE_URL: &str = "qfex.trade_url";
 /// Explicit provider account for private trading: `primary` or a subaccount UUID.
 /// Requiring a value prevents a missing subaccount setting from trading the primary account.
 pub const ACCOUNT_ID: &str = "qfex.account_id";
+/// The consumer's local AccountKey for the selected provider account. This mapping is
+/// caller-attested and checked against ExecSessionConfig before endpoint planning.
+pub const ACCOUNT_KEY: &str = "qfex.account_key";
+
+/// Require a canonical local key alongside the explicit provider account selection.
+pub fn account_key(cfg: &VenueConfig) -> Result<AccountKey, ConfigError> {
+    account_selection(cfg)?;
+    let raw = cfg
+        .get(ACCOUNT_KEY)
+        .ok_or(ConfigError::Missing(ACCOUNT_KEY))?;
+    let number = raw.parse::<u16>().map_err(|_| ConfigError::Invalid {
+        key: ACCOUNT_KEY,
+        reason: "expected a canonical decimal AccountKey",
+    })?;
+    if raw != number.to_string() {
+        return Err(ConfigError::Invalid {
+            key: ACCOUNT_KEY,
+            reason: "expected a canonical decimal AccountKey",
+        });
+    }
+    Ok(AccountKey::new(number))
+}
 
 /// The provider account selected for one authenticated trade connection.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -60,7 +87,7 @@ fn valid_account_id(id: &str) -> bool {
             if matches!(i, 8 | 13 | 18 | 23) {
                 byte == b'-'
             } else {
-                byte.is_ascii_hexdigit()
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
             }
         })
 }
@@ -173,4 +200,113 @@ pub fn frame(
     .collect::<Result<Vec<_>, _>>()?;
     WireSlice::redacted(body.into_bytes(), spans)
         .map_err(|_| SignError::Backend("auth frame redaction"))
+}
+
+/// An error may echo the authentication payload. Keep any frame carrying a known account
+/// identifier or a signature field out of the journal. Such a frame replays as undecodable,
+/// leaving the connection unready.
+pub fn inbound_spans(bytes: &[u8], public: &Secret, subaccount: Option<&str>) -> InboundSpans {
+    let contains = |needle: &[u8]| {
+        !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
+    };
+    let sensitive = contains(public.expose().as_bytes())
+        || subaccount.is_some_and(|id| contains(id.as_bytes()))
+        || contains(b"\"signature\"");
+    if sensitive
+        && let Ok(end) = u32::try_from(bytes.len())
+        && end > 0
+    {
+        return InboundSpans::frame(std::iter::once(0..end).collect());
+    }
+    InboundSpans::NONE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fbc_core::{MonoNs, NonceBlock, WallNs};
+
+    #[test]
+    fn unsafe_auth_inputs_refuse_and_diagnostics_hide_selected_account() {
+        let mut cfg = VenueConfig::new();
+        assert!(account_selection(&cfg).is_err());
+        cfg.insert(ACCOUNT_ID, "11111111-1111-1111-1111-111111111111");
+        assert!(!format!("{:?}", account_selection(&cfg).unwrap()).contains("11111111"));
+        cfg.insert(ACCOUNT_ID, "abcdefab-cdef-abcd-efab-cdefabcdefab");
+        assert!(matches!(
+            account_selection(&cfg),
+            Ok(AccountSelection::Subaccount(_))
+        ));
+        cfg.insert(ACCOUNT_ID, "ABCDEFAB-CDEF-ABCD-EFAB-CDEFABCDEFAB");
+        assert!(
+            account_selection(&cfg).is_err(),
+            "uppercase UUIDs are not canonical"
+        );
+        cfg.insert(ACCOUNT_ID, "primary");
+        assert_eq!(format!("{:?}", account_selection(&cfg).unwrap()), "Primary");
+        cfg.insert(ACCOUNT_KEY, "bad");
+        assert!(account_key(&cfg).is_err());
+        cfg.insert(ACCOUNT_KEY, "04");
+        assert!(account_key(&cfg).is_err());
+
+        let public = Secret::new("qfex_pub_synthetic_1".to_owned());
+        let secret = Secret::new("synthetic-secret".to_owned());
+        let ctx = EncodeCtx {
+            wall: WallNs(1_760_545_414_000_000_000),
+            mono: MonoNs(0),
+            nonces: NonceBlock::new(vec![1, 2]),
+        };
+        assert!(opening_url("wss://trade.qfex.com", "bad/key").is_err());
+        assert!(
+            frame(
+                &Secret::new("bad/key".to_owned()),
+                &secret,
+                &ctx,
+                AccountSelection::Primary
+            )
+            .is_err()
+        );
+        assert!(
+            frame(
+                &public,
+                &secret,
+                &ctx,
+                AccountSelection::Subaccount("bad-id")
+            )
+            .is_err()
+        );
+        let one_nonce = EncodeCtx {
+            nonces: NonceBlock::new(vec![1]),
+            ..ctx.clone()
+        };
+        assert!(frame(&public, &secret, &one_nonce, AccountSelection::Primary).is_err());
+        let bad_wall = EncodeCtx {
+            wall: WallNs(-1),
+            ..ctx
+        };
+        assert!(frame(&public, &secret, &bad_wall, AccountSelection::Primary).is_err());
+    }
+
+    #[test]
+    fn echoed_auth_material_is_redacted_without_treating_plain_replies_as_secret() {
+        let public = Secret::new("qfex_pub_synthetic_1".to_owned());
+        let echoed = br#"{"error":{"signature":"synthetic-value"}}"#;
+        assert_eq!(
+            inbound_spans(echoed, &public, None).body()[0],
+            0..echoed.len() as u32
+        );
+        let echoed_key = br#"{"error":{"public_key":"qfex_pub_synthetic_1"}}"#;
+        assert_eq!(
+            inbound_spans(echoed_key, &public, None).body()[0],
+            0..echoed_key.len() as u32
+        );
+        let subaccount = "abcdefab-cdef-abcd-efab-cdefabcdefab";
+        let echoed_account = format!("{{\"account_id\":\"{subaccount}\"}}");
+        assert_eq!(
+            inbound_spans(echoed_account.as_bytes(), &public, Some(subaccount)).body()[0],
+            0..echoed_account.len() as u32
+        );
+        let plain = br#"{"type":"auth","result":"success"}"#;
+        assert!(inbound_spans(plain, &public, None).body().is_empty());
+    }
 }

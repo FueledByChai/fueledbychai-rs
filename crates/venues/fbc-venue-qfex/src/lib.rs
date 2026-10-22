@@ -1,12 +1,18 @@
-//! QFEX public market data and instrument discovery. Order entry is deliberately unavailable
-//! (decision 0117).
+//! QFEX public market data and instrument discovery, with an offline private auth codec.
+//! Order entry remains unavailable to runtime sessions (`caps.exec: None`, Record readiness)
+//! until private order, fill and resync truth is established (decisions 0117 and 0122).
 //!
 //! The public WebSocket and its `bbo`, `level2`, and `trade` messages are documented at
 //! <https://docs.qfex.com/websocket/main> and the corresponding MDS channel pages.
 
+mod auth;
 mod caps;
 pub mod discover;
+mod exec;
 mod md;
+mod sign;
+
+pub use sign::QfexNonces;
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -49,6 +55,30 @@ const SCHEMA: &[FieldSpec] = &[
         scope: ConfigScope::Process,
         unit: FieldUnit::Duration,
         doc: "positive public REST request timeout as <n>ms or <n>s",
+    },
+    FieldSpec {
+        key: auth::PUBLIC_KEY,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "public half of the QFEX API credential, matched exactly before private use",
+    },
+    FieldSpec {
+        key: auth::TRADE_URL,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "private trade WebSocket origin",
+    },
+    FieldSpec {
+        key: auth::ACCOUNT_ID,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "explicit primary or subaccount UUID selection; never defaults to primary",
+    },
+    FieldSpec {
+        key: auth::ACCOUNT_KEY,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Dimensionless,
+        doc: "caller-attested decimal AccountKey of the selected provider account",
     },
 ];
 
@@ -137,6 +167,13 @@ impl VenueFactory for Qfex {
         Ok(caps::caps())
     }
 
+    fn exec_account_key(
+        &self,
+        cfg: &VenueConfig,
+    ) -> Result<Option<fbc_core::AccountKey>, ConfigError> {
+        auth::account_key(cfg).map(Some)
+    }
+
     fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
         discover::parse_fbc_common_symbol(s)
     }
@@ -174,16 +211,16 @@ impl VenueFactory for Qfex {
         Box::new(QfexMd::new(ep.stream))
     }
 
-    fn plan_exec(&self, _cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
-        Ok(Vec::new())
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        exec::plan(cfg)
     }
 
     fn exec_codec(
         &self,
-        _cfg: &VenueConfig,
-        _creds: Secrets,
+        cfg: &VenueConfig,
+        creds: Secrets,
     ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        None
+        Some(exec::codec(cfg, creds).map(|codec| Box::new(codec) as Box<dyn ExecCodec>))
     }
 
     fn test_connection(

@@ -1,10 +1,39 @@
 #[path = "../src/auth.rs"]
+#[allow(dead_code)]
 mod auth;
 #[path = "../src/sign.rs"]
 mod sign;
 
-use fbc_core::{EncodeCtx, MonoNs, NonceBlock, NonceSource, Secret, VenueConfig, WallNs};
+use fbc_core::{
+    AccountKey, EncodeCtx, MonoNs, NonceBlock, NonceSource, Secret, VenueConfig, VenueFactory,
+    WallNs,
+};
+use fbc_venue_qfex::Qfex;
 use serde_json::Value;
+
+#[test]
+fn selected_provider_account_requires_a_canonical_local_binding() {
+    let mut cfg = VenueConfig::new();
+    assert!(Qfex.exec_account_key(&cfg).is_err());
+    cfg.insert(auth::ACCOUNT_ID, "primary");
+    assert!(Qfex.exec_account_key(&cfg).is_err());
+    cfg.insert(auth::ACCOUNT_KEY, "04");
+    assert!(Qfex.exec_account_key(&cfg).is_err());
+    cfg.insert(auth::ACCOUNT_KEY, "4");
+    assert_eq!(
+        Qfex.exec_account_key(&cfg).unwrap(),
+        Some(AccountKey::new(4))
+    );
+    cfg.insert(auth::ACCOUNT_ID, "11111111-1111-1111-1111-111111111111");
+    assert_eq!(
+        Qfex.exec_account_key(&cfg).unwrap(),
+        Some(AccountKey::new(4))
+    );
+    cfg.insert(auth::ACCOUNT_ID, "not-a-subaccount");
+    assert!(Qfex.exec_account_key(&cfg).is_err());
+    let diagnostic = format!("{cfg:?}");
+    assert!(!diagnostic.contains("11111111-1111-1111-1111-111111111111"));
+}
 
 #[test]
 fn independent_hmac_vector_and_redacted_debug() {

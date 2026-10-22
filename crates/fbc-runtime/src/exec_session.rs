@@ -446,6 +446,9 @@ pub enum ExecSessionError {
     OpenNeverFits,
     /// The venue declares no supported cancel-on-disconnect protection (0058, 0121).
     CancelOnDisconnect(CancelOnDisconnect),
+    /// The venue's configured account binding differs from the account this session would use.
+    /// Nothing was planned or opened.
+    AccountBinding,
     /// An account-wide arm would cancel orders placed by other clients, but the consumer did
     /// not explicitly authorize this account (0121). Nothing was planned or opened.
     AccountWideCodAuthority,
@@ -527,6 +530,9 @@ impl fmt::Display for ExecSessionError {
             ExecSessionError::AccountWideCodAuthority => f.write_str(
                 "account-wide cancel-on-disconnect requires explicit authority for this account",
             ),
+            ExecSessionError::AccountBinding => {
+                f.write_str("venue account binding does not match this session account")
+            }
             ExecSessionError::ResyncNeverFits => f.write_str(
                 "the frames the resync asks for weigh more together than the buckets ever admit",
             ),
@@ -1697,6 +1703,13 @@ struct Parts {
 /// none ([`ExecSession::new`] and [`ExecSession::in_process`] say which).
 fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionError> {
     let (venue, cfg) = (config.venue, &config.cfg);
+    if venue
+        .exec_account_key(cfg)
+        .map_err(SessionError::Config)?
+        .is_some_and(|bound| bound != config.acct)
+    {
+        return Err(ExecSessionError::AccountBinding);
+    }
     let caps = venue.caps(cfg).map_err(SessionError::Config)?;
     let Some(exec) = &caps.exec else {
         return Err(ExecSessionError::NoOrderEntry);

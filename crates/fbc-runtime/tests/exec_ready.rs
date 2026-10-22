@@ -24,6 +24,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,6 +71,7 @@ const HEAVY_ARM: &str = "ready.heavy_arm";
 const HTTP_RESYNC: &str = "ready.http_resync";
 /// The URL the HTTP resync reads; by default one never reached.
 const HTTP_RESYNC_URL: &str = "ready.http_resync_url";
+const BOUND_ACCOUNT: &str = "ready.bound_account";
 
 const ACCT: AccountKey = AccountKey::new(4);
 
@@ -90,6 +92,7 @@ type Calls = Arc<Mutex<Vec<Call>>>;
 #[derive(Default)]
 struct ReadyToy {
     calls: Calls,
+    plans: AtomicUsize,
 }
 
 impl ReadyToy {
@@ -126,6 +129,19 @@ impl VenueFactory for ReadyToy {
 
     fn config_schema(&self) -> &'static [FieldSpec] {
         &[]
+    }
+
+    fn exec_account_key(&self, cfg: &VenueConfig) -> Result<Option<AccountKey>, ConfigError> {
+        cfg.get(BOUND_ACCOUNT)
+            .map(|raw| {
+                raw.parse::<u16>()
+                    .map(AccountKey::new)
+                    .map_err(|_| ConfigError::Invalid {
+                        key: BOUND_ACCOUNT,
+                        reason: "expected AccountKey",
+                    })
+            })
+            .transpose()
     }
 
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
@@ -176,6 +192,7 @@ impl VenueFactory for ReadyToy {
     }
 
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        self.plans.fetch_add(1, Ordering::Relaxed);
         Ok(vec![ExecEndpoint {
             stream: exec_toy::EXEC_STREAM,
             url: WireUrl::plain(cfg.get(URL).unwrap()),
@@ -1412,6 +1429,36 @@ fn account_wide_protection_requires_explicit_authority_for_the_same_account() {
     let (session, _) = ExecSession::new(config, |_: Envelope<ExecEvent>| {}).unwrap();
     assert!(!session.orders().may_place());
     assert!(venue.calls().is_empty(), "construction sent no auth or arm");
+}
+
+#[test]
+fn venue_account_binding_refuses_mismatch_before_endpoint_planning() {
+    let venue = ReadyToy::leak();
+    let (mut config, _) = setup(
+        venue,
+        "ws://127.0.0.1:1/exec",
+        &[(COD, "account"), (BOUND_ACCOUNT, "9")],
+    );
+    config.account_wide_cod_authority = Some(AccountWideCodAuthority::new(ACCT));
+    assert_eq!(
+        ExecSession::new(config, |_: Envelope<ExecEvent>| {}).err(),
+        Some(ExecSessionError::AccountBinding)
+    );
+    assert_eq!(
+        ExecSessionError::AccountBinding.to_string(),
+        "venue account binding does not match this session account"
+    );
+    assert_eq!(venue.plans.load(Ordering::Relaxed), 0);
+
+    let (mut config, _) = setup(
+        venue,
+        "ws://127.0.0.1:1/exec",
+        &[(COD, "account"), (BOUND_ACCOUNT, "4")],
+    );
+    config.account_wide_cod_authority = Some(AccountWideCodAuthority::new(ACCT));
+    let (session, _) = ExecSession::new(config, |_: Envelope<ExecEvent>| {}).unwrap();
+    assert!(!session.orders().may_place());
+    assert_eq!(venue.plans.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test(start_paused = true)]
