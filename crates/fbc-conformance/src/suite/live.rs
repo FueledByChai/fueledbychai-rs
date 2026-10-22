@@ -24,18 +24,19 @@ use std::time::Duration;
 use std::time::Instant;
 
 use fbc_core::{
-    AccountKey, AccountLease, ClientOrderId, ConnKey, Envelope, ExecEvent, ItemRef, LimitScope,
-    Lots, MarketLease, MonoNs, NewOrder, NonceBlock, NonceSource, OpKind, OrderCaps, OrderKind,
-    OrderKindTag, RateLimit, RpcId, Side, SignedLots, SnapshotSource, SubmitHandle, SubmitOutcome,
-    Ticks, VenueCaps, VenueFactory, VenueOrderId, WallNs, encode_cid,
+    AccountKey, AccountLease, CancelOnDisconnect, ClientOrderId, ConnKey, Envelope, ExecEvent,
+    ItemRef, LimitScope, Lots, MarketLease, MonoNs, NewOrder, NonceBlock, NonceSource, OpKind,
+    OrderCaps, OrderKind, OrderKindTag, RateLimit, RpcId, Side, SignedLots, SnapshotSource,
+    SubmitHandle, SubmitOutcome, Ticks, VenueCaps, VenueFactory, VenueOrderId, WallNs, encode_cid,
 };
 use fbc_oms::{
     Authorization, LadderConfig, LeaseKeys, Leases, MarketCapsConfig, OrderKey, OrderOp,
     PreTradeCaps, Registry, ResyncSnapshot,
 };
 use fbc_runtime::{
-    BucketKey, Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, IngestClock,
-    ProxyConfig, RateLimiter, ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
+    AccountWideCodAuthority, BucketKey, Connector, ExecHandler, ExecOrders, ExecSession,
+    ExecSessionConfig, IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds,
+    SafetyReserve, WriteStall,
 };
 use futures_util::FutureExt;
 
@@ -233,7 +234,9 @@ impl<'s> Live<'s> {
                 cfg,
                 creds,
                 acct: ACCT,
-                account_wide_cod_authority: None,
+                account_wide_cod_authority: (self.order.cancel_on_disconnect
+                    == CancelOnDisconnect::AccountWide)
+                    .then(|| AccountWideCodAuthority::new(ACCT)),
                 rpc_ids: RpcIds::default(),
                 ns: NAMESPACE,
                 specs: self.h.specs().clone(),

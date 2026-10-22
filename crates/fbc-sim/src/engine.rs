@@ -126,6 +126,8 @@ struct Settle {
     rpc: u64,
     idx: u16,
     phase: Phase,
+    /// Its request outcome belongs to the synthetic secondary connection.
+    other: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -569,7 +571,9 @@ impl SimEngine {
             } else if settle == Some(first) {
                 if let Some(((mono, _), s)) = self.settles.pop_first() {
                     let wall = s.wall;
+                    self.placing_other = s.other;
                     self.settle(s, At { mono, wall });
+                    self.placing_other = false;
                 }
             } else if let Some(due) = self.dead_man {
                 self.lapse(due);
@@ -646,7 +650,9 @@ impl SimEngine {
                 // settled as withdrawn, so the codec awaits it no longer (Codex r4309341215).
                 let Some(held) = self.held.remove(&n) else {
                     let (rpc, idx) = (s.rpc, s.idx);
-                    self.answer(at, Reply::Withdrawn { rpc, idx });
+                    if !self.placing_other {
+                        self.answer(at, Reply::Withdrawn { rpc, idx });
+                    }
                     return;
                 };
                 let (state, px) = (SimState::Rejected(refusal), held.px);
@@ -665,7 +671,13 @@ impl SimEngine {
                 }
             }
         };
-        self.answer(at, reply);
+        if self.placing_other {
+            if let Reply::RiskReject { order, .. } = reply {
+                self.answer(at, Reply::Order(order));
+            }
+        } else {
+            self.answer(at, reply);
+        }
     }
 
     /// The simulated stream opens at `now`, a stamp the host read: what was due by then acts
@@ -948,7 +960,9 @@ impl SimEngine {
             },
             ItemResult::Rejected(refusal) => Reply::Rejected { rpc, refusal },
         };
-        self.answer(at, reply);
+        if !self.placing_other {
+            self.answer(at, reply);
+        }
         for event in item.events {
             self.answer(at, event);
         }
@@ -973,13 +987,15 @@ impl SimEngine {
     fn answer_items(&mut self, rpc: u64, items: Vec<Item>, at: At) {
         let (results, events): (Vec<_>, Vec<_>) =
             items.into_iter().map(|i| (i.result, i.events)).unzip();
-        self.answer(
-            at,
-            Reply::Items {
-                rpc,
-                items: results,
-            },
-        );
+        if !self.placing_other {
+            self.answer(
+                at,
+                Reply::Items {
+                    rpc,
+                    items: results,
+                },
+            );
+        }
         for event in events.into_iter().flatten() {
             self.answer(at, event);
         }
@@ -1122,6 +1138,7 @@ impl SimEngine {
             rpc: item.0,
             idx: item.1,
             phase,
+            other: self.placing_other,
         };
         self.settles.insert((when.mono, self.settled), settle);
         self.settled += 1;

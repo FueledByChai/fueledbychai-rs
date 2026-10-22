@@ -2527,19 +2527,11 @@ fn account_wide_arm_cancels_a_later_order_from_another_connection_and_rearms() {
         v.send_other(limit(other, Side::Buy, 199, 1), 2, T0 + 10 * MS);
         v.tick(T0 + 15 * MS);
         let got = v.events();
-        let ExecEvent::Outcome {
-            item:
-                Some(ItemRef {
-                    vid: Some(other_vid),
-                    ..
-                }),
-            outcome: SubmitOutcome::Accepted { .. },
-            ..
-        } = &got[0].1
-        else {
+        let [(_, ExecEvent::Order(open))] = got.as_slice() else {
             panic!("{got:?}")
         };
-        let other_vid = other_vid.clone();
+        let other_vid = open.vid.clone().unwrap();
+        assert_eq!(open.state, VenueOrderState::Open);
         v.close(T0 + 20 * MS);
         let ended = venue_canceled(&v.events());
         assert_eq!(ended.len(), usize::from(account_wide_scope), "{ended:?}");
@@ -2567,6 +2559,69 @@ fn account_wide_arm_cancels_a_later_order_from_another_connection_and_rearms() {
             "{ended:?}"
         );
     }
+}
+
+#[test]
+fn a_secondary_connection_never_answers_the_primary_connection_rpc() {
+    let mut v = account_wide();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let secondary = cid();
+    let primary = cid();
+    // The two connections can independently use the same RPC number.
+    v.send_other(limit(secondary, Side::Buy, 199, 1), 7, T0);
+    v.send(limit(primary, Side::Buy, 199, 1), 7, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.events();
+    let outcomes: Vec<_> = got
+        .iter()
+        .filter_map(|(_, event)| match event {
+            ExecEvent::Outcome { rpc, item, .. } => Some((rpc, item)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes.len(), 1, "{got:?}");
+    assert_eq!(*outcomes[0].0, RpcId(7));
+    assert_eq!(
+        outcomes[0].1.as_ref().and_then(|item| item.cid),
+        Some(primary)
+    );
+    assert_eq!(
+        got.iter()
+            .filter(|(_, event)| matches!(event, ExecEvent::Order(_)))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn secondary_connection_two_phase_outcomes_stay_on_that_connection() {
+    let mut v = two_phase();
+    v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+    let accepted = cid();
+    let rejected = cid();
+    v.engine
+        .risk_reject(rejected, Duration::from_millis(20), RiskRefusal::Margin)
+        .unwrap();
+    v.send_other(limit(accepted, Side::Buy, 199, 1), 7, T0);
+    v.send_other(limit(rejected, Side::Buy, 199, 1), 8, T0);
+    v.tick(T0 + 5 * MS);
+    let got = v.events();
+    assert!(
+        got.iter()
+            .all(|(_, event)| !matches!(event, ExecEvent::Outcome { .. })),
+        "{got:?}"
+    );
+    v.tick(T0 + 25 * MS);
+    let got = v.events();
+    assert!(
+        matches!(got.as_slice(), [(_, ExecEvent::Order(_))]),
+        "{got:?}"
+    );
+    v.tick(T0 + 5 * MS + WINDOW);
+    assert!(
+        v.events().is_empty(),
+        "secondary final reply leaked to the primary stream"
+    );
 }
 
 #[test]
