@@ -1,7 +1,9 @@
 //! Credential handling for QFEX trade WebSocket authentication. Both the
 //! account-identifying public key and the short-lived signature are redacted.
 
-use fbc_core::{ConfigError, EncodeCtx, Secret, SignError, WireSlice, WireUrl};
+use core::fmt;
+
+use fbc_core::{ConfigError, EncodeCtx, Secret, SignError, VenueConfig, WireSlice, WireUrl};
 
 use crate::sign;
 
@@ -19,6 +21,49 @@ pub fn valid_public_key(key: &str) -> bool {
 pub const PUBLIC_KEY: &str = "qfex.public_key";
 /// The trade WebSocket origin. `wss://` is required outside a loopback test.
 pub const TRADE_URL: &str = "qfex.trade_url";
+/// Explicit provider account for private trading: `primary` or a subaccount UUID.
+/// Requiring a value prevents a missing subaccount setting from trading the primary account.
+pub const ACCOUNT_ID: &str = "qfex.account_id";
+
+/// The provider account selected for one authenticated trade connection.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum AccountSelection<'a> {
+    Primary,
+    Subaccount(&'a str),
+}
+
+impl fmt::Debug for AccountSelection<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Primary => f.write_str("Primary"),
+            Self::Subaccount(_) => f.write_str("Subaccount(<redacted>)"),
+        }
+    }
+}
+
+/// Parse the account-scoped selection; never default to the primary account.
+pub fn account_selection(cfg: &VenueConfig) -> Result<AccountSelection<'_>, ConfigError> {
+    match cfg.get(ACCOUNT_ID) {
+        Some("primary") => Ok(AccountSelection::Primary),
+        Some(id) if valid_account_id(id) => Ok(AccountSelection::Subaccount(id)),
+        Some(_) => Err(ConfigError::Invalid {
+            key: ACCOUNT_ID,
+            reason: "expected primary or a canonical subaccount UUID",
+        }),
+        None => Err(ConfigError::Missing(ACCOUNT_ID)),
+    }
+}
+
+fn valid_account_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, byte)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
 
 /// Check the URL's configured public key against the credential the codec will
 /// authenticate with, before any private connection or authenticated write.
@@ -71,6 +116,7 @@ pub fn frame(
     public_key: &Secret,
     signing_key: &Secret,
     ctx: &EncodeCtx,
+    account: AccountSelection<'_>,
 ) -> Result<WireSlice, SignError> {
     let key = public_key.expose();
     if !valid_public_key(key) {
@@ -95,16 +141,36 @@ pub fn frame(
     let sig_start = body.len();
     body.push_str(signed.signature());
     let sig_end = body.len();
-    body.push_str("\"}}}");
-    let spans = [key_start..key_end, sig_start..sig_end]
-        .into_iter()
-        .map(|span| {
-            Ok(
-                u32::try_from(span.start).map_err(|_| SignError::Unsignable("auth frame"))?
-                    ..u32::try_from(span.end).map_err(|_| SignError::Unsignable("auth frame"))?,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    body.push_str("\"}");
+    let account_span = match account {
+        AccountSelection::Primary => None,
+        AccountSelection::Subaccount(id) => {
+            if !valid_account_id(id) {
+                return Err(SignError::Unsignable("QFEX subaccount id"));
+            }
+            body.push_str(",\"account_id\":\"");
+            let start = body.len();
+            body.push_str(id);
+            let end = body.len();
+            body.push('"');
+            Some(start..end)
+        }
+    };
+    body.push_str("}}");
+    let spans = [
+        Some(key_start..key_end),
+        Some(sig_start..sig_end),
+        account_span,
+    ]
+    .into_iter()
+    .flatten()
+    .map(|span| {
+        Ok(
+            u32::try_from(span.start).map_err(|_| SignError::Unsignable("auth frame"))?
+                ..u32::try_from(span.end).map_err(|_| SignError::Unsignable("auth frame"))?,
+        )
+    })
+    .collect::<Result<Vec<_>, _>>()?;
     WireSlice::redacted(body.into_bytes(), spans)
         .map_err(|_| SignError::Backend("auth frame redaction"))
 }

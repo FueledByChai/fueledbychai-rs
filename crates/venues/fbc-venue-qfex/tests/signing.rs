@@ -3,7 +3,7 @@ mod auth;
 #[path = "../src/sign.rs"]
 mod sign;
 
-use fbc_core::{EncodeCtx, MonoNs, NonceBlock, NonceSource, Secret, WallNs};
+use fbc_core::{EncodeCtx, MonoNs, NonceBlock, NonceSource, Secret, VenueConfig, WallNs};
 use serde_json::Value;
 
 #[test]
@@ -43,7 +43,7 @@ fn auth_frame_is_exact_and_redacts_both_account_key_and_signature() {
         mono: MonoNs(0),
         nonces: NonceBlock::new(vec![0xc0fe, 0xbabe]),
     };
-    let frame = auth::frame(&public, &secret, &ctx).unwrap();
+    let frame = auth::frame(&public, &secret, &ctx, auth::AccountSelection::Primary).unwrap();
     let parsed: Value = serde_json::from_slice(frame.bytes()).unwrap();
     assert_eq!(parsed["type"], "auth");
     assert_eq!(parsed["params"]["hmac"]["public_key"], public.expose());
@@ -55,6 +55,7 @@ fn auth_frame_is_exact_and_redacts_both_account_key_and_signature() {
     let vector: Value =
         serde_json::from_str(include_str!("../../../../fixtures/qfex/signing/hmac.json")).unwrap();
     assert_eq!(parsed["params"]["hmac"]["signature"], vector["signature"]);
+    assert!(parsed["params"].get("account_id").is_none());
     assert_eq!(frame.redactions().len(), 2);
     let debug = format!("{frame:?}");
     assert!(!debug.contains(public.expose()));
@@ -126,12 +127,92 @@ fn auth_frame_requires_nonce_and_safe_public_key() {
         mono: MonoNs(0),
         nonces: NonceBlock::EMPTY,
     };
-    assert!(auth::frame(&public, &secret, &no_nonce).is_err());
+    assert!(auth::frame(&public, &secret, &no_nonce, auth::AccountSelection::Primary).is_err());
     let one_nonce = EncodeCtx {
         nonces: NonceBlock::new(vec![7]),
         ..no_nonce.clone()
     };
-    assert!(auth::frame(&public, &secret, &one_nonce).is_err());
+    assert!(
+        auth::frame(
+            &public,
+            &secret,
+            &one_nonce,
+            auth::AccountSelection::Primary
+        )
+        .is_err()
+    );
     let bad_key = Secret::new("bad/key".to_owned());
-    assert!(auth::frame(&bad_key, &secret, &no_nonce).is_err());
+    assert!(
+        auth::frame(
+            &bad_key,
+            &secret,
+            &no_nonce,
+            auth::AccountSelection::Primary
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn subaccount_is_explicit_in_auth_and_redacted() {
+    let account_id = "11111111-1111-1111-1111-111111111111";
+    let mut cfg = VenueConfig::new();
+    assert!(auth::account_selection(&cfg).is_err());
+    cfg.insert(auth::ACCOUNT_ID, "primary");
+    assert_eq!(
+        auth::account_selection(&cfg).unwrap(),
+        auth::AccountSelection::Primary
+    );
+    cfg.insert(auth::ACCOUNT_ID, account_id);
+    let account = auth::account_selection(&cfg).unwrap();
+    assert_eq!(account, auth::AccountSelection::Subaccount(account_id));
+    assert!(!format!("{account:?}").contains(account_id));
+
+    let public = Secret::new("qfex_pub_synthetic_1".to_owned());
+    let secret = Secret::new("synthetic-qfex-secret".to_owned());
+    let ctx = EncodeCtx {
+        wall: WallNs(1_760_545_414_000_000_000),
+        mono: MonoNs(0),
+        nonces: NonceBlock::new(vec![0xc0fe, 0xbabe]),
+    };
+    let frame = auth::frame(&public, &secret, &ctx, account).unwrap();
+    let parsed: Value = serde_json::from_slice(frame.bytes()).unwrap();
+    assert_eq!(parsed["params"]["account_id"], account_id);
+    assert!(parsed["params"]["hmac"].get("account_id").is_none());
+    assert_eq!(frame.redactions().len(), 3);
+    assert!(!format!("{frame:?}").contains(account_id));
+    assert!(frame.redactions().iter().any(|span| {
+        &frame.bytes()[span.start as usize..span.end as usize] == account_id.as_bytes()
+    }));
+}
+
+#[test]
+fn invalid_subaccount_never_falls_back_to_primary() {
+    let mut cfg = VenueConfig::new();
+    for bad in [
+        "",
+        "PRIMARY",
+        "not-a-uuid",
+        "11111111-1111-1111-1111-11111111111/",
+        "11111111-1111-1111-1111-11111111111\"",
+    ] {
+        cfg.insert(auth::ACCOUNT_ID, bad);
+        assert!(auth::account_selection(&cfg).is_err(), "{bad}");
+    }
+    let public = Secret::new("qfex_pub_synthetic_1".to_owned());
+    let secret = Secret::new("synthetic-qfex-secret".to_owned());
+    let ctx = EncodeCtx {
+        wall: WallNs(1_760_545_414_000_000_000),
+        mono: MonoNs(0),
+        nonces: NonceBlock::new(vec![1, 2]),
+    };
+    assert!(
+        auth::frame(
+            &public,
+            &secret,
+            &ctx,
+            auth::AccountSelection::Subaccount("not-a-uuid"),
+        )
+        .is_err()
+    );
 }
