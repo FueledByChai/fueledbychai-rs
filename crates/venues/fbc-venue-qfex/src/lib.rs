@@ -80,6 +80,12 @@ const SCHEMA: &[FieldSpec] = &[
         unit: FieldUnit::Dimensionless,
         doc: "caller-attested decimal AccountKey of the selected provider account",
     },
+    FieldSpec {
+        key: exec::RPC_TIMEOUT_KEY,
+        scope: ConfigScope::Account,
+        unit: FieldUnit::Duration,
+        doc: "positive private RPC timeout as <n>ms or <n>s",
+    },
 ];
 
 fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {

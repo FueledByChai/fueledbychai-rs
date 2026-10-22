@@ -17,6 +17,7 @@ fn config(account: &str, key: &str) -> VenueConfig {
     cfg.insert("qfex.public_key", PUBLIC);
     cfg.insert("qfex.account_id", account);
     cfg.insert("qfex.account_key", key);
+    cfg.insert("qfex.rpc_timeout", "2500ms");
     cfg
 }
 

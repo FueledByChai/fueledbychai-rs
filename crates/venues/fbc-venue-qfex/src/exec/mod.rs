@@ -10,11 +10,40 @@ use fbc_core::{
     VenueError, VenueMeta, WireSlice,
 };
 use serde_json::Value;
+use std::time::Duration;
 
 use crate::auth::{self, AccountSelection};
 use crate::valid_host_port;
 
 const TRADE: StreamId = StreamId(0);
+const RPC_TIMEOUT: &str = "qfex.rpc_timeout";
+
+mod order;
+
+pub const RPC_TIMEOUT_KEY: &str = RPC_TIMEOUT;
+
+fn rpc_timeout(cfg: &VenueConfig) -> Result<Duration, ConfigError> {
+    let raw = cfg
+        .get(RPC_TIMEOUT)
+        .ok_or(ConfigError::Missing(RPC_TIMEOUT))?;
+    let (number, unit) = if let Some(n) = raw.strip_suffix("ms") {
+        (n, 1u64)
+    } else if let Some(n) = raw.strip_suffix('s') {
+        (n, 1000u64)
+    } else {
+        ("", 0)
+    };
+    let ms = number
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .and_then(|n| n.checked_mul(unit))
+        .ok_or(ConfigError::Invalid {
+            key: RPC_TIMEOUT,
+            reason: "expected positive whole <n>ms or <n>s",
+        })?;
+    Ok(Duration::from_millis(ms))
+}
 
 fn trade_origin(cfg: &VenueConfig) -> Result<&str, ConfigError> {
     let raw = cfg
@@ -46,6 +75,7 @@ pub fn plan(cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
 pub fn codec(cfg: &VenueConfig, mut creds: Secrets) -> Result<QfexExec, VenueError> {
     auth::account_key(cfg)?;
     trade_origin(cfg)?;
+    let rpc_timeout = rpc_timeout(cfg)?;
     let configured = cfg
         .get(auth::PUBLIC_KEY)
         .ok_or(ConfigError::Missing(auth::PUBLIC_KEY))?;
@@ -64,6 +94,7 @@ pub fn codec(cfg: &VenueConfig, mut creds: Secrets) -> Result<QfexExec, VenueErr
         public,
         secret,
         subaccount,
+        rpc_timeout,
         waiting_auth: false,
         authenticated: false,
     })
@@ -73,6 +104,7 @@ pub struct QfexExec {
     public: Secret,
     secret: Secret,
     subaccount: Option<String>,
+    rpc_timeout: Duration,
     waiting_auth: bool,
     authenticated: bool,
 }
@@ -135,14 +167,28 @@ impl ExecCodec for QfexExec {
 
     fn encode(
         &mut self,
-        _cmd: &VenueCommand,
-        _rpc: RpcId,
-        _specs: &SpecTable,
+        cmd: &VenueCommand,
+        rpc: RpcId,
+        specs: &SpecTable,
         _ctx: &EncodeCtx,
         _t: &mut PathStamps<'_>,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
-        Err(NotSentReason::Unsupported)
+        if !self.authenticated {
+            return Err(NotSentReason::Disconnected);
+        }
+        let (frame, charge) = order::frame(cmd, specs)?;
+        fx.push(Effect::Send {
+            stream: TRADE,
+            frame: WireSlice::plain(frame),
+            rpc: Some(fbc_core::RpcCall {
+                id: rpc,
+                timeout: self.rpc_timeout,
+            }),
+            class: cmd.traffic_class(),
+            charge,
+        });
+        Ok(EncodeReceipt::new())
     }
 
     fn on_frame(

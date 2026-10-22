@@ -105,7 +105,10 @@ fn matches_request(
                 && params.get("client_order_id").and_then(Value::as_str) == Some(client_id)
         }
         Operation::Modify { venue_id } => {
-            (kind == Some("modify_order") || status == Some("MODIFIED"))
+            // A successful modify replaces the old UUID with a new order_id, and its
+            // client_order_id may be empty. Only an exact echo names the old target.
+            evidence == Evidence::CommandEcho
+                && kind == Some("modify_order")
                 && params.get("order_id").and_then(Value::as_str) == Some(venue_id)
         }
         Operation::Cancel { venue_id } => {

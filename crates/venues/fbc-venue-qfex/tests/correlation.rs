@@ -105,4 +105,16 @@ fn command_echo_requires_type_symbol_and_target() {
     let text_echo = br#"{"err":{"error_code":"InvalidOrder","incoming_message":"modify_order"}}"#;
     assert_eq!(correlate(text_echo, &pending).unwrap(), Correlation::None);
     assert!(correlate(b"not json", &pending).is_err());
+    let new_order_id = include_bytes!("../../../../fixtures/qfex/private/modified_new_id.json");
+    assert_eq!(
+        correlate(new_order_id, &pending).unwrap(),
+        Correlation::None,
+        "MODIFIED reports a replacement UUID, never the pending old target"
+    );
+    let old_order_id = br#"{"order_response":{"symbol":"AAPL-USD","order_id":"11111111-1111-4111-8111-111111111111","status":"MODIFIED"}}"#;
+    assert_eq!(
+        correlate(old_order_id, &pending).unwrap(),
+        Correlation::None,
+        "even an old-id status is unsolicited order truth, not a command echo"
+    );
 }
