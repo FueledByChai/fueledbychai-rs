@@ -609,6 +609,11 @@ static NO_SNAPSHOT: Variant = Variant {
     caps: |c| c.exec.as_mut().unwrap().order.snapshot_source = SnapshotSource::None,
     twist: Twist::None,
 };
+/// The toy's connection arm has an account-wide effect, authorized for the suite's ACCT.
+static ACCOUNT_WIDE_COD: Variant = Variant {
+    caps: |c| c.exec.as_mut().unwrap().order.cancel_on_disconnect = CancelOnDisconnect::AccountWide,
+    twist: Twist::None,
+};
 
 fn amend(caps: &mut VenueCaps) -> &mut fbc_core::AmendCaps {
     let order = &mut caps.exec.as_mut().unwrap().order;
@@ -2011,6 +2016,14 @@ fn every_order_entry_check_starts_and_passes_whatever_snapshot_source_the_venue_
             let probed = passed(name, check(&variant.subject(assumed)));
             assert_eq!(probed, trusted, "{name}");
         }
+    }
+}
+
+#[test]
+fn account_wide_cod_runs_session_backed_order_entry_checks() {
+    for check in [suite::amend_ack as Check, suite::resync_after_reconnect] {
+        let result = check(&ACCOUNT_WIDE_COD.subject(assumed));
+        assert!(matches!(result, Ok(Verdict::Passed { .. })), "{result:?}");
     }
 }
 
