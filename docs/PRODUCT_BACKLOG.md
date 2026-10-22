@@ -291,12 +291,44 @@ Paradex and Binance before any order path exists.
   each market's status as it changes, mapped as discovery maps it and `Halted` while a read
   fails, for the consumer to pass the planner. Between reads it also reports a market `Halted`,
   without waiting for the next read, from the start of each maintenance window the last read
-  published (`maintenanceWindow`, SDK `types.py` `MaintenanceWindow`) and from the end of an FX
-  contract's session in its calendar, never `Trading` on a schedule alone, so only a change no
-  schedule announces reaches the consumer up to one interval late. That ticket lands before any
-  Hibachi order path quotes. Hand-built fixtures pin a contract in each of the four non-live
-  states, the exchange in each maintenance state, and a contract `status` absent, null and
-  undocumented (0003).
+  published (`maintenanceWindow`, SDK `types.py` `MaintenanceWindow`), from the end of an FX
+  contract's session in its calendar, and from a contract's advertised close, never `Trading` on
+  a schedule alone, so only a change no schedule announces reaches the consumer up to one
+  interval late. A window's `begin` and `end` are each read as a decimal count of Unix seconds
+  in a number or a string: the spec types both as strings, while the SDK's `MaintenanceWindow`
+  and its test data hold numbers and its README says seconds since the Unix epoch. Hibachi's
+  trading docs give each temp market "a predefined expiration time", when its open positions
+  settle at the final mark price and "a brief settlement phase occurs before the market is
+  removed", and its Market API spec gives every contract an optional `marketCloseTimestamp` and
+  `marketOpenTimestamp`, each a string or null with no description and no unit. No source shows
+  one that is not null: the SDK's `types.py` `FutureContract` keeps both as optional strings,
+  its exchange-info test data has both null on every contract, and Java's `HibachiRestApi.java`
+  `parseContract` stores them and never reads them. Each is read as Unix seconds in a decimal
+  string, the form that test data gives the sibling `marketCreationTimestamp`. One absent or
+  null advertises nothing. A close or an open that is not a decimal count of seconds, or that
+  read as seconds lies after 2100-01-01 UTC, as a count of milliseconds would (its halt would
+  then never come), refuses the answer as malformed naming the field, and the re-read refuses a
+  window bound the same way. Discovery, whose parser reads no clock (0035), closes the
+  contract's session calendar from its advertised close on and before its advertised open. The
+  re-read halts a market at the earlier of its calendar's close and the close its last read
+  advertised, and reports a subscribed market a read no longer lists `Halted`. A codec learns
+  the wall time only from `MdCodec::on_timer` (`on_open` and `on_http` carry none; 0002), and a
+  read shows the venue at some instant between its send and its answer, so the re-read sends
+  each read from a timer and judges each answer at the wall time of a timer it asks for once the
+  answer arrives. A market is `Trading` after a read only if it was throughout that span: the
+  read lists it `LIVE` and the exchange `NORMAL`, advertises no open after the read's send and
+  no close at or before the answer's judged time, and no halt of that market was reported after
+  the read's send, on a schedule or by another read. A read sent before the market's open or
+  judged at or after its close is `Halted` whatever its `status` says (the docs do not say which
+  status a settling temp shows), and a read in flight when a close, a window's begin or a
+  session's end halts the market never lifts that halt; only a read sent after it can. That
+  ticket lands before any Hibachi order path quotes. Hand-built fixtures pin a contract in each
+  of the four non-live states, the exchange in each maintenance state, a contract `status`
+  absent, null and undocumented, a window bound as a number, as a string and in milliseconds, a
+  `LIVE` contract whose close falls between two reads, a close in milliseconds and one that is
+  not a number, a read sent before a close, a window's begin or a session's end and answered
+  after its halt, still `Halted`, a read answered after a close it first advertises, `Halted`,
+  and a market a later read leaves out (0003).
 - Funding's interval comes from the venue's own record, against its docs. Hibachi's trading docs
   say funding is paid every eight hours (00:00, 08:00 and 16:00 UTC) and give the rate's formula
   over that period, but the settled history it publishes on the market-data host
@@ -480,7 +512,12 @@ entry starts from a proven signer that never needed a connection to be tested.
   big-endian as nonce u64, contract id u32, quantity u64, side u32 (ASK 0, BID 1), price u64
   (omitted for a market order) and max fees u64: 40 bytes for a limit order, 32 for a market
   order (Java `HibachiPayloadPacker.java`; SDK `api.py`; 0009). Max fees is an input the caller
-  passes with each place and modify; the signer holds no value and no default for it.
+  passes with each place and modify; the signer holds no value and no default for it. It scales
+  whatever decimal the request's `maxFeesPercent` carries, whose unit the sources disagree on:
+  the signing docs' field list says basis points while their worked example passes a fraction
+  (0.0005, "5 basis points"), the SDK's docstrings say a percentage while its examples pass
+  0.0005 and 0.00045, and Java's `HibachiConfiguration.java` reads it as a percent (0.05 for
+  5 bps).
 - A cancel signs the 8-byte order id, or the order's placement nonce as 8 bytes (SDK `api.py`
   `__cancel_order_payload`; Java cancels by order id or nonce); a cancel by client id (its ASCII
   bytes, which only the API docs describe) is declared only once a golden vector or the owner's
@@ -495,9 +532,16 @@ entry starts from a proven signer that never needed a connection to be tested.
   ECDSA only, with no HMAC path (Java `EcdsaHibachiSigner.java`; the coordinator's default of
   2026-10-19).
 - Golden vectors from a Java oracle on a SYNTHETIC key under `fixtures/hibachi/signing` match:
-  the packed bytes of every command, the docs' worked example buffer byte for byte, and each
-  signature equal to the oracle's or, if the Java signer's nonce is shown not to be RFC 6979,
-  verifying and recovering to the synthetic public key (design §6 `signing_golden`).
+  the packed bytes of every command, the worked example buffer of Hibachi's signing docs byte
+  for byte, and each signature equal to the oracle's or, if the Java signer's nonce is shown not
+  to be RFC 6979, verifying and recovering to the synthetic public key (design §6
+  `signing_golden`). That example's fee arithmetic is wrong: the docs say rate fees scale by
+  10^8, but pack the example's `max_fees` 0.0005 as 5000 (`0x1388`), which is 0.0005 × 10^7.
+  The SDK (`api.py` `__create_or_update_order_payload`) and Java (`HibachiPayloadPacker.java`
+  `scaleMaxFeesPercent`, through which Java's broker signs its orders, and whose test packs 0.5
+  as `0x2faf080`) both scale by 10^8. So the worked buffer is reproduced from max fees 0.00005,
+  a second vector with the example's other inputs and max fees 0.0005 packs the fee as 50000
+  (`0xc350`), and the signer has no 10^7 path.
 - The decimal inputs are checked against the grid before packing: a price off `tickSize` is
   refused, never rounded (SDK `types.py` `check_tick_size`), and so is a quantity off
   `stepSize`, a stricter rule than the SDK's, which truncates the quantity silently (`api.py`). The
