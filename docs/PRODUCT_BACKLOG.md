@@ -281,10 +281,22 @@ Paradex and Binance before any order path exists.
   and QFEX discoveries refuse an undocumented status; neither `marketOpenTimestamp` nor the
   session calendar ever makes a contract trading. While the answer's exchange-level `status` is
   anything but `NORMAL` (the spec lists `SCHEDULED_MAINTENANCE` and `UNSCHEDULED_MAINTENANCE`),
-  every contract is `Halted`. `fbc-oms` refuses every place and amend on a halted market and
-  still sends its cancels (0111). Hand-built fixtures pin a contract in each of the four
-  non-live states, the exchange in each maintenance state, and a contract `status` absent, null
-  and undocumented (0003).
+  every contract is `Halted`. What reads that status is `fbc-oms`'s `ExecutionPlanner`, which
+  plans no place or amend on a market whose status, in the `PlanVenue` the consumer passes it,
+  is `Halted`, and still plans its cancels (0111); a command the consumer authorizes through
+  the registry directly is not checked against status. Discovery's status is a snapshot of one
+  answer, so a contract that goes `PAUSED` after it (an FX pair each weekend) or an exchange
+  that enters maintenance is not seen until a ticket under this story re-reads
+  `/market/exchange-info` on an interval from a required venue configuration key and reports
+  each market's status as it changes, mapped as discovery maps it and `Halted` while a read
+  fails, for the consumer to pass the planner. Between reads it also reports a market `Halted`,
+  without waiting for the next read, from the start of each maintenance window the last read
+  published (`maintenanceWindow`, SDK `types.py` `MaintenanceWindow`) and from the end of an FX
+  contract's session in its calendar, never `Trading` on a schedule alone, so only a change no
+  schedule announces reaches the consumer up to one interval late. That ticket lands before any
+  Hibachi order path quotes. Hand-built fixtures pin a contract in each of the four non-live
+  states, the exchange in each maintenance state, and a contract `status` absent, null and
+  undocumented (0003).
 - Funding's interval comes from the venue's own record, against its docs. Hibachi's trading docs
   say funding is paid every eight hours (00:00, 08:00 and 16:00 UTC) and give the rate's formula
   over that period, but the settled history it publishes on the market-data host
@@ -330,6 +342,33 @@ Paradex and Binance before any order path exists.
   size produces no Touch, since a `None` side reads as an empty one, and is counted, never given a
   synthesized size, a fixture pinning each case (Java `HibachiMarketSubscribeMessage.java`,
   `HibachiQuoteEngine.java`; SDK `api_ws_market.py`, `types.py`).
+- Each `orderbook` subscription names its `granularity`, the instrument's quote grid as its
+  contract lists it among `orderbookGranularities`, and its `depth`, from a required venue
+  configuration key with no default, refused outside 1 to 100, so the venue's undocumented
+  default never decides what the book means. Hibachi's WebSocket market docs make both optional,
+  take one set per subscription (a subscribe with another set replaces the earlier one) and refer
+  to REST `/market/data/orderbook`, whose depth the SDK bounds to 1 to 100 and whose granularity
+  to the contract's `orderbookGranularities` (`api.py` `get_orderbook`); Java subscribes with
+  neither. No source shows a subscription carrying them by example, so each frame's own
+  `granularity` and `depth`, which the docs' example frame carries, confirm it: a frame whose
+  `granularity` or `depth` differs from its subscription's, or lacks either, is counted and gaps
+  the book as a frame failing the bounds check below does, so the `depth` that check reads is
+  the subscription's. An instrument whose quote grid is not among its listed granularities gets
+  no `orderbook` subscription and is counted, never subscribed at the venue's default. The
+  levels are aggregated at that granularity (SDK `api.py` `get_orderbook`; Java
+  `HibachiRestApi.java` `resolveEffectiveTickSize`) while orders rest on the finer `tickSize`:
+  where the quote grid is coarser than the tick, a level's price is a bucket's label, not a
+  price an order rests at, its size is the bucket's sum, the touch can sit up to one granularity
+  from the venue's own, and which way a bucket rounds is undocumented. The crate docs state
+  this, and the `orderbook` channel's caps declare `max_depth` as the configured depth,
+  `windowed` and `QueueModelQuality::BracketOnly`; since no capability says that a book's levels
+  are buckets, a ticket under this story adds one, a mandatory field under a decision record
+  (0003), before a SimVenue stand-in or a quote reads Hibachi's book. A book is crossed when its
+  best bid is above its best ask. A locked book, best bid equal to best ask, is not, since two
+  buckets can share a label while no order crosses: it passes the bounds check below and is
+  counted apart. The owner's capture shows the bounds rule only at the parameters it was taken
+  with, so a frame failing it at the configured ones gaps the book, the safe direction, and is
+  counted.
 - An Update applies each side's window as Hibachi's WebSocket market docs specify: levels
   outside the min..max of the side's `startPrice` and `endPrice` are removed before its listed
   levels apply (Java `HibachiQuoteEngine.java` `pruneOutsideWindow` prunes to the same min..max,
@@ -404,15 +443,15 @@ Paradex and Binance before any order path exists.
   then asks for a fresh Snapshot on the same connection, leaving the other books there valid:
   after the retry interval of a required venue configuration key, with no default and zero
   refused (as `binance_usdm.depth_snapshot_retry`), it unsubscribes that instrument's
-  `orderbook` and subscribes it again with the same parameters, each frame charged as a
-  subscription of that instrument (0018), again at each interval while Snapshots come back
-  empty or failing the check and never for a subscription the consumer has removed; when a
-  resubscribe brings back no Snapshot within the interval, it asks for a reconnect paced by the
-  consumer's `ReconnectPacing` (0023), which gaps every book that connection fed. Decision 0022
-  rejected a Paradex codec writing its own subscribe frames, since the reconciler would no
-  longer know what the connection has, so a decision record states why this codec may, for
-  every gap it finds itself, before it does. A hand-built fixture pins the empty Snapshot, and a
-  test against a local stub on a paused clock shows the book not valid through the Updates
+  `orderbook` and subscribes it again with the same `granularity` and `depth`, each frame
+  charged as a subscription of that instrument (0018), again at each interval while Snapshots
+  come back empty or failing the check and never for a subscription the consumer has removed;
+  when a resubscribe brings back no Snapshot within the interval, it asks for a reconnect paced
+  by the consumer's `ReconnectPacing` (0023), which gaps every book that connection fed.
+  Decision 0022 rejected a Paradex codec writing its own subscribe frames, since the reconciler
+  would no longer know what the connection has, so a decision record states why this codec may,
+  for every gap it finds itself, before it does. A hand-built fixture pins the empty Snapshot,
+  and a test against a local stub on a paused clock shows the book not valid through the Updates
   after it while another instrument's book on the connection stays valid, the resubscribe at
   the interval, the same resubscribe after an Update whose bounds disagree with the book, the
   book equal to the populated Snapshot that answers each, and the reconnect when a resubscribe
@@ -500,9 +539,11 @@ capability table only, as BT-102 promises.
   with the conformance toy on two local servers (0115).
 - A production `NonceSource` issues monotonic wall-clock microseconds over an injected clock:
   strictly increasing when the clock stalls or steps back, never reissuing a nonce an earlier
-  journal holds, and refusing rather than issuing a nonce outside the window the caller passes
-  (Hibachi documents 15 s either side of server time); its nonces are journaled and replay
-  without the clock byte-identically (Java `HibachiBroker.java`; 0006, 0114).
+  journal holds or one an earlier process sent while its journal record was still unwritten
+  (the case 0114's item 2 leaves out), and refusing rather than issuing a nonce outside the
+  window the caller passes (Hibachi documents 15 s either side of server time); its nonces are
+  journaled and replay without the clock byte-identically (Java `HibachiBroker.java`; 0006,
+  0114).
 - Nothing in this story places a Hibachi order: Hibachi's capabilities keep `exec: None`, and
   this story leaves the session's cancel-on-disconnect gate as 0058 and 0121 set it.
 
@@ -521,13 +562,23 @@ Depends on BT-601, BT-602 and BT-603.
 - Before any order-entry ticket other than the probe's starts, a merged decision record, based
   on the evidence of the owner-run cancel-on-disconnect probe, supersedes 0058's Hibachi
   sentence. It cites the probe's run record (date, scenarios, observed order states and times,
-  and which scenarios it marks inconclusive and why), rests on no inconclusive scenario and on
-  no cancel reason alone, since Hibachi has been seen to report a cancel it started itself as
-  `USER_CANCELED` (Java `HibachiConfiguration.java`), and declares what
+  and which scenarios it marks inconclusive and why). It rests on no inconclusive scenario, a
+  scenario being inconclusive unless reads of `/market/exchange-info` through its window showed
+  the exchange `NORMAL` and the market `LIVE`; on none the probe's two runs did not both find
+  conclusive and agreeing; and on no cancel reason alone, since Hibachi has been seen to report
+  a cancel it started itself as `USER_CANCELED` (Java `HibachiConfiguration.java`). It states
+  the cancel delay observed for each kind of drop the probe runs, a silent loss of the link
+  included (one that sends Hibachi nothing, so only Hibachi's own idle close of the connection
+  can notice it: Java `HibachiTradeWebSocketClient.java`); what a consumer must assume for a
+  silent loss, declaring no protection the probe did not show; and what the probe's silent loss
+  cannot show, since its REST reads still reach Hibachi meanwhile, so it shows the idle close
+  over a working path rather than a partition. It declares what
   `orders.enableCancelOnDisconnect` does (its scope, per connection as 0080 has it or
   account-wide as 0121 has it; whether it re-arms per connection; whether it covers orders
   already open) and so what cancel-on-disconnect Hibachi declares, or that 0058's refusal
-  stands. Until it merges, 0058's refusal stands for Hibachi order entry.
+  stands; and where the probe did not show an order cancelled after a silent loss, it states
+  whether 0058's refusal may still be lifted, and on what grounds, against 0058's "What would
+  show this was wrong". Until it merges, 0058's refusal stands for Hibachi order entry.
 
 ## Epic G: QFEX
 
