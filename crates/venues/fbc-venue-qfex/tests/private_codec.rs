@@ -214,6 +214,90 @@ fn primary_auth_omits_subaccount_and_private_events_stay_unsettled() {
 }
 
 #[test]
+fn documented_fill_and_partial_resync_frames_never_emit_unproven_truth() {
+    let cfg = config("primary", "4");
+    let caps = Qfex.caps(&cfg).unwrap();
+    for raw in [
+        include_str!("../../../../fixtures/qfex/private/fill_response.json"),
+        include_str!("../../../../fixtures/qfex/private/open_orders_page.json"),
+        include_str!("../../../../fixtures/qfex/private/user_trades_page.json"),
+        include_str!("../../../../fixtures/qfex/private/position_pulse.json"),
+    ] {
+        let mut codec = Qfex.exec_codec(&cfg, credentials(PUBLIC)).unwrap().unwrap();
+        let mut effects = Effects::new();
+        let mut sink = Sink::default();
+        codec.on_open(StreamId(0), &context(), &mut effects);
+        effects.take();
+        dispatch_market_data(&caps, |scope| {
+            codec.on_frame(
+                StreamId(0),
+                RawFrame::Text(r#"{"type":"auth","result":"success"}"#),
+                scope,
+                &SpecTable::new(),
+                &mut sink,
+                &mut effects,
+            )
+        })
+        .unwrap();
+        effects.take();
+        dispatch_market_data(&caps, |scope| {
+            codec.on_frame(
+                StreamId(0),
+                RawFrame::Text(raw),
+                scope,
+                &SpecTable::new(),
+                &mut sink,
+                &mut effects,
+            )
+        })
+        .unwrap();
+        assert_eq!(sink.0.len(), 1, "only auth may be emitted");
+        assert!(matches!(effects.as_slice(), [Effect::Reconnect { .. }]));
+    }
+}
+
+#[test]
+fn malformed_documented_fill_reconnects_with_generic_diagnostic() {
+    let cfg = config("primary", "4");
+    let caps = Qfex.caps(&cfg).unwrap();
+    let mut codec = Qfex.exec_codec(&cfg, credentials(PUBLIC)).unwrap().unwrap();
+    let mut effects = Effects::new();
+    let mut sink = Sink::default();
+    codec.on_open(StreamId(0), &context(), &mut effects);
+    effects.take();
+    dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            StreamId(0),
+            RawFrame::Text(r#"{"type":"auth","result":"success"}"#),
+            scope,
+            &SpecTable::new(),
+            &mut sink,
+            &mut effects,
+        )
+    })
+    .unwrap();
+    effects.take();
+    let malformed = r#"{"fill_response":{"trade_id":"secret","fee":3}}"#;
+    let result = dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            StreamId(0),
+            RawFrame::Text(malformed),
+            scope,
+            &SpecTable::new(),
+            &mut sink,
+            &mut effects,
+        )
+    });
+    assert_eq!(
+        result,
+        Err(DecodeError::Malformed("invalid QFEX private state"))
+    );
+    assert!(!format!("{result:?}").contains("secret"));
+    assert_eq!(sink.0.len(), 1);
+    assert!(matches!(effects.as_slice(), [Effect::Reconnect { .. }]));
+}
+
+#[test]
 fn rejected_or_missing_auth_never_emits_authenticated() {
     for reply in [
         r#"{"type":"auth","result":"failure","err":"bad signature"}"#,

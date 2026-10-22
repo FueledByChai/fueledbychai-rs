@@ -19,6 +19,7 @@ const TRADE: StreamId = StreamId(0);
 const RPC_TIMEOUT: &str = "qfex.rpc_timeout";
 
 mod order;
+mod private;
 
 pub const RPC_TIMEOUT_KEY: &str = RPC_TIMEOUT;
 
@@ -195,7 +196,7 @@ impl ExecCodec for QfexExec {
         &mut self,
         stream: StreamId,
         frame: RawFrame<'_>,
-        _scope: &DecodeScope<'_>,
+        scope: &DecodeScope<'_>,
         _specs: &SpecTable,
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
@@ -243,12 +244,16 @@ impl ExecCodec for QfexExec {
         if value.get("subscribed").and_then(Value::as_str).is_some() {
             return Ok(());
         }
+        // Inspect documented private shapes without treating a page or pulse as a complete
+        // resync, or a raw fee as a signed cost. Unknown shapes are equally untrusted.
+        let inspected = private::inspect(&value, scope);
         // No unsolicited order or fill is normalized until its identifiers, fee sign and
         // cumulative quantities have been established by private conformance fixtures.
         // A DecodeError alone only increments the runtime's error counter, so explicitly
         // end this authenticated epoch rather than leave it running on unknown private truth.
         self.authenticated = false;
         Self::reconnect(fx);
+        inspected.map_err(|_| DecodeError::Malformed("invalid QFEX private state"))?;
         Ok(())
     }
 

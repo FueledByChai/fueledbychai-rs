@@ -1,0 +1,14 @@
+{
+  "user_trades": [{
+    "trade_id": "92adf4db-1e48-40cf-9e2a-b0ecf079a16a",
+    "symbol": "AAPL-USD",
+    "price": 200.0,
+    "quantity": 1.0,
+    "aggressor_side": "BUY",
+    "order_id": "5b309929-206f-40ec-804d-cbe46e81afc1",
+    "client_order_id": "",
+    "fee": 0.002,
+    "timestamp": 1746908400
+  }],
+  "count": 1
+}
