@@ -238,15 +238,17 @@ account unless the owner obtains testnet access.
 
 BT-601 to BT-603 open no order path. Decision 0058's refusal stands for Hibachi order entry
 until a new record, based on the probe's evidence, supersedes its Hibachi sentence; BT-604
-begins with that record. The facts below come from the Java library
-(`commons/hibachi-common-api`, `implementations/*/hibachi-*`, `market-data-collector`), the
-public SDK (`hibachi-xyz/hibachi_sdk` at 14a76b9, `python/hibachi_xyz`) and Hibachi's API docs,
-cited by file, and from the owner's reads of two public Hibachi sources on 2026-10-22, the
-`orderbook` feed and the settled funding history, cited only for what they show: beyond the
-spacing of the funding settlements, which BT-601 states as the settlement interval, their
-measurements stay in his private notes (0009). Fixtures are hand-built from those shapes and
-SYNTHETIC: never a recorded production frame, a credential or an account id (0009). No test or
-agent sends anything to Hibachi.
+begins with that record. On 2026-10-22 the owner had BT-601 to BT-603 cut down as BT-604 was on
+2026-10-20: each story states what it delivers and how that is proven, and its detailed rules
+live in the tickets that implement it. Those tickets carry the facts the rules rest on, from the
+Java library (`commons/hibachi-common-api`, `implementations/*/hibachi-*`,
+`market-data-collector`), the public SDK (`hibachi-xyz/hibachi_sdk` at 14a76b9,
+`python/hibachi_xyz`) and Hibachi's API docs, cited by file, and from the owner's reads of two
+public Hibachi sources on 2026-10-22, the `orderbook` feed and the settled funding history,
+cited only for what they show: beyond the spacing of the funding settlements, which BT-601
+states as the settlement interval, their measurements stay in his private notes (0009). Fixtures
+are hand-built from those shapes and SYNTHETIC: never a recorded production frame, a credential
+or an account id (0009). No test or agent sends anything to Hibachi.
 
 ### BT-601 — Hibachi market data from the anonymous feed, and md_watch on ETH
 
@@ -258,243 +260,30 @@ Paradex and Binance before any order path exists.
 
 **Acceptance criteria:**
 
-- `fbc-venue-hibachi` discovers instruments from REST `/market/exchange-info`
-  (`futureContracts[]`): the contract `id` is the `native_id`, `tickSize` the price grid, and
-  the quote grid the finest `orderbookGranularities` entry at or above `tickSize`, which is
-  `tickSize` itself only when Hibachi lists that tick and is coarser otherwise, a fixture
-  pinning both cases (a contract with no such entry is refused, or quoted on `tickSize` as Java
-  does, as discovery states and a fixture pins); `stepSize`, `minOrderSize` and `minNotional`
-  fill `size_step`, `min_size` and `min_notional` from the contract's own values, never a
-  placeholder, with a fixture pinning each; `underlyingDecimals` and `settlementDecimals` fill
-  the instrument's signing parameters, and an FX contract carries a weekend session calendar,
-  both in the `signing` and `sessions` fields `InstrumentSpec` gains under BT-102 with no
-  `Default` (Java `HibachiRestApi.java`, `HibachiRestApiTickTest.java`; 0003).
-- Discovery maps each contract's `status` into `InstrumentSpec::status` conservatively.
-  Hibachi's Market API spec makes it a required `ContractStatus`, one of `LISTED`, `PRE_OPEN`,
-  `LIVE`, `PAUSED` and `CLOSED`, and describes none of them, so only `LIVE` is
-  `TradingStatus::Trading`, and `LISTED`, `PRE_OPEN`, `PAUSED` and `CLOSED` are each `Halted`,
-  never `PostOnly`, `ReduceOnly` or `Delisted` on a guess at a state the venue does not describe
-  (Hibachi's FX trading docs say a pair's weekend halt "transitions to PAUSED"; the SDK's
-  `types.py` keeps the field a plain string, and Java's `HibachiRestApi.java` reads it without
-  acting on it). A contract whose `status` is absent or null refuses the answer as missing, and
-  any other value, matched exactly, as malformed, never read as trading, as the Binance USD-M
-  and QFEX discoveries refuse an undocumented status; neither `marketOpenTimestamp` nor the
-  session calendar ever makes a contract trading. While the answer's exchange-level `status` is
-  anything but `NORMAL` (the spec lists `SCHEDULED_MAINTENANCE` and `UNSCHEDULED_MAINTENANCE`),
-  every contract is `Halted`. What reads that status is `fbc-oms`'s `ExecutionPlanner`, which
-  plans no place or amend on a market whose status, in the `PlanVenue` the consumer passes it,
-  is `Halted`, and still plans its cancels (0111); a command the consumer authorizes through
-  the registry directly is not checked against status. Discovery's status is a snapshot of one
-  answer, so a contract that goes `PAUSED` after it (an FX pair each weekend) or an exchange
-  that enters maintenance is not seen until a ticket under this story re-reads
-  `/market/exchange-info` on an interval from a required venue configuration key and reports
-  each market's status as it changes, mapped as discovery maps it and `Halted` while a read
-  fails, for the consumer to pass the planner. Between reads it also reports a market `Halted`,
-  without waiting for the next read, from the start of each maintenance window the last read
-  published (`maintenanceWindow`, SDK `types.py` `MaintenanceWindow`), from the end of an FX
-  contract's session in its calendar, and from a contract's advertised close, never `Trading` on
-  a schedule alone, so only a change no schedule announces reaches the consumer up to one
-  interval late. A window's `begin` and `end` are each read as a decimal count of Unix seconds
-  in a number or a string: the spec types both as strings, while the SDK's `MaintenanceWindow`
-  and its test data hold numbers and its README says seconds since the Unix epoch. Hibachi's
-  trading docs give each temp market "a predefined expiration time", when its open positions
-  settle at the final mark price and "a brief settlement phase occurs before the market is
-  removed", and its Market API spec gives every contract an optional `marketCloseTimestamp` and
-  `marketOpenTimestamp`, each a string or null with no description and no unit. No source shows
-  one that is not null: the SDK's `types.py` `FutureContract` keeps both as optional strings,
-  its exchange-info test data has both null on every contract, and Java's `HibachiRestApi.java`
-  `parseContract` stores them and never reads them. Each is read as Unix seconds in a decimal
-  string, the form that test data gives the sibling `marketCreationTimestamp`. One absent or
-  null advertises nothing. A close or an open that is not a decimal count of seconds, or that
-  read as seconds lies after 2100-01-01 UTC, as a count of milliseconds would (its halt would
-  then never come), refuses the answer as malformed naming the field, and the re-read refuses a
-  window bound the same way. Discovery, whose parser reads no clock (0035), closes the
-  contract's session calendar from its advertised close on and before its advertised open. The
-  re-read halts a market at the earlier of its calendar's close and the close its last read
-  advertised, and reports a subscribed market a read no longer lists `Halted`. A codec learns
-  the wall time only from `MdCodec::on_timer` (`on_open` and `on_http` carry none; 0002), and a
-  read shows the venue at some instant between its send and its answer, so the re-read sends
-  each read from a timer and judges each answer at the wall time of a timer it asks for once the
-  answer arrives. A market is `Trading` after a read only if it was throughout that span: the
-  read lists it `LIVE` and the exchange `NORMAL`, advertises no open after the read's send and
-  no close at or before the answer's judged time, and no halt of that market was reported after
-  the read's send, on a schedule or by another read. A read sent before the market's open or
-  judged at or after its close is `Halted` whatever its `status` says (the docs do not say which
-  status a settling temp shows), and a read in flight when a close, a window's begin or a
-  session's end halts the market never lifts that halt; only a read sent after it can. That
-  ticket lands before any Hibachi order path quotes. Hand-built fixtures pin a contract in each
-  of the four non-live states, the exchange in each maintenance state, a contract `status`
-  absent, null and undocumented, a window bound as a number, as a string and in milliseconds, a
-  `LIVE` contract whose close falls between two reads, a close in milliseconds and one that is
-  not a number, a read sent before a close, a window's begin or a session's end and answered
-  after its halt, still `Halted`, a read answered after a close it first advertises, `Halted`,
-  and a market a later read leaves out (0003).
-- Funding's interval comes from the venue's own record, against its docs. Hibachi's trading docs
-  say funding is paid every eight hours (00:00, 08:00 and 16:00 UTC) and give the rate's formula
-  over that period, but the settled history it publishes on the market-data host
-  (`GET /market/data/funding-rates`, not in its published Market API spec), read by the owner on
-  2026-10-22, lists consecutive settlements, each with a `fundingRate` and an `indexPrice`, each
-  on the UTC hour and its `fundingTimestamp` (epoch seconds) exactly 3600 s after the one
-  before, and the Java library derives an hourly interval from the same spacing
-  (`market-data-collector` `FundingSources.java`). The crate states the settlement interval as
-  one hour, cited to that history, records the docs' eight hours as contradicted by it, and pins
-  it with a hand-built fixture in that endpoint's shape, a test deriving the interval from
-  consecutive settlements. The history does not show what a rate is for: a rate for its hour, or
-  an eight-hour rate settled in hourly slices. The docs' limit of -10% to 10% names no interval,
-  and Java reads the rate both ways (`HibachiQuoteEngine.java` `onFundingRateUpdate` divides the
-  estimate by an interval that defaults to eight hours, while `FundingSources.java` annualizes
-  each settled rate as hourly). `MdEvent::Funding`'s rate is per interval and
-  `FundingSpec::Known` carries a cap per interval (`fbc-core` `event.rs`, `instrument.rs`), so
-  until the owner's evidence settles what the rate is for (a funding payment on an account he
-  holds a position on, set against the position, that hour's settled rate and its index price,
-  compared on his machine with only the conclusion recorded), discovery states each perpetual's
-  funding as `FundingSpec::Unknown`, and the codec pushes `funding_rate_estimation`'s rate
-  exactly as the frame carries it, with `interval: None`, so nothing scales it by an interval.
-  Once that evidence is recorded, discovery states `FundingSpec::Known` with the interval and
-  the cap per interval it shows.
-- Its capabilities declare `exec: None` and `Readiness::Record` with a source on every value:
-  JSON encoding, the order book `Continuity::Unsequenced` on a pulse, the funding stream with no
-  interval in its frames, and a timestamp precision no finer than the frames carry (Java
-  `HibachiQuoteEngine.java`; 0003, 0015). The owner's capture of the public feed, 2026-10-22
-  (the ETH/USDT-P `orderbook` on the anonymous `/ws/market`; its measurements are in his private
-  notes, never here), showed Updates coming on a steady venue tick a little slower than Hibachi
-  support's 250 ms (2026-05-27), sent even when nothing changed, so a silence of a few ticks is
-  abnormal (the consumer's `Liveness`, 0033). The pulse declared is support's 250 ms, or
-  `Cadence::Unknown` if the owner judges that disagreement decisive, never a value measured from
-  the capture.
-- The market-data codec subscribes on the anonymous `/ws/market` with the `parameters` key and
-  decodes `orderbook` Snapshot and Update frames (absolute sizes, a zero quantity removes a level,
-  no sequence numbers, so recovery is a fresh Snapshot only, and a Snapshot with no level never
-  makes a book valid, as a criterion below says), `ask_bid_price`, both `trades` shapes,
-  `mark_price`, `funding_rate_estimation` and `spot_price`, synthesizing no exchange timestamp
-  where a frame has none; `ask_bid_price` becomes
-  an `MdEvent::Touch` only when the frame carries each side's price and its size
-  (`bidPrice`/`bidSize`, `askPrice`/`askSize`, each optional in Java's `HibachiQuoteEngine.java`
-  `onAskBidUpdate`, and the docs' example shows prices only), while a frame with a price but no
-  size produces no Touch, since a `None` side reads as an empty one, and is counted, never given a
-  synthesized size, a fixture pinning each case (Java `HibachiMarketSubscribeMessage.java`,
-  `HibachiQuoteEngine.java`; SDK `api_ws_market.py`, `types.py`).
-- Each `orderbook` subscription names its `granularity`, the instrument's quote grid as its
-  contract lists it among `orderbookGranularities`, and its `depth`, from a required venue
-  configuration key with no default, refused outside 1 to 100, so the venue's undocumented
-  default never decides what the book means. Hibachi's WebSocket market docs make both optional,
-  take one set per subscription (a subscribe with another set replaces the earlier one) and refer
-  to REST `/market/data/orderbook`, whose depth the SDK bounds to 1 to 100 and whose granularity
-  to the contract's `orderbookGranularities` (`api.py` `get_orderbook`); Java subscribes with
-  neither. No source shows a subscription carrying them by example, so each frame's own
-  `granularity` and `depth`, which the docs' example frame carries, confirm it: a frame whose
-  `granularity` or `depth` differs from its subscription's, or lacks either, is counted and gaps
-  the book as a frame failing the bounds check below does, so the `depth` that check reads is
-  the subscription's. An instrument whose quote grid is not among its listed granularities gets
-  no `orderbook` subscription and is counted, never subscribed at the venue's default. The
-  levels are aggregated at that granularity (SDK `api.py` `get_orderbook`; Java
-  `HibachiRestApi.java` `resolveEffectiveTickSize`) while orders rest on the finer `tickSize`:
-  where the quote grid is coarser than the tick, a level's price is a bucket's label, not a
-  price an order rests at, its size is the bucket's sum, the touch can sit up to one granularity
-  from the venue's own, and which way a bucket rounds is undocumented. The crate docs state
-  this, and the `orderbook` channel's caps declare `max_depth` as the configured depth,
-  `windowed` and `QueueModelQuality::BracketOnly`; since no capability says that a book's levels
-  are buckets, a ticket under this story adds one, a mandatory field under a decision record
-  (0003), before a SimVenue stand-in or a quote reads Hibachi's book. A book is crossed when its
-  best bid is above its best ask. A locked book, best bid equal to best ask, is not, since two
-  buckets can share a label while no order crosses: it passes the bounds check below and is
-  counted apart. The owner's capture shows the bounds rule only at the parameters it was taken
-  with, so a frame failing it at the configured ones gaps the book, the safe direction, and is
-  counted.
-- An Update applies each side's window as Hibachi's WebSocket market docs specify: levels
-  outside the min..max of the side's `startPrice` and `endPrice` are removed before its listed
-  levels apply (Java `HibachiQuoteEngine.java` `pruneOutsideWindow` prunes to the same min..max,
-  and not at all without both bounds, only on its partner feed). In the owner's capture of the
-  public feed, 2026-10-22, the venue sent every level that scrolled into or out of a window
-  itself, so the prune never changed a book there: a zero quantity naming a level the prune
-  already removed, as many of the capture's removals did, is not an error, while a level the
-  prune removes that the frame does not itself set to zero is one a lost frame left behind, a
-  gap (the bounds check below). In that capture a side with nothing to change came as
-  `levels: []` with both bounds present and unchanged, often and on both sides, and no side of
-  an Update or a Snapshot came null, absent or missing a bound. Hibachi's docs say a side sent
-  as null removes all its levels, but their own Update example sends `"bid": null` beside
-  changes to the ask side, and Java's `onOrderBookUpdate` reads a null or absent side as no
-  levels, leaving it unchanged; the capture gives that reading no support, since "unchanged" has
-  its own encoding. So a side sent as null clears that side, and since it carries no bounds to
-  check and has never been seen, the codec counts it, emits that side's clear and then a gap for
-  that book's feed, and pushes nothing else of the frame or the book until a resubscribe, as the
-  criterion on an empty Snapshot below makes one, brings a Snapshot that makes it valid. A side
-  absent from the frame, or one without both bounds, which neither the docs nor the capture
-  show, is malformed: it is counted and gaps the book the same way, never read as unchanged or
-  left unchecked. An Update for an instrument with no book (the capture showed such an Update
-  after an unsubscribe, before the next Snapshot) is ignored. Since `MdEvent::Window` bounds
-  both sides at once and no event clears one side (`fbc-core` `event.rs`, `fbc-book`
-  `L2Book::set_window`), a side-aware window and a one-side clear are added to the common event
-  and the book model, under a decision record, before the codec maps an Update onto them, so a
-  one-sided Update never prunes or clears the other side. The codec never stands in for them
-  with zero-quantity levels: a level that only left a side's window is unknown, not emptied, and
-  `fbc-sim` reads a level set to zero as public cancels ahead of a simulated order.
-- The feed has no sequence number, so its bounds are its gap detector. They describe the book
-  after the frame: after every Update of the capture, and in each of its Snapshots, each side's
-  best level sat at `startPrice` and its `depth`-th level (the frame's `depth`) at `endPrice`,
-  and the bid's window runs downward (`startPrice` above `endPrice` in every frame), so every
-  window test uses min..max. Once both sides of a frame apply, each side must hold its best
-  level at `startPrice`, exactly `depth` levels within the min..max of its bounds, the last of
-  them at `endPrice`, and none outside, the book must not be crossed, and the prune must have
-  removed no level the frame does not itself set to zero; a frame that fails is counted and gaps
-  the book as a null side does. The check runs on a Snapshot too, so a Snapshot that fails it,
-  one with a null, absent or unbounded side included, never makes a book valid. A side thinner
-  than `depth`, which the capture never showed, fails the check: what `endPrice` names on one is
-  unknown, so the codec guesses nothing and counts it apart, and a market that thin on a side
-  stays gapped, resubscribed at each interval, until evidence of a thin side settles it; that is
-  an assumption, and a fixture pins it. The check detects gaps and proves no continuity:
-  replaying the capture offline with each Update that carried a level dropped in turn, it caught
-  most drops, usually at the very next frame, but missed some, leaving books that looked valid
-  with wrong levels, while the capture as recorded raised none. The codec keeps its own copy of
-  each subscribed book's levels to run it, since a venue crate holds no `fbc-book` book
-  (`fbc-runtime`'s `MdBooks` does) and `MdHandler` receives a frame's events one at a time
-  (0023): it applies the whole frame to that copy and checks it before it emits any event of the
-  frame; when the check fails it emits a null side's clear, if the frame has one, then the gap,
-  and nothing else of the frame, and otherwise it emits the windows and every removal of both
-  sides before any level it sets, so the book `MdBooks` holds is never crossed between two
-  events of one frame (applying one side alone crossed the capture's book in some frames,
-  whichever side went first, and in none once both sides applied). A quoting decision reads the
-  touch in the shard host's decide pass, after the frame's last event (0100); a handler that
-  reads it between two events of one frame sees the book partway through that frame, never
-  crossed. A hand-built fixture pins each case, a bid side whose bounds descend among them, and
-  a stale level outside the window never becomes the touch.
-- An `orderbook` Snapshot with no level on either side never makes a book valid. Hibachi's
-  WebSocket market docs send a Snapshot, which "contains all price levels", when a subscription
-  is first made, and the Updates after it carry only the levels that changed (Java
-  `HibachiQuoteEngine.java`, whose `BookState` comment blames a book built from Updates alone for a
-  wrong best ask, and whose `onOrderBookUpdate` saw empty Snapshots on reconnect, cleared its
-  book and so rebuilt it from the Updates alone). The frame cannot tell a market with no resting
-  order from a Snapshot sent before the venue's book was ready: a book made valid by it and
-  filled by the Updates after it would show a touch, and call levels empty, from deltas alone,
-  while a book left invalid costs a truly empty market nothing, since neither has a touch to
-  quote. So on such a Snapshot, on a first subscription, a resubscribe or a reconnect, and on
-  every gap the codec finds itself (a null, absent or unbounded side, or a Snapshot or Update
-  that fails the bounds check above), the codec reports that book's feed as a gap (`fbc-book`
-  then drops its Updates until a complete snapshot, 0039) and pushes no level or window of it
-  until a Snapshot with a level that passes the check, which it applies as a fresh snapshot. It
-  then asks for a fresh Snapshot on the same connection, leaving the other books there valid:
-  after the retry interval of a required venue configuration key, with no default and zero
-  refused (as `binance_usdm.depth_snapshot_retry`), it unsubscribes that instrument's
-  `orderbook` and subscribes it again with the same `granularity` and `depth`, each frame
-  charged as a subscription of that instrument (0018), again at each interval while Snapshots
-  come back empty or failing the check and never for a subscription the consumer has removed;
-  when a resubscribe brings back no Snapshot within the interval, it asks for a reconnect paced
-  by the consumer's `ReconnectPacing` (0023), which gaps every book that connection fed.
-  Decision 0022 rejected a Paradex codec writing its own subscribe frames, since the reconciler
-  would no longer know what the connection has, so a decision record states why this codec may,
-  for every gap it finds itself, before it does. A hand-built fixture pins the empty Snapshot,
-  and a test against a local stub on a paused clock shows the book not valid through the Updates
-  after it while another instrument's book on the connection stays valid, the resubscribe at
-  the interval, the same resubscribe after an Update whose bounds disagree with the book, the
-  book equal to the populated Snapshot that answers each, and the reconnect when a resubscribe
-  brings none.
-- A trade printing inside the book changes no book state and never holds or rejects a book
-  update (the Java library's trades-versus-book check froze its book and was deleted), and a
-  reconnect replays every subscription.
+- `fbc-venue-hibachi` discovers each contract from `/market/exchange-info` into an
+  `InstrumentSpec` with the venue's own price grid, sizes, signing parameters and session
+  calendar, and the book's quote grid, never a placeholder. Its capabilities declare
+  `exec: None` and `Readiness::Record` with a source on every value (0003, 0015).
+- Each contract's trading status is mapped conservatively: only a live contract on an exchange
+  in normal operation trades, and an absent, null or unlisted status is refused. After
+  discovery the status is re-read and reported to the consumer as it changes, each scheduled
+  halt at its time, and that lands before any Hibachi order path quotes (0003, 0111).
+- The anonymous `/ws/market` feed decodes into normalized book, touch, trade, mark, funding and
+  spot events. No exchange timestamp or size is synthesized, and no touch stays in force once a
+  frame can no longer confirm it. Funding's settlement interval is stated as one hour, from
+  Hibachi's settled history, and the funding rate is never scaled by an interval until the
+  owner's evidence shows what it is a rate for.
+- Hibachi's book feed carries no sequence number, and the book is never presented as valid when
+  a frame shows it may be wrong. Each frame is checked against the venue's window bounds before
+  any of its events is pushed, and a book that fails is gapped and recovered from a fresh
+  snapshot, first by resubscribing on the same connection, which leaves the other books there
+  valid. Its levels are declared as buckets of the quote grid before a simulation or a quote
+  reads them. Hand-built SYNTHETIC fixtures under `fixtures/hibachi` and a stub test on a paused
+  clock pin each case (0003, 0023, 0039).
 - The market-data conformance checks pass on fixtures under `fixtures/hibachi`, with the
   order-entry checks skipped by name, and decoder replay of a journal rebuilds the book
-  byte-identically (0006, 0009).
-- Hibachi's MM-partner-only book topic is neither planned nor decoded.
+  byte-identically. Hibachi's MM-partner-only book topic is neither planned nor decoded (0006,
+  0009).
 - `md_watch` takes `--hibachi <symbol>`, ETH/USDT-P first beside `--binance ETHUSDT`; its test
   drives the Hibachi wiring against a local stub server, and nothing in the repository runs it
   against Hibachi.
@@ -508,54 +297,17 @@ entry starts from a proven signer that never needed a connection to be tested.
 
 **Acceptance criteria:**
 
-- `crates/venues/fbc-venue-hibachi/src/sign` (a review path) packs a place and a modify
-  big-endian as nonce u64, contract id u32, quantity u64, side u32 (ASK 0, BID 1), price u64
-  (omitted for a market order) and max fees u64: 40 bytes for a limit order, 32 for a market
-  order (Java `HibachiPayloadPacker.java`; SDK `api.py`; 0009). Max fees is an input the caller
-  passes with each place and modify; the signer holds no value and no default for it. It scales
-  whatever decimal the request's `maxFeesPercent` carries, whose unit the sources disagree on:
-  the signing docs' field list says basis points while their worked example passes a fraction
-  (0.0005, "5 basis points"), the SDK's docstrings say a percentage while its examples pass
-  0.0005 and 0.00045, and Java's `HibachiConfiguration.java` reads it as a percent (0.05 for
-  5 bps).
-- A cancel signs the 8-byte order id, or the order's placement nonce as 8 bytes (SDK `api.py`
-  `__cancel_order_payload`; Java cancels by order id or nonce); a cancel by client id (its ASCII
-  bytes, which only the API docs describe) is declared only once a golden vector or the owner's
-  evidence backs it. Cancel-all signs its 8-byte nonce, and so can the cancel-on-disconnect arm
-  (`orders.enableCancelOnDisconnect`, params `{nonce}`), with its own golden vector: Hibachi's API
-  collection is cited as requiring a signature over the arm's nonce, while the SDK at 14a76b9
-  sends the arm unsigned (`api_ws_trade.py` `enable_cancel_on_disconnect`, `types.py`
-  `EnableCancelOnDisconnectParams`), so the probe records which form Hibachi accepts and the
-  order-entry codec sends that form. `creationDeadline`, `orderFlags`, trigger, TWAP and
-  parent-order fields are JSON-only and never signed.
-- The signature is ECDSA secp256k1 over SHA-256 of the pack, 65 bytes r, s, v with v in {0, 1};
-  ECDSA only, with no HMAC path (Java `EcdsaHibachiSigner.java`; the coordinator's default of
-  2026-10-19).
-- Golden vectors from a Java oracle on a SYNTHETIC key under `fixtures/hibachi/signing` match:
-  the packed bytes of every command, the worked example buffer of Hibachi's signing docs byte
-  for byte, and each signature equal to the oracle's or, if the Java signer's nonce is shown not
-  to be RFC 6979, verifying and recovering to the synthetic public key (design §6
-  `signing_golden`). That example's fee arithmetic is wrong: the docs say rate fees scale by
-  10^8, but pack the example's `max_fees` 0.0005 as 5000 (`0x1388`), which is 0.0005 × 10^7.
-  The SDK (`api.py` `__create_or_update_order_payload`) and Java (`HibachiPayloadPacker.java`
-  `scaleMaxFeesPercent`, through which Java's broker signs its orders, and whose test packs 0.5
-  as `0x2faf080`) both scale by 10^8. So the worked buffer is reproduced from max fees 0.00005,
-  a second vector with the example's other inputs and max fees 0.0005 packs the fee as 50000
-  (`0xc350`), and the signer has no 10^7 path.
-- The decimal inputs are checked against the grid before packing: a price off `tickSize` is
-  refused, never rounded (SDK `types.py` `check_tick_size`), and so is a quantity off
-  `stepSize`, a stricter rule than the SDK's, which truncates the quantity silently (`api.py`). The
-  scaled price, price × 2^32 × 10^(settlementDecimals − underlyingDecimals), is then truncated
-  toward zero as the SDK's `price_to_bytes` and Java's packer do, since that truncation is part
-  of the wire format and is rarely exact for an on-grid price; quantity (× 10^underlyingDecimals)
-  and max fees (× 10^8) must scale exactly or are refused. A golden vector with a price whose
-  scaling is not exact pins the truncation: on a synthetic instrument with ETH's decimals
-  (underlying 9, settlement 6) and a 0.01 tick, 2500.01 packs to price 10737461189 (SDK
-  `api.py` `price_to_bytes` and its order payload).
-- The venue crate's `src/auth` (a review path) takes the private key from `Secrets`, validates
-  it and hands an initialized signer to the codec, as Paradex's `auth::order_signer` does;
-  `src/sign` holds only the cryptographic signer. Neither the key nor a signed payload is
-  logged, and the crypto crate passes the licence gate (0009, 0017).
+- `crates/venues/fbc-venue-hibachi/src/sign` (a review path) packs and signs offline every
+  command Hibachi order entry may sign (place, modify, cancel, cancel-all and the
+  cancel-on-disconnect arm), with ECDSA secp256k1 only and no HMAC path (0009).
+- Golden vectors from a Java oracle on a SYNTHETIC key under `fixtures/hibachi/signing` pin
+  every packed payload byte for byte and every signature, and the buffer of Hibachi's worked
+  signing example is reproduced (design §6 `signing_golden`).
+- A price or quantity off the instrument's grid is refused before signing, never rounded onto
+  it.
+- The private key reaches the signer only through the venue crate's `src/auth` (a review path),
+  from `Secrets`. Neither the key nor a signed payload is logged, and the crypto crate passes
+  the licence gate (0009, 0017, 0043).
 
 ### BT-603 — Runtime prerequisites for a venue on two authenticated sockets
 
@@ -567,27 +319,19 @@ capability table only, as BT-102 promises.
 
 **Acceptance criteria:**
 
-- A planned endpoint's credential headers (Hibachi's `Authorization` API key) are sent on the
-  WebSocket upgrade of its first connection and of every reconnect, a market-data socket sends
-  none, and the key appears in none of the journal's bytes, log lines or errors; the header code
-  lives under `crates/fbc-runtime/src/auth` (a review path), as decision 0116 states (0006,
-  0009).
-- The venue crate's `src/auth` (a review path) puts the API-key headers on private REST and on
-  the `/ws/trade` and `/ws/account` upgrades with the account id in their URLs, keeps the
-  account id and the account stream's listen key out of the journal's bytes, log lines and
-  errors as it keeps the key (a test proves each absent), and decodes a test-connection reply into
-  `AccountSummary` and a refused key into a typed error, all with synthetic credentials (0009).
-- One order-entry session runs one `ExecCodec` over every connection its plan names: each
-  endpoint opens and reconnects in its own epoch while the other's stays open, a frame goes to
-  the endpoint its effect names, and the events of both are stamped in one ingest order, tested
-  with the conformance toy on two local servers (0115).
-- A production `NonceSource` issues monotonic wall-clock microseconds over an injected clock:
-  strictly increasing when the clock stalls or steps back, never reissuing a nonce an earlier
-  journal holds or one an earlier process sent while its journal record was still unwritten
-  (the case 0114's item 2 leaves out), and refusing rather than issuing a nonce outside the
-  window the caller passes (Hibachi documents 15 s either side of server time); its nonces are
-  journaled and replay without the clock byte-identically (Java `HibachiBroker.java`; 0006,
-  0114).
+- A planned endpoint's credential headers go on the WebSocket upgrade of every connection and
+  reconnect, a market-data socket sends none, and no credential reaches the journal's bytes, a
+  log line or an error (0006, 0009, 0116).
+- Hibachi's credential module (the venue crate's `src/auth`, a review path) authenticates
+  private REST and the trade and account socket upgrades. It keeps the API key, the account id
+  and the account stream's listen key out of the journal, logs and errors, and reads a test
+  connection as an `AccountSummary` or a typed refusal, all with synthetic credentials (0009).
+- One order-entry session drives every connection its plan names, each in its own epoch,
+  routing each frame to the stream its effect names and stamping the events of all of them in
+  one ingest order, proven with the conformance toy on two local servers (0115).
+- A production nonce source issues monotonic wall-clock microseconds within the caller's
+  window, never reissues a nonce an earlier journal holds, and its nonces replay
+  byte-identically without the clock (0006, 0114).
 - Nothing in this story places a Hibachi order: Hibachi's capabilities keep `exec: None`, and
   this story leaves the session's cancel-on-disconnect gate as 0058 and 0121 set it.
 
