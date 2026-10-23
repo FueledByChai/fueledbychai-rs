@@ -23,7 +23,9 @@ different declarations or safety reserves for that key fail closed. The registry
 the budget for the process lifetime so dropping the last session cannot reset a live window.
 The keyed constructor accepts only
 user-scoped limits; a mixed declaration fails rather than silently sharing account or
-connection buckets incorrectly.
+connection buckets incorrectly. Bucket timestamps follow mutex acquisition order: a shard's
+clock sample older than the last processed sample is clamped to that last time, so a delayed
+thread cannot make a newly sent request expire early.
 
 For v1, one process owns private traffic for each QFEX provider user. An external owner lease
 must prevent a second process from trading that user, because a process-local budget cannot
