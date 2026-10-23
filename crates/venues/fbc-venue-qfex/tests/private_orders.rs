@@ -8,10 +8,10 @@ use fbc_core::{
     AccountKey, AmendOrder, AssetSym, CancelOrder, Channel, CidMint, ClientIdFormat, ClientOrderId,
     Effect, Effects, EncodeCtx, ExecEvent, ExecSink, FundingSpec, InstrumentId, InstrumentKind,
     InstrumentSpec, Lots, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NotSentReason,
-    OpKind, OrderKind, OrderRef, PathStamps, PriceGrid, RawFrame, RpcId, Secret, Secrets, Side,
-    SizeStep, SpecTable, StreamId, Ticks, Tif, TradingStatus, UnderlyingId, VenueCommand,
-    VenueConfig, VenueFactory, VenueId, VenueMeta, VenueOrderId, WallNs, dispatch_market_data,
-    encode_cid,
+    OpKind, OrderKind, OrderRef, PathStamps, PriceGrid, QueryOrder, RawFrame, RpcId, Secret,
+    Secrets, Side, SizeStep, SpecTable, StreamId, Ticks, Tif, TradingStatus, UnderlyingId,
+    VenueCommand, VenueConfig, VenueFactory, VenueId, VenueMeta, VenueOrderId, WallNs,
+    dispatch_market_data, encode_cid,
 };
 use fbc_venue_qfex::{KEY_MDS_URL, Qfex};
 use rust_decimal::Decimal;
@@ -181,7 +181,7 @@ fn sent(
 }
 
 #[test]
-fn selected_commands_encode_exact_wire_and_one_weight() {
+fn selected_commands_encode_exact_wire_and_documented_weights() {
     let mut codec = Qfex.exec_codec(&cfg(), creds()).unwrap().unwrap();
     let mut fx = Effects::new();
     assert_eq!(
@@ -255,6 +255,21 @@ fn selected_commands_encode_exact_wire_and_one_weight() {
     );
     assert_eq!(class, fbc_core::TrafficClass::Safety);
 
+    let query = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Venue(venue_id(OLD)),
+        inst: INST,
+        placement_nonce: None,
+    });
+    let (body, charge, class) = sent(&mut codec, &query, RpcId(4));
+    assert_eq!(
+        body,
+        json!({"type":"get_order","params":{"symbol":"AAPL-USD","order_id":OLD}})
+    );
+    assert_eq!(charge.op, OpKind::Query);
+    assert_eq!(charge.inst, Some(INST));
+    assert_eq!(charge.weight.get(), 2);
+    assert_eq!(class, fbc_core::TrafficClass::Safety);
+
     let mut sink = Sink::default();
     let replacement = include_str!("../../../../fixtures/qfex/private/modified_new_id.json");
     dispatch_market_data(&Qfex.caps(&cfg()).unwrap(), |scope| {
@@ -297,6 +312,44 @@ fn selected_commands_encode_exact_wire_and_one_weight() {
 }
 
 #[test]
+fn get_order_page_cannot_settle_a_query_without_request_identity() {
+    let mut codec = Qfex.exec_codec(&cfg(), creds()).unwrap().unwrap();
+    let mut fx = Effects::new();
+    auth(&mut codec, &mut fx);
+    let query = VenueCommand::Query(QueryOrder {
+        target: OrderRef::Venue(venue_id("2f05173c-992a-426b-bcaf-6b341644bb62")),
+        inst: INST,
+        placement_nonce: None,
+    });
+    sent(&mut codec, &query, RpcId(11));
+    let mut sink = Sink::default();
+    dispatch_market_data(&Qfex.caps(&cfg()).unwrap(), |scope| {
+        codec.on_frame(
+            StreamId(0),
+            RawFrame::Text(include_str!(
+                "../../../../fixtures/qfex/private/open_orders_page.json"
+            )),
+            scope,
+            &specs(),
+            &mut sink,
+            &mut fx,
+        )
+    })
+    .unwrap();
+    assert!(sink.0.is_empty());
+    assert!(matches!(fx.as_slice(), [Effect::Reconnect { .. }]));
+    codec.on_rpc_timeout(RpcId(11), &mut sink);
+    assert_eq!(
+        sink.0,
+        [ExecEvent::Outcome {
+            rpc: RpcId(11),
+            item: None,
+            outcome: fbc_core::SubmitOutcome::Unknown,
+        }]
+    );
+}
+
+#[test]
 fn unsafe_command_shapes_and_missing_timeout_refuse_without_effects() {
     let mut missing = cfg();
     missing.insert("qfex.rpc_timeout", "");
@@ -326,6 +379,22 @@ fn unsafe_command_shapes_and_missing_timeout_refuse_without_effects() {
                 target: OrderRef::Venue(venue_id("not-a-uuid")),
                 inst: INST,
                 side: Side::Buy,
+                placement_nonce: None,
+            }),
+            NotSentReason::Unencodable,
+        ),
+        (
+            VenueCommand::Query(QueryOrder {
+                target: OrderRef::Client(cid()),
+                inst: INST,
+                placement_nonce: None,
+            }),
+            NotSentReason::Unsupported,
+        ),
+        (
+            VenueCommand::Query(QueryOrder {
+                target: OrderRef::Venue(venue_id("not-a-uuid")),
+                inst: INST,
                 placement_nonce: None,
             }),
             NotSentReason::Unencodable,

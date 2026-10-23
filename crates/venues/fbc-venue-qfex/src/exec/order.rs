@@ -7,6 +7,7 @@ use fbc_core::{
     RateCharge, Side, SpecTable, Tif, VenueCommand, encode_cid,
 };
 use rust_decimal::Decimal;
+use std::num::NonZeroU32;
 
 use NotSentReason::{Unencodable, Unsupported};
 
@@ -73,9 +74,35 @@ pub fn frame(
                 cancel.inst,
             )
         }
+        VenueCommand::Query(query) => {
+            // The published endpoint only accepts a venue order UUID. An Unknown place
+            // without one cannot be resolved by guessing from its client id.
+            let spec = specs.get(query.inst).ok_or(Unencodable)?;
+            let venue_id = json_string(venue_uuid(&query.target)?);
+            let symbol = json_string(spec.venue_symbol.as_wire());
+            (
+                format!(
+                    "{{\"type\":\"get_order\",\"params\":{{\"symbol\":{symbol},\"order_id\":{venue_id}}}}}"
+                ),
+                OpKind::Query,
+                query.inst,
+            )
+        }
         _ => return Err(Unsupported),
     };
-    Ok((body.into_bytes(), RateCharge::one(op, Some(inst))))
+    // QFEX documents get_order as two general-bucket units. Other supported
+    // commands cost one unit in this offline codec; the final private limits
+    // will scale all weights together before order entry is enabled.
+    let charge = if op == OpKind::Query {
+        RateCharge {
+            op,
+            inst: Some(inst),
+            weight: NonZeroU32::new(2).expect("two is nonzero"),
+        }
+    } else {
+        RateCharge::one(op, Some(inst))
+    };
+    Ok((body.into_bytes(), charge))
 }
 
 fn side(side: Side) -> &'static str {
