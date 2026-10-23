@@ -289,6 +289,17 @@ struct Inner {
     reserve: SafetyReserve,
     buckets: HashMap<(usize, BucketKey), Bucket>,
     counts: RateCounts,
+    /// Serialized charge time. A shard may sample its clock before another shard but take
+    /// this mutex later; never append an older timestamp behind a newer charge.
+    last_now: Option<Instant>,
+}
+
+impl Inner {
+    fn at(&mut self, now: Instant) -> Instant {
+        let at = self.last_now.map_or(now, |last| last.max(now));
+        self.last_now = Some(at);
+        at
+    }
 }
 
 /// Opaque, consumer-assigned identity of one provider user. Every API key and subaccount of
@@ -392,6 +403,7 @@ impl RateLimiter {
             reserve,
             buckets: HashMap::new(),
             counts: RateCounts::default(),
+            last_now: None,
         };
         Ok(RateLimiter {
             inner: Arc::new(Mutex::new(inner)),
@@ -419,6 +431,7 @@ impl RateLimiter {
     /// its window.
     pub fn used(&self, now: Instant, limit: usize, key: BucketKey) -> u64 {
         let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
         let Some(per) = inner.limits.get(limit).map(|l| l.per) else {
             return 0;
         };
@@ -459,6 +472,7 @@ impl RateLimiter {
     /// it rather than the venue's count running ahead of the buckets.
     pub fn record(&self, now: Instant, conn: ConnKey, request: Request) {
         let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
         let Inner {
             limits, buckets, ..
         } = &mut *inner;
@@ -508,11 +522,13 @@ impl RateLimiter {
         requests: &[Request],
     ) -> Result<Charged, Refused> {
         let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
         let Inner {
             limits,
             reserve,
             buckets,
             counts,
+            ..
         } = &mut *inner;
         let needs = needs(limits, conn, requests);
         // A batch with any normal request in it keeps out of the reserve of every bucket it
@@ -921,6 +937,29 @@ mod tests {
         other.charge(t0, CONN, &[place]).unwrap();
         assert_eq!(other.used(t0, 0, BucketKey::Shared), 1);
         assert_eq!(sessions[0].2.used(t0 + secs(60), 0, BucketKey::Shared), 0);
+    }
+
+    #[test]
+    fn stale_shard_time_cannot_expire_a_newly_admitted_user_request() {
+        let user = RateUserKey::new(0xe5bd_0004);
+        let limits = [limit(LimitScope::User, &[OpKind::Place], 2, 60)];
+        let rates =
+            RateLimiter::for_user(user, &limits, SafetyReserve::percent(0).unwrap()).unwrap();
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        rates.charge(t0, CONN, &[place]).unwrap();
+        // A later timestamp acquires the lock first and expires the original charge.
+        rates.charge(t0 + secs(61), CONN, &[place]).unwrap();
+        // This shard sampled time earlier, but its charge happens after the above write.
+        rates.charge(t0 + secs(1), CONN, &[place]).unwrap();
+        assert_eq!(rates.used(t0 + secs(62), 0, BucketKey::Shared), 2);
+        assert_eq!(
+            rates
+                .charge(t0 + secs(62), CONN, &[place])
+                .unwrap_err()
+                .ready_at,
+            Some(t0 + secs(121))
+        );
     }
 
     #[test]
