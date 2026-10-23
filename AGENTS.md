@@ -177,7 +177,8 @@ rather than guess.
     a codec's HTTP requests run with their timeouts and answer only the epoch that asked, and a
     poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
     `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,
-    `BookId`), routing each book event by its channel, and exposes each instrument's trading
+    `BookId`), routing each book event by its channel (a one-side prune or clear too, each
+    feeding its book for its epoch's end, 0124), and exposes each instrument's trading
     book as the consumer's `TradingBooks` configures it (FBC-nij); a session tells its handler
     each connection epoch's end (`MdHandler::on_epoch_end`, live and in replay), and every book
     that epoch fed is then gapped until its next snapshot (0039);
@@ -280,7 +281,9 @@ rather than guess.
     `fbc-sim`'s, by path).
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
-    snapshots, deltas, windows and gap invalidation, touch, top-n, one level's size where it is
+    snapshots, deltas, windows, one-side prunes and clears and gap invalidation (`SidePrune`
+    and `SideClear` keep no state and act where a delta would, a cleared side unknown with no
+    touch on a valid book, 0124), touch, top-n, one level's size where it is
     known (inside the window, or no deeper than a capped book shows), an exact
     top-n comparison and canonical bytes; still planned: the ex-own projection, touch arbitration and
     continuity policies), `crates/fbc-oms` (it depends on `fbc-core` only, `proptest` as a
@@ -394,6 +397,8 @@ rather than guess.
     a `SimConfig` with no `Default`, and a resync answered with the resting orders and the
     positions the fills imply, 0049, answers ordered by the stood-in venue's key with realized
     P&L and funding on fills where it declares them and derived fills as order updates, 0050;
+    a prune or a clear of one side moving no simulated order in its queue under any bracket, and
+    an order to rest on a side the book shows no level of refused like unknown depth, 0124;
     crossing orders meeting SimVenue's own resting orders under the stood-in venue's
     `stp_scope` and depleting the displayed levels they take until the book's next event
     there, 0051; `SimPeer`, the venue end of the runtime's in-process order-entry stream over

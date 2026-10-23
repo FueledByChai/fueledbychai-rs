@@ -241,6 +241,8 @@ fn inst_of(ev: &MdEvent) -> InstrumentId {
         | MdEvent::BookSnapshotEnd { inst, .. }
         | MdEvent::Level { inst, .. }
         | MdEvent::Window { inst, .. }
+        | MdEvent::SidePrune { inst, .. }
+        | MdEvent::SideClear { inst, .. }
         | MdEvent::Trade { inst, .. }
         | MdEvent::Mark { inst, .. }
         | MdEvent::Index { inst, .. }
