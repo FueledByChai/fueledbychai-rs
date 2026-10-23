@@ -256,8 +256,9 @@ impl Item {
 ///   (decision 0038); the rest of an immediate-or-cancel, fill-or-kill or market order is
 ///   cancelled unfilled, and a fill-or-kill order that cannot fill whole fills nothing. A
 ///   good-till-cancelled order that would rest where the book does not know the size (past
-///   its depth or window) is refused whole (`no_book`), the part that would cross included,
-///   since its queue position cannot be set. A resting order queues behind the level's size
+///   its depth or window, or on a side the book shows no level of, decision 0124) is refused
+///   whole (`no_book`), the part that would cross included, since its queue position cannot
+///   be set. A resting order queues behind the level's size
 ///   less the trades printed at its price whose shrink the level has not shown yet; a trade
 ///   printed through a level counts as taking all of it.
 /// - A crossing order also meets SimVenue's own resting orders on the other side (decision
@@ -512,7 +513,9 @@ impl SimEngine {
 
     /// One of the shard's market-data envelopes, in ingest order: the commands that arrived
     /// by its stamp act first, then the event. Book events build the engine's books; a trade
-    /// fills resting orders. Refused when the book refuses the event.
+    /// fills resting orders. A prune or a clear of one side changes only the books: it is no
+    /// level change and moves no queue (decision 0124). Refused when the book refuses the
+    /// event.
     pub fn on_market(&mut self, env: &Envelope<MdEvent>) -> Result<(), SimError> {
         self.advance(env.stamp.recv_mono);
         if let Some(book) = book_of(&env.body) {
@@ -2193,18 +2196,27 @@ fn after(wall: WallNs, d: Duration) -> WallNs {
     WallNs(wall.0.saturating_add(nanos))
 }
 
-/// The book an event is about, if it is about one.
+/// The book an event is about, if it is about one. The match names every event, so a new book
+/// event cannot fall through to `None` and escape an epoch's end (decision 0124).
 fn book_of(ev: &MdEvent) -> Option<(InstrumentId, BookId)> {
     match *ev {
         MdEvent::BookSnapshotBegin { inst, book, .. }
         | MdEvent::BookSnapshotEnd { inst, book }
         | MdEvent::Level { inst, book, .. }
         | MdEvent::Window { inst, book, .. }
+        | MdEvent::SidePrune { inst, book, .. }
+        | MdEvent::SideClear { inst, book, .. }
         | MdEvent::Health {
             inst,
             feed: Feed::Book(book),
             ..
         } => Some((inst, book)),
-        _ => None,
+        MdEvent::Health { .. }
+        | MdEvent::Touch { .. }
+        | MdEvent::Trade { .. }
+        | MdEvent::Mark { .. }
+        | MdEvent::Index { .. }
+        | MdEvent::Funding { .. }
+        | MdEvent::Stats { .. } => None,
     }
 }

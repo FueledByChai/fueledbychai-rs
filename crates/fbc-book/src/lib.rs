@@ -4,8 +4,10 @@
 //! [`Books`] keeps one [`L2Book`] per (instrument, [`BookId`](fbc_core::BookId)) and feeds it
 //! [`MdEvent`](fbc_core::MdEvent)s: `BookSnapshotBegin` starts a replacement under its epoch,
 //! `Level` sets a level in that replacement or, as a delta, in the book (zero quantity removes
-//! it), `BookSnapshotEnd` makes the replacement the book, `Window` bounds a windowed book, and
-//! `Health` with a gap on the book's feed invalidates it until the next complete snapshot.
+//! it), `BookSnapshotEnd` makes the replacement the book, `Window` bounds a windowed book on both
+//! sides, `SidePrune` and `SideClear` remove one side's levels outside a price range or all of
+//! them where a delta would, keeping no state (decision 0124), and `Health` with a gap on the
+//! book's feed invalidates it until the next complete snapshot.
 //!
 //! A valid book gives its [`touch`](L2Book::touch), its [`top`](L2Book::top) levels per side and
 //! one [`level`](L2Book::level)'s size,

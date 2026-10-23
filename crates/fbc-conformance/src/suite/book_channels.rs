@@ -11,9 +11,9 @@
 //! - every channel a frame shows is one the book declares;
 //! - every channel the book declares is shown by some frame of the case;
 //! - every frame that pushes a level states its channels, and only such a frame states any;
-//! - every book event a frame pushes (snapshot, level, window, and the book's health) is on the
-//!   channel's own [`BookId`](fbc_core::BookId): the runtime routes each by its book (Codex
-//!   r4218492678).
+//! - every book event a frame pushes (snapshot, level, window, a prune or a clear of one side,
+//!   and the book's health) is on the channel's own [`BookId`](fbc_core::BookId): the runtime
+//!   routes each by its book (Codex r4218492678, decision 0124). Only a level shows liquidity.
 
 use std::collections::BTreeSet;
 
@@ -87,17 +87,26 @@ pub fn book_channels(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     book_cases::verdict(CHECK, &books, NO_BOOK, outcome)
 }
 
-/// The book `ev` is on, and whether it is a level, if it is a book event.
+/// The book `ev` is on, and whether it is a level, if it is a book event. The match names every
+/// event, so a new one is judged here by choice (decision 0124).
 fn book_of(ev: &MdEvent) -> Option<(BookId, bool)> {
     match ev {
         MdEvent::Level { book, .. } => Some((*book, true)),
         MdEvent::BookSnapshotBegin { book, .. }
         | MdEvent::BookSnapshotEnd { book, .. }
         | MdEvent::Window { book, .. }
+        | MdEvent::SidePrune { book, .. }
+        | MdEvent::SideClear { book, .. }
         | MdEvent::Health {
             feed: Feed::Book(book),
             ..
         } => Some((*book, false)),
-        _ => None,
+        MdEvent::Health { .. }
+        | MdEvent::Touch { .. }
+        | MdEvent::Trade { .. }
+        | MdEvent::Mark { .. }
+        | MdEvent::Index { .. }
+        | MdEvent::Funding { .. }
+        | MdEvent::Stats { .. } => None,
     }
 }
