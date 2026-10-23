@@ -23,9 +23,10 @@ different declarations or safety reserves for that key fail closed. The registry
 the budget for the process lifetime so dropping the last session cannot reset a live window.
 The keyed constructor accepts only
 user-scoped limits; a mixed declaration fails rather than silently sharing account or
-connection buckets incorrectly. A user budget samples Tokio's instant under its shared lock
-and uses the later of that acquisition time and the caller's virtual time. Bucket timestamps
-also never move backward. A shard delayed before the lock cannot make a newly admitted
+connection buckets incorrectly. All limiters now sample Tokio's instant under their shared lock
+and use the later of that acquisition time and the caller's virtual time. This refines decision
+0030's clockless implementation now that limiters are shareable across shard threads. Bucket
+timestamps never move backward. A shard delayed before the lock cannot make a newly admitted
 request expire early; replayed virtual time still advances the same buckets deterministically.
 
 For v1, one process owns private traffic for each QFEX provider user. An external owner lease
