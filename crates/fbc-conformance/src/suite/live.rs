@@ -35,8 +35,8 @@ use fbc_oms::{
 };
 use fbc_runtime::{
     AccountWideCodAuthority, BucketKey, Connector, ExecHandler, ExecOrders, ExecSession,
-    ExecSessionConfig, IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds,
-    SafetyReserve, WriteStall,
+    ExecSessionConfig, IngestClock, ProxyConfig, RateError, RateLimiter, RateUserKey,
+    ReconnectPacing, RpcIds, SafetyReserve, WriteStall,
 };
 use futures_util::FutureExt;
 
@@ -306,8 +306,51 @@ impl<'s> Live<'s> {
     fn limiter(&self) -> Result<RateLimiter, Failure> {
         let caps: &VenueCaps = &self.h.caps;
         let reserve = SafetyReserve::percent(0).expect("0% is a reserve");
-        RateLimiter::new(&caps.limits, reserve)
+        harness_limiter(&caps.limits, reserve)
             .map_err(|e| self.h.fail("VenueCaps.limits", format!("refused: {e:?}")))
+    }
+}
+
+/// Each independent conformance run receives its own synthetic user; no provider identity or
+/// credential enters this harness. User-scoped venues use the same keyed construction their
+/// consumers must use, while other venues keep the ordinary constructor.
+fn harness_limiter(limits: &[RateLimit], reserve: SafetyReserve) -> Result<RateLimiter, RateError> {
+    if limits.iter().any(|limit| limit.scope == LimitScope::User) {
+        static NEXT_USER: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_USER.fetch_add(1, Ordering::Relaxed);
+        RateLimiter::for_user(
+            RateUserKey::new(0xc0f0_0000_0000_0000 | id),
+            limits,
+            reserve,
+        )
+    } else {
+        RateLimiter::new(limits, reserve)
+    }
+}
+
+#[cfg(test)]
+mod user_rate_tests {
+    use super::*;
+    use fbc_core::TagSet;
+
+    #[test]
+    fn live_harness_constructs_a_keyed_user_limiter() {
+        let reserve = SafetyReserve::percent(0).unwrap();
+        let user = RateLimit {
+            scope: LimitScope::User,
+            ops: TagSet::of(&[OpKind::Place]),
+            per: Duration::from_secs(60),
+            units: 2,
+        };
+        assert!(harness_limiter(&[user], reserve).unwrap().serves(&[user]));
+        let account = RateLimit {
+            scope: LimitScope::Account,
+            ..user
+        };
+        assert_eq!(
+            harness_limiter(&[user, account], reserve).unwrap_err(),
+            RateError::MixedUserScopes
+        );
     }
 }
 
