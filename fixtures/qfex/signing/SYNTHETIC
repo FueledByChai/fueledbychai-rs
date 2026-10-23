@@ -1,0 +1,4 @@
+All key material and identifiers in this directory are synthetic. The HMAC
+result was calculated independently with Python's stdlib hmac and hashlib,
+following the published QFEX nonce:timestamp signing rule. No funded account
+uses these values.
