@@ -211,6 +211,8 @@ fn the_documented_answer_decodes_into_one_draft_per_perpetual_in_the_decode_scop
         },
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
     };
     assert_eq!(drafts[0], expected);
     let eth = &drafts[1];

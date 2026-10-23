@@ -5,7 +5,8 @@
 //! restart-safe minting under a namespace lease ([`mint`]), fees with one sign convention and
 //! per-account fee rates ([`fee`]), the decode scope that alone builds venue ids, venue
 //! symbols and fees ([`scope`]), instrument specs with maker-safe quantization
-//! ([`instrument`]), instrument resolution through an alias table ([`resolve`]) and venue
+//! ([`instrument`]) and the clock-free session calendars they carry ([`calendar`], decision
+//! 0125), instrument resolution through an alias table ([`resolve`]) and venue
 //! capabilities with every field mandatory ([`caps`]); decisions
 //! 0003, 0004 and 0008 fix their shape.
 //!
@@ -17,6 +18,7 @@
 //! ([`venue`]). Credentials reach a codec only as [`auth::Secrets`] (decision 0009).
 
 pub mod auth;
+pub mod calendar;
 pub mod caps;
 pub mod cid;
 pub mod codec;
@@ -36,6 +38,10 @@ pub mod units;
 pub mod venue;
 
 pub use auth::{HandshakeHeader, Secret, Secrets};
+pub use calendar::{
+    CalendarParts, ClosedWindow, DstRule, LocalTime, Month, SessionCalendar, Transition,
+    UtcOffsetRule, WeekOfMonth, WeekTime, Weekday, WeeklyClosure,
+};
 pub use caps::{
     AckModel, AmendAck, AmendCaps, AmendQty, Batch, BookCaps, Cadence, CancelBatch,
     CancelOnDisconnect, CapTag, ConnTopology, Continuity, Encoding, ExecCaps, Feature, FeedSource,
@@ -75,8 +81,8 @@ pub use ids::{
     Namespace, OrderRef, TradeId, UnderlyingId, VenueId, VenueOrderId, VenueSymbol,
 };
 pub use instrument::{
-    FundingSpec, InstrumentKind, InstrumentSpec, QtyError, QuantizeError, SizeStep, TradingStatus,
-    VenueNativeId,
+    FundingSpec, InstrumentKind, InstrumentSpec, QtyError, QuantizeError, SigningParams, SizeStep,
+    TradingStatus, VenueNativeId,
 };
 pub use lease::{AccountLease, LeaseName, MAX_LOCK_FILE_NAME_LEN, MarketLease, NamedLeaseError};
 pub use mint::{CidMint, LeaseError, LeaseIo, NamespaceLease};

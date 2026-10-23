@@ -111,7 +111,8 @@ rather than guess.
 
 - A Cargo workspace (0001, 0008). `crates/fbc-core` exists, with time, units,
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
-  `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), instrument
+  `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`; `SigningParams` and
+  a clock-free `SessionCalendar`, 0125), instrument
   resolution (`AssetKey`, `AliasTable`, `InstrumentResolver`, `InstrumentSpecDraft`; 0035),
   `VenueCaps`, the market-data and execution events, venue commands, and the codec, signer,
   nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery and
@@ -138,6 +139,13 @@ rather than guess.
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
     `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0034).
+    A spec states `signing: Option<SigningParams>` (`AssetDecimals { underlying, settlement }`,
+    its contract id kept in `native_id`) and `sessions: Option<SessionCalendar>`
+    (`src/calendar.rs`: an earliest open, a close that never reopens, dated `ClosedWindow`s and
+    `WeeklyClosure`s in a zone's wall time under a POSIX-style `UtcOffsetRule`, evaluated by
+    integer civil-date arithmetic with no zone data and no clock; `is_open(at)` only ever
+    closes, fail-closed across daylight-saving edges; `None` where it closes nothing), copied
+    from the draft by the resolver, neither in `version` (0125).
     A `FillEvent` states its `origin: FillOrigin` once: an order's execution (`Order`, its
     client id and grid price) or a change the venue made itself (`Venue`, a `VenueFillKind`:
     liquidation, transfer, settlement or block trade, with no client id and the exact
