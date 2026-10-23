@@ -1,7 +1,8 @@
 //! Design §4.4, decisions 0003 and 0004: `InstrumentSpec::quantize` is the only place a model
 //! price becomes an order price, and it is maker-safe on every kind of grid: a bid floors and
 //! an ask ceils onto the grid valid at the resulting price. `floor_qty` floors a size onto the
-//! size step and refuses one below the minimum. The spec below is synthetic.
+//! size step and refuses one below the minimum. The spec below is synthetic, and states its
+//! signing parameters and its session calendar like every other field (decision 0125).
 
 use std::time::Duration;
 
@@ -9,9 +10,11 @@ mod common;
 
 use common::market_data_only_caps;
 use fbc_core::{
-    AssetSym, Bps, FeeRate, FeeSchedule, FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec,
-    Lots, Money, PriceGrid, PublishedRates, QtyError, QuantizeError, Side, SizeStep, Ticks,
-    TradingStatus, UnderlyingId, VenueId, VenueNativeId, WallNs, dispatch_market_data,
+    AssetSym, Bps, CalendarParts, DstRule, FeeRate, FeeSchedule, FundingSpec, InstrumentId,
+    InstrumentKind, InstrumentSpec, LocalTime, Lots, Money, Month, PriceGrid, PublishedRates,
+    QtyError, QuantizeError, SessionCalendar, Side, SigningParams, SizeStep, Ticks, TradingStatus,
+    Transition, UnderlyingId, UtcOffsetRule, VenueId, VenueNativeId, WallNs, WeekOfMonth, WeekTime,
+    Weekday, WeeklyClosure, dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -23,7 +26,47 @@ fn usd() -> AssetSym {
     AssetSym::new("USD").unwrap()
 }
 
-/// A synthetic perpetual on `grid`: size step 0.001, minimum 10 lots.
+const fn hm(h: u8, m: u8) -> LocalTime {
+    LocalTime::hms(h, m, 0).unwrap()
+}
+
+/// New York's rule as POSIX states it (EST5EDT,M3.2.0/2,M11.1.0/2), a checked const.
+const NEW_YORK: UtcOffsetRule = UtcOffsetRule::with_dst(
+    -18_000,
+    DstRule::new(
+        3_600,
+        Transition {
+            month: Month::March,
+            week: WeekOfMonth::Second,
+            weekday: Weekday::Sunday,
+            at: hm(2, 0),
+        },
+        Transition {
+            month: Month::November,
+            week: WeekOfMonth::First,
+            weekday: Weekday::Sunday,
+            at: hm(2, 0),
+        },
+    )
+    .unwrap(),
+)
+.unwrap();
+
+/// A weekly closure from Friday 17:00 to Sunday 17:00 in New York: an FX weekend.
+fn fx_weekend() -> WeeklyClosure {
+    let friday = WeekTime {
+        weekday: Weekday::Friday,
+        at: hm(17, 0),
+    };
+    let sunday = WeekTime {
+        weekday: Weekday::Sunday,
+        at: hm(17, 0),
+    };
+    WeeklyClosure::new(NEW_YORK, friday, sunday).unwrap()
+}
+
+/// A synthetic perpetual on `grid`: size step 0.001, minimum 10 lots, closed over the FX
+/// weekend, its signer packing by nine underlying and six settlement decimals.
 fn spec(grid: PriceGrid) -> InstrumentSpec {
     // A venue symbol comes only from the decode scope, in tests as well (decision 0004).
     let venue_symbol = dispatch_market_data(&market_data_only_caps(), |scope| {
@@ -61,6 +104,16 @@ fn spec(grid: PriceGrid) -> InstrumentSpec {
             rpi: None,
         }),
         status: TradingStatus::Trading,
+        sessions: SessionCalendar::new(CalendarParts {
+            first_open: None,
+            final_close: None,
+            windows: vec![],
+            weekly: vec![fx_weekend()],
+        }),
+        signing: Some(SigningParams::AssetDecimals {
+            underlying: 9,
+            settlement: 6,
+        }),
         version: 1,
         fetched_at: WallNs(1_759_363_200_000_000_000),
     }
@@ -353,6 +406,40 @@ fn a_spec_states_every_field_and_a_size_step_is_positive() {
     assert_ne!(dated, spec);
     assert_eq!(dated.funding, FundingSpec::NotApplicable);
     assert_ne!(FundingSpec::Unknown, FundingSpec::NotApplicable);
+}
+
+#[test]
+fn the_synthetic_spec_states_its_signing_and_sessions() {
+    let spec = fixed("0.5");
+    let decimals = SigningParams::AssetDecimals {
+        underlying: 9,
+        settlement: 6,
+    };
+    assert_eq!(spec.signing, Some(decimals));
+    let sessions = spec.sessions.as_ref().unwrap();
+    assert_eq!(sessions.parts().weekly, [fx_weekend()]);
+    assert_eq!(sessions.parts().first_open, None);
+    assert_eq!(sessions.parts().final_close, None);
+    // Saturday 2027-07-10T16:00Z is inside the weekend; Wednesday 2027-07-07T16:00Z is not.
+    assert!(!sessions.is_open(WallNs(1_815_235_200_000_000_000)));
+    assert!(sessions.is_open(WallNs(1_814_976_000_000_000_000)));
+    // A calendar that closes nothing is no calendar: a venue with no timetable says `None`.
+    let nothing = CalendarParts {
+        first_open: None,
+        final_close: None,
+        windows: vec![],
+        weekly: vec![],
+    };
+    assert_eq!(SessionCalendar::new(nothing), None);
+    // Neither field is part of what the version indexes: a spec differing only in them is a
+    // different spec of the same version (decision 0004).
+    let unscheduled = InstrumentSpec {
+        sessions: None,
+        signing: None,
+        ..fixed("0.5")
+    };
+    assert_ne!(unscheduled, spec);
+    assert_eq!(unscheduled.version, spec.version);
 }
 
 #[test]

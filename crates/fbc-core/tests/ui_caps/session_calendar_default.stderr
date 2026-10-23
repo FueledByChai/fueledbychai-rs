@@ -1,0 +1,11 @@
+error[E0599]: no associated function or constant named `default` found for struct `SessionCalendar` in the current scope
+ --> tests/ui_caps/session_calendar_default.rs:5:30
+  |
+5 |     let _ = SessionCalendar::default();
+  |                              ^^^^^^^ associated function or constant not found in `SessionCalendar`
+  |
+note: if you're trying to build a new `SessionCalendar`, consider using `SessionCalendar::new` which returns `Option<SessionCalendar>`
+ --> src/calendar.rs
+  |
+  |     pub fn new(mut parts: CalendarParts) -> Option<SessionCalendar> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

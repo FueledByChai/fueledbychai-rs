@@ -209,6 +209,8 @@ fn draft(
         funding: FundingSpec::Unknown,
         public_fees: None,
         status,
+        sessions: None,
+        signing: None,
     })
 }
 
