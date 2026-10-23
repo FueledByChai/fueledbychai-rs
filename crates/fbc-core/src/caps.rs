@@ -472,6 +472,8 @@ pub struct RateLimit {
 pub enum LimitScope {
     /// One account.
     Account,
+    /// One provider user, shared by its API keys, connections and subaccounts.
+    User,
     /// One source IP address.
     Ip,
     /// One instrument.
@@ -497,7 +499,10 @@ impl RateLimit {
         let keyed = match self.scope {
             LimitScope::Pair => charge.inst.is_some(),
             LimitScope::Connection => via == Via::Frame,
-            LimitScope::Account | LimitScope::Ip | LimitScope::AddressVolume { .. } => true,
+            LimitScope::Account
+            | LimitScope::User
+            | LimitScope::Ip
+            | LimitScope::AddressVolume { .. } => true,
         };
         keyed && self.ops.contains(charge.op)
     }
