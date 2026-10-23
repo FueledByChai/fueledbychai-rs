@@ -119,10 +119,14 @@ augments 0003, 0004 and 0035.
 - A zone rule outside this model: a transition at 24:00 or later, which POSIX allows
   (America/Santiago's `M9.1.6/24`), or before midnight, which RFC 9636 allows (America/Nuuk's
   `M3.5.0/-1`).
-- A rule whose start can fall after the next year's end, such as one with near-whole-day offsets
-  and a late-December start: point 4's latest-transition rule then keeps daylight time where libc
-  and zoneinfo, evaluating each year's pair on its own, keep standard time. No real zone does
-  this and nothing builds one (Reviewer B on PR #203, RB203-1).
+- A rule whose 31 December transition falls, as an instant, after the next day's 1 January one,
+  or at it when the December one is an end: in wall time, a start less than the save before an
+  end, or, under a negative save, an end at most the save's size before a start. Point 4 then
+  keeps the offset the December transition sets until the same transition a year later, where
+  macOS's libc keeps the other. Python's zoneinfo, evaluating each year's pair on its own,
+  differs again there and on rules whose transitions tie, reorder or fall near New Year. No real
+  zone has such a rule and nothing here builds one (Reviewers B and C on PR #203, RB203-1 and
+  RC203-1).
 - A replay of an older day disagreeing with what the venue did then because a zone's law
   changed.
 - A feed silent through a closed session tripping a liveness alarm.
