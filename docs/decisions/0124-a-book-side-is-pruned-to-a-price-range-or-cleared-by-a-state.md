@@ -114,7 +114,11 @@ or is it a stateless prune after which the side reads as any side reads? The own
 the matches item 7 names as naming every event now do. `L2Book` gains `prune_side` and
 `clear_side`, and `set_level` shares their routing. Decoder replay needs no change. `fbc-sim`
 cannot rest an order on a side the venue cleared until a level shows there, and keeps a resting
-order's place behind public size a prune removed; both are conservative. FBC-2kmp emits each
+order's place behind public size a prune removed; both are conservative. With a side cleared,
+`fbc-sim` also cannot classify a trade print whose aggressor is unknown by that side's touch, so a
+print at the price of an order already resting there fills nothing, as on any side zero levels
+emptied; that too is conservative, and a venue whose trades name the taker, as Hibachi's do, is
+unaffected (Reviewer B on PR #202, RB202-1). FBC-2kmp emits each
 stated zero as item 6 reads it, an emptied level's before its side's prune and a scrolled-out
 one's after it or not at all, and every removal before any level it sets. Two books that differ
 by a prune or a clear serialize differently through the levels it removed; one that removed
