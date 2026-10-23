@@ -18,10 +18,9 @@
 //! [`LimitScope::AddressVolume`] (requests earned by traded volume) is not supported yet: a
 //! limiter refuses limits that declare it, naming the scope, rather than leave them uncounted.
 //!
-//! Ordinary limiters use only the times their callers pass. A user-scoped limiter also samples
-//! Tokio's instant under its shared lock, so a delayed shard cannot charge at a stale time.
-//! Clones share their buckets, and independently built user-scoped limiters share by
-//! provider-user key within this process.
+//! Every limiter also samples Tokio's instant under its lock, so a delayed shard cannot charge
+//! at a stale time. Clones share their buckets, and independently built user-scoped limiters
+//! share by provider-user key within this process.
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -293,18 +292,11 @@ struct Inner {
     /// Serialized charge time. A shard may sample its clock before another shard but take
     /// this mutex later; never append an older timestamp behind a newer charge.
     last_now: Option<Instant>,
-    /// A user budget is shared across shard threads; sample the admission time only after the
-    /// shared lock is acquired. Ordinary single-shard limiters preserve caller-time semantics.
-    clock_on_lock: bool,
 }
 
 impl Inner {
     fn at(&mut self, now: Instant) -> Instant {
-        let now = if self.clock_on_lock {
-            now.max(Instant::now())
-        } else {
-            now
-        };
+        let now = now.max(Instant::now());
         let at = self.last_now.map_or(now, |last| last.max(now));
         self.last_now = Some(at);
         at
@@ -355,7 +347,7 @@ impl RateLimiter {
         if limits.iter().any(|limit| limit.scope == LimitScope::User) {
             return Err(RateError::UserKeyRequired);
         }
-        Self::build(limits, reserve, false)
+        Self::build(limits, reserve)
     }
 
     /// Returns the process-wide budget for one provider user. Independently built sessions
@@ -372,7 +364,7 @@ impl RateLimiter {
         if limits.is_empty() || limits.iter().any(|limit| limit.scope != LimitScope::User) {
             return Err(RateError::MixedUserScopes);
         }
-        let built = Self::build(limits, reserve, true)?;
+        let built = Self::build(limits, reserve)?;
         let mut registry = user_registry().lock().expect("user rate registry poisoned");
         if let Some(existing) = registry.get(&user) {
             let inner = existing.lock().expect("user rate budget poisoned");
@@ -388,11 +380,7 @@ impl RateLimiter {
         Ok(built)
     }
 
-    fn build(
-        limits: &[RateLimit],
-        reserve: SafetyReserve,
-        clock_on_lock: bool,
-    ) -> Result<RateLimiter, RateError> {
+    fn build(limits: &[RateLimit], reserve: SafetyReserve) -> Result<RateLimiter, RateError> {
         for limit in limits {
             if let LimitScope::AddressVolume { .. } = limit.scope {
                 return Err(RateError::Unsupported(limit.scope));
@@ -417,7 +405,6 @@ impl RateLimiter {
             buckets: HashMap::new(),
             counts: RateCounts::default(),
             last_now: None,
-            clock_on_lock,
         };
         Ok(RateLimiter {
             inner: Arc::new(Mutex::new(inner)),
@@ -727,7 +714,8 @@ mod tests {
         rates.charge(t0 + secs(2), CONN, &place(2)).unwrap();
         // Normal traffic stops at 3 of 4: one more waits until the first charge expires.
         let refused = rates.charge(t0 + secs(3), CONN, &place(1)).unwrap_err();
-        assert_eq!(refused.ready_at, Some(t0 + secs(10)));
+        let ready = refused.ready_at.unwrap();
+        assert!(ready >= t0 + secs(10) && ready <= Instant::now() + secs(10));
         // Two more wait for the second too; four never fit under the normal cap.
         let refused = rates.charge(t0 + secs(3), CONN, &place(3)).unwrap_err();
         assert_eq!(refused.ready_at, Some(t0 + secs(12)));
@@ -736,8 +724,8 @@ mod tests {
             None
         );
         assert_eq!(rates.used(t0 + secs(9), 0, BucketKey::Shared), 3);
-        assert_eq!(rates.used(t0 + secs(10), 0, BucketKey::Shared), 2);
-        rates.charge(t0 + secs(10), CONN, &place(1)).unwrap();
+        assert_eq!(rates.used(t0 + secs(11), 0, BucketKey::Shared), 2);
+        rates.charge(t0 + secs(11), CONN, &place(1)).unwrap();
         assert_eq!(rates.counts().refused.account, 3);
         // Nothing of a limit that is not declared, or of a bucket never charged.
         assert_eq!(rates.used(t0, 1, BucketKey::Shared), 0);
@@ -811,10 +799,8 @@ mod tests {
         let t0 = Instant::now();
         let charged = rates.connect(t0).unwrap();
         assert!(charged.includes(LimitScope::Ip) && !charged.includes(LimitScope::Connection));
-        assert_eq!(
-            rates.connect(t0 + secs(1)).unwrap_err().ready_at,
-            Some(t0 + secs(10))
-        );
+        let ready = rates.connect(t0 + secs(1)).unwrap_err().ready_at.unwrap();
+        assert!(ready >= t0 + secs(10) && ready <= Instant::now() + secs(10));
         rates.rejected(charged);
         let counts = rates.counts();
         assert_eq!(counts.rejected.get(LimitScope::Ip), 1);
@@ -976,29 +962,34 @@ mod tests {
     }
 
     #[test]
-    fn delayed_user_charge_uses_time_after_acquiring_the_shared_lock() {
+    fn delayed_charge_uses_time_after_acquiring_the_shared_lock() {
         let user = RateUserKey::new(0xe5bd_0005);
-        let limits = [limit(LimitScope::User, &[OpKind::Place], 2, 60)];
-        let rates =
-            RateLimiter::for_user(user, &limits, SafetyReserve::percent(0).unwrap()).unwrap();
-        let sampled = Instant::now();
-        let guard = rates.inner.lock().unwrap();
-        let worker_rates = rates.clone();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            worker_rates
-                .charge(sampled, CONN, &[req(OpKind::Place, None, 1, N)])
-                .unwrap();
-        });
-        started_rx.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        let released_at = Instant::now();
-        drop(guard);
-        worker.join().unwrap();
-        let inner = rates.inner.lock().unwrap();
-        let charged_at = inner.buckets[&(0, BucketKey::Shared)].log.back().unwrap().0;
-        assert!(charged_at >= released_at);
+        let reserve = SafetyReserve::percent(0).unwrap();
+        let user_limits = [limit(LimitScope::User, &[OpKind::Place], 2, 60)];
+        let account_limits = [limit(LimitScope::Account, &[OpKind::Place], 2, 60)];
+        for rates in [
+            RateLimiter::for_user(user, &user_limits, reserve).unwrap(),
+            RateLimiter::new(&account_limits, reserve).unwrap(),
+        ] {
+            let sampled = Instant::now();
+            let guard = rates.inner.lock().unwrap();
+            let worker_rates = rates.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                worker_rates
+                    .charge(sampled, CONN, &[req(OpKind::Place, None, 1, N)])
+                    .unwrap();
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let released_at = Instant::now();
+            drop(guard);
+            worker.join().unwrap();
+            let inner = rates.inner.lock().unwrap();
+            let charged_at = inner.buckets[&(0, BucketKey::Shared)].log.back().unwrap().0;
+            assert!(charged_at >= released_at);
+        }
     }
 
     #[test]
