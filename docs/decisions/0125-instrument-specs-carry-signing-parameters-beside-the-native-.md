@@ -119,6 +119,10 @@ augments 0003, 0004 and 0035.
 - A zone rule outside this model: a transition at 24:00 or later, which POSIX allows
   (America/Santiago's `M9.1.6/24`), or before midnight, which RFC 9636 allows (America/Nuuk's
   `M3.5.0/-1`).
+- A rule whose start can fall after the next year's end, such as one with near-whole-day offsets
+  and a late-December start: point 4's latest-transition rule then keeps daylight time where libc
+  and zoneinfo, evaluating each year's pair on its own, keep standard time. No real zone does
+  this and nothing builds one (Reviewer B on PR #203, RB203-1).
 - A replay of an older day disagreeing with what the venue did then because a zone's law
   changed.
 - A feed silent through a closed session tripping a liveness alarm.
