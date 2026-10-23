@@ -20,7 +20,7 @@ pub(super) enum PrivateTruth {
     OpenOrdersPage {
         orders: Vec<VenueOrderId>,
     },
-    /// `user_trades` omits our side and does not identify a stable page boundary.
+    /// Trade history omits our side and does not identify a stable page boundary.
     TradesPage {
         trades: Vec<FillId>,
     },
@@ -40,6 +40,7 @@ pub(super) fn inspect(
         "fill_response",
         "all_orders_response",
         "user_trades",
+        "user_trades_response",
         "position_response",
     ]
     .iter()
@@ -86,12 +87,18 @@ pub(super) fn inspect(
         }
         return Ok(PrivateTruth::OpenOrdersPage { orders: ids });
     }
-    if let Some(rows) = object.get("user_trades") {
+    if let Some((rows, documented)) = object
+        .get("user_trades")
+        .map(|rows| (rows, true))
+        .or_else(|| object.get("user_trades_response").map(|rows| (rows, false)))
+    {
         let rows = rows.as_array().ok_or("trades page")?;
-        object
-            .get("count")
-            .and_then(Value::as_u64)
-            .ok_or("trades count")?;
+        if documented || object.contains_key("count") {
+            object
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or("trades count")?;
+        }
         let mut ids = Vec::with_capacity(rows.len());
         let mut seen = HashSet::new();
         for row in rows {
@@ -279,6 +286,14 @@ mod tests {
                 inspect(&json!({"user_trades":[],"count":-1}), scope),
                 Err("trades count")
             );
+            assert_eq!(
+                inspect(&json!({"user_trades_response":[]}), scope),
+                Ok(PrivateTruth::TradesPage { trades: vec![] })
+            );
+            assert_eq!(
+                inspect(&json!({"user_trades":[],"user_trades_response":[]}), scope),
+                Err("ambiguous private envelope")
+            );
         });
     }
 
@@ -299,6 +314,54 @@ mod tests {
                 .unwrap()
                 .push(duplicate);
             assert_eq!(inspect(&orders, scope), Err("duplicate order id in page"));
+        });
+    }
+
+    #[test]
+    fn observed_trade_envelope_and_malformed_private_pages_fail_closed() {
+        let orders = fixture(include_str!(
+            "../../../../../fixtures/qfex/private/open_orders_page.json"
+        ));
+        let mut trades = fixture(include_str!(
+            "../../../../../fixtures/qfex/private/user_trades_page.json"
+        ));
+        let rows = trades
+            .as_object_mut()
+            .unwrap()
+            .remove("user_trades")
+            .unwrap();
+        trades.as_object_mut().unwrap().remove("count");
+        trades["user_trades_response"] = rows;
+        with_scope(|scope| {
+            assert_eq!(inspect(&json!([]), scope), Err("private envelope"));
+            assert_eq!(
+                inspect(
+                    &json!({"all_orders_response":{"orders":{},"twaps":[]}}),
+                    scope
+                ),
+                Err("orders page")
+            );
+            let mut bad_order = orders.clone();
+            bad_order["all_orders_response"]["orders"][0]["quantity_remaining"] = json!(-1);
+            assert_eq!(inspect(&bad_order, scope), Err("nonnegative"));
+
+            assert_eq!(
+                inspect(&trades, scope),
+                Ok(PrivateTruth::TradesPage {
+                    trades: vec![
+                        scope
+                            .fill_id("92adf4db-1e48-40cf-9e2a-b0ecf079a16a")
+                            .unwrap()
+                    ],
+                })
+            );
+            assert_eq!(
+                inspect(&json!({"user_trades_response":{}}), scope),
+                Err("trades page")
+            );
+            let mut bad_trade = trades.clone();
+            bad_trade["user_trades_response"][0]["fee"] = Value::Null;
+            assert_eq!(inspect(&bad_trade, scope), Err("number"));
         });
     }
 

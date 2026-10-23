@@ -124,7 +124,7 @@ fn selected_subaccount_is_signed_redacted_and_reauthenticated_on_reconnect() {
     let result = dispatch_market_data(&caps, |scope| {
         codec.on_frame(
             StreamId(0),
-            RawFrame::Text(r#"{"type":"auth","result":"success"}"#),
+            RawFrame::Text(r#"{"authenticated":true}"#),
             scope,
             &SpecTable::new(),
             &mut sink,
@@ -301,6 +301,8 @@ fn malformed_documented_fill_reconnects_with_generic_diagnostic() {
 fn rejected_or_missing_auth_never_emits_authenticated() {
     for reply in [
         r#"{"type":"auth","result":"failure","err":"bad signature"}"#,
+        r#"{"authenticated":false}"#,
+        r#"{"authenticated":true,"order_response":{"status":"ACK"}}"#,
         r#"{"order_response":{"status":"ACK"}}"#,
     ] {
         let cfg = config("primary", "4");

@@ -217,10 +217,14 @@ impl ExecCodec for QfexExec {
             DecodeError::Malformed("invalid QFEX private JSON")
         })?;
         if self.waiting_auth {
-            if value.get("type").and_then(Value::as_str) == Some("auth")
+            let documented = value.get("type").and_then(Value::as_str) == Some("auth")
                 && value.get("result").and_then(Value::as_str) == Some("success")
-                && value.get("err").is_none()
-            {
+                && value.get("err").is_none();
+            let observed = value.as_object().is_some_and(|fields| {
+                fields.len() == 1
+                    && fields.get("authenticated").and_then(Value::as_bool) == Some(true)
+            });
+            if documented || observed {
                 self.waiting_auth = false;
                 self.authenticated = true;
                 sink.push(
