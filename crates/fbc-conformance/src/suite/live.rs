@@ -462,9 +462,10 @@ impl Ctx<'_> {
                 .map(|epoch| used(BucketKey::Connection(ConnKey { conn: 0, epoch })))
                 .max()
                 .unwrap_or_default(),
-            LimitScope::Account | LimitScope::Ip | LimitScope::AddressVolume { .. } => {
-                used(BucketKey::Shared)
-            }
+            LimitScope::Account
+            | LimitScope::User
+            | LimitScope::Ip
+            | LimitScope::AddressVolume { .. } => used(BucketKey::Shared),
         }
     }
 
