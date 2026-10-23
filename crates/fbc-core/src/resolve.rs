@@ -26,11 +26,13 @@ use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 
+use crate::calendar::SessionCalendar;
 use crate::fee::FeeSchedule;
 use crate::grid::PriceGrid;
 use crate::ids::{InstrumentId, UnderlyingId, VenueId, VenueSymbol};
 use crate::instrument::{
-    FundingSpec, InstrumentKind, InstrumentSpec, SizeStep, TradingStatus, VenueNativeId,
+    FundingSpec, InstrumentKind, InstrumentSpec, SigningParams, SizeStep, TradingStatus,
+    VenueNativeId,
 };
 use crate::time::WallNs;
 use crate::units::{AssetSym, Bps, Lots, Money};
@@ -306,6 +308,8 @@ impl InstrumentResolver {
             funding: draft.funding,
             public_fees: draft.public_fees,
             status: draft.status,
+            sessions: draft.sessions,
+            signing: draft.signing,
             version,
             fetched_at,
         })
@@ -340,6 +344,8 @@ pub struct InstrumentSpecDraft {
     pub funding: FundingSpec,
     pub public_fees: Option<FeeSchedule>,
     pub status: TradingStatus,
+    pub sessions: Option<SessionCalendar>,
+    pub signing: Option<SigningParams>,
 }
 
 #[cfg(test)]

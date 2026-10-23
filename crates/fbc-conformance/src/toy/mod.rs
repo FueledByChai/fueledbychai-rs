@@ -345,6 +345,8 @@ fn spec(id: InstrumentId, symbol: &str) -> InstrumentSpec {
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     }

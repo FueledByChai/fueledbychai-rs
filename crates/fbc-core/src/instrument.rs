@@ -22,6 +22,11 @@
 //! [`InstrumentSpec::version`] ties [`Ticks`] and [`Lots`] to the spec they index: a new tick or
 //! size step is a new version, and the books resync and resting orders re-quantize (decision
 //! 0004).
+//!
+//! A spec also states when a venue's timetable closes the instrument
+//! ([`InstrumentSpec::sessions`], a [`SessionCalendar`]) and what its venue's signer packs for
+//! it beyond its grid, step and native id ([`InstrumentSpec::signing`], [`SigningParams`]).
+//! Neither is part of what the version indexes (decision 0125).
 
 use core::fmt;
 use core::fmt::Write as _;
@@ -31,6 +36,7 @@ use arrayvec::ArrayString;
 use compact_str::CompactString;
 use rust_decimal::{Decimal, RoundingStrategy};
 
+use crate::calendar::SessionCalendar;
 use crate::fee::FeeSchedule;
 use crate::grid::PriceGrid;
 use crate::ids::{InstrumentId, UnderlyingId, VenueId, VenueSymbol};
@@ -88,6 +94,12 @@ pub struct InstrumentSpec {
     pub public_fees: Option<FeeSchedule>,
     /// Whether the instrument is trading.
     pub status: TradingStatus,
+    /// When a timetable the venue states closes it, `None` where the venue states none. It
+    /// only ever closes: whether the instrument trades is still `status` too (decision 0125).
+    pub sessions: Option<SessionCalendar>,
+    /// What the venue's signer packs for it beyond the fields above, `None` where it needs
+    /// nothing more (decision 0125).
+    pub signing: Option<SigningParams>,
     /// The spec's version: a new tick or size step bumps it, and books resync and resting
     /// orders re-quantize.
     pub version: u32,
@@ -102,6 +114,22 @@ pub enum VenueNativeId {
     Number(u64),
     /// A string (an asset hash).
     Text(CompactString),
+}
+
+/// What a venue's signer packs for an instrument beyond its price grid, size step and
+/// [`native_id`](InstrumentSpec::native_id), named by the shape of the values and never by a
+/// venue (decisions 0003, 0125). The instrument's own key, such as a contract id, is its
+/// `native_id` and is never repeated here. No `Default`: no decimals are ever assumed.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum SigningParams {
+    /// The decimal places the venue states for the asset traded and for the asset it settles
+    /// in; how its signer scales by them is the venue crate's.
+    AssetDecimals {
+        /// The traded asset's decimal places.
+        underlying: u8,
+        /// The settlement asset's decimal places.
+        settlement: u8,
+    },
 }
 
 /// What kind of contract an instrument is.

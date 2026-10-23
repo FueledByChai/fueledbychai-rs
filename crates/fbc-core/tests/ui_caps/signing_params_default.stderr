@@ -1,0 +1,5 @@
+error[E0599]: no variant, associated function, or constant named `default` found for enum `SigningParams` in the current scope
+ --> tests/ui_caps/signing_params_default.rs:5:28
+  |
+5 |     let _ = SigningParams::default();
+  |                            ^^^^^^^ variant, associated function, or constant not found in `SigningParams`

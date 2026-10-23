@@ -58,7 +58,10 @@ use fbc_core::{
     VenueMeta, VenueOrderSnapshot, VenueOrderState, Via, WallNs, WireSlice, WireUrl,
     common_symbol_parts, decode_cid, dispatch, dispatch_market_data, encode_cid,
 };
-use fbc_core::{ConfigScope, FieldUnit, Header, Secret, Secrets};
+use fbc_core::{
+    CalendarParts, ClosedWindow, ConfigScope, FieldUnit, Header, Secret, Secrets, SessionCalendar,
+    SigningParams,
+};
 use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------------------------------------
@@ -746,6 +749,8 @@ fn draft(line: &str, scope: &DecodeScope<'_>) -> Result<InstrumentSpecDraft, Pla
         funding: FundingSpec::Unknown,
         public_fees: None,
         status,
+        sessions: None,
+        signing: None,
     })
 }
 
@@ -1071,6 +1076,8 @@ fn specs() -> SpecTable {
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     });
@@ -1919,6 +1926,8 @@ fn discovery_is_a_plan_of_http_effects_whose_parser_builds_drafts_in_the_decode_
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
     };
     assert_eq!(drafts[0], expected);
     assert_eq!(drafts[1].status, TradingStatus::Halted);
@@ -1946,6 +1955,29 @@ fn a_draft_and_a_java_era_ticker_resolve_to_one_instrument_through_the_alias_tab
     // The resolved draft is the spec the other tests trade against.
     let spec = resolver.spec(TOY_VENUE, drafts[0].clone(), 1, WallNs(0));
     assert_eq!(spec.as_ref(), Ok(specs().get(INST).unwrap()));
+    // A draft's session calendar and signing parameters reach its spec unchanged (0125).
+    let close = WallNs(1_900_000_000_000_000_000);
+    let window = ClosedWindow::new(WallNs(close.0 - 7_200_000_000_000), close).unwrap();
+    let parts = CalendarParts {
+        first_open: Some(WallNs(1_800_000_000_000_000_000)),
+        final_close: Some(close),
+        windows: vec![window],
+        weekly: vec![],
+    };
+    let signing = SigningParams::AssetDecimals {
+        underlying: 10,
+        settlement: 6,
+    };
+    let scheduled = InstrumentSpecDraft {
+        sessions: SessionCalendar::new(parts),
+        signing: Some(signing),
+        ..drafts[0].clone()
+    };
+    let resolved = resolver.spec(TOY_VENUE, scheduled.clone(), 1, WallNs(0));
+    let resolved = resolved.unwrap();
+    assert_eq!(resolved.sessions, scheduled.sessions);
+    assert_eq!(resolved.signing, Some(signing));
+    assert!(resolved.sessions.is_some());
 
     // Nothing is guessed: a market the consumer did not list, or the same keys read without
     // the aliases, resolve to nothing.

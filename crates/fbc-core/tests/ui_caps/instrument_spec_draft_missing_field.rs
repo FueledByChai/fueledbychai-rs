@@ -24,6 +24,8 @@ fn draft(asset: AssetKey, venue_symbol: VenueSymbol, settle_ccy: AssetSym) -> In
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
     }
 }
 
