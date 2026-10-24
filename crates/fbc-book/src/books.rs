@@ -24,9 +24,11 @@ impl Books {
         self.books.get(&(inst, book))
     }
 
-    /// Applies one market-data event. Book events go to their book; `Health` with
+    /// Applies one market-data event. Book events (a snapshot's begin or end, a level, a
+    /// window, a prune or a clear of one side) go to their book; `Health` with
     /// [`FeedHealth::Gap`] on a book feed invalidates that book; everything else is
-    /// [`Applied::Unchanged`].
+    /// [`Applied::Unchanged`]. The match names every event, so a new one is routed or refused
+    /// here by choice, never dropped by a fallback (decision 0124).
     pub fn apply(&mut self, ev: &MdEvent) -> Result<Applied, BookError> {
         match *ev {
             MdEvent::BookSnapshotBegin { inst, book, epoch } => {
@@ -48,6 +50,14 @@ impl Books {
                 self.entry(inst, book).set_window(lo, hi)?;
                 Ok(Applied::Changed)
             }
+            MdEvent::SidePrune {
+                inst,
+                book,
+                side,
+                lo,
+                hi,
+            } => self.entry(inst, book).prune_side(side, lo, hi),
+            MdEvent::SideClear { inst, book, side } => Ok(self.entry(inst, book).clear_side(side)),
             MdEvent::Health {
                 inst,
                 feed: Feed::Book(book),
@@ -60,7 +70,13 @@ impl Books {
                 // A book that never got an event is already awaiting its first snapshot.
                 None => Ok(Applied::Unchanged),
             },
-            _ => Ok(Applied::Unchanged),
+            MdEvent::Health { .. }
+            | MdEvent::Touch { .. }
+            | MdEvent::Trade { .. }
+            | MdEvent::Mark { .. }
+            | MdEvent::Index { .. }
+            | MdEvent::Funding { .. }
+            | MdEvent::Stats { .. } => Ok(Applied::Unchanged),
         }
     }
 

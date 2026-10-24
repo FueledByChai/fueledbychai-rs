@@ -3,6 +3,13 @@
 //! outside its window; touch() and top(15) match a hand-built book; the top-n comparison names
 //! a planted difference; and two books fed the same events have identical canonical bytes,
 //! while a one-lot difference changes them. The error paths are here too.
+//!
+//! FBC-n35m's book half (decision 0124): a prune of one side to a price range removes only that
+//! side's levels outside it, and a clear of one side empties only that side, the book staying
+//! valid with no touch there; both act where a delta would (the snapshot in progress, else a
+//! valid book); an inverted range is refused in every state; a pruned or cleared side reads as
+//! any side its levels leave; the both-sides window keeps its behaviour; and the canonical bytes
+//! change exactly when a prune or clear removed a level, their layout unchanged.
 
 use fbc_core::{BookId, BookSide, Feed, FeedHealth, InstrumentId, Lots, Lvl, MdEvent, Ticks};
 
@@ -61,6 +68,26 @@ fn window(lo: i64, hi: i64) -> MdEvent {
         book: BOOK,
         lo: Ticks(lo),
         hi: Ticks(hi),
+    }
+}
+
+/// A prune of `side` to `lo..=hi` (decision 0124).
+fn prune(side: BookSide, lo: i64, hi: i64) -> MdEvent {
+    MdEvent::SidePrune {
+        inst: INST,
+        book: BOOK,
+        side,
+        lo: Ticks(lo),
+        hi: Ticks(hi),
+    }
+}
+
+/// A clear of `side` (decision 0124).
+fn clear(side: BookSide) -> MdEvent {
+    MdEvent::SideClear {
+        inst: INST,
+        book: BOOK,
+        side,
     }
 }
 
@@ -725,4 +752,392 @@ fn events_that_are_not_about_a_book_change_nothing() {
         assert_eq!(books.apply(&ev), Ok(Applied::Unchanged));
     }
     assert!(books.get(INST, BOOK).is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-n35m: a prune or a clear of one side (decision 0124).
+// ---------------------------------------------------------------------------------------------
+
+/// Bids 95x1, 98x2, 100x3 against asks 101x4, 103x5, 106x6 under epoch 1.
+fn wide_snapshot() -> Vec<MdEvent> {
+    vec![
+        begin(1),
+        bid(95, 1),
+        bid(98, 2),
+        bid(100, 3),
+        ask(101, 4),
+        ask(103, 5),
+        ask(106, 6),
+        end(),
+    ]
+}
+
+#[test]
+fn a_side_prune_removes_only_that_sides_levels_outside_its_range_and_keeps_the_book_valid() {
+    let mut books = Books::new();
+    feed(&mut books, &wide_snapshot());
+    assert_eq!(
+        books.apply(&prune(BookSide::Bid, 97, 99)),
+        Ok(Applied::Changed)
+    );
+    // Only the bids outside 97..=99 went; every ask stays, those outside the range included.
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(98, 2)],
+            asks: vec![lvl(101, 4), lvl(103, 5), lvl(106, 6)],
+        }
+    );
+    assert_eq!(book(&books).state(), BookState::Valid { epoch: 1 });
+    // It keeps no range: the book has no window.
+    assert_eq!(book(&books).window(), None);
+
+    // The asks' side prunes the asks alone.
+    assert_eq!(
+        books.apply(&prune(BookSide::Ask, 103, 200)),
+        Ok(Applied::Changed)
+    );
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(98, 2)],
+            asks: vec![lvl(103, 5), lvl(106, 6)],
+        }
+    );
+
+    // A later both-sides window still bounds both sides, as it always has.
+    assert_eq!(books.apply(&window(97, 104)), Ok(Applied::Changed));
+    assert_eq!(
+        book(&books).window(),
+        Some(Window::new(Ticks(97), Ticks(104)).unwrap())
+    );
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(98, 2)],
+            asks: vec![lvl(103, 5)],
+        }
+    );
+}
+
+#[test]
+fn a_side_clear_empties_only_that_side_and_leaves_the_book_valid_with_no_touch_there() {
+    let mut books = Books::new();
+    feed(&mut books, &small_snapshot());
+    assert_eq!(books.apply(&clear(BookSide::Ask)), Ok(Applied::Changed));
+    assert_eq!(
+        book(&books).touch(),
+        Ok(Touch {
+            bid: Some(lvl(101, 3)),
+            ask: None,
+        })
+    );
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(101, 3), lvl(100, 2)],
+            asks: vec![],
+        }
+    );
+    // Valid, with no gap: a cleared side is a routine state of a valid book.
+    assert_eq!(book(&books).state(), BookState::Valid { epoch: 1 });
+    assert_eq!(book(&books).window(), None);
+
+    // A level set on the cleared side later shows as any delta does.
+    assert_eq!(books.apply(&ask(104, 1)), Ok(Applied::Changed));
+    assert_eq!(
+        book(&books).touch(),
+        Ok(Touch {
+            bid: Some(lvl(101, 3)),
+            ask: Some(lvl(104, 1)),
+        })
+    );
+
+    // A book that is not valid, with no snapshot in progress, takes neither, as it takes no
+    // delta.
+    let mut gapped = Books::new();
+    feed(&mut gapped, &small_snapshot());
+    feed(&mut gapped, &[gap()]);
+    let mut awaiting = Books::new();
+    awaiting.apply(&bid(1, 1)).unwrap();
+    for books in [&mut gapped, &mut awaiting] {
+        let before = book(books).canonical_bytes();
+        let state = book(books).state();
+        assert!(!matches!(state, BookState::Valid { .. }));
+        assert_eq!(
+            books.apply(&clear(BookSide::Ask)),
+            Ok(Applied::DroppedNotValid)
+        );
+        assert_eq!(
+            books.apply(&prune(BookSide::Bid, 0, 1)),
+            Ok(Applied::DroppedNotValid)
+        );
+        assert_eq!(book(books).canonical_bytes(), before);
+        assert_eq!(book(books).state(), state);
+
+        // With a snapshot in progress, the replacement takes them.
+        books.apply(&begin(1)).unwrap();
+        assert_eq!(books.apply(&clear(BookSide::Ask)), Ok(Applied::Changed));
+        assert_eq!(
+            books.apply(&prune(BookSide::Bid, 0, 1)),
+            Ok(Applied::Changed)
+        );
+        assert_eq!(book(books).state(), state);
+    }
+}
+
+#[test]
+fn a_side_prune_or_clear_in_a_snapshot_in_progress_changes_only_that_side_of_the_replacement() {
+    let mut books = Books::new();
+    feed(&mut books, &small_snapshot());
+    let old = top_all(&books);
+    feed(
+        &mut books,
+        &[
+            begin(2),
+            bid(90, 1),
+            bid(95, 2),
+            ask(103, 3),
+            ask(110, 4),
+            prune(BookSide::Bid, 94, 96),
+        ],
+    );
+    // As a delta in a snapshot does, it acts on the replacement only: the book it replaces
+    // reads as it did until the snapshot ends.
+    assert_eq!(top_all(&books), old);
+    assert_eq!(book(&books).state(), BookState::Valid { epoch: 1 });
+    assert_eq!(books.apply(&end()), Ok(Applied::Changed));
+    assert_eq!(book(&books).state(), BookState::Valid { epoch: 2 });
+    // It bounds the replacement's bids only: its asks, all outside 94..=96, stay.
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(95, 2)],
+            asks: vec![lvl(103, 3), lvl(110, 4)],
+        }
+    );
+
+    // A clear of the asks in the next snapshot empties the replacement's asks only.
+    let old = top_all(&books);
+    feed(
+        &mut books,
+        &[
+            begin(3),
+            bid(90, 1),
+            bid(95, 2),
+            ask(103, 3),
+            clear(BookSide::Ask),
+        ],
+    );
+    assert_eq!(top_all(&books), old);
+    assert_eq!(books.apply(&end()), Ok(Applied::Changed));
+    assert_eq!(book(&books).state(), BookState::Valid { epoch: 3 });
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(95, 2), lvl(90, 1)],
+            asks: vec![],
+        }
+    );
+
+    // A prune before any level of a snapshot keeps no range: the snapshot's later levels stay,
+    // wherever they lie.
+    feed(
+        &mut books,
+        &[
+            begin(4),
+            prune(BookSide::Bid, 0, 0),
+            clear(BookSide::Ask),
+            bid(50, 1),
+            ask(60, 1),
+            end(),
+        ],
+    );
+    assert_eq!(
+        top_all(&books),
+        Top {
+            bids: vec![lvl(50, 1)],
+            asks: vec![lvl(60, 1)],
+        }
+    );
+}
+
+#[test]
+fn an_inverted_side_prune_is_refused_in_every_state_and_changes_nothing() {
+    let inverted = Err(BookError::InvertedWindow {
+        lo: Ticks(105),
+        hi: Ticks(95),
+    });
+    let refused = |books: &mut Books| {
+        let before = book(books).canonical_bytes();
+        let window = book(books).window();
+        for side in [BookSide::Bid, BookSide::Ask] {
+            assert_eq!(books.apply(&prune(side, 105, 95)), inverted);
+        }
+        assert_eq!(book(books).canonical_bytes(), before);
+        assert_eq!(book(books).window(), window);
+    };
+    let mut books = Books::new();
+    // Awaiting its first snapshot.
+    books.apply(&bid(1, 1)).unwrap();
+    refused(&mut books);
+    // Valid, and windowed.
+    feed(&mut books, &small_snapshot());
+    refused(&mut books);
+    feed(&mut books, &[window(90, 110)]);
+    refused(&mut books);
+    // With a snapshot in progress.
+    feed(&mut books, &[begin(2), bid(99, 1)]);
+    refused(&mut books);
+    // Gapped.
+    feed(&mut books, &[gap()]);
+    refused(&mut books);
+    // A one-tick range is fine.
+    feed(&mut books, &small_snapshot());
+    assert_eq!(
+        books.apply(&prune(BookSide::Bid, 101, 101)),
+        Ok(Applied::Changed)
+    );
+    assert_eq!(top_all(&books).bids, vec![lvl(101, 3)]);
+}
+
+#[test]
+fn a_pruned_or_cleared_side_reads_as_any_side_its_levels_leave() {
+    let mut b = L2Book::new();
+    b.begin_snapshot(1);
+    for (px, qty) in [(100, 3), (99, 2), (97, 2)] {
+        b.set_level(BookSide::Bid, Ticks(px), lots(qty));
+    }
+    b.set_level(BookSide::Ask, Ticks(101), lots(4));
+    b.set_level(BookSide::Ask, Ticks(104), lots(1));
+    b.end_snapshot().unwrap();
+    let prices = 85..=115;
+    let asks = |b: &L2Book| -> Vec<_> {
+        prices
+            .clone()
+            .map(|px| b.level(BookSide::Ask, Ticks(px)))
+            .collect()
+    };
+    let asks_before = asks(&b);
+
+    // The best bid leaves: a price better than the new touch, or between two levels, is empty,
+    // one past the deepest level unknown.
+    assert_eq!(
+        b.prune_side(BookSide::Bid, Ticks(97), Ticks(99)),
+        Ok(Applied::Changed)
+    );
+    assert_eq!(b.level(BookSide::Bid, Ticks(100)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Bid, Ticks(99)), Ok(Some(lots(2))));
+    assert_eq!(b.level(BookSide::Bid, Ticks(98)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.level(BookSide::Bid, Ticks(97)), Ok(Some(lots(2))));
+    assert_eq!(b.level(BookSide::Bid, Ticks(96)), Ok(None));
+
+    // The deepest bid leaves: what lay past the level now deepest is unknown.
+    assert_eq!(
+        b.prune_side(BookSide::Bid, Ticks(99), Ticks(200)),
+        Ok(Applied::Changed)
+    );
+    assert_eq!(b.level(BookSide::Bid, Ticks(97)), Ok(None));
+    assert_eq!(b.level(BookSide::Bid, Ticks(98)), Ok(None));
+    assert_eq!(b.level(BookSide::Bid, Ticks(99)), Ok(Some(lots(2))));
+
+    // No range is kept: a level set outside the last prune is kept and reported.
+    assert_eq!(
+        b.set_level(BookSide::Bid, Ticks(90), lots(1)),
+        Applied::Changed
+    );
+    assert_eq!(b.level(BookSide::Bid, Ticks(90)), Ok(Some(lots(1))));
+    assert_eq!(b.level(BookSide::Bid, Ticks(95)), Ok(Some(Lots::ZERO)));
+    assert_eq!(b.top(15).unwrap().bids, vec![lvl(99, 2), lvl(90, 1)]);
+
+    // A cleared side is unknown at every price, and the other side reads as it did.
+    assert_eq!(b.clear_side(BookSide::Bid), Applied::Changed);
+    for px in prices.clone() {
+        assert_eq!(b.level(BookSide::Bid, Ticks(px)), Ok(None), "bid {px}");
+    }
+    assert_eq!(asks(&b), asks_before);
+    assert_eq!(
+        b.touch(),
+        Ok(Touch {
+            bid: None,
+            ask: Some(lvl(101, 4)),
+        })
+    );
+    assert_eq!(b.state(), BookState::Valid { epoch: 1 });
+
+    // Under a both-sides window the window decides what is known: a clear leaves it, and the
+    // cleared side reads empty inside it and unknown outside it.
+    let mut windowed = L2Book::new();
+    windowed.begin_snapshot(1);
+    windowed.set_level(BookSide::Bid, Ticks(100), lots(3));
+    windowed.set_level(BookSide::Ask, Ticks(101), lots(4));
+    windowed.end_snapshot().unwrap();
+    windowed.set_window(Ticks(98), Ticks(102)).unwrap();
+    let w = windowed.window();
+    assert_eq!(windowed.clear_side(BookSide::Ask), Applied::Changed);
+    assert_eq!(windowed.window(), w);
+    assert_eq!(
+        windowed.level(BookSide::Ask, Ticks(101)),
+        Ok(Some(Lots::ZERO))
+    );
+    assert_eq!(windowed.level(BookSide::Ask, Ticks(104)), Ok(None));
+    assert_eq!(windowed.level(BookSide::Bid, Ticks(100)), Ok(Some(lots(3))));
+
+    // A book that is not valid takes neither, and reads as not valid.
+    let mut gapped = b.clone();
+    gapped.gap();
+    assert_eq!(
+        gapped.prune_side(BookSide::Ask, Ticks(0), Ticks(1)),
+        Ok(Applied::DroppedNotValid)
+    );
+    assert_eq!(gapped.clear_side(BookSide::Ask), Applied::DroppedNotValid);
+    assert_eq!(
+        gapped.level(BookSide::Ask, Ticks(101)),
+        Err(BookError::NotValid(BookState::Gapped))
+    );
+}
+
+#[test]
+fn side_events_change_the_canonical_bytes_exactly_when_they_remove_a_level() {
+    // Bids only: the asks' side is already empty.
+    let snapshot = [begin(1), bid(98, 1), bid(99, 2), bid(100, 3), end()];
+    let fed = |extra: &[MdEvent]| {
+        let mut books = Books::new();
+        feed(&mut books, &snapshot);
+        feed(&mut books, extra);
+        books
+    };
+    let a = fed(&[]);
+    // A prune that removes a level, and a clear.
+    let b = fed(&[prune(BookSide::Bid, 99, 100)]);
+    let c = fed(&[clear(BookSide::Bid)]);
+    // A prune whose range holds every bid, and a clear of the empty asks' side: nothing left.
+    let d = fed(&[prune(BookSide::Bid, 90, 110), clear(BookSide::Ask)]);
+    let bytes = |books: &Books| book(books).canonical_bytes();
+    assert_ne!(bytes(&a), bytes(&b));
+    assert_ne!(bytes(&a), bytes(&c));
+    assert_ne!(bytes(&b), bytes(&c));
+    // Equal bytes, equal books field for field, and equal reads.
+    assert_eq!(bytes(&d), bytes(&a));
+    assert_eq!(book(&d), book(&a));
+    assert_eq!(book(&d).touch(), book(&a).touch());
+    assert_eq!(top_all(&d), top_all(&a));
+    for side in [BookSide::Bid, BookSide::Ask] {
+        for px in 90..=110 {
+            assert_eq!(
+                book(&d).level(side, Ticks(px)),
+                book(&a).level(side, Ticks(px)),
+                "{side:?} {px}"
+            );
+        }
+    }
+    // The layout keeps its version: a prune or a clear stores nothing of its own.
+    for books in [&a, &b, &c, &d] {
+        assert_eq!(&bytes(books)[..5], b"FBCB\x01");
+    }
+    // Inside a snapshot in progress too, the bytes change when the replacement lost a level.
+    let e = fed(&[begin(2), bid(10, 1), ask(20, 1)]);
+    let f = fed(&[begin(2), bid(10, 1), ask(20, 1), clear(BookSide::Ask)]);
+    assert_ne!(bytes(&e), bytes(&f));
+    assert_eq!(top_all(&e), top_all(&f), "the replaced book reads alike");
 }

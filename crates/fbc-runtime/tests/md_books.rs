@@ -8,6 +8,11 @@
 //! one instrument, valid on one session's connection, read invalid (and so does the trading
 //! book) from the moment that connection drops until the new epoch's snapshot of each, while a
 //! book another session's connection feeds stays valid throughout.
+//!
+//! FBC-n35m's routing (decision 0124): a prune or a clear of one side reaches only the book of
+//! its (instrument, `BookId`), and counts as feeding that book, applied or not, so its
+//! connection epoch's end gaps it (0039); an inverted prune is refused, counted, and still
+//! reaches the handler.
 
 mod common;
 
@@ -101,11 +106,19 @@ fn channel(ev: &MdEvent) -> Option<BookId> {
         | MdEvent::BookSnapshotEnd { book, .. }
         | MdEvent::Level { book, .. }
         | MdEvent::Window { book, .. }
+        | MdEvent::SidePrune { book, .. }
+        | MdEvent::SideClear { book, .. }
         | MdEvent::Health {
             feed: Feed::Book(book),
             ..
         } => Some(book),
-        _ => None,
+        MdEvent::Health { .. }
+        | MdEvent::Touch { .. }
+        | MdEvent::Trade { .. }
+        | MdEvent::Mark { .. }
+        | MdEvent::Index { .. }
+        | MdEvent::Funding { .. }
+        | MdEvent::Stats { .. } => None,
     }
 }
 
@@ -743,4 +756,114 @@ fn an_epochs_end_gaps_only_the_books_its_connection_fed_last_in_it_or_before() {
     assert_eq!(state(&books, A, PUBLIC), BookState::Valid { epoch: 3 });
     assert_eq!(state(&books, B, PUBLIC), BookState::Valid { epoch: 1 });
     assert_eq!(books.refused(), 0);
+}
+
+#[test]
+fn a_side_prune_or_clear_reaches_only_its_book_and_feeds_it_for_an_epochs_end() {
+    let mut books = MdBooks::new(TradingBooks::new([(inst(A), PUBLIC)]).unwrap());
+    let levels = [
+        (BookSide::Bid, 90, 1),
+        (BookSide::Bid, 80, 1),
+        (BookSide::Ask, 110, 1),
+    ];
+    snapshot_from(&mut books, from(3, 0), A, PUBLIC, 1, &levels);
+    snapshot_from(&mut books, from(3, 0), A, INTERACTIVE, 1, &levels);
+    snapshot_from(&mut books, from(3, 0), B, PUBLIC, 1, &levels);
+    let all = |books: &MdBooks| {
+        [(A, PUBLIC), (A, INTERACTIVE), (B, PUBLIC)]
+            .map(|(id, book)| books.book(inst(id), book).unwrap().canonical_bytes())
+    };
+
+    // A's interactive bids pruned to 85..=95: that book alone changes.
+    let before = all(&books);
+    let prune = MdEvent::SidePrune {
+        inst: inst(A),
+        book: INTERACTIVE,
+        side: BookSide::Bid,
+        lo: Ticks(85),
+        hi: Ticks(95),
+    };
+    assert_eq!(books.apply(from(4, 0), &prune), Ok(Applied::Changed));
+    let after = all(&books);
+    assert_eq!((after[0] == before[0], after[2] == before[2]), (true, true));
+    assert_ne!(after[1], before[1]);
+    let interactive = books.book(inst(A), INTERACTIVE).unwrap();
+    assert_eq!(interactive.top(15).unwrap().bids, vec![lvl(90, 1)]);
+    assert_eq!(interactive.top(15).unwrap().asks, vec![lvl(110, 1)]);
+
+    // B's public asks cleared: that book alone changes, valid with no ask.
+    let before = after;
+    let clear = MdEvent::SideClear {
+        inst: inst(B),
+        book: PUBLIC,
+        side: BookSide::Ask,
+    };
+    assert_eq!(books.apply(from(4, 0), &clear), Ok(Applied::Changed));
+    let after = all(&books);
+    assert_eq!(after[..2], before[..2]);
+    assert_ne!(after[2], before[2]);
+    let b = books.book(inst(B), PUBLIC).unwrap();
+    assert_eq!(b.state(), BookState::Valid { epoch: 1 });
+    assert_eq!(
+        b.touch(),
+        Ok(Touch {
+            bid: Some(lvl(90, 1)),
+            ask: None,
+        })
+    );
+
+    // Each fed its book for its epoch: connection 3's end gaps only the book nothing else fed
+    // since, and connection 4's the two the prune and the clear fed.
+    assert_eq!(books.end_epoch(from(3, 0)), 1);
+    let state = |books: &MdBooks, id, book| books.book(inst(id), book).unwrap().state();
+    assert_eq!(state(&books, A, PUBLIC), BookState::Gapped);
+    assert_eq!(state(&books, A, INTERACTIVE), BookState::Valid { epoch: 1 });
+    assert_eq!(state(&books, B, PUBLIC), BookState::Valid { epoch: 1 });
+    assert_eq!(books.end_epoch(from(4, 0)), 2);
+    assert_eq!(state(&books, A, INTERACTIVE), BookState::Gapped);
+    assert_eq!(state(&books, B, PUBLIC), BookState::Gapped);
+
+    // A clear the gapped book drops still feeds it: its epoch's end gaps it again.
+    let late = MdEvent::SideClear {
+        inst: inst(A),
+        book: PUBLIC,
+        side: BookSide::Bid,
+    };
+    assert_eq!(books.apply(from(5, 0), &late), Ok(Applied::DroppedNotValid));
+    assert_eq!(books.end_epoch(from(5, 0)), 1);
+    assert_eq!(books.refused(), 0);
+
+    // An inverted prune is refused and counted, and the keeper still hands it on.
+    let inverted = MdEvent::SidePrune {
+        inst: inst(A),
+        book: INTERACTIVE,
+        side: BookSide::Ask,
+        lo: Ticks(2),
+        hi: Ticks(1),
+    };
+    assert_eq!(
+        books.apply(from(5, 0), &inverted),
+        Err(BookError::InvertedWindow {
+            lo: Ticks(2),
+            hi: Ticks(1),
+        })
+    );
+    assert_eq!(books.refused(), 1);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = seen.clone();
+    let mut keeper = BookKeeper::new(
+        MdBooks::new(TradingBooks::new([]).unwrap()),
+        move |env: Envelope<MdEvent>, books: &MdBooks| {
+            log.borrow_mut().push((env.body, books.refused()))
+        },
+    );
+    let stamp = fbc_core::Stamp {
+        ingest_seq: 0,
+        kernel_rx: None,
+        recv_mono: fbc_core::MonoNs(0),
+        recv_wall: fbc_core::WallNs(0),
+        conn: from(5, 0),
+    };
+    keeper.on_md(Envelope::new(stamp, fbc_core::VenueMeta::NONE, inverted));
+    assert_eq!(*seen.borrow(), [(inverted, 1)]);
 }

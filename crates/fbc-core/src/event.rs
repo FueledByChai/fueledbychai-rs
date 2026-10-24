@@ -159,12 +159,34 @@ pub enum MdEvent {
         px: Ticks,
         qty: Lots,
     },
-    /// Windowed book channel `book`'s levels now cover `lo..=hi`; anything outside is unknown.
+    /// Windowed book channel `book`'s levels now cover `lo..=hi` on both sides; anything outside
+    /// is unknown. It holds across snapshots until the next `Window`. One side's bounds are a
+    /// [`MdEvent::SidePrune`] (decision 0124).
     Window {
         inst: InstrumentId,
         book: BookId,
         lo: Ticks,
         hi: Ticks,
+    },
+    /// Book channel `book`'s `side` shows no level outside `lo..=hi` now: its levels outside it
+    /// go, from the snapshot in progress while one is, else from the book while it is valid, as
+    /// a delta's would. It keeps no range: a level set later is kept wherever it lies, and what a
+    /// price reads follows from the levels left and any both-sides `Window`, as after any delta
+    /// (decision 0124). `lo > hi` is refused. The other side is untouched.
+    SidePrune {
+        inst: InstrumentId,
+        book: BookId,
+        side: BookSide,
+        lo: Ticks,
+        hi: Ticks,
+    },
+    /// Book channel `book`'s `side` has no level: all of them go, from the snapshot in progress
+    /// while one is, else from the book while it is valid. The book stays valid, with no touch on
+    /// that side; the other side is untouched (decision 0124).
+    SideClear {
+        inst: InstrumentId,
+        book: BookId,
+        side: BookSide,
     },
     /// A public trade.
     Trade {

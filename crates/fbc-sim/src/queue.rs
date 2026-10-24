@@ -82,8 +82,9 @@ pub enum QueueError {
     ZeroQuantity(OrderKey),
     /// The book cannot be read.
     Book(BookError),
-    /// The book does not know the level's size at the order's price: outside its window, or
-    /// past the deepest level a capped book shows ([`L2Book::level`]).
+    /// The book does not know the level's size at the order's price: outside its window, past
+    /// the deepest level a capped book shows, or on a side it shows no level of
+    /// ([`L2Book::level`]; decision 0124).
     UnknownLevel { side: BookSide, px: Ticks },
     /// Lots at a level (the modelled orders there, or the size ahead of one) past an `i64`.
     Overflow { side: BookSide, px: Ticks },

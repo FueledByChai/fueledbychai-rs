@@ -42,6 +42,13 @@
 //! FBC-2zxk adds a two-phase venue's amend, sent and answered provisionally, then settled by
 //! the amended order's event (decision 0102); its done line is fbc-venue-paradex's
 //! tests/sim_stand_in.rs.
+//!
+//! FBC-n35m's SimVenue half (decision 0124): a level a prune or a clear of one side removes
+//! moves no simulated order in its queue under any bracket, shown again it credits no cancel,
+//! an order cannot rest on a side the book shows no level of, a prune inside a snapshot leaves
+//! the snapshot's shrink credited, either event feeds its book for its epoch's end, and a zero
+//! the venue states credits a cancel where the record's emission order sends it: an emptied
+//! level's before its side's prune, a scrolled-out one's after it, where it credits none.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -384,12 +391,17 @@ impl Venue {
     }
 
     fn md(&mut self, mono: u64, body: MdEvent) -> Result<(), SimError> {
+        self.md_from(0, mono, body)
+    }
+
+    /// `body` at `mono`, from market-data connection `conn`'s epoch 1.
+    fn md_from(&mut self, conn: u16, mono: u64, body: MdEvent) -> Result<(), SimError> {
         let stamp = Stamp {
             ingest_seq: self.ingest,
             kernel_rx: None,
             recv_mono: MonoNs(mono),
             recv_wall: WallNs(WALL0 + mono as i64),
-            conn: ConnKey { conn: 0, epoch: 1 },
+            conn: ConnKey { conn, epoch: 1 },
         };
         self.ingest += 1;
         self.engine
@@ -6006,4 +6018,191 @@ fn a_withdrawn_placement_is_settled_on_the_wire_so_the_codec_awaits_it_no_longer
     assert_eq!(frames.len(), 1, "{frames:?}");
     assert_eq!(frames[0].0, MonoNs(T0 + 25 * MS) + TO_CLIENT);
     assert!(frames[0].1.is_empty(), "{frames:?}");
+}
+
+// FBC-n35m: a prune or a clear of one side of the book (decision 0124).
+
+fn side_prune(side: BookSide, lo: i64, hi: i64) -> MdEvent {
+    MdEvent::SidePrune {
+        inst: INST,
+        book: BOOK,
+        side,
+        lo: Ticks(lo),
+        hi: Ticks(hi),
+    }
+}
+
+fn side_clear(side: BookSide) -> MdEvent {
+    MdEvent::SideClear {
+        inst: INST,
+        book: BOOK,
+        side,
+    }
+}
+
+#[test]
+fn a_level_a_side_prune_or_clear_removes_moves_no_simulated_order_under_any_bracket() {
+    for bracket in [Bracket::Pessimistic, Bracket::Middle, Bracket::Optimistic] {
+        let mut v = Venue::new(bracket);
+        v.snapshot(T0, &[(199, 6), (198, 4)], &[(201, 5), (202, 3)]);
+        let buy = v.rest(limit(cid(), Side::Buy, 198, 2), 1, T0);
+        let sell = v.rest(limit(cid(), Side::Sell, 202, 2), 2, T0 + 10 * MS);
+        assert_eq!((v.ahead(&buy), v.ahead(&sell)), (4, 3), "{bracket:?}");
+
+        // The bid at 198, then the ask at 201, leave their side's range, and then every ask
+        // goes: none of it is a cancel.
+        v.md(T0 + 20 * MS, side_prune(BookSide::Bid, 199, 199))
+            .unwrap();
+        v.md(T0 + 20 * MS, side_prune(BookSide::Ask, 202, 210))
+            .unwrap();
+        v.md(T0 + 20 * MS, side_clear(BookSide::Ask)).unwrap();
+        assert_eq!((v.ahead(&buy), v.ahead(&sell)), (4, 3), "{bracket:?}");
+        let got = v.events();
+        assert!(got.is_empty(), "{bracket:?}: {got:?}");
+
+        // Shown again, smaller, each level is one the book did not know: no shrink to credit.
+        v.level(T0 + 21 * MS, BookSide::Bid, 198, 1);
+        v.level(T0 + 21 * MS, BookSide::Ask, 202, 1);
+        assert_eq!((v.ahead(&buy), v.ahead(&sell)), (4, 3), "{bracket:?}");
+        let got = v.events();
+        assert!(got.is_empty(), "{bracket:?}: {got:?}");
+
+        // With no bid shown, the book knows no size at a bid's price: nothing can rest there
+        // until a level arrives.
+        v.md(T0 + 22 * MS, side_clear(BookSide::Bid)).unwrap();
+        v.send(limit(cid(), Side::Buy, 199, 1), 3, T0 + 22 * MS);
+        v.tick(T0 + 27 * MS);
+        let got = v.events();
+        assert_eq!(got.len(), 1, "{bracket:?}: {got:?}");
+        let ExecEvent::Outcome {
+            outcome: SubmitOutcome::Rejected(r),
+            ..
+        } = &got[0].1
+        else {
+            panic!("{got:?}")
+        };
+        assert_eq!(
+            (r.kind, r.venue_code.as_deref()),
+            (RejectKind::Other, Some("no_book"))
+        );
+        assert_eq!((v.ahead(&buy), v.ahead(&sell)), (4, 3), "{bracket:?}");
+    }
+}
+
+#[test]
+fn a_side_prune_inside_a_snapshot_leaves_the_snapshots_shrink_credited() {
+    // As in a_snapshot_that_replaces_the_book_advances_queues_by_its_shrinks, with a prune of
+    // the bids right after the snapshot begins. It acts on the replacement only (0124), so the
+    // book the snapshot replaces still shows 6 at 199 when the snapshot ends with 3 there: a
+    // shrink of 3, credited as a level cancel. Had the prune removed 199 from the book being
+    // replaced, the snapshot's end would compare nothing there, and credit nothing.
+    let mut filled = Vec::new();
+    for bracket in [Bracket::Pessimistic, Bracket::Optimistic] {
+        let mut v = Venue::new(bracket);
+        v.snapshot(T0, &[(199, 6)], &[(201, 5)]);
+        v.send(limit(cid(), Side::Buy, 199, 2), 1, T0);
+        v.send(limit(cid(), Side::Sell, 201, 1), 2, T0);
+        v.tick(T0 + 5 * MS);
+        assert_eq!(v.answers().len(), 4);
+        v.trade(T0 + 5 * MS, Aggressor::Buyer, 200, 1);
+        v.md(
+            T0 + 6 * MS,
+            MdEvent::BookSnapshotBegin {
+                inst: INST,
+                book: BOOK,
+                epoch: 2,
+            },
+        )
+        .unwrap();
+        v.md(T0 + 6 * MS, side_prune(BookSide::Bid, 150, 198))
+            .unwrap();
+        v.level(T0 + 6 * MS, BookSide::Bid, 199, 3);
+        v.level(T0 + 6 * MS, BookSide::Ask, 201, 5);
+        v.md(
+            T0 + 6 * MS,
+            MdEvent::BookSnapshotEnd {
+                inst: INST,
+                book: BOOK,
+            },
+        )
+        .unwrap();
+        v.trade(T0 + 7 * MS, Aggressor::Seller, 199, 4);
+        filled.push(
+            v.answers()
+                .iter()
+                .filter_map(|(_, ev)| fill_of(ev))
+                .map(|f| f.1)
+                .sum::<i64>(),
+        );
+    }
+    assert_eq!(filled, [0, 1]);
+}
+
+#[test]
+fn a_side_prune_or_clear_feeds_its_book_for_an_epochs_end() {
+    let mut v = Venue::new(Bracket::Middle);
+    v.snapshot(T0, &[(199, 6), (198, 4)], &[(201, 5)]);
+    v.md_from(1, T0 + MS, side_clear(BookSide::Ask)).unwrap();
+    // The clear from connection 1 fed the book last: connection 0's end leaves it, 1's gaps it.
+    assert_eq!(v.engine.end_epoch(ConnKey { conn: 0, epoch: 1 }), 0);
+    assert_eq!(v.engine.end_epoch(ConnKey { conn: 1, epoch: 1 }), 1);
+
+    // So does a prune, even one a gapped book drops.
+    v.md_from(2, T0 + 2 * MS, side_prune(BookSide::Bid, 199, 199))
+        .unwrap();
+    assert_eq!(v.engine.end_epoch(ConnKey { conn: 1, epoch: 1 }), 0);
+    assert_eq!(v.engine.end_epoch(ConnKey { conn: 2, epoch: 1 }), 1);
+
+    // An inverted prune is refused, as the book refuses it.
+    v.snapshot(T0 + 3 * MS, &[(199, 6)], &[(201, 5)]);
+    assert_eq!(
+        v.md(T0 + 4 * MS, side_prune(BookSide::Bid, 200, 199)),
+        Err(SimError::Book(fbc_book::BookError::InvertedWindow {
+            lo: Ticks(200),
+            hi: Ticks(199),
+        }))
+    );
+}
+
+#[test]
+fn a_stated_zero_credits_a_cancel_before_its_sides_prune_and_a_scrolled_out_one_none_after_it() {
+    // Decision 0124 item 6, on a feed three bids deep. A zero the venue states inside its
+    // side's range after the frame, or better than its best end, is a level emptied: sent
+    // before the prune it shrinks a level the book knows, a cancel credited by the bracket,
+    // while after the prune it reads empty and credits nothing. A zero past the range's deep
+    // end may only have scrolled out, its orders still at the venue: sent after the prune it
+    // reads unknown and moves no queue, while before the prune it would credit a cancel that
+    // never happened.
+    let brackets = [Bracket::Pessimistic, Bracket::Middle, Bracket::Optimistic];
+    // The size ahead of an order resting at `at`, after a frame stating `at` at zero, pruning
+    // the bids to `range` and showing the level `shown`.
+    let ahead = |at: i64, range: (i64, i64), shown: (i64, i64), zero_first: bool| {
+        brackets.map(|bracket| {
+            let mut v = Venue::new(bracket);
+            v.snapshot(T0, &[(200, 6), (199, 5), (198, 4)], &[(203, 5)]);
+            let buy = v.rest(limit(cid(), Side::Buy, at, 2), 1, T0);
+            let t = T0 + 10 * MS;
+            if zero_first {
+                v.level(t, BookSide::Bid, at, 0);
+            }
+            v.md(t, side_prune(BookSide::Bid, range.0, range.1))
+                .unwrap();
+            if !zero_first {
+                v.level(t, BookSide::Bid, at, 0);
+            }
+            v.level(t, BookSide::Bid, shown.0, shown.1);
+            let got = v.events();
+            assert!(got.is_empty(), "{bracket:?}: {got:?}");
+            v.ahead(&buy)
+        })
+    };
+    // 200 empties and 197 scrolls in: the zero at 200 is better than the range 197..=199.
+    // Before the prune, six lots leave a level of eight (two of them ours): none, floor(6 × 6
+    // / 8) or all six were ahead of the order.
+    assert_eq!(ahead(200, (197, 199), (197, 3), true), [6, 2, 0]);
+    assert_eq!(ahead(200, (197, 199), (197, 3), false), [6, 6, 6]);
+    // 201 scrolls in and pushes 198 out: the zero at 198 is past the range 199..=201. After
+    // the prune it credits nothing; before it, four lots would leave a level of six.
+    assert_eq!(ahead(198, (199, 201), (201, 2), false), [4, 4, 4]);
+    assert_eq!(ahead(198, (199, 201), (201, 2), true), [4, 2, 0]);
 }

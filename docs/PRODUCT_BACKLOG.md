@@ -213,6 +213,161 @@ ordering fixes are proven against the failures that hurt the Java stack.
 - The toy venue from BT-102 passes the suite, and a deliberately broken toy (an absent
   capability that still sends bytes) fails `caps_truthful`.
 
+## Epic F: Hibachi
+
+Decision 0016 ordered Hibachi (`fbc-venue-hibachi`) after Paradex order entry had traded live,
+which it did on 2026-10-17/18; decision 0117 supersedes 0016 and keeps Hibachi's implementation
+going. The owner set this epic's scope on 2026-10-19 (to the coordinator). He asked "while that
+is going on, can we start implementing hibachi in FBC?"; to "What should the Hibachi round build
+now?" he chose "MD + signer + runtime prep (Recommended)": "Market data, the md_watch sample,
+signing parameters, the offline signer, and the runtime's WS auth headers, two-socket session
+and nonce source. Order entry waits for the cancel-on-disconnect decision." To "How do we settle
+Hibachi's cancel-on-disconnect, which decision 0058 still refuses?" he chose "Probe only": "Skip
+asking. Rely on a supervised probe's evidence for the record." To "Which Hibachi account should
+the Rust stack use?" he chose "Separate account + key (Recommended)": "A new Hibachi account
+only Rust uses, so nonces, the account-wide cancel-all and rate limits never collide with the
+Java instances." To "First Hibachi market for Rust?" he answered "ETH" (the other options
+offered, and why, are in the owner's private notes).
+
+The coordinator's defaults, which the owner was told on 2026-10-19 and did not object to:
+ECDSA secp256k1 signing only at first (Java production's scheme; HMAC later if ever);
+Hibachi's MM-partner-only book topic stays out of this public repository until its entitlement
+is clear; and, since no public Hibachi testnet is confirmed, the cancel-on-disconnect probe is
+an owner-run, supervised, minimum-size post-only order on Hibachi mainnet from the separate
+account unless the owner obtains testnet access.
+
+BT-601 to BT-603 open no order path. Decision 0058's refusal stands for Hibachi order entry
+until a new record, based on the probe's evidence, supersedes its Hibachi sentence; BT-604
+begins with that record. On 2026-10-22 the owner had BT-601 to BT-603 cut down as BT-604 was on
+2026-10-20: each story states what it delivers and how that is proven, and its detailed rules
+live in the tickets that implement it. Those tickets carry the facts the rules rest on, from the
+Java library (`commons/hibachi-common-api`, `implementations/*/hibachi-*`,
+`market-data-collector`), the public SDK (`hibachi-xyz/hibachi_sdk` at 14a76b9,
+`python/hibachi_xyz`) and Hibachi's API docs, cited by file, and from the owner's reads of two
+public Hibachi sources on 2026-10-22, the `orderbook` feed and the settled funding history,
+cited only for what they show: beyond the spacing of the funding settlements, which BT-601
+states as the settlement interval, their measurements stay in his private notes (0009). Fixtures
+are hand-built from those shapes and SYNTHETIC: never a recorded production frame, a credential
+or an account id (0009). No test or agent sends anything to Hibachi.
+
+### BT-601 — Hibachi market data from the anonymous feed, and md_watch on ETH
+
+**Status:** Proposed  
+**User story:** As a trading program that will quote on Hibachi, I want its instruments
+discovered with the grid the book actually quotes on, and its public book, touch, trades, mark,
+funding and spot decoded into normalized events, so that I can watch a Hibachi market beside
+Paradex and Binance before any order path exists.
+
+**Acceptance criteria:**
+
+- `fbc-venue-hibachi` discovers each contract from `/market/exchange-info` into an
+  `InstrumentSpec` with the venue's own price grid, sizes, signing parameters and session
+  calendar, and the book's quote grid, never a placeholder. Its capabilities declare
+  `exec: None` and `Readiness::Record` with a source on every value (0003, 0015).
+- Each contract's trading status is mapped conservatively: only a live contract on an exchange
+  in normal operation trades, and an absent, null or unlisted status is refused. After
+  discovery the status is re-read and reported to the consumer as it changes, each scheduled
+  halt at its time, and that lands before any Hibachi order path quotes (0003, 0111).
+- The anonymous `/ws/market` feed decodes into normalized book, touch, trade, mark, funding and
+  spot events. No exchange timestamp or size is synthesized, and no touch stays in force once a
+  frame can no longer confirm it. Funding's settlement interval is stated as one hour, from
+  Hibachi's settled history, and the funding rate is never scaled by an interval until the
+  owner's evidence shows what it is a rate for.
+- Hibachi's book feed carries no sequence number, and the book is never presented as valid when
+  a frame shows it may be wrong. Each frame is checked against the venue's window bounds before
+  any of its events is pushed, and a book that fails is gapped and recovered from a fresh
+  snapshot, first by resubscribing on the same connection, which leaves the other books there
+  valid. Its levels are declared as buckets of the quote grid before a simulation or a quote
+  reads them. Hand-built SYNTHETIC fixtures under `fixtures/hibachi` and a stub test on a paused
+  clock pin each case (0003, 0023, 0039).
+- The market-data conformance checks pass on fixtures under `fixtures/hibachi`, with the
+  order-entry checks skipped by name, and decoder replay of a journal rebuilds the book
+  byte-identically. Hibachi's MM-partner-only book topic is neither planned nor decoded (0006,
+  0009).
+- `md_watch` takes `--hibachi <symbol>`, ETH/USDT-P first beside `--binance ETHUSDT`; its test
+  drives the Hibachi wiring against a local stub server, and nothing in the repository runs it
+  against Hibachi.
+
+### BT-602 — The offline Hibachi signer
+
+**Status:** Proposed  
+**User story:** As the owner, I want Hibachi's orders, modifies, cancels and cancel-all signed by
+a hand-written offline signer checked byte for byte against the Java library, so that order
+entry starts from a proven signer that never needed a connection to be tested.
+
+**Acceptance criteria:**
+
+- `crates/venues/fbc-venue-hibachi/src/sign` (a review path) packs and signs offline every
+  command Hibachi order entry may sign (place, modify, cancel, cancel-all and the
+  cancel-on-disconnect arm), with ECDSA secp256k1 only and no HMAC path (0009).
+- Golden vectors from a Java oracle on a SYNTHETIC key under `fixtures/hibachi/signing` pin
+  every packed payload byte for byte and every signature, and the buffer of Hibachi's worked
+  signing example is reproduced (design §6 `signing_golden`).
+- A price or quantity off the instrument's grid is refused before signing, never rounded onto
+  it.
+- The private key reaches the signer only through the venue crate's `src/auth` (a review path),
+  from `Secrets`. Neither the key nor a signed payload is logged, and the crypto crate passes
+  the licence gate (0009, 0017, 0043).
+
+### BT-603 — Runtime prerequisites for a venue on two authenticated sockets
+
+**Status:** Proposed  
+**User story:** As the author of the Hibachi adapter, I want the runtime to authenticate a
+WebSocket upgrade with headers, run one order-entry session over two sockets, and issue nonces
+from the wall clock, so that Hibachi order entry, once a record allows it, is codecs and a
+capability table only, as BT-102 promises.
+
+**Acceptance criteria:**
+
+- A planned endpoint's credential headers go on the WebSocket upgrade of every connection and
+  reconnect, a market-data socket sends none, and no credential reaches the journal's bytes, a
+  log line or an error (0006, 0009, 0116).
+- Hibachi's credential module (the venue crate's `src/auth`, a review path) authenticates
+  private REST and the trade and account socket upgrades. It keeps the API key, the account id
+  and the account stream's listen key out of the journal, logs and errors, and reads a test
+  connection as an `AccountSummary` or a typed refusal, all with synthetic credentials (0009).
+- One order-entry session drives every connection its plan names, each in its own epoch,
+  routing each frame to the stream its effect names and stamping the events of all of them in
+  one ingest order, proven with the conformance toy on two local servers (0115).
+- A production nonce source issues monotonic wall-clock microseconds within the caller's
+  window, never reissues a nonce an earlier journal holds, and its nonces replay
+  byte-identically without the clock (0006, 0114).
+- Nothing in this story places a Hibachi order: Hibachi's capabilities keep `exec: None`, and
+  this story leaves the session's cancel-on-disconnect gate as 0058 and 0121 set it.
+
+### BT-604 — Hibachi order entry, gated on the cancel-on-disconnect probe
+
+**Status:** Proposed  
+**User story:** As the owner, I want to place, modify and cancel Hibachi orders from the
+separate Rust-only account, but only after a supervised probe has shown what Hibachi's
+cancel-on-disconnect does, so that no Hibachi order rests unprotected through a dropped
+connection.
+
+Depends on BT-601, BT-602 and BT-603.
+
+**Acceptance criteria:**
+
+- Before any order-entry ticket other than the probe's starts, a merged decision record, based
+  on the evidence of the owner-run cancel-on-disconnect probe, supersedes 0058's Hibachi
+  sentence. It cites the probe's run record (date, scenarios, observed order states and times,
+  and which scenarios it marks inconclusive and why). It rests on no inconclusive scenario, a
+  scenario being inconclusive unless reads of `/market/exchange-info` through its window showed
+  the exchange `NORMAL` and the market `LIVE`; on none the probe's two runs did not both find
+  conclusive and agreeing; and on no cancel reason alone, since Hibachi has been seen to report
+  a cancel it started itself as `USER_CANCELED` (Java `HibachiConfiguration.java`). It states
+  the cancel delay observed for each kind of drop the probe runs, a silent loss of the link
+  included (one that sends Hibachi nothing, so only Hibachi's own idle close of the connection
+  can notice it: Java `HibachiTradeWebSocketClient.java`); what a consumer must assume for a
+  silent loss, declaring no protection the probe did not show; and what the probe's silent loss
+  cannot show, since its REST reads still reach Hibachi meanwhile, so it shows the idle close
+  over a working path rather than a partition. It declares what
+  `orders.enableCancelOnDisconnect` does (its scope, per connection as 0080 has it or
+  account-wide as 0121 has it; whether it re-arms per connection; whether it covers orders
+  already open) and so what cancel-on-disconnect Hibachi declares, or that 0058's refusal
+  stands; and where the probe did not show an order cancelled after a silent loss, it states
+  whether 0058's refusal may still be lifted, and on what grounds, against 0058's "What would
+  show this was wrong". Until it merges, 0058's refusal stands for Hibachi order entry.
+
 ## Epic G: QFEX
 
 ### BT-701 — QFEX public market data before order entry
