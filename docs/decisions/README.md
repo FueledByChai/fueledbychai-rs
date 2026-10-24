@@ -124,4 +124,5 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0119](0119-public-trade-ids-keep-numeric-and-uuid-identities-in-a-copya.md) Public trade IDs keep numeric and UUID identities in a copyable generic value — accepted
 - [0120](0120-venue-initiated-fills-carry-their-origin-and-exact-price-and.md) Venue-initiated fills carry their origin and exact price and reach the inventory once through the fill ledger on no order, counting after a snapshot seed unless their arrival or time places them in it, augmenting 0005, 0014, 0055 and 0095 — accepted
 - [0121](0121-account-wide-cancel-on-disconnect-needs-explicit-account-aut.md) Account-wide cancel-on-disconnect needs explicit account authority and rearms each connection — accepted
+- [0123](0123-provider-user-rate-budgets-share-across-qfex-accounts-in-one.md) Provider-user rate budgets share across QFEX accounts in one owner process — accepted
 - [0124](0124-a-book-side-is-pruned-to-a-price-range-or-cleared-by-a-state.md) A book side is pruned to a price range or cleared by a stateless one-side event and read as any side its levels leave, augmenting 0014, 0038 and 0039 — accepted
