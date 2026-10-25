@@ -1,0 +1,14 @@
+[package]
+name = "fbc-venue-hibachi"
+description = "Hibachi venue adapter: instrument discovery and market-data capabilities; order entry is not enabled."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fbc-core = { path = "../../fbc-core" }
+rust_decimal.workspace = true
+serde_json.workspace = true
