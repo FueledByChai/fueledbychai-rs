@@ -127,3 +127,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0123](0123-provider-user-rate-budgets-share-across-qfex-accounts-in-one.md) Provider-user rate budgets share across QFEX accounts in one owner process — accepted
 - [0124](0124-a-book-side-is-pruned-to-a-price-range-or-cleared-by-a-state.md) A book side is pruned to a price range or cleared by a stateless one-side event and read as any side its levels leave, augmenting 0014, 0038 and 0039 — accepted
 - [0125](0125-instrument-specs-carry-signing-parameters-beside-the-native-.md) Instrument specs carry signing parameters beside the native id and a clock-free session calendar that only closes, its weekly closures in wall time under an offset rule stated as data — accepted
+- [0126](0126-websocket-rate-refusals-hold-the-shared-provider-budget-with.md) WebSocket rate refusals hold the shared provider budget without settling requests — accepted

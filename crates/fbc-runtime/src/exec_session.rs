@@ -2011,7 +2011,7 @@ fn carries(
         }
         Effect::Http { timeout, .. } => !http || unbounded(*timeout),
         Effect::Reconnect { .. } => true,
-        Effect::Timer { .. } => false,
+        Effect::Timer { .. } | Effect::RateLimited { .. } => false,
     };
     let effects = fx.as_slice();
     let asks = effects.iter().filter(|e| matches!(e, Effect::Http { .. }));

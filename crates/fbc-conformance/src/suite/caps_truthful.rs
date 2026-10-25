@@ -220,7 +220,7 @@ fn requests(fx: &Effects) -> Vec<String> {
                     .collect::<Vec<_>>(),
                 req.body.bytes()
             )),
-            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+            Effect::Timer { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. } => None,
         })
         .collect()
 }
