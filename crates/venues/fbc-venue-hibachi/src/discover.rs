@@ -24,7 +24,8 @@
 //!   SDK's `NORMAL, MAINTENANCE` comment included, makes every contract
 //!   [`TradingStatus::Halted`]. `currentMaintenanceWindow` and `maintenanceWindow` are not read
 //!   here: the re-read of `/market/exchange-info` (FBC-1632) reads them and halts each market at
-//!   a window's begin.
+//!   a window's begin. So no contract's session calendar holds them as `ClosedWindow`s yet, which
+//!   decision 0125's Consequences expect; FBC-ord5 maps them.
 //! - A contract's `status` ([SPEC] `ContractStatus`: `LISTED`, `PRE_OPEN`, `LIVE`, `PAUSED`,
 //!   `CLOSED`, none described), matched exactly: `LIVE` is [`TradingStatus::Trading`] while the
 //!   exchange is `NORMAL`; `LISTED`, `PRE_OPEN`, `PAUSED` and `CLOSED` are each
@@ -77,8 +78,9 @@
 //!   from Friday 17:00 to Sunday 17:00 New York time ([`FX_WEEKEND`], [FX]). No field of the
 //!   answer marks a contract FX, so the underlyings [FX] names as FX pairs are listed here; a
 //!   pair it does not name has no weekend calendar until it is added, and the re-read still
-//!   halts it when Hibachi shows it `PAUSED`. The weekend holds through the 15-minute call
-//!   auction before each reopening ([AUCTION]), which trades nothing.
+//!   halts it when Hibachi shows it `PAUSED`. The weekend holds through the call auction before
+//!   each reopening ([AUCTION]: its "resumption after a trading halt (24/5 FX markets)"; about 15
+//!   minutes in its EUR/USD example, no fixed duration stated), which trades nothing.
 //! - Not stated, so `None`: the largest order, the position limit (free margin times leverage,
 //!   per account, [LIMITS]), a price band (the 50 bps limit on [LIMITS] is market orders'), the
 //!   open-order limit and the fee schedule (`feeConfig` is not read). Funding is
