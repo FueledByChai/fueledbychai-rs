@@ -42,7 +42,8 @@
 //! none well formed, or all finer), which `resolveEffectiveTickSize` also falls back to the tick
 //! for. The second is not refused, since refusing it would refuse the whole discovery answer
 //! (decision 0035). Its orderbook subscription then names a granularity Hibachi does not list, so
-//! FBC-2kmp must not trust that book's grid without checking it (each level on the tick).
+//! FBC-2kmp counts a level whose price is off the tick and gaps that book, as it does a frame
+//! failing its bounds check, never trusting the venue's default.
 //!
 //! # Trading status
 //!
@@ -62,7 +63,10 @@
 //! An FX contract (an underlying [`discover::FX_UNDERLYINGS`] lists) closes every week from
 //! Friday 17:00 to Sunday 17:00 New York time, a rule stated as data (decision 0125); a
 //! contract's advertised `marketOpenTimestamp` and `marketCloseTimestamp` are its calendar's first
-//! open and final close. ETH, like every crypto contract with neither, has no calendar.
+//! open and final close. ETH, like every crypto contract with neither, has no calendar. The
+//! published maintenance windows are not in any calendar yet (decision 0125's Consequences
+//! expect them as `ClosedWindow`s; FBC-ord5 maps them), so `is_open` does not see them; FBC-1632's
+//! re-read halts each market at a window's begin.
 //!
 //! # Funding
 //!
