@@ -7,6 +7,8 @@
 mod caps;
 pub mod discover;
 mod md;
+#[doc(hidden)]
+pub mod rate;
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr};

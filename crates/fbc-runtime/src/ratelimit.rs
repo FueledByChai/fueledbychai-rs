@@ -13,7 +13,9 @@
 //! [`SafetyReserve`], the share the consumer configures; [`TrafficClass::Safety`] traffic may
 //! use it until the bucket is empty. A request is charged in all its buckets or in none, and a
 //! refusal is counted once under each scope whose bucket refused it ([`RateCounts`]); so is a
-//! venue's HTTP 429 or 418 to a request charged to that scope ([`RateLimiter::rejected`]).
+//! venue's HTTP 429 or 418 to a request charged to that scope ([`RateLimiter::rejected`]),
+//! or its WebSocket rate refusal ([`RateLimiter::provider_rejected`]). The latter also holds
+//! admission until the provider's retry hint, since its limiter may use a different window model.
 //!
 //! [`LimitScope::AddressVolume`] (requests earned by traded volume) is not supported yet: a
 //! limiter refuses limits that declare it, naming the scope, rather than leave them uncounted.
@@ -164,7 +166,7 @@ impl ScopeCounts {
 pub struct RateCounts {
     /// Requests the limiter refused, once under each scope whose bucket refused them.
     pub refused: ScopeCounts,
-    /// HTTP 429 and 418 responses, once under each scope the request was charged to.
+    /// HTTP 429/418 or WebSocket rate refusals, once under each affected scope.
     pub rejected: ScopeCounts,
 }
 
@@ -230,7 +232,9 @@ impl Request {
     pub fn of(effect: &Effect) -> Option<Request> {
         let class = match effect {
             Effect::Send { class, .. } | Effect::Http { class, .. } => *class,
-            Effect::Timer { .. } | Effect::Reconnect { .. } => return None,
+            Effect::Timer { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. } => {
+                return None;
+            }
         };
         let (charge, via) = effect.charge()?;
         Some(Request { charge, via, class })
@@ -288,6 +292,10 @@ struct Inner {
     limits: Vec<RateLimit>,
     reserve: SafetyReserve,
     buckets: HashMap<(usize, BucketKey), Bucket>,
+    /// Provider retry hints gate admission in addition to locally counted usage.
+    holds: HashMap<(usize, BucketKey), Instant>,
+    /// An unidentifiable rejected frame can belong to any frame bucket.
+    frame_hold: Option<Instant>,
     counts: RateCounts,
     /// Serialized charge time. A shard may sample its clock before another shard but take
     /// this mutex later; never append an older timestamp behind a newer charge.
@@ -403,6 +411,8 @@ impl RateLimiter {
             limits: limits.to_vec(),
             reserve,
             buckets: HashMap::new(),
+            holds: HashMap::new(),
+            frame_hold: None,
             counts: RateCounts::default(),
             last_now: None,
         };
@@ -508,11 +518,67 @@ impl RateLimiter {
             .bump(charged.0);
     }
 
+    /// Apply a provider WebSocket rate refusal to this shared budget. The echoed request's
+    /// charge may select its bucket only when the codec established it unambiguously. With no
+    /// such identity, every frame is held, including cancels. A missing or zero retry hint
+    /// holds the affected budget for at least its longest declared window. This never settles
+    /// or retries an RPC; the session's ordinary deadline leaves an unanswered sent RPC Unknown.
+    pub fn provider_rejected(
+        &self,
+        now: Instant,
+        conn: ConnKey,
+        charge: Option<RateCharge>,
+        retry_after: Option<std::time::Duration>,
+    ) {
+        let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
+        let request = charge.map(|charge| Request {
+            charge,
+            via: Via::Frame,
+            class: TrafficClass::Normal,
+        });
+        let affected: Vec<_> = request
+            .as_ref()
+            .map(|request| matches(&inner.limits, Some(conn), request).collect())
+            .unwrap_or_default();
+        let fallback = if affected.is_empty() {
+            inner.limits.iter().map(|l| l.per).max()
+        } else {
+            affected.iter().map(|(i, _)| inner.limits[*i].per).max()
+        }
+        .unwrap_or(std::time::Duration::from_secs(60));
+        let wait = retry_after.filter(|d| !d.is_zero()).unwrap_or(fallback);
+        let until = now.checked_add(wait).unwrap_or_else(|| now + fallback);
+        let mut scopes = Scopes::default();
+        if affected.is_empty() {
+            for limit in &inner.limits {
+                if limit
+                    .ops
+                    .iter()
+                    .any(|op| op != OpKind::Connect && op != OpKind::Rest)
+                {
+                    scopes.add(limit.scope);
+                }
+            }
+            inner.frame_hold = Some(inner.frame_hold.map_or(until, |old| old.max(until)));
+        } else {
+            for (i, key) in affected {
+                scopes.add(inner.limits[i].scope);
+                let held = inner.holds.entry((i, key)).or_insert(until);
+                *held = (*held).max(until);
+            }
+        }
+        inner.counts.rejected.bump(scopes);
+    }
+
     /// Forgets the per-connection buckets of `conn`, an epoch that ended.
     pub fn closed(&self, conn: ConnKey) {
         let mut inner = self.inner.lock().expect("rate limiter poisoned");
         inner
             .buckets
+            .retain(|(_, key), _| *key != BucketKey::Connection(conn));
+        inner
+            .holds
             .retain(|(_, key), _| *key != BucketKey::Connection(conn));
     }
 
@@ -528,6 +594,8 @@ impl RateLimiter {
             limits,
             reserve,
             buckets,
+            holds,
+            frame_hold,
             counts,
             ..
         } = &mut *inner;
@@ -537,6 +605,15 @@ impl RateLimiter {
         let normal = requests.iter().any(|r| r.class == TrafficClass::Normal);
         let (mut refused, mut ready_at, mut charged) =
             (Scopes::default(), Some(now), Scopes::default());
+        if requests.iter().any(|r| r.via == Via::Frame)
+            && let Some(until) = *frame_hold
+            && until > now
+        {
+            for need in &needs {
+                refused.add(limits[need.limit].scope);
+            }
+            ready_at = Some(until);
+        }
         for need in &needs {
             let limit = limits[need.limit];
             let cap = match normal {
@@ -546,6 +623,12 @@ impl RateLimiter {
             let bucket = buckets.entry((need.limit, need.key)).or_default();
             bucket.expire(now, limit.per);
             charged.add(limit.scope);
+            if let Some(until) = holds.get(&(need.limit, need.key))
+                && *until > now
+            {
+                refused.add(limit.scope);
+                ready_at = ready_at.map(|at| at.max(*until));
+            }
             if bucket.used + need.units > cap {
                 refused.add(limit.scope);
                 let at = bucket.ready_at(limit.per, need.units, cap);
@@ -936,6 +1019,66 @@ mod tests {
         other.charge(t0, CONN, &[place]).unwrap();
         assert_eq!(other.used(t0, 0, BucketKey::Shared), 1);
         assert_eq!(sessions[0].2.used(t0 + secs(61), 0, BucketKey::Shared), 0);
+    }
+
+    #[test]
+    fn qfex_provider_refusal_holds_the_shared_bucket_without_spending_cancel_reserve() {
+        let limits = [
+            limit(LimitScope::User, &[OpKind::Place, OpKind::Query], 10, 60),
+            limit(
+                LimitScope::User,
+                &[OpKind::Cancel, OpKind::CancelAll],
+                10,
+                60,
+            ),
+        ];
+        let reserve = SafetyReserve::percent(50).unwrap();
+        let primary =
+            RateLimiter::for_user(RateUserKey::new(0x7a00_0001), &limits, reserve).unwrap();
+        let subaccount =
+            RateLimiter::for_user(RateUserKey::new(0x7a00_0001), &limits, reserve).unwrap();
+        let other = RateLimiter::for_user(RateUserKey::new(0x7a00_0002), &limits, reserve).unwrap();
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        let cancel = req(OpKind::Cancel, None, 1, S);
+        primary.charge(t0, CONN, &[place]).unwrap();
+        subaccount.provider_rejected(t0, CONN, Some(place.charge), Some(secs(7)));
+        assert!(primary.charge(t0, CONN, &[place]).is_err());
+        assert!(
+            primary
+                .charge(t0, CONN, &[req(OpKind::Query, None, 1, S)])
+                .is_err()
+        );
+        assert!(subaccount.charge(t0, CONN, &[cancel]).is_ok());
+        assert!(other.charge(t0, CONN, &[place]).is_ok());
+        assert!(primary.charge(t0 + secs(8), CONN, &[place]).is_ok());
+
+        // An absent or ambiguous echoed message cannot select a bucket. Hold both, across
+        // both accounts, and use the declared window when the provider hint is absent.
+        primary.provider_rejected(t0 + secs(8), CONN, None, None);
+        subaccount.provider_rejected(t0 + secs(9), CONN, None, Some(secs(70)));
+        for request in [place, cancel] {
+            let refused = subaccount
+                .charge(t0 + secs(10), CONN, &[request])
+                .unwrap_err();
+            assert!(refused.ready_at.unwrap() >= t0 + secs(79));
+        }
+        assert_eq!(primary.counts().rejected.user, 3);
+    }
+
+    #[test]
+    fn connection_scoped_provider_hold_ends_with_only_its_epoch() {
+        let limits = [limit(LimitScope::Connection, &[OpKind::Place], 10, 60)];
+        let rates = RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap();
+        let other = ConnKey { conn: 2, epoch: 0 };
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        rates.provider_rejected(t0, CONN, Some(place.charge), Some(secs(5)));
+        rates.provider_rejected(t0, other, Some(place.charge), Some(secs(5)));
+        assert!(rates.charge(t0, CONN, &[place]).is_err());
+        rates.closed(CONN);
+        assert!(rates.charge(t0, CONN, &[place]).is_ok());
+        assert!(rates.charge(t0, other, &[place]).is_err());
     }
 
     #[test]

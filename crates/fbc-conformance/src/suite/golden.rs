@@ -133,7 +133,7 @@ fn one_frame(fx: &Effects) -> Option<&[u8]> {
     let mut writes = fx.as_slice().iter().filter_map(|effect| match effect {
         Effect::Send { frame, .. } => Some(Some(frame.bytes())),
         Effect::Http { .. } => Some(None),
-        Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+        Effect::Timer { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. } => None,
     });
     match (writes.next(), writes.next()) {
         (Some(frame), None) => frame,

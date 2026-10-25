@@ -567,6 +567,15 @@ pub enum Effect {
         stream: StreamId,
         reason: &'static str,
     },
+    /// A provider WebSocket rate refusal. `charge` identifies the echoed request only when
+    /// its operation is unambiguous; `None` holds every frame budget conservatively. This
+    /// does not answer or retry any RPC. The provider's retry hint is kept as a duration,
+    /// never as an echoed frame or diagnostic string.
+    RateLimited {
+        stream: StreamId,
+        charge: Option<RateCharge>,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl Effect {
@@ -577,7 +586,7 @@ impl Effect {
         match self {
             Effect::Send { charge, .. } => Some((*charge, Via::Frame)),
             Effect::Http { charge, .. } => Some((*charge, Via::Http)),
-            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+            Effect::Timer { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. } => None,
         }
     }
 }
@@ -637,7 +646,7 @@ impl Effects {
                 class: labelled,
                 ..
             } => Some((*call, *labelled)),
-            Effect::Timer { .. } | Effect::Reconnect { .. } => None,
+            Effect::Timer { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. } => None,
         });
         let mut any = false;
         let all = requests.all(|named| {
