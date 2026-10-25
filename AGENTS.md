@@ -131,8 +131,9 @@ rather than guess.
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
   (`src/factory.rs`, market data and order entry, 0072),
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
-  and `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
-  and `crates/fbc-examples` with the owner-run samples; the
+  `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
+  `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery and caps (no
+  codec yet), and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -561,8 +562,23 @@ rather than guess.
     most one signature in progress, and on Linux reports their kernel-receive-to-write-done p99
     (0100); and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
-    BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
-    (0016).
+    BT-401 book and bbo-touch agreement checks), and `crates/venues/fbc-venue-hibachi`
+    (market data only, FBC-jyyl: `exec: None` and `Readiness::Record` caps in `src/caps.rs`
+    citing Hibachi's docs, its SDK and the Java library: the `orderbook` channel at the required
+    `hibachi.orderbook_depth` (1 to 100, no default), `Cadence::Unknown` (the owner's decision of
+    2026-10-25, support's 250 ms cited as not taken), `Continuity::Unsequenced`, windowed and
+    bracket-only, its levels buckets of the quote grid (FBC-jwn9 adds the capability), the
+    funding stream with no interval, one-second timestamps, the per-IP REST limit and the taker
+    speed bump; discovery in `src/discover.rs` from `GET /market/exchange-info`: the contract id
+    as native id, `tickSize` as price grid and the finest listed granularity at or above it as
+    quote grid where it is coarser (`None`, fbc-core's meaning, where it is the tick or there is
+    none: quoted on the tick), the sizes,
+    `SigningParams::AssetDecimals` and a session calendar from the advertised open and close
+    and, for the FX underlyings the docs name, the New York weekend (0125); only `LIVE` on a
+    `NORMAL` exchange trading, every other listed status `Halted`, an absent, null or
+    undocumented one refused; `FUNDING_SETTLEMENT_INTERVAL` one hour and funding `Unknown` until
+    FBC-204c; `X/USDT` is `X/USDT-P`; `plan_md` refuses every feed until FBC-2kmp's `/ws/market`
+    codec; held to the hand-built `fixtures/hibachi/rest/`).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
     crates only. Nothing here depends on the private consumer. `scripts/check-deps.sh` holds
@@ -583,6 +599,9 @@ rather than guess.
   position responses; `fixtures/paradex/rest/` a hand-built `/orderbook` response
   in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
+  `fixtures/hibachi/rest/` (marked `SYNTHETIC`) holds hand-built `/market/exchange-info` answers,
+  with a variant for each status and timestamp refusal, and a funding-history answer, its README
+  citing each field's source.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs
