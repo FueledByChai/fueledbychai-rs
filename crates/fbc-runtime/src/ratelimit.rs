@@ -605,10 +605,9 @@ impl RateLimiter {
         let normal = requests.iter().any(|r| r.class == TrafficClass::Normal);
         let (mut refused, mut ready_at, mut charged) =
             (Scopes::default(), Some(now), Scopes::default());
-        if requests.iter().any(|r| r.via == Via::Frame)
-            && let Some(until) = *frame_hold
-            && until > now
-        {
+        let frame_hold_until = (*frame_hold)
+            .filter(|until| *until > now && requests.iter().any(|r| r.via == Via::Frame));
+        if let Some(until) = frame_hold_until {
             for need in &needs {
                 refused.add(limits[need.limit].scope);
             }
@@ -635,7 +634,7 @@ impl RateLimiter {
                 ready_at = ready_at.zip(at).map(|(a, b)| a.max(b));
             }
         }
-        if refused != Scopes::default() {
+        if frame_hold_until.is_some() || refused != Scopes::default() {
             counts.refused.bump(refused);
             return Err(Refused { ready_at });
         }
@@ -1064,6 +1063,34 @@ mod tests {
             assert!(refused.ready_at.unwrap() >= t0 + secs(79));
         }
         assert_eq!(primary.counts().rejected.user, 3);
+    }
+
+    #[test]
+    fn unknown_provider_echo_holds_frames_even_without_a_matching_bucket() {
+        let t0 = Instant::now();
+        let reserve = SafetyReserve::percent(0).unwrap();
+        let limits = [limit(LimitScope::Account, &[OpKind::Place], 10, 60)];
+        let rates = RateLimiter::new(&limits, reserve).unwrap();
+        let unmatched = req(OpKind::Subscribe, None, 1, N);
+        rates.provider_rejected(t0, CONN, None, Some(secs(5)));
+        assert!(rates.charge(t0, CONN, &[unmatched]).unwrap_err().ready_at >= Some(t0 + secs(5)));
+        assert!(rates.charge(t0 + secs(6), CONN, &[unmatched]).is_ok());
+
+        let without_limits = RateLimiter::new(&[], reserve).unwrap();
+        without_limits.provider_rejected(t0, CONN, None, Some(secs(5)));
+        assert!(
+            without_limits
+                .charge(t0, CONN, &[unmatched])
+                .unwrap_err()
+                .ready_at
+                >= Some(t0 + secs(5))
+        );
+        assert!(without_limits.connect(t0).is_ok());
+        assert!(
+            without_limits
+                .charge(t0 + secs(6), CONN, &[unmatched])
+                .is_ok()
+        );
     }
 
     #[test]
