@@ -14,12 +14,14 @@ AFTER = "2026-10-26T05:08:54Z"
 
 
 def summary(*, head=HEAD, status="completed", unresolved=False, findings=False,
-            login=BOT, user_type="Bot", updated=AFTER, marker=True):
+            login=BOT, user_type="Bot", updated=AFTER, completed=AFTER, marker=True):
     state = {"code_review": {"commit_sha": head, "status": status,
              "has_unresolved_findings": unresolved, "has_any_findings": findings}}
     line = "<!-- codex-review-state:v1 " + json.dumps(state) + " -->" if marker else "no marker"
+    completion_row = ('\n| 📝 **Code Review** | ✅ **Completed** '
+                      '<relative-time datetime="' + completed + '">done</relative-time> |')
     return {"id": 10, "user": {"login": login, "type": user_type},
-            "body": HEADING + "\n" + line, "updated_at": updated,
+            "body": HEADING + "\n" + line + completion_row, "updated_at": updated,
             "created_at": BEFORE, "html_url": "https://example.invalid/summary"}
 
 
@@ -60,6 +62,16 @@ class CodexEvidenceTests(unittest.TestCase):
         inline = request("2026-10-26T05:09:00Z")
         inline["body"] = "Could you run @codex review now?"
         self.assertFalse(assess([summary(), inline], HEAD)[0])
+
+    def test_unrelated_summary_edit_cannot_hide_a_newer_code_review_request(self):
+        edited = summary(updated="2026-10-26T05:10:00Z")
+        self.assertEqual(assess([edited, request("2026-10-26T05:09:00Z")], HEAD)[1],
+                         "a newer Codex review request is pending")
+
+    def test_missing_code_review_completion_time_holds(self):
+        incomplete = summary()
+        incomplete["body"] = incomplete["body"].split("\n|", 1)[0]
+        self.assertEqual(assess([incomplete], HEAD)[1], "Codex completion time is missing")
 
 
 if __name__ == "__main__":
