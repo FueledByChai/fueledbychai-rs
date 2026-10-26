@@ -16,6 +16,10 @@ from datetime import datetime
 BOT = "chatgpt-codex-connector[bot]"
 HEADING = "<!-- codex-pull-request-review-summary -->"
 MARKER = re.compile(r"<!-- codex-review-state:v1 (\{.*\}) -->")
+COMPLETION = re.compile(
+    r'^\|[^\n]*\*\*Code Review\*\*[^\n]*\*\*Completed\*\*[^\n]*'
+    r'<relative-time datetime="([^"]+)"', re.MULTILINE,
+)
 HEAD = re.compile(r"[0-9a-f]{40}\Z")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 NEW_REQUEST = re.compile(r"@codex\s+review\b", re.IGNORECASE)
@@ -47,7 +51,6 @@ def assess(comments, head):
         if marker is None:
             return False, "trusted summary has no valid state marker", summary.get("html_url")
         review = json.loads(marker.group(1))["code_review"]
-        updated = _time(summary["updated_at"])
     except (IndexError, KeyError, TypeError, ValueError):
         return False, "trusted summary is malformed", summary.get("html_url")
     if review.get("commit_sha") != head:
@@ -59,10 +62,14 @@ def assess(comments, head):
     if not isinstance(review.get("has_any_findings"), bool):
         return False, "Codex findings state is unknown", summary.get("html_url")
     try:
+        completion = COMPLETION.search(summary["body"])
+        if completion is None:
+            return False, "Codex completion time is missing", summary.get("html_url")
+        completed_at = _time(completion.group(1))
         if any(
             _login(comment)[0] != BOT
             and NEW_REQUEST.search(comment.get("body") or "")
-            and _time(comment["created_at"]) >= updated
+            and _time(comment["created_at"]) >= completed_at
             for comment in comments
         ):
             return False, "a newer Codex review request is pending", summary.get("html_url")
