@@ -177,6 +177,7 @@ pub fn synthetic_caps() -> VenueCaps {
                 units: 300,
             },
         ],
+        exec_limits: None,
         readiness_ceiling: Readiness::Paper,
     }
 }
@@ -187,6 +188,7 @@ pub fn synthetic_caps() -> VenueCaps {
 pub fn market_data_only_caps() -> VenueCaps {
     VenueCaps {
         exec: None,
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
         ..synthetic_caps()
     }

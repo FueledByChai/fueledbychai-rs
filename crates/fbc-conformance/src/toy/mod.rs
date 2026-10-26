@@ -278,6 +278,7 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
             per: Duration::from_secs(1),
             units: 50,
         }],
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }

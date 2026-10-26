@@ -505,6 +505,7 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
             max_conn_lifetime: None,
         },
         limits,
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }

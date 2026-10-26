@@ -1,5 +1,5 @@
-error[E0063]: missing field `readiness_ceiling` in initializer of `VenueCaps`
+error[E0063]: missing fields `exec_limits` and `readiness_ceiling` in initializer of `VenueCaps`
   --> tests/ui_caps/venue_caps_missing_field.rs:11:13
    |
 11 |     let _ = VenueCaps {
-   |             ^^^^^^^^^ missing `readiness_ceiling`
+   |             ^^^^^^^^^ missing `exec_limits` and `readiness_ceiling`

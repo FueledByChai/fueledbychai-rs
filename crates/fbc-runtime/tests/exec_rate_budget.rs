@@ -27,14 +27,14 @@ use armed_oms::{
 use common::{Peer, ScriptedWs};
 use exec_toy::{INST_A, INST_B};
 use fbc_core::{
-    AckLevel, Channel, ClientOrderId, Envelope, ExecEvent, ItemRef, LimitScope, Lots, MonoNs,
-    NewOrder, NotSentReason, OpKind, OrderKind, OrderRef, QueryOrder, RateLimit, RpcId, Side,
-    SubmitHandle, SubmitOutcome, TagSet, Ticks, Tif,
+    AccountKey, AckLevel, Channel, ClientOrderId, Envelope, ExecEvent, ItemRef, LimitScope, Lots,
+    MonoNs, NewOrder, NotSentReason, OpKind, OrderKind, OrderRef, QueryOrder, RateLimit, RpcId,
+    Side, SubmitHandle, SubmitOutcome, TagSet, Ticks, Tif, TrafficClass, Via,
 };
 use fbc_oms::{Authorization, ControlCommand, OrderOp};
 use fbc_runtime::{
-    BucketKey, ExecHandler, ExecOrders, ExecSession, RateCounts, RateLimiter, SafetyReserve,
-    ScopeCounts,
+    BucketKey, ExecHandler, ExecOrders, ExecSession, ExecSessionError, RateCounts, RateError,
+    RateLimiter, RateUserKey, Request, SafetyReserve, ScopeCounts, SessionError,
 };
 use tokio::time::Instant;
 
@@ -118,6 +118,60 @@ fn session(
     let (session, control) = ExecSession::new(config, keep).unwrap();
     let orders = session.orders();
     (session, control, rates, orders, handles, events)
+}
+
+#[test]
+fn order_entry_checks_its_private_declaration_when_public_limits_differ() {
+    let private = vec![RateLimit {
+        scope: LimitScope::User,
+        ops: TagSet::of(&[OpKind::Place, OpKind::Cancel]),
+        per: Duration::from_secs(60),
+        units: 10,
+    }];
+    let venue = Held::with_split_limits(Vec::new(), private.clone());
+    let reserve = SafetyReserve::percent(20).unwrap();
+    let reserved = Reserved::default();
+    let config = || session_config_for(venue, reserve, "ws://127.0.0.1:1", &reserved);
+    let handler = || Keep {
+        handles: Handles::default(),
+        events: Events::default(),
+    };
+
+    assert!(matches!(
+        ExecSession::new(config(), handler()),
+        Err(ExecSessionError::Session(SessionError::Rates(
+            RateError::OtherLimits
+        )))
+    ));
+    assert_eq!(
+        RateLimiter::new(&private, reserve).unwrap_err(),
+        RateError::UserKeyRequired
+    );
+    let primary_rates =
+        RateLimiter::for_user(RateUserKey::new(0xb63f_0100), &private, reserve).unwrap();
+    let sub_rates =
+        RateLimiter::for_user(RateUserKey::new(0xb63f_0100), &private, reserve).unwrap();
+    let mut primary = config();
+    primary.acct = AccountKey::new(1);
+    primary.limiter = primary_rates.clone();
+    let mut sub = config();
+    sub.acct = AccountKey::new(2);
+    sub.limiter = sub_rates.clone();
+    let (_primary_session, _) = ExecSession::new(primary, handler()).unwrap();
+    let (_sub_session, _) = ExecSession::new(sub, handler()).unwrap();
+
+    let now = Instant::now();
+    let conn = fbc_core::ConnKey { conn: 1, epoch: 1 };
+    let place = Request {
+        charge: fbc_core::RateCharge::one(OpKind::Place, None),
+        via: Via::Frame,
+        class: TrafficClass::Normal,
+    };
+    for _ in 0..8 {
+        primary_rates.charge(now, conn, &[place]).unwrap();
+    }
+    assert!(sub_rates.charge(now, conn, &[place]).is_err());
+    assert_eq!(sub_rates.used(now, 0, BucketKey::Shared), 8);
 }
 
 /// Keeps the paused clock from auto-advancing while the sockets are idle, until dropped.

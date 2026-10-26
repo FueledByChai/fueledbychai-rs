@@ -65,6 +65,7 @@ pub(crate) fn caps() -> VenueCaps {
         // QFEX's published 12,000-unit limit covers the authenticated trading WebSocket,
         // not this public MDS connection. No public numeric limit is documented.
         limits: Vec::new(),
+        exec_limits: Some(crate::trade_rate::limits().to_vec()),
         readiness_ceiling: Readiness::Record,
     }
 }

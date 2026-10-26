@@ -9,6 +9,7 @@ fn caps(order: OrderCaps, matching: MatchingCaps, md: MdCaps) -> VenueCaps {
         matching,
         md,
         limits: vec![],
+        exec_limits: None,
         readiness_ceiling: Readiness::Live,
     }
 }

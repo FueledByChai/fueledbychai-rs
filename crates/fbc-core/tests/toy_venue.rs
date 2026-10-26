@@ -1009,6 +1009,7 @@ fn toy_caps() -> VenueCaps {
                 units: 5,
             },
         ],
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }
