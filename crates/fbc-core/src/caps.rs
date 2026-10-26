@@ -41,8 +41,12 @@ pub struct VenueCaps {
     pub matching: MatchingCaps,
     /// What market data the venue publishes, and how.
     pub md: MdCaps,
-    /// Every rate limit the venue enforces.
+    /// The limits used by market-data sessions, also used for order entry when
+    /// [`exec_limits`](VenueCaps::exec_limits) is `None`.
     pub limits: Vec<RateLimit>,
+    /// Separate limits for order-entry sessions, or `None` when they use [`limits`](Self::limits).
+    /// This remains declared for a recording-only venue developing private connectivity.
+    pub exec_limits: Option<Vec<RateLimit>>,
     /// The furthest this adapter may be promoted: recording, shadow, paper or live.
     pub readiness_ceiling: Readiness,
 }
@@ -975,6 +979,7 @@ pub(crate) mod testing {
                 max_conn_lifetime: None,
             },
             limits: Vec::new(),
+            exec_limits: None,
             readiness_ceiling: Readiness::Record,
         }
     }

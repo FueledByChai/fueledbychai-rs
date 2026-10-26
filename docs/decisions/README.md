@@ -129,3 +129,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0125](0125-instrument-specs-carry-signing-parameters-beside-the-native-.md) Instrument specs carry signing parameters beside the native id and a clock-free session calendar that only closes, its weekly closures in wall time under an offset rule stated as data — accepted
 - [0126](0126-websocket-rate-refusals-hold-the-shared-provider-budget-with.md) WebSocket rate refusals hold the shared provider budget without settling requests — accepted
 - [0127](0127-exact-head-codex-review-is-the-external-model-gate-while-dee.md) Exact-head Codex review is the external model gate while DeepSeek is disabled — accepted
+- [0128](0128-separate-public-market-data-and-private-execution-rate-decla.md) Separate public market-data and private execution rate declarations — accepted

@@ -139,6 +139,7 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
             units: 350,
         }],
         // Recording only: no order path exists (BT-601 to BT-603 open none).
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }

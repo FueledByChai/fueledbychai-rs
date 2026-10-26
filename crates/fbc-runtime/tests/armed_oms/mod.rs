@@ -42,18 +42,21 @@ const CAP: i64 = 1_000;
 /// the orders already open (FBC-nvxn).
 pub struct Held {
     limits: Option<Vec<RateLimit>>,
+    exec_limits: Option<Vec<RateLimit>>,
     covers_open_orders: bool,
 }
 
 /// The toy as it declares itself.
 pub static HELD: Held = Held {
     limits: None,
+    exec_limits: None,
     covers_open_orders: false,
 };
 
 /// The toy declaring that an accepted cancel-on-disconnect arm covers the orders already open.
 pub static COVERING: Held = Held {
     limits: None,
+    exec_limits: None,
     covers_open_orders: true,
 };
 
@@ -62,6 +65,16 @@ impl Held {
     pub fn with_limits(limits: Vec<RateLimit>) -> &'static Held {
         Box::leak(Box::new(Held {
             limits: Some(limits),
+            exec_limits: None,
+            covers_open_orders: false,
+        }))
+    }
+
+    /// A venue with distinct public and order-entry declarations.
+    pub fn with_split_limits(public: Vec<RateLimit>, private: Vec<RateLimit>) -> &'static Held {
+        Box::leak(Box::new(Held {
+            limits: Some(public),
+            exec_limits: Some(private),
             covers_open_orders: false,
         }))
     }
@@ -81,6 +94,7 @@ impl VenueFactory for Held {
         if let Some(limits) = &self.limits {
             caps.limits.clone_from(limits);
         }
+        caps.exec_limits.clone_from(&self.exec_limits);
         if self.covers_open_orders {
             let order = &mut caps.exec.as_mut().unwrap().order;
             order.cancel_on_disconnect = CancelOnDisconnect::PerConnection {

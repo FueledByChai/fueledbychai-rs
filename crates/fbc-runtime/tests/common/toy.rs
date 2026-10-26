@@ -260,6 +260,7 @@ pub fn caps() -> VenueCaps {
             max_conn_lifetime: None,
         },
         limits: Vec::new(),
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }
