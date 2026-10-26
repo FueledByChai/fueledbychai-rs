@@ -111,7 +111,8 @@ rather than guess.
 
 - A Cargo workspace (0001, 0008). `crates/fbc-core` exists, with time, units,
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
-  `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`), instrument
+  `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`; `SigningParams` and
+  a clock-free `SessionCalendar`, 0125), instrument
   resolution (`AssetKey`, `AliasTable`, `InstrumentResolver`, `InstrumentSpecDraft`; 0035),
   `VenueCaps`, the market-data and execution events, venue commands, and the codec, signer,
   nonce and factory traits with `Effects` and `EncodeCtx` (the factory's discovery and
@@ -130,14 +131,22 @@ rather than guess.
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
   (`src/factory.rs`, market data and order entry, 0072),
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
-  and `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
-  and `crates/fbc-examples` with the owner-run samples; the
+  `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
+  `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery and caps (no
+  codec yet), and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
     `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0034).
+    A spec states `signing: Option<SigningParams>` (`AssetDecimals { underlying, settlement }`,
+    its contract id kept in `native_id`) and `sessions: Option<SessionCalendar>`
+    (`src/calendar.rs`: an earliest open, a close that never reopens, dated `ClosedWindow`s and
+    `WeeklyClosure`s in a zone's wall time under a POSIX-style `UtcOffsetRule`, evaluated by
+    integer civil-date arithmetic with no zone data and no clock; `is_open(at)` only ever
+    closes, fail-closed across daylight-saving edges; `None` where it closes nothing), copied
+    from the draft by the resolver, neither in `version` (0125).
     A `FillEvent` states its `origin: FillOrigin` once: an order's execution (`Order`, its
     client id and grid price) or a change the venue made itself (`Venue`, a `VenueFillKind`:
     liquidation, transfer, settlement or block trade, with no client id and the exact
@@ -177,7 +186,8 @@ rather than guess.
     a codec's HTTP requests run with their timeouts and answer only the epoch that asked, and a
     poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
     `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,
-    `BookId`), routing each book event by its channel, and exposes each instrument's trading
+    `BookId`), routing each book event by its channel (a one-side prune or clear too, each
+    feeding its book for its epoch's end, 0124), and exposes each instrument's trading
     book as the consumer's `TradingBooks` configures it (FBC-nij); a session tells its handler
     each connection epoch's end (`MdHandler::on_epoch_end`, live and in replay), and every book
     that epoch fed is then gapped until its next snapshot (0039);
@@ -280,7 +290,9 @@ rather than guess.
     `fbc-sim`'s, by path).
   - `crates/fbc-book` (it depends on `fbc-core` only: one tick-indexed L2 book per
     instrument and `BookId`, built from book events the same live and in replay, with
-    snapshots, deltas, windows and gap invalidation, touch, top-n, one level's size where it is
+    snapshots, deltas, windows, one-side prunes and clears and gap invalidation (`SidePrune`
+    and `SideClear` keep no state and act where a delta would, a cleared side unknown with no
+    touch on a valid book, 0124), touch, top-n, one level's size where it is
     known (inside the window, or no deeper than a capped book shows), an exact
     top-n comparison and canonical bytes; still planned: the ex-own projection, touch arbitration and
     continuity policies), `crates/fbc-oms` (it depends on `fbc-core` only, `proptest` as a
@@ -394,6 +406,8 @@ rather than guess.
     a `SimConfig` with no `Default`, and a resync answered with the resting orders and the
     positions the fills imply, 0049, answers ordered by the stood-in venue's key with realized
     P&L and funding on fills where it declares them and derived fills as order updates, 0050;
+    a prune or a clear of one side moving no simulated order in its queue under any bracket, and
+    an order to rest on a side the book shows no level of refused like unknown depth, 0124;
     crossing orders meeting SimVenue's own resting orders under the stood-in venue's
     `stp_scope` and depleting the displayed levels they take until the book's next event
     there, 0051; `SimPeer`, the venue end of the runtime's in-process order-entry stream over
@@ -548,8 +562,23 @@ rather than guess.
     most one signature in progress, and on Linux reports their kernel-receive-to-write-done p99
     (0100); and, in
     `tests/oracle/` with `fbc-book` as a dev-dependency only, the
-    BT-401 book and bbo-touch agreement checks), later `crates/venues/fbc-venue-hibachi`
-    (0016).
+    BT-401 book and bbo-touch agreement checks), and `crates/venues/fbc-venue-hibachi`
+    (market data only, FBC-jyyl: `exec: None` and `Readiness::Record` caps in `src/caps.rs`
+    citing Hibachi's docs, its SDK and the Java library: the `orderbook` channel at the required
+    `hibachi.orderbook_depth` (1 to 100, no default), `Cadence::Unknown` (the owner's decision of
+    2026-10-25, support's 250 ms cited as not taken), `Continuity::Unsequenced`, windowed and
+    bracket-only, its levels buckets of the quote grid (FBC-jwn9 adds the capability), the
+    funding stream with no interval, one-second timestamps, the per-IP REST limit and the taker
+    speed bump; discovery in `src/discover.rs` from `GET /market/exchange-info`: the contract id
+    as native id, `tickSize` as price grid and the finest listed granularity at or above it as
+    quote grid where it is coarser (`None`, fbc-core's meaning, where it is the tick or there is
+    none: quoted on the tick), the sizes,
+    `SigningParams::AssetDecimals` and a session calendar from the advertised open and close
+    and, for the FX underlyings the docs name, the New York weekend (0125); only `LIVE` on a
+    `NORMAL` exchange trading, every other listed status `Halted`, an absent, null or
+    undocumented one refused; `FUNDING_SETTLEMENT_INTERVAL` one hour and funding `Unknown` until
+    FBC-204c; `X/USDT` is `X/USDT-P`; `plan_md` refuses every feed until FBC-2kmp's `/ws/market`
+    codec; held to the hand-built `fixtures/hibachi/rest/`).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
     crates only. Nothing here depends on the private consumer. `scripts/check-deps.sh` holds
@@ -570,6 +599,9 @@ rather than guess.
   position responses; `fixtures/paradex/rest/` a hand-built `/orderbook` response
   in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
+  `fixtures/hibachi/rest/` (marked `SYNTHETIC`) holds hand-built `/market/exchange-info` answers,
+  with a variant for each status and timestamp refusal, and a funding-history answer, its README
+  citing each field's source.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs
@@ -639,10 +671,40 @@ moving it is a ticket. The one planned step still marked TODO in the script is t
 golden-refresh flag. It stays open now that `fbc-journal` exists: exact-replay goldens compare
 outbound bytes, which need the exec path (BT-402).
 
-### External model review (DeepSeek)
+### External model review (Codex; 0127)
 
-Codex ran out of credits on 2026-10-05, so a model of another family reviews every pull
-request in its place (owner decision 2026-10-05): `.github/workflows/deepseek-review.yml` runs
+The active external model gate is a completed Codex code review of the pull request's full,
+current head SHA. The trusted identity is `chatgpt-codex-connector[bot]` with GitHub user type
+`Bot`; a look-alike comment from any other account is not evidence. Request `@codex review`
+for the selected candidate when the current head lacks a completed review. Before independent
+acceptance and again at the final gate, run:
+
+```bash
+python3 scripts/codex_review_evidence.py --repo <owner/repo> --pr <number> --head <full-head-sha>
+```
+
+The helper reads every issue-comment page and accepts only the trusted bot's latest Codex
+summary with a `codex-review-state:v1` marker naming the exact full head, `code_review.status`
+`completed`, a known findings state, and `has_unresolved_findings` false. A newer review request,
+queued or running state, stale head, malformed marker, unavailable API, or look-alike holds the
+candidate. A pass means only that the external review completed: read its receipt, findings,
+author replies and all review threads. Fix P1 and P2 findings with proof or answer each with
+evidence; fix or answer P3s. Confirm no unresolved conversation or requested changes. The
+independent reviewer still checks the whole diff, acceptance criteria and local proof; final-head
+CI and all six `pr-readiness.sh` gates still apply. A model review is advisory and reads
+untrusted pull request text.
+
+If the trusted Codex service cannot complete a review of that head, hold the PR and report the
+cause to the owner. An alternate external reviewer requires the owner's explicit per-PR direction
+or a new decision record; independent acceptance alone does not waive this gate. Decision 0127
+records the owner's #205 exception and makes this path the standing policy. Do not enable the
+DeepSeek workflow as a side effect of this change.
+
+#### Dormant DeepSeek workflow
+
+The 2026-10-05 policy used DeepSeek while Codex credits were unavailable. The DeepSeek workflow
+is now manually disabled; its code and offline tests remain for a deliberate future activation.
+When enabled, `.github/workflows/deepseek-review.yml` runs
 `scripts/deepseek-review.py` on every push to a ready pull request from this repository's own
 branches (`pull_request` opened, ready_for_review, synchronize and reopened; drafts and forks
 run nothing, and there is no `pull_request_target`). A new head cancels the run for the old one.
@@ -704,27 +766,8 @@ imports, and pins every action to a full commit SHA. The job is not a required s
   2), `DEEPSEEK_TIMEOUT` (seconds per request, default 600), `DEEPSEEK_RETRIES` (default 2) and
   `DEEPSEEK_RETRY_DELAY` (seconds, default 10). A review that keeps ending cut off at max_tokens
   is fixed by raising `DEEPSEEK_MAX_OUTPUT_TOKENS` or `DEEPSEEK_SPLIT_DEPTH`.
-- How the loop treats the comment: as it treated Codex's review. Where a loop prompt asks for a
-  completed Codex review of the head, read the newest `DeepSeek review` comment instead. Only a
-  comment authored by `github-actions[bot]` (the workflow's own token) counts. Anyone can
-  comment on this public repository, so a look-alike from any other account, with the heading
-  and a marker line copied, is ignored and reported to the owner. List the workflow's comments
-  for the head with this command, putting the repository, PR number and full head SHA in place
-  of `<owner/repo>`, `<PR>` and `<HEAD>`. The last line it prints is the newest such comment
-  (its URL and marker line):
-
-  ```
-  gh api repos/<owner/repo>/issues/<PR>/comments --paginate --jq '.[] | select(.user.login == "github-actions[bot]" and .user.type == "Bot" and (.body | startswith("## DeepSeek review\n")) and (.body | contains("<!-- deepseek-review head=<HEAD> "))) | "\(.html_url) \(.body | split("\n")[2])"'
-  ```
-
-  A comment counts only when it names the PR's current head SHA and is complete (the marker line
-  under the heading says `status=complete`). A `status=truncated` comment is not a complete
-  review: read every finding and the report from that run's job log lines, fix or answer the P1s
-  and P2s, and push; the next head's review counts. Every P1 and P2 finding is fixed, with a test, or
-  answered with evidence in a reply naming its id before merge; P3s are fixed or answered. A
-  comment saying the review did not complete is not a review: re-run the workflow for that head
-  or report the cause. The comment is advisory input from a model reading untrusted pull
-  request text; it does not replace the independent reviewers.
+- Historical DeepSeek comments, including complete ones by `github-actions[bot]`, do not satisfy
+  the active Codex gate. Reinstating them as review evidence requires a new owner decision.
 
 ### Rules
 

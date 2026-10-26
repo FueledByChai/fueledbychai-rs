@@ -1,0 +1,17 @@
+Synthetic REST answers (decision 0009). Nothing in this directory was received from Hibachi or
+belongs to an account.
+
+- Every file is hand-built in the shapes Hibachi publishes for GET /market/exchange-info (its
+  Market API spec and SDK) and GET /market/data/funding-rates (as the public Java library reads
+  it); README.md cites the source of each field.
+- The contract ids, statuses, ticks, steps, minimum sizes and notionals, decimals, granularities,
+  timestamps, fee rates, withdrawal limits, funding rates and index prices are made-up inputs,
+  except the ETH/USDT-P contract's id, decimals, tick, step, granularities and margin rates and
+  its marketCreationTimestamp, which are the public example values of api-doc.hibachi.xyz and
+  the SDK's test data, and EUR/USDT-P's id, decimals, tick and step, which are the public Java
+  library's test values.
+- No file holds an account id, an address, a key or any other key-shaped value: feeConfig's
+  instantWithdrawDstPublicKey, a key-shaped field of the published examples, is left out.
+- No value was measured from Hibachi's live feeds or history.
+
+This marker covers fixtures/hibachi/rest/ only. Recorded Hibachi answers never go here.

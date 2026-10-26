@@ -51,6 +51,8 @@ fn spec_on(tick: &str) -> InstrumentSpec {
         },
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     }
@@ -88,6 +90,7 @@ fn decode_caps() -> VenueCaps {
             max_conn_lifetime: None,
         },
         limits: vec![],
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }

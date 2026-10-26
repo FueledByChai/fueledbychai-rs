@@ -219,6 +219,8 @@ pub fn specs() -> SpecTable {
             funding: FundingSpec::Unknown,
             public_fees: None,
             status: TradingStatus::Trading,
+            sessions: None,
+            signing: None,
             version: 1,
             fetched_at: WallNs(0),
         });
@@ -258,6 +260,7 @@ pub fn caps() -> VenueCaps {
             max_conn_lifetime: None,
         },
         limits: Vec::new(),
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }

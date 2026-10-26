@@ -567,6 +567,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fbc-venue-hibachi"
+version = "0.0.1"
+dependencies = [
+ "fbc-core",
+ "rust_decimal",
+ "serde_json",
+]
+
+[[package]]
 name = "fbc-venue-paradex"
 version = "0.0.1"
 dependencies = [
@@ -596,12 +605,14 @@ version = "0.0.1"
 dependencies = [
  "fbc-book",
  "fbc-core",
+ "fbc-runtime",
  "getrandom 0.3.4",
  "hmac",
  "rust_decimal",
  "serde_json",
  "sha2",
  "time",
+ "tokio",
 ]
 
 [[package]]

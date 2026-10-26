@@ -1,0 +1,40 @@
+{
+  "data": [
+    {
+      "contractId": 1,
+      "fundingRate": "0.0000125",
+      "fundingTimestamp": 1829998800,
+      "indexPrice": "3000.50"
+    },
+    {
+      "contractId": 1,
+      "fundingRate": "0.0000100",
+      "fundingTimestamp": 1830002400,
+      "indexPrice": "3001.25"
+    },
+    {
+      "contractId": 1,
+      "fundingRate": "-0.0000050",
+      "fundingTimestamp": 1830006000,
+      "indexPrice": "2999.75"
+    },
+    {
+      "contractId": 1,
+      "fundingRate": "0.0000000",
+      "fundingTimestamp": 1830009600,
+      "indexPrice": "3002.00"
+    },
+    {
+      "contractId": 1,
+      "fundingRate": "0.0000075",
+      "fundingTimestamp": 1830013200,
+      "indexPrice": "3003.10"
+    },
+    {
+      "contractId": 1,
+      "fundingRate": "0.0000150",
+      "fundingTimestamp": 1830016800,
+      "indexPrice": "3001.90"
+    }
+  ]
+}

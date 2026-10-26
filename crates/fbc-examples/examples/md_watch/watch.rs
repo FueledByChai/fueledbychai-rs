@@ -191,6 +191,8 @@ fn specs(
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     });
@@ -409,7 +411,9 @@ impl Watcher {
             MdEvent::BookSnapshotBegin { .. }
             | MdEvent::BookSnapshotEnd { .. }
             | MdEvent::Level { .. }
-            | MdEvent::Window { .. } => self.pending = Some((seq, at)),
+            | MdEvent::Window { .. }
+            | MdEvent::SidePrune { .. }
+            | MdEvent::SideClear { .. } => self.pending = Some((seq, at)),
             MdEvent::Mark { .. }
             | MdEvent::Index { .. }
             | MdEvent::Funding { .. }
@@ -701,4 +705,117 @@ pub async fn run(
     flush(&watchers);
     ran?;
     out.error()
+}
+
+/// FBC-n35m (decision 0124): md_watch treats a prune or a clear of one side as an event of its
+/// book, printing the book a frame holding only such events leaves. Run in tests/md_watch.rs,
+/// which includes this file by path.
+#[cfg(test)]
+mod tests {
+    use fbc_core::{BookSide, MonoNs, Stamp, VenueMeta};
+
+    use super::*;
+
+    const BOOK: BookId = BookId(0);
+
+    fn watcher(out: Out) -> Watcher {
+        let opts = Options {
+            paradex: None,
+            paradex_touch: ParadexTouch::Bbo,
+            binance: None,
+            proxy: fbc_runtime::ProxyConfig::Direct,
+            seconds: None,
+            top: 2,
+            paradex_url: String::new(),
+            binance_ws: String::new(),
+            binance_rest: String::new(),
+        };
+        let labels = Labels {
+            venue: "toy",
+            symbol: "TOY-PERP".to_owned(),
+            inst: PARADEX_INST,
+            touches: Vec::new(),
+            book: BOOK,
+            book_name: "book",
+            tick: Decimal::ONE,
+            step: Decimal::ONE,
+        };
+        let sink = Sink {
+            out,
+            closed: Rc::new(Notify::new()),
+            failed: Rc::new(RefCell::new(None)),
+        };
+        Watcher::new(labels, &opts, false, Rc::new(Cell::new(false)), sink)
+    }
+
+    fn env(seq: u64, body: MdEvent) -> Envelope<MdEvent> {
+        let stamp = Stamp {
+            ingest_seq: seq,
+            kernel_rx: None,
+            recv_mono: MonoNs(0),
+            recv_wall: WallNs(0),
+            conn: ConnKey { conn: 0, epoch: 0 },
+        };
+        Envelope::new(stamp, VenueMeta::NONE, body)
+    }
+
+    fn level(side: BookSide, px: i64) -> MdEvent {
+        MdEvent::Level {
+            inst: PARADEX_INST,
+            book: BOOK,
+            side,
+            px: Ticks(px),
+            qty: Lots::new(1).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_frame_of_only_side_prunes_or_clears_prints_the_book_it_leaves() {
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut w = watcher(buf.clone());
+        let inst = PARADEX_INST;
+        let snapshot = [
+            MdEvent::BookSnapshotBegin {
+                inst,
+                book: BOOK,
+                epoch: 1,
+            },
+            level(BookSide::Bid, 99),
+            level(BookSide::Bid, 98),
+            level(BookSide::Ask, 101),
+            level(BookSide::Ask, 102),
+            MdEvent::BookSnapshotEnd { inst, book: BOOK },
+        ];
+        for ev in snapshot {
+            w.on_event(env(1, ev));
+        }
+        let prune = MdEvent::SidePrune {
+            inst,
+            book: BOOK,
+            side: BookSide::Ask,
+            lo: Ticks(101),
+            hi: Ticks(101),
+        };
+        w.on_event(env(2, prune));
+        let clear = MdEvent::SideClear {
+            inst,
+            book: BOOK,
+            side: BookSide::Bid,
+        };
+        w.on_event(env(3, clear));
+        w.flush();
+        let text = String::from_utf8(buf.borrow().clone()).unwrap();
+        let books: Vec<&str> = text.split("BOOK ").skip(1).collect();
+        assert_eq!(
+            books,
+            [
+                "toy TOY-PERP book bid 99 x 1 ask 101 x 1 mid 100 spread 200.00bps\n  \
+                 1 bid 99 x 1 | ask 101 x 1\n  2 bid 98 x 1 | ask 102 x 1\n",
+                "toy TOY-PERP book bid 99 x 1 ask 101 x 1 mid 100 spread 200.00bps\n  \
+                 1 bid 99 x 1 | ask 101 x 1\n  2 bid 98 x 1 | ask -\n",
+                "toy TOY-PERP book bid - ask 101 x 1 mid - spread -\n  1 bid - | ask 101 x 1\n",
+            ],
+            "{text}"
+        );
+    }
 }

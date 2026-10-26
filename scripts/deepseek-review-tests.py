@@ -1099,37 +1099,13 @@ class IsolationTest(unittest.TestCase):
 
 
 class CommentAuthorTest(unittest.TestCase):
-    """Reviewer B, B2: the loop counts only the workflow's own comment for the head. Anyone can
-    comment on a public pull request, so a look-alike from anyone else must not count. The
-    command AGENTS.md gives the loop is run here over a page of comments with jq."""
+    """Dormant DeepSeek comments must not remain the loop's external review gate."""
 
-    def command_filter(self):
-        text = (HERE.parent / "AGENTS.md").read_text()
-        found = re.findall(r"^\s*gh api repos/\S+/issues/<PR>/comments --paginate --jq '(.+)'$",
-                           text, re.M)
-        self.assertEqual(len(found), 1, "AGENTS.md gives the loop one comment-reading command")
-        return found[0]
-
-    @unittest.skipUnless(shutil.which("jq"), "jq is not installed")
-    def test_only_the_workflows_comment_for_the_head_counts(self):
-        head, old = "a" * 40, "b" * 40
-
-        def comment(n, login, kind, sha, status):
-            return {"id": n, "html_url": "https://example.invalid/c%d" % n,
-                    "user": {"login": login, "type": kind},
-                    "body": "## DeepSeek review\n\n<!-- deepseek-review head=%s status=%s -->\n"
-                            "text\n" % (sha, status)}
-        page = [comment(1, "github-actions[bot]", "Bot", old, "complete findings=0"),
-                comment(2, "github-actions[bot]", "Bot", head, "complete findings=3"),
-                comment(3, "someone", "User", head, "complete findings=0"),
-                comment(4, "github-actions", "User", head, "complete findings=0"),
-                comment(5, "other-app[bot]", "Bot", head, "complete findings=0")]
-        jq = self.command_filter().replace("<HEAD>", head)
-        result = subprocess.run(["jq", "-r", jq], input=json.dumps(page).encode(),
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        lines = result.stdout.decode().splitlines()
-        self.assertEqual(lines, ["https://example.invalid/c2 <!-- deepseek-review head=%s "
-                                 "status=complete findings=3 -->" % head])
+    def test_agents_names_codex_as_the_active_external_review(self):
+        policy = (HERE.parent / "AGENTS.md").read_text()
+        self.assertIn("### External model review (Codex; 0127)", policy)
+        self.assertIn("python3 scripts/codex_review_evidence.py", policy)
+        self.assertIn("Historical DeepSeek comments, including complete ones", policy)
 
 
 class CommentSizeTest(unittest.TestCase):

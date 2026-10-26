@@ -29,6 +29,9 @@
 //! - Paradex's perpetuals are linear: one unit of size is one unit of the base, so the
 //!   multiplier is 1. The symbol is all an order names, so there is no native id. `fee_config`
 //!   (an override of the account's rates) is not read: no public fee schedule is stated.
+//! - `open_at` and `expiry_at` (`0` for a perpetual) are not read yet, so a draft states no
+//!   session calendar (`sessions: None`); Paradex's signer signs the symbol at its fixed
+//!   scaling, so it states no signing parameters (`signing: None`; decision 0125).
 //!
 //! [`parse_fbc_common_symbol`] is FBC's Java-era rule: `X/USDT` is `X-USD-PERP`, read as the key
 //! that market's draft states (`X`, `USD`, perpetual).
@@ -248,6 +251,8 @@ fn draft(
         funding,
         public_fees: None,
         status,
+        sessions: None,
+        signing: None,
     }))
 }
 

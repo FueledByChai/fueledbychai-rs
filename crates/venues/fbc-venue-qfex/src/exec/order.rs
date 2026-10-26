@@ -90,17 +90,13 @@ pub fn frame(
         }
         _ => return Err(Unsupported),
     };
-    // QFEX documents get_order as two general-bucket units. Other supported
-    // commands cost one unit in this offline codec; the final private limits
-    // will scale all weights together before order entry is enabled.
-    let charge = if op == OpKind::Query {
-        RateCharge {
-            op,
-            inst: Some(inst),
-            weight: NonZeroU32::new(2).expect("two is nonzero"),
-        }
-    } else {
-        RateCharge::one(op, Some(inst))
+    // The private limiter counts tenths of QFEX's published weight unit: get_order
+    // costs 2.0 (20 tenths), the other supported commands cost 1.0 (10 tenths).
+    let charge = RateCharge {
+        op,
+        inst: Some(inst),
+        weight: NonZeroU32::new(if op == OpKind::Query { 20 } else { 10 })
+            .expect("a documented QFEX command has positive weight"),
     };
     Ok((body.into_bytes(), charge))
 }

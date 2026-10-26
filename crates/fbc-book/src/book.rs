@@ -174,11 +174,15 @@ struct Levels {
 }
 
 impl Levels {
-    fn set(&mut self, side: BookSide, px: Ticks, qty: Lots) {
-        let levels = match side {
+    fn side_mut(&mut self, side: BookSide) -> &mut BTreeMap<Ticks, Lots> {
+        match side {
             BookSide::Bid => &mut self.bids,
             BookSide::Ask => &mut self.asks,
-        };
+        }
+    }
+
+    fn set(&mut self, side: BookSide, px: Ticks, qty: Lots) {
+        let levels = self.side_mut(side);
         if qty == Lots::ZERO {
             levels.remove(&px);
         } else {
@@ -189,6 +193,16 @@ impl Levels {
     fn retain_within(&mut self, window: Window) {
         self.bids.retain(|px, _| window.contains(*px));
         self.asks.retain(|px, _| window.contains(*px));
+    }
+
+    /// Drops `side`'s levels outside `range`; the other side is untouched.
+    fn retain_side_within(&mut self, side: BookSide, range: Window) {
+        self.side_mut(side).retain(|px, _| range.contains(*px));
+    }
+
+    /// Drops every level of `side`; the other side is untouched.
+    fn clear_side(&mut self, side: BookSide) {
+        self.side_mut(side).clear();
     }
 
     fn write(&self, out: &mut Vec<u8>) {
@@ -223,6 +237,11 @@ struct Pending {
 /// - [`set_window`](L2Book::set_window) bounds a windowed book: levels outside it are
 ///   unknown, so it drops them, and levels set outside it later are never reported. The
 ///   window holds across snapshots until the next one.
+/// - [`prune_side`](L2Book::prune_side) drops one side's levels outside a price range, and
+///   [`clear_side`](L2Book::clear_side) every level of one side, where a delta would act (the
+///   replacement in progress, else a valid book). Neither keeps anything: the other side, the
+///   window, the state and whether a snapshot is in progress are as they were, and the side
+///   reads as the levels left say (decision 0124).
 /// - [`gap`](L2Book::gap) invalidates the book, levels and replacement in progress included,
 ///   until the next complete snapshot.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
@@ -287,17 +306,60 @@ impl L2Book {
         Ok(())
     }
 
+    /// The levels a delta changes: the replacement in progress, else the book if it is valid,
+    /// else none.
+    fn delta_levels(&mut self) -> Option<&mut Levels> {
+        match (&mut self.pending, self.state) {
+            (Some(pending), _) => Some(&mut pending.levels),
+            (None, BookState::Valid { .. }) => Some(&mut self.levels),
+            (None, BookState::AwaitingSnapshot | BookState::Gapped) => None,
+        }
+    }
+
     /// Sets one level to `qty` (zero removes it): in the replacement in progress, else in the
     /// book if it is valid, else nowhere ([`Applied::DroppedNotValid`]).
     pub fn set_level(&mut self, side: BookSide, px: Ticks, qty: Lots) -> Applied {
-        if let Some(pending) = &mut self.pending {
-            pending.levels.set(side, px, qty);
-        } else if let BookState::Valid { .. } = self.state {
-            self.levels.set(side, px, qty);
-        } else {
-            return Applied::DroppedNotValid;
+        match self.delta_levels() {
+            Some(levels) => {
+                levels.set(side, px, qty);
+                Applied::Changed
+            }
+            None => Applied::DroppedNotValid,
         }
-        Applied::Changed
+    }
+
+    /// Drops `side`'s levels outside `lo..=hi` where a delta would act: in the replacement in
+    /// progress, else in the book if it is valid, else nowhere ([`Applied::DroppedNotValid`]).
+    /// It keeps no range (decision 0124): a level set later is kept wherever it lies. Refused,
+    /// with nothing changed, when `lo > hi`, whatever the book's state.
+    pub fn prune_side(
+        &mut self,
+        side: BookSide,
+        lo: Ticks,
+        hi: Ticks,
+    ) -> Result<Applied, BookError> {
+        // Validated first, in every state, and never stored.
+        let range = Window::new(lo, hi)?;
+        Ok(match self.delta_levels() {
+            Some(levels) => {
+                levels.retain_side_within(side, range);
+                Applied::Changed
+            }
+            None => Applied::DroppedNotValid,
+        })
+    }
+
+    /// Drops every level of `side` where a delta would act: in the replacement in progress,
+    /// else in the book if it is valid, else nowhere ([`Applied::DroppedNotValid`]). The book
+    /// stays valid, with no touch on that side (decision 0124).
+    pub fn clear_side(&mut self, side: BookSide) -> Applied {
+        match self.delta_levels() {
+            Some(levels) => {
+                levels.clear_side(side);
+                Applied::Changed
+            }
+            None => Applied::DroppedNotValid,
+        }
     }
 
     /// Bounds the book to `lo..=hi`, dropping the levels outside it, from the book and from
@@ -332,9 +394,11 @@ impl L2Book {
     /// The size at `px` on `side`, where the book knows it: `Some(Lots::ZERO)` when the book
     /// has no level there, and `None` where it does not know. A windowed book knows every
     /// price inside its window and none outside it. A book with no window knows a side down to
-    /// the deepest level it shows there, and nothing of a side it shows no level of: a capped
-    /// feed (the top n levels) does not say what lies past its depth, so the book never calls
-    /// a level there empty.
+    /// the deepest level it shows there, and nothing of a side it shows no level of, a side a
+    /// [`clear_side`](L2Book::clear_side) emptied included: a capped feed (the top n levels)
+    /// does not say what lies past its depth, so the book never calls a level there empty. A
+    /// [`prune_side`](L2Book::prune_side) keeps no range, so a side it pruned reads by the same
+    /// rules from the levels it left (decision 0124).
     pub fn level(&self, side: BookSide, px: Ticks) -> Result<Option<Lots>, BookError> {
         if !matches!(self.state, BookState::Valid { .. }) {
             return Err(BookError::NotValid(self.state));
@@ -376,7 +440,9 @@ impl L2Book {
     }
 
     /// A stable serialization of the book's whole state, so two books compare byte for byte:
-    /// equal bytes mean equal books, and a rebuild from the same events gives the same bytes.
+    /// equal bytes mean equal books, and a rebuild from the same events gives the same bytes. A
+    /// one-side prune or clear keeps no state of its own, so it shows here only through the
+    /// levels it removed (decision 0124).
     ///
     /// Layout, integers little-endian: `FBCB`, the layout version (1); the state (0 awaiting a
     /// snapshot, 1 valid followed by its `u32` epoch, 2 gapped); the window (0 none, 1 followed

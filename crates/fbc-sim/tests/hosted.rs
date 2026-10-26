@@ -175,6 +175,7 @@ fn stood_caps() -> VenueCaps {
             max_conn_lifetime: None,
         },
         limits: vec![],
+        exec_limits: None,
         readiness_ceiling: Readiness::Paper,
     }
 }

@@ -1,8 +1,8 @@
 use fbc_core::{
     AccountKey, ConnState, CtxCall, DecodeError, Effect, Effects, EncodeCtx, ExecEvent, ExecSink,
-    HttpFailure, HttpResponse, HttpTag, Inbound, MonoNs, NonceBlock, NotSentReason, PathStamps,
-    RawFrame, Readiness, RpcId, Secret, Secrets, SpecTable, StreamId, TimerTag, VenueCommand,
-    VenueConfig, VenueFactory, VenueMeta, WallNs, dispatch_market_data,
+    HttpFailure, HttpResponse, HttpTag, Inbound, MonoNs, NonceBlock, NotSentReason, OpKind,
+    PathStamps, RawFrame, Readiness, RpcId, Secret, Secrets, SpecTable, StreamId, TimerTag,
+    VenueCommand, VenueConfig, VenueFactory, VenueMeta, WallNs, dispatch_market_data,
 };
 use fbc_venue_qfex::{KEY_MDS_URL, Qfex};
 use serde_json::Value;
@@ -170,6 +170,79 @@ fn selected_subaccount_is_signed_redacted_and_reauthenticated_on_reconnect() {
     let spans = codec.redact_inbound(Inbound::Frame(RawFrame::Text(&echoed)));
     assert_eq!(spans.body().len(), 1);
     assert_eq!(spans.body()[0], 0..echoed.len() as u32);
+}
+
+#[test]
+fn private_rate_errors_feed_budgets_without_settling_or_reconnecting_orders() {
+    for (account, key) in [("primary", "4"), (SUBACCOUNT, "9")] {
+        let cfg = config(account, key);
+        let caps = Qfex.caps(&cfg).unwrap();
+        let mut codec = Qfex.exec_codec(&cfg, credentials(PUBLIC)).unwrap().unwrap();
+        let mut effects = Effects::new();
+        let mut sink = Sink::default();
+        codec.on_open(StreamId(0), &context(), &mut effects);
+        effects.take();
+        dispatch_market_data(&caps, |scope| {
+            codec.on_frame(
+                StreamId(0),
+                RawFrame::Text(r#"{"authenticated":true}"#),
+                scope,
+                &SpecTable::new(),
+                &mut sink,
+                &mut effects,
+            )
+        })
+        .unwrap();
+        effects.take();
+
+        for (echo, expected) in [
+            (r#"{"type":"add_order"}"#, Some(OpKind::Place)),
+            (r#"{"type":"cancel_order"}"#, Some(OpKind::Cancel)),
+            (r#"{"type":"unknown"}"#, None),
+        ] {
+            let frame = format!(
+                "{{\"type\":\"Err\",\"error_code\":\"RateLimited\",\"message\":\"Rate limit exceeded, retry after 7 seconds\",\"incoming_message\":{echo}}}"
+            );
+            let spans = codec.redact_inbound(Inbound::Frame(RawFrame::Text(&frame)));
+            assert_eq!(spans.body().len(), 1);
+            assert_eq!(spans.body()[0], 0..frame.len() as u32);
+            dispatch_market_data(&caps, |scope| {
+                codec.on_frame(
+                    StreamId(0),
+                    RawFrame::Text(&frame),
+                    scope,
+                    &SpecTable::new(),
+                    &mut sink,
+                    &mut effects,
+                )
+            })
+            .unwrap();
+            let [
+                Effect::RateLimited {
+                    stream,
+                    charge,
+                    retry_after,
+                },
+            ] = effects.as_slice()
+            else {
+                panic!("rate error must only update the budget");
+            };
+            assert_eq!(*stream, StreamId(0));
+            assert_eq!(charge.map(|charge| charge.op), expected);
+            assert_eq!(*retry_after, Some(std::time::Duration::from_secs(7)));
+            effects.take();
+        }
+        assert_eq!(sink.0.len(), 1, "no guessed order outcome");
+        codec.on_rpc_timeout(RpcId(17), &mut sink);
+        assert!(matches!(
+            sink.0.last(),
+            Some(ExecEvent::Outcome {
+                rpc: RpcId(17),
+                outcome: fbc_core::SubmitOutcome::Unknown,
+                ..
+            })
+        ));
+    }
 }
 
 #[test]

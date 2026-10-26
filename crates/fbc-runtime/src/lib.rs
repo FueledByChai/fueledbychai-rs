@@ -184,8 +184,8 @@ pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
 pub use nonce::{JournalGap, SystemWallClock, WallClock, WallClockNonces, ZeroWindow, last_nonce};
 pub use pacing::{PacingError, ReconnectPacing};
 pub use ratelimit::{
-    BucketKey, Charged, RateCounts, RateError, RateLimiter, Refused, Request, SafetyReserve,
-    ScopeCounts,
+    BucketKey, Charged, RateCounts, RateError, RateLimiter, RateUserKey, Refused, Request,
+    SafetyReserve, ScopeCounts,
 };
 pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use replay::{

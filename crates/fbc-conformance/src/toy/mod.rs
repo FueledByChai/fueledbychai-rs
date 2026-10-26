@@ -278,6 +278,7 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
             per: Duration::from_secs(1),
             units: 50,
         }],
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }
@@ -345,6 +346,8 @@ fn spec(id: InstrumentId, symbol: &str) -> InstrumentSpec {
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     }

@@ -13,6 +13,9 @@ mod md;
 mod sign;
 
 pub use sign::QfexNonces;
+#[doc(hidden)]
+pub mod rate;
+mod trade_rate;
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr};

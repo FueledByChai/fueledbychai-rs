@@ -39,6 +39,9 @@
 //!   funding schedule (that is `GET /fapi/v1/fundingInfo`), no position limit (leverage brackets
 //!   are per account), no single price band (`PERCENT_PRICE` is asymmetric) and no fee schedule:
 //!   those are not stated.
+//! - Only perpetuals are kept, and `onboardDate` and `deliveryDate` are not read, so a draft
+//!   states no session calendar (`sessions: None`); the adapter is market data only
+//!   (`exec: None`), so it states no signing parameters (`signing: None`; decision 0125).
 //!
 //! [`parse_fbc_common_symbol`] is FBC's Java-era rule: `X/USDT` is `XUSDT`, read as the key that
 //! perpetual's draft states (`X`, `USDT`, perpetual).
@@ -216,6 +219,8 @@ fn draft(
         funding: FundingSpec::Unknown,
         public_fees: None,
         status,
+        sessions: None,
+        signing: None,
     }))
 }
 

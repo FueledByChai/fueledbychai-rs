@@ -22,10 +22,11 @@ step "privacy"
 scripts/privacy-check.sh --self-test
 scripts/privacy-check.sh
 
-# The external model reviewer (FBC-bk02): scripts/deepseek-review.py and its workflow, proven
-# offline against local stubs of the chat completions endpoint and the GitHub comments API.
-step "deepseek reviewer"
+# Keep the dormant DeepSeek workflow's proof passing, and check the active Codex
+# exact-head evidence parser against stale, running, and look-alike summaries (0127).
+step "external model review evidence"
 python3 scripts/deepseek-review-tests.py
+python3 scripts/codex_review_evidence_tests.py
 
 if [ -f Cargo.toml ]; then
   step "format"

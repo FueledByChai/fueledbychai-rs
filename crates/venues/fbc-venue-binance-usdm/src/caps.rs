@@ -170,6 +170,7 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
             },
         ],
         // Recording only: the reference feed, never traded.
+        exec_limits: None,
         readiness_ceiling: Readiness::Record,
     }
 }

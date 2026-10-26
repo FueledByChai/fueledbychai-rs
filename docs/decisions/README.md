@@ -125,3 +125,9 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0120](0120-venue-initiated-fills-carry-their-origin-and-exact-price-and.md) Venue-initiated fills carry their origin and exact price and reach the inventory once through the fill ledger on no order, counting after a snapshot seed unless their arrival or time places them in it, augmenting 0005, 0014, 0055 and 0095 — accepted
 - [0121](0121-account-wide-cancel-on-disconnect-needs-explicit-account-aut.md) Account-wide cancel-on-disconnect needs explicit account authority and rearms each connection — accepted
 - [0122](0122-qfex-private-account-selection-is-bound-to-the-consumer-acco.md) QFEX private account selection is bound to the consumer account before planning — accepted
+- [0123](0123-provider-user-rate-budgets-share-across-qfex-accounts-in-one.md) Provider-user rate budgets share across QFEX accounts in one owner process — accepted
+- [0124](0124-a-book-side-is-pruned-to-a-price-range-or-cleared-by-a-state.md) A book side is pruned to a price range or cleared by a stateless one-side event and read as any side its levels leave, augmenting 0014, 0038 and 0039 — accepted
+- [0125](0125-instrument-specs-carry-signing-parameters-beside-the-native-.md) Instrument specs carry signing parameters beside the native id and a clock-free session calendar that only closes, its weekly closures in wall time under an offset rule stated as data — accepted
+- [0126](0126-websocket-rate-refusals-hold-the-shared-provider-budget-with.md) WebSocket rate refusals hold the shared provider budget without settling requests — accepted
+- [0127](0127-exact-head-codex-review-is-the-external-model-gate-while-dee.md) Exact-head Codex review is the external model gate while DeepSeek is disabled — accepted
+- [0128](0128-separate-public-market-data-and-private-execution-rate-decla.md) Separate public market-data and private execution rate declarations — accepted

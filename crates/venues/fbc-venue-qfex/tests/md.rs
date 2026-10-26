@@ -9,6 +9,10 @@ use fbc_core::{
     TradingStatus, UnderlyingId, VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta, WallNs,
     dispatch_market_data,
 };
+use fbc_runtime::{
+    Connector, IngestClock, Liveness, MdSession, MdSessionConfig, ProxyConfig, RateLimiter,
+    ReconnectPacing, SafetyReserve, WriteStall,
+};
 use fbc_venue_qfex::{BOOK_LEVEL2, KEY_MDS_URL, Qfex, TOUCH_BBO};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -25,6 +29,42 @@ fn bbo_cadence_remains_unpromised_by_the_venue() {
         caps.md.books[0].cadence,
         Cadence::Pulsed(std::time::Duration::from_millis(500))
     );
+}
+
+#[test]
+fn public_mds_session_starts_without_a_provider_user_key() {
+    let cfg = cfg();
+    let caps = Qfex.caps(&cfg).unwrap();
+    let reserve = SafetyReserve::percent(20).unwrap();
+    let limiter = RateLimiter::new(&caps.limits, reserve).unwrap();
+    let subs = [sub(Feed::Trades)].into_iter().collect();
+    let plan = Qfex.plan_md(&cfg, &specs(), &subs).unwrap().remove(0);
+    let config = MdSessionConfig {
+        venue: &Qfex,
+        cfg,
+        plan,
+        specs: specs(),
+        connector: Connector::new(ProxyConfig::Direct),
+        pacing: ReconnectPacing::new(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(100),
+            3,
+            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap(),
+        clock: IngestClock::new(),
+        http_max_body: 1024,
+        conn: 1,
+        limiter,
+        liveness: Liveness::new(
+            std::time::Duration::MAX,
+            std::time::Duration::from_millis(1),
+        )
+        .unwrap(),
+        write_stall: WriteStall::new(std::time::Duration::from_secs(10)).unwrap(),
+    };
+    assert!(MdSession::new(config, |_: fbc_core::Envelope<MdEvent>| {}).is_ok());
 }
 
 fn cfg() -> VenueConfig {
@@ -64,6 +104,8 @@ fn specs_for(symbol: &str) -> SpecTable {
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     });

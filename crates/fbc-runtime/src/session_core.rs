@@ -897,14 +897,31 @@ impl Core {
                     close(ws, &self.rates, key);
                     open = false;
                 }
+                (
+                    Effect::RateLimited {
+                        stream,
+                        charge,
+                        retry_after,
+                    },
+                    _,
+                ) if stream == own => {
+                    self.rates
+                        .provider_rejected(Instant::now(), key, charge, retry_after);
+                }
                 (ask @ Effect::Http { .. }, _) => self.ask(inputs, epoch, ask, charged),
                 // Another connection's, which the session executes there (FBC-tnsf).
-                (other @ (Effect::Send { .. } | Effect::Reconnect { .. }), _)
-                    if stream_of(&other).is_some_and(|s| self.siblings.contains(&s)) =>
-                {
+                (
+                    other @ (Effect::Send { .. }
+                    | Effect::Reconnect { .. }
+                    | Effect::RateLimited { .. }),
+                    _,
+                ) if stream_of(&other).is_some_and(|s| self.siblings.contains(&s)) => {
                     self.spilled.push_back((other, origin));
                 }
-                (Effect::Send { .. } | Effect::Reconnect { .. }, _) => {
+                (
+                    Effect::Send { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. },
+                    _,
+                ) => {
                     self.counters.refused_effects += 1;
                 }
             }
@@ -1197,7 +1214,9 @@ fn inbound_spans(redact: Option<Redact<'_>>, input: Inbound<'_>) -> (InboundSpan
 /// The stream a frame or a reconnect names; `None` for a timer or an HTTP request.
 pub(crate) fn stream_of(effect: &Effect) -> Option<StreamId> {
     match effect {
-        Effect::Send { stream, .. } | Effect::Reconnect { stream, .. } => Some(*stream),
+        Effect::Send { stream, .. }
+        | Effect::Reconnect { stream, .. }
+        | Effect::RateLimited { stream, .. } => Some(*stream),
         Effect::Timer { .. } | Effect::Http { .. } => None,
     }
 }
@@ -1568,6 +1587,78 @@ mod tests {
         };
         assert_eq!(stream_of(&reconnect), Some(stream));
         assert_eq!(stream_of(&timer), None);
+    }
+
+    #[tokio::test]
+    async fn provider_rate_effect_updates_the_shared_budget_without_writing_or_answering() {
+        use crate::ratelimit::{RateUserKey, SafetyReserve};
+        use fbc_core::{LimitScope, RateLimit, TagSet};
+
+        let limits = [
+            RateLimit {
+                scope: LimitScope::User,
+                ops: TagSet::of(&[OpKind::Place]),
+                per: Duration::from_secs(60),
+                units: 10,
+            },
+            RateLimit {
+                scope: LimitScope::User,
+                ops: TagSet::of(&[OpKind::Cancel]),
+                per: Duration::from_secs(60),
+                units: 10,
+            },
+        ];
+        let rates = RateLimiter::for_user(
+            RateUserKey::new(0x7a00_2001),
+            &limits,
+            SafetyReserve::percent(50).unwrap(),
+        )
+        .unwrap();
+        let (tx, stop) = watch::channel(());
+        let pacing = ReconnectPacing::new(
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+            10,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let mut core = Core::new(CoreConfig {
+            own: StreamId(1),
+            connector: Connector::new(crate::ProxyConfig::Direct),
+            clock: IngestClock::new(),
+            pacing,
+            write_stall: Duration::from_secs(1),
+            conn: 1,
+            stop,
+            http_max_body: 0,
+            rates: rates.clone(),
+        });
+        let mut fx = Effects::new();
+        let effect = Effect::RateLimited {
+            stream: StreamId(1),
+            charge: Some(RateCharge::one(OpKind::Place, None)),
+            retry_after: Some(Duration::from_secs(5)),
+        };
+        assert_eq!(stream_of(&effect), Some(StreamId(1)));
+        assert_eq!(Request::of(&effect), None);
+        fx.push(effect);
+        assert!(
+            core.execute(&mut None::<WebSocket>, &mut Nothing(false), fx, false, None)
+                .await
+                .unwrap()
+        );
+        let now = Instant::now();
+        let conn = core.current();
+        let request = |op| Request {
+            charge: RateCharge::one(op, None),
+            via: fbc_core::Via::Frame,
+            class: TrafficClass::Safety,
+        };
+        assert!(rates.charge(now, conn, &[request(OpKind::Place)]).is_err());
+        assert!(rates.charge(now, conn, &[request(OpKind::Cancel)]).is_ok());
+        assert_eq!(rates.counts().rejected.user, 1);
+        drop(tx);
     }
 
     #[test]

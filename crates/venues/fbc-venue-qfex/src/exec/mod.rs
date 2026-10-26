@@ -13,6 +13,7 @@ use serde_json::Value;
 use std::time::Duration;
 
 use crate::auth::{self, AccountSelection};
+use crate::rate;
 use crate::valid_host_port;
 
 const TRADE: StreamId = StreamId(0);
@@ -126,7 +127,7 @@ impl QfexExec {
                 frame: WireSlice::plain(body.into_bytes()),
                 rpc: None,
                 class: TrafficClass::Safety,
-                // One whole unit conservatively exceeds QFEX's currently documented 0.1.
+                // One local tenth is QFEX's documented 0.1 weight unit.
                 charge: RateCharge::one(OpKind::Subscribe, None),
             });
         }
@@ -245,6 +246,12 @@ impl ExecCodec for QfexExec {
             Self::reconnect(fx);
             return Ok(());
         }
+        // A rate error is feedback about the shared provider budget, never proof that an
+        // order did or did not take effect. Leave any sent RPC to its Unknown timeout.
+        if let Some(feedback) = rate::effect(stream, &value) {
+            fx.push(feedback);
+            return Ok(());
+        }
         if value.get("subscribed").and_then(Value::as_str).is_some() {
             return Ok(());
         }
@@ -297,6 +304,9 @@ impl ExecCodec for QfexExec {
         let Inbound::Frame(frame) = input else {
             return InboundSpans::NONE;
         };
+        if let Some(spans) = rate::echoed_frame_spans(frame.bytes()) {
+            return spans;
+        }
         auth::inbound_spans(frame.bytes(), &self.public, self.subaccount.as_deref())
     }
 }

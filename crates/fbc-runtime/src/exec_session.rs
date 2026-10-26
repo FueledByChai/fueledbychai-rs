@@ -1729,7 +1729,9 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
     };
     // Our client id names one venue order where amends keep the venue id (decision 0080).
     let one_id = exec.order.amend.is_none_or(|amend| amend.keeps_venue_id);
-    config.limiter.check(&caps.limits)?;
+    config
+        .limiter
+        .check(caps.exec_limits.as_deref().unwrap_or(&caps.limits))?;
     let plan = venue.plan_exec(cfg).map_err(ExecSessionError::Venue)?;
     // The first endpoint carries the orders; an in-process stream stands in for exactly one
     // (decisions 0104, 0115).
@@ -2024,7 +2026,7 @@ fn carries(
         }
         Effect::Http { timeout, .. } => !http || unbounded(*timeout),
         Effect::Reconnect { .. } => true,
-        Effect::Timer { .. } => false,
+        Effect::Timer { .. } | Effect::RateLimited { .. } => false,
     };
     let effects = fx.as_slice();
     let asks = effects.iter().filter(|e| matches!(e, Effect::Http { .. }));

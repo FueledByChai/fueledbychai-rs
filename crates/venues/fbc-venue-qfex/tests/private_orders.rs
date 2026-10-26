@@ -79,6 +79,8 @@ fn specs() -> SpecTable {
         funding: FundingSpec::Unknown,
         public_fees: None,
         status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
         version: 1,
         fetched_at: WallNs(0),
     });
@@ -209,7 +211,9 @@ fn selected_commands_encode_exact_wire_and_documented_weights() {
             "client_order_id":wire_cid.as_str(),"reduce_only":false
         }})
     );
-    assert_eq!(charge, fbc_core::RateCharge::one(OpKind::Place, Some(INST)));
+    assert_eq!(charge.op, OpKind::Place);
+    assert_eq!(charge.inst, Some(INST));
+    assert_eq!(charge.weight.get(), 10);
     assert_eq!(class, fbc_core::TrafficClass::Normal);
 
     let amend = VenueCommand::Amend(AmendOrder {
@@ -233,7 +237,9 @@ fn selected_commands_encode_exact_wire_and_documented_weights() {
             "quantity":2.5,"price":201,"reduce_only":true
         }})
     );
-    assert_eq!(charge, fbc_core::RateCharge::one(OpKind::Amend, Some(INST)));
+    assert_eq!(charge.op, OpKind::Amend);
+    assert_eq!(charge.inst, Some(INST));
+    assert_eq!(charge.weight.get(), 10);
     assert_eq!(class, fbc_core::TrafficClass::Safety);
 
     let cancel = VenueCommand::Cancel(CancelOrder {
@@ -249,10 +255,9 @@ fn selected_commands_encode_exact_wire_and_documented_weights() {
             "order_id":OLD,"symbol":"AAPL-USD","cancel_order_id_type":"order_id"
         }})
     );
-    assert_eq!(
-        charge,
-        fbc_core::RateCharge::one(OpKind::Cancel, Some(INST))
-    );
+    assert_eq!(charge.op, OpKind::Cancel);
+    assert_eq!(charge.inst, Some(INST));
+    assert_eq!(charge.weight.get(), 10);
     assert_eq!(class, fbc_core::TrafficClass::Safety);
 
     let query = VenueCommand::Query(QueryOrder {
@@ -267,7 +272,7 @@ fn selected_commands_encode_exact_wire_and_documented_weights() {
     );
     assert_eq!(charge.op, OpKind::Query);
     assert_eq!(charge.inst, Some(INST));
-    assert_eq!(charge.weight.get(), 2);
+    assert_eq!(charge.weight.get(), 20);
     assert_eq!(class, fbc_core::TrafficClass::Safety);
 
     let mut sink = Sink::default();

@@ -3,7 +3,7 @@
 //!
 //! A [`RateLimiter`] holds the buckets of one venue's declared limits. A request is charged its
 //! weight in every bucket whose limit [counts](RateLimit::counts) it, in the bucket its scope
-//! picks: the one bucket of an [`Account`](LimitScope::Account) or [`Ip`](LimitScope::Ip)
+//! picks: the one bucket of an [`Account`](LimitScope::Account), [`User`](LimitScope::User) or [`Ip`](LimitScope::Ip)
 //! limit, the named instrument's of a [`Pair`](LimitScope::Pair) limit, the connection epoch's
 //! of a [`Connection`](LimitScope::Connection) limit. A bucket is a sliding window: it holds
 //! what was charged in the last `per`, so no window of that length ever holds more than
@@ -13,19 +13,20 @@
 //! [`SafetyReserve`], the share the consumer configures; [`TrafficClass::Safety`] traffic may
 //! use it until the bucket is empty. A request is charged in all its buckets or in none, and a
 //! refusal is counted once under each scope whose bucket refused it ([`RateCounts`]); so is a
-//! venue's HTTP 429 or 418 to a request charged to that scope ([`RateLimiter::rejected`]).
+//! venue's HTTP 429 or 418 to a request charged to that scope ([`RateLimiter::rejected`]),
+//! or its WebSocket rate refusal ([`RateLimiter::provider_rejected`]). The latter also holds
+//! admission until the provider's retry hint, since its limiter may use a different window model.
 //!
 //! [`LimitScope::AddressVolume`] (requests earned by traded volume) is not supported yet: a
 //! limiter refuses limits that declare it, naming the scope, rather than leave them uncounted.
 //!
-//! The limiter is logic over the times its caller passes; it reads no clock and holds no task.
-//! Clones share their buckets, so every session of a venue, and every venue that shares an
-//! egress IP with it, can charge the same ones; it is single-threaded, like the shard.
+//! Every limiter also samples Tokio's instant under its lock, so a delayed shard cannot charge
+//! at a stale time. Clones share their buckets, and independently built user-scoped limiters
+//! share by provider-user key within this process.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fbc_core::{ConnKey, Effect, InstrumentId, LimitScope, RateCharge, RateLimit, TrafficClass};
 use fbc_core::{OpKind, Via};
@@ -73,6 +74,12 @@ pub enum RateError {
     NeverFits(RateCharge),
     /// A limiter built for limits other than the venue's own.
     OtherLimits,
+    /// A user-scoped limit needs an explicit provider-user key.
+    UserKeyRequired,
+    /// A keyed user limiter may contain only user-scoped limits.
+    MixedUserScopes,
+    /// The live limiter for this provider user has different limits or reserve.
+    UserBudgetMismatch,
 }
 
 impl fmt::Display for RateError {
@@ -100,6 +107,15 @@ impl fmt::Display for RateError {
             RateError::OtherLimits => {
                 f.write_str("the rate limiter was built for other limits than the venue's")
             }
+            RateError::UserKeyRequired => {
+                f.write_str("a user-scoped rate limit needs a provider-user key")
+            }
+            RateError::MixedUserScopes => {
+                f.write_str("a keyed provider-user limiter needs only user-scoped limits")
+            }
+            RateError::UserBudgetMismatch => {
+                f.write_str("this provider user's live budget has different limits or reserve")
+            }
         }
     }
 }
@@ -110,6 +126,7 @@ impl std::error::Error for RateError {}
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub struct ScopeCounts {
     pub account: u64,
+    pub user: u64,
     pub ip: u64,
     pub pair: u64,
     pub connection: u64,
@@ -125,6 +142,7 @@ impl ScopeCounts {
     fn slot(&mut self, scope: LimitScope) -> Option<&mut u64> {
         match scope {
             LimitScope::Account => Some(&mut self.account),
+            LimitScope::User => Some(&mut self.user),
             LimitScope::Ip => Some(&mut self.ip),
             LimitScope::Pair => Some(&mut self.pair),
             LimitScope::Connection => Some(&mut self.connection),
@@ -148,13 +166,14 @@ impl ScopeCounts {
 pub struct RateCounts {
     /// Requests the limiter refused, once under each scope whose bucket refused them.
     pub refused: ScopeCounts,
-    /// HTTP 429 and 418 responses, once under each scope the request was charged to.
+    /// HTTP 429/418 or WebSocket rate refusals, once under each affected scope.
     pub rejected: ScopeCounts,
 }
 
 /// The scopes buckets are kept for, in the order [`Scopes`] numbers them.
-const SCOPES: [LimitScope; 4] = [
+const SCOPES: [LimitScope; 5] = [
     LimitScope::Account,
+    LimitScope::User,
     LimitScope::Ip,
     LimitScope::Pair,
     LimitScope::Connection,
@@ -213,7 +232,9 @@ impl Request {
     pub fn of(effect: &Effect) -> Option<Request> {
         let class = match effect {
             Effect::Send { class, .. } | Effect::Http { class, .. } => *class,
-            Effect::Timer { .. } | Effect::Reconnect { .. } => return None,
+            Effect::Timer { .. } | Effect::Reconnect { .. } | Effect::RateLimited { .. } => {
+                return None;
+            }
         };
         let (charge, via) = effect.charge()?;
         Some(Request { charge, via, class })
@@ -271,13 +292,51 @@ struct Inner {
     limits: Vec<RateLimit>,
     reserve: SafetyReserve,
     buckets: HashMap<(usize, BucketKey), Bucket>,
+    /// Provider retry hints gate admission in addition to locally counted usage.
+    holds: HashMap<(usize, BucketKey), Instant>,
+    /// An unidentifiable rejected frame can belong to any frame bucket.
+    frame_hold: Option<Instant>,
     counts: RateCounts,
+    /// Serialized charge time. A shard may sample its clock before another shard but take
+    /// this mutex later; never append an older timestamp behind a newer charge.
+    last_now: Option<Instant>,
+}
+
+impl Inner {
+    fn at(&mut self, now: Instant) -> Instant {
+        let now = now.max(Instant::now());
+        let at = self.last_now.map_or(now, |last| last.max(now));
+        self.last_now = Some(at);
+        at
+    }
+}
+
+/// Opaque, consumer-assigned identity of one provider user. Every API key and subaccount of
+/// that user must use the same key; different users must use different keys. It contains no
+/// provider credential or account identifier.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct RateUserKey(u64);
+
+impl RateUserKey {
+    pub const fn new(n: u64) -> Self {
+        Self(n)
+    }
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+type UserRegistry = HashMap<RateUserKey, Arc<Mutex<Inner>>>;
+
+fn user_registry() -> &'static Mutex<UserRegistry> {
+    static REGISTRY: OnceLock<Mutex<UserRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// The buckets of one venue's declared limits, shared by its clones.
 #[derive(Clone, Debug)]
 pub struct RateLimiter {
-    inner: Rc<RefCell<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 /// One bucket a batch needs: the limit, the key and the units.
@@ -293,6 +352,43 @@ impl RateLimiter {
     /// units, no window or no operation) and one that lists an operation its scope never
     /// counts ([`RateError::Unreachable`]).
     pub fn new(limits: &[RateLimit], reserve: SafetyReserve) -> Result<RateLimiter, RateError> {
+        if limits.iter().any(|limit| limit.scope == LimitScope::User) {
+            return Err(RateError::UserKeyRequired);
+        }
+        Self::build(limits, reserve)
+    }
+
+    /// Returns the process-wide budget for one provider user. Independently built sessions
+    /// with the same key share its buckets, even across shard threads or different venue
+    /// instance IDs. The caller must assign the same key to the primary account and every
+    /// subaccount of that user, distinct keys to distinct users, and ensure only this process
+    /// owns their private traffic. A different declaration or reserve for a live key is refused
+    /// instead of silently creating another budget.
+    pub fn for_user(
+        user: RateUserKey,
+        limits: &[RateLimit],
+        reserve: SafetyReserve,
+    ) -> Result<RateLimiter, RateError> {
+        if limits.is_empty() || limits.iter().any(|limit| limit.scope != LimitScope::User) {
+            return Err(RateError::MixedUserScopes);
+        }
+        let built = Self::build(limits, reserve)?;
+        let mut registry = user_registry().lock().expect("user rate registry poisoned");
+        if let Some(existing) = registry.get(&user) {
+            let inner = existing.lock().expect("user rate budget poisoned");
+            if inner.limits != limits || inner.reserve != reserve {
+                return Err(RateError::UserBudgetMismatch);
+            }
+            drop(inner);
+            return Ok(RateLimiter {
+                inner: Arc::clone(existing),
+            });
+        }
+        registry.insert(user, Arc::clone(&built.inner));
+        Ok(built)
+    }
+
+    fn build(limits: &[RateLimit], reserve: SafetyReserve) -> Result<RateLimiter, RateError> {
         for limit in limits {
             if let LimitScope::AddressVolume { .. } = limit.scope {
                 return Err(RateError::Unsupported(limit.scope));
@@ -315,16 +411,19 @@ impl RateLimiter {
             limits: limits.to_vec(),
             reserve,
             buckets: HashMap::new(),
+            holds: HashMap::new(),
+            frame_hold: None,
             counts: RateCounts::default(),
+            last_now: None,
         };
         Ok(RateLimiter {
-            inner: Rc::new(RefCell::new(inner)),
+            inner: Arc::new(Mutex::new(inner)),
         })
     }
 
     /// Whether this limiter was built for exactly `limits`.
     pub fn serves(&self, limits: &[RateLimit]) -> bool {
-        self.inner.borrow().limits == limits
+        self.inner.lock().expect("rate limiter poisoned").limits == limits
     }
 
     /// Refuses [`RateError::OtherLimits`] unless this limiter was built for exactly `limits`.
@@ -336,13 +435,14 @@ impl RateLimiter {
 
     /// What it has counted.
     pub fn counts(&self) -> RateCounts {
-        self.inner.borrow().counts
+        self.inner.lock().expect("rate limiter poisoned").counts
     }
 
     /// The units charged at `now` in the bucket `key` of the `limit`th declared limit, within
     /// its window.
     pub fn used(&self, now: Instant, limit: usize, key: BucketKey) -> u64 {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
         let Some(per) = inner.limits.get(limit).map(|l| l.per) else {
             return 0;
         };
@@ -382,7 +482,8 @@ impl RateLimiter {
     /// to send (a pong the WebSocket layer writes on its own), so that later traffic waits for
     /// it rather than the venue's count running ahead of the buckets.
     pub fn record(&self, now: Instant, conn: ConnKey, request: Request) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
         let Inner {
             limits, buckets, ..
         } = &mut *inner;
@@ -399,7 +500,7 @@ impl RateLimiter {
     /// venue's 429 or 418 to it is counted under when it was charged together with another,
     /// such as the connection an HTTP request opens (Codex r4179558360).
     pub fn scopes(&self, conn: ConnKey, request: &Request) -> Charged {
-        let inner = self.inner.borrow();
+        let inner = self.inner.lock().expect("rate limiter poisoned");
         let mut scopes = Scopes::default();
         for (i, _) in matches(&inner.limits, Some(conn), request) {
             scopes.add(inner.limits[i].scope);
@@ -409,14 +510,75 @@ impl RateLimiter {
 
     /// Counts a venue's HTTP 429 or 418 to a request charged `charged`.
     pub fn rejected(&self, charged: Charged) {
-        self.inner.borrow_mut().counts.rejected.bump(charged.0);
+        self.inner
+            .lock()
+            .expect("rate limiter poisoned")
+            .counts
+            .rejected
+            .bump(charged.0);
+    }
+
+    /// Apply a provider WebSocket rate refusal to this shared budget. The echoed request's
+    /// charge may select its bucket only when the codec established it unambiguously. With no
+    /// such identity, every frame is held, including cancels. A missing or zero retry hint
+    /// holds the affected budget for at least its longest declared window. This never settles
+    /// or retries an RPC; the session's ordinary deadline leaves an unanswered sent RPC Unknown.
+    pub fn provider_rejected(
+        &self,
+        now: Instant,
+        conn: ConnKey,
+        charge: Option<RateCharge>,
+        retry_after: Option<std::time::Duration>,
+    ) {
+        let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
+        let request = charge.map(|charge| Request {
+            charge,
+            via: Via::Frame,
+            class: TrafficClass::Normal,
+        });
+        let affected: Vec<_> = request
+            .as_ref()
+            .map(|request| matches(&inner.limits, Some(conn), request).collect())
+            .unwrap_or_default();
+        let fallback = if affected.is_empty() {
+            inner.limits.iter().map(|l| l.per).max()
+        } else {
+            affected.iter().map(|(i, _)| inner.limits[*i].per).max()
+        }
+        .unwrap_or(std::time::Duration::from_secs(60));
+        let wait = retry_after.filter(|d| !d.is_zero()).unwrap_or(fallback);
+        let until = now.checked_add(wait).unwrap_or_else(|| now + fallback);
+        let mut scopes = Scopes::default();
+        if affected.is_empty() {
+            for limit in &inner.limits {
+                if limit
+                    .ops
+                    .iter()
+                    .any(|op| op != OpKind::Connect && op != OpKind::Rest)
+                {
+                    scopes.add(limit.scope);
+                }
+            }
+            inner.frame_hold = Some(inner.frame_hold.map_or(until, |old| old.max(until)));
+        } else {
+            for (i, key) in affected {
+                scopes.add(inner.limits[i].scope);
+                let held = inner.holds.entry((i, key)).or_insert(until);
+                *held = (*held).max(until);
+            }
+        }
+        inner.counts.rejected.bump(scopes);
     }
 
     /// Forgets the per-connection buckets of `conn`, an epoch that ended.
     pub fn closed(&self, conn: ConnKey) {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("rate limiter poisoned");
         inner
             .buckets
+            .retain(|(_, key), _| *key != BucketKey::Connection(conn));
+        inner
+            .holds
             .retain(|(_, key), _| *key != BucketKey::Connection(conn));
     }
 
@@ -426,12 +588,16 @@ impl RateLimiter {
         conn: Option<ConnKey>,
         requests: &[Request],
     ) -> Result<Charged, Refused> {
-        let mut inner = self.inner.borrow_mut();
+        let mut inner = self.inner.lock().expect("rate limiter poisoned");
+        let now = inner.at(now);
         let Inner {
             limits,
             reserve,
             buckets,
+            holds,
+            frame_hold,
             counts,
+            ..
         } = &mut *inner;
         let needs = needs(limits, conn, requests);
         // A batch with any normal request in it keeps out of the reserve of every bucket it
@@ -439,6 +605,14 @@ impl RateLimiter {
         let normal = requests.iter().any(|r| r.class == TrafficClass::Normal);
         let (mut refused, mut ready_at, mut charged) =
             (Scopes::default(), Some(now), Scopes::default());
+        let frame_hold_until = (*frame_hold)
+            .filter(|until| *until > now && requests.iter().any(|r| r.via == Via::Frame));
+        if let Some(until) = frame_hold_until {
+            for need in &needs {
+                refused.add(limits[need.limit].scope);
+            }
+            ready_at = Some(until);
+        }
         for need in &needs {
             let limit = limits[need.limit];
             let cap = match normal {
@@ -448,13 +622,19 @@ impl RateLimiter {
             let bucket = buckets.entry((need.limit, need.key)).or_default();
             bucket.expire(now, limit.per);
             charged.add(limit.scope);
+            if let Some(until) = holds.get(&(need.limit, need.key))
+                && *until > now
+            {
+                refused.add(limit.scope);
+                ready_at = ready_at.map(|at| at.max(*until));
+            }
             if bucket.used + need.units > cap {
                 refused.add(limit.scope);
                 let at = bucket.ready_at(limit.per, need.units, cap);
                 ready_at = ready_at.zip(at).map(|(a, b)| a.max(b));
             }
         }
-        if refused != Scopes::default() {
+        if frame_hold_until.is_some() || refused != Scopes::default() {
             counts.refused.bump(refused);
             return Err(Refused { ready_at });
         }
@@ -482,9 +662,10 @@ fn matches<'a>(
         let key = match limit.scope {
             LimitScope::Pair => BucketKey::Pair(request.charge.inst?),
             LimitScope::Connection => BucketKey::Connection(conn?),
-            LimitScope::Account | LimitScope::Ip | LimitScope::AddressVolume { .. } => {
-                BucketKey::Shared
-            }
+            LimitScope::Account
+            | LimitScope::User
+            | LimitScope::Ip
+            | LimitScope::AddressVolume { .. } => BucketKey::Shared,
         };
         Some((i, key))
     })
@@ -508,7 +689,7 @@ fn needs(limits: &[RateLimit], conn: Option<ConnKey>, requests: &[Request]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fbc_core::TagSet;
+    use fbc_core::{AccountKey, TagSet};
     use std::num::NonZeroU32;
     use std::time::Duration;
 
@@ -615,7 +796,8 @@ mod tests {
         rates.charge(t0 + secs(2), CONN, &place(2)).unwrap();
         // Normal traffic stops at 3 of 4: one more waits until the first charge expires.
         let refused = rates.charge(t0 + secs(3), CONN, &place(1)).unwrap_err();
-        assert_eq!(refused.ready_at, Some(t0 + secs(10)));
+        let ready = refused.ready_at.unwrap();
+        assert!(ready >= t0 + secs(10) && ready <= Instant::now() + secs(10));
         // Two more wait for the second too; four never fit under the normal cap.
         let refused = rates.charge(t0 + secs(3), CONN, &place(3)).unwrap_err();
         assert_eq!(refused.ready_at, Some(t0 + secs(12)));
@@ -624,8 +806,8 @@ mod tests {
             None
         );
         assert_eq!(rates.used(t0 + secs(9), 0, BucketKey::Shared), 3);
-        assert_eq!(rates.used(t0 + secs(10), 0, BucketKey::Shared), 2);
-        rates.charge(t0 + secs(10), CONN, &place(1)).unwrap();
+        assert_eq!(rates.used(t0 + secs(11), 0, BucketKey::Shared), 2);
+        rates.charge(t0 + secs(11), CONN, &place(1)).unwrap();
         assert_eq!(rates.counts().refused.account, 3);
         // Nothing of a limit that is not declared, or of a bucket never charged.
         assert_eq!(rates.used(t0, 1, BucketKey::Shared), 0);
@@ -699,10 +881,8 @@ mod tests {
         let t0 = Instant::now();
         let charged = rates.connect(t0).unwrap();
         assert!(charged.includes(LimitScope::Ip) && !charged.includes(LimitScope::Connection));
-        assert_eq!(
-            rates.connect(t0 + secs(1)).unwrap_err().ready_at,
-            Some(t0 + secs(10))
-        );
+        let ready = rates.connect(t0 + secs(1)).unwrap_err().ready_at.unwrap();
+        assert!(ready >= t0 + secs(10) && ready <= Instant::now() + secs(10));
         rates.rejected(charged);
         let counts = rates.counts();
         assert_eq!(counts.rejected.get(LimitScope::Ip), 1);
@@ -754,5 +934,298 @@ mod tests {
         };
         let request = Request::of(&send).unwrap();
         assert_eq!((request.via, request.class), (Via::Frame, S));
+    }
+
+    #[test]
+    fn one_provider_user_budget_covers_primary_and_subaccounts_across_threads() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<RateLimiter>();
+
+        let user = RateUserKey::new(0xe5bd_0001);
+        let other_user = RateUserKey::new(0xe5bd_0002);
+        let reserve = SafetyReserve::percent(50).unwrap();
+        let limits = [
+            limit(
+                LimitScope::User,
+                &[OpKind::Place, OpKind::Amend, OpKind::Query],
+                4,
+                60,
+            ),
+            limit(LimitScope::User, &[OpKind::Cancel], 2, 60),
+        ];
+        assert_eq!(
+            RateLimiter::new(&limits, reserve).unwrap_err(),
+            RateError::UserKeyRequired
+        );
+
+        // Each account has its own key and API key, and independently constructs its limiter.
+        // The provider-user key binds all three to one budget.
+        let sessions = [
+            (
+                AccountKey::new(1),
+                "primary-key",
+                RateLimiter::for_user(user, &limits, reserve).unwrap(),
+            ),
+            (
+                AccountKey::new(2),
+                "sub-key-a",
+                RateLimiter::for_user(user, &limits, reserve).unwrap(),
+            ),
+            (
+                AccountKey::new(3),
+                "sub-key-b",
+                RateLimiter::for_user(user, &limits, reserve).unwrap(),
+            ),
+        ];
+        assert_ne!(sessions[0].0, sessions[1].0);
+        assert_ne!(sessions[0].1, sessions[1].1);
+        let other = RateLimiter::for_user(other_user, &limits, reserve).unwrap();
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        let cancel = req(OpKind::Cancel, None, 1, S);
+        let query = req(OpKind::Query, None, 1, S);
+        let first = sessions[0].2.charge(t0, CONN, &[place]).unwrap();
+        assert!(first.includes(LimitScope::User));
+        let on_another_shard = sessions[1].2.clone();
+        std::thread::spawn(move || {
+            on_another_shard
+                .charge(t0, ConnKey { conn: 2, epoch: 0 }, &[place])
+                .unwrap()
+        })
+        .join()
+        .unwrap();
+        let ready = sessions[2]
+            .2
+            .charge(t0, ConnKey { conn: 3, epoch: 0 }, &[place])
+            .unwrap_err()
+            .ready_at
+            .unwrap();
+        assert!(ready >= t0 + secs(60) && ready <= Instant::now() + secs(60));
+        assert_eq!(sessions[0].2.used(t0, 0, BucketKey::Shared), 2);
+        // Safety traffic can use the reserved half of the general bucket. The cancel bucket
+        // remains independent, but is shared across the same three sessions.
+        sessions[2].2.charge(t0, CONN, &[query, query]).unwrap();
+        assert!(sessions[0].2.charge(t0, CONN, &[query]).is_err());
+        sessions[0].2.charge(t0, CONN, &[cancel]).unwrap();
+        sessions[1].2.charge(t0, CONN, &[cancel]).unwrap();
+        assert!(sessions[2].2.charge(t0, CONN, &[cancel]).is_err());
+        assert_eq!(sessions[2].2.used(t0, 1, BucketKey::Shared), 2);
+
+        // A venue RateLimited reply reaches the same counters whichever account sees it.
+        sessions[1].2.rejected(first);
+        assert_eq!(sessions[2].2.counts().rejected.user, 1);
+        assert_eq!(sessions[0].2.counts().refused.user, 3);
+        other.charge(t0, CONN, &[place]).unwrap();
+        assert_eq!(other.used(t0, 0, BucketKey::Shared), 1);
+        assert_eq!(sessions[0].2.used(t0 + secs(61), 0, BucketKey::Shared), 0);
+    }
+
+    #[test]
+    fn qfex_provider_refusal_holds_the_shared_bucket_without_spending_cancel_reserve() {
+        let limits = [
+            limit(LimitScope::User, &[OpKind::Place, OpKind::Query], 10, 60),
+            limit(
+                LimitScope::User,
+                &[OpKind::Cancel, OpKind::CancelAll],
+                10,
+                60,
+            ),
+        ];
+        let reserve = SafetyReserve::percent(50).unwrap();
+        let primary =
+            RateLimiter::for_user(RateUserKey::new(0x7a00_0001), &limits, reserve).unwrap();
+        let subaccount =
+            RateLimiter::for_user(RateUserKey::new(0x7a00_0001), &limits, reserve).unwrap();
+        let other = RateLimiter::for_user(RateUserKey::new(0x7a00_0002), &limits, reserve).unwrap();
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        let cancel = req(OpKind::Cancel, None, 1, S);
+        primary.charge(t0, CONN, &[place]).unwrap();
+        subaccount.provider_rejected(t0, CONN, Some(place.charge), Some(secs(7)));
+        assert!(primary.charge(t0, CONN, &[place]).is_err());
+        assert!(
+            primary
+                .charge(t0, CONN, &[req(OpKind::Query, None, 1, S)])
+                .is_err()
+        );
+        assert!(subaccount.charge(t0, CONN, &[cancel]).is_ok());
+        assert!(other.charge(t0, CONN, &[place]).is_ok());
+        assert!(primary.charge(t0 + secs(8), CONN, &[place]).is_ok());
+
+        // An absent or ambiguous echoed message cannot select a bucket. Hold both, across
+        // both accounts, and use the declared window when the provider hint is absent.
+        primary.provider_rejected(t0 + secs(8), CONN, None, None);
+        subaccount.provider_rejected(t0 + secs(9), CONN, None, Some(secs(70)));
+        for request in [place, cancel] {
+            let refused = subaccount
+                .charge(t0 + secs(10), CONN, &[request])
+                .unwrap_err();
+            assert!(refused.ready_at.unwrap() >= t0 + secs(79));
+        }
+        assert_eq!(primary.counts().rejected.user, 3);
+    }
+
+    #[test]
+    fn unknown_provider_echo_holds_frames_even_without_a_matching_bucket() {
+        let t0 = Instant::now();
+        let reserve = SafetyReserve::percent(0).unwrap();
+        let limits = [limit(LimitScope::Account, &[OpKind::Place], 10, 60)];
+        let rates = RateLimiter::new(&limits, reserve).unwrap();
+        let unmatched = req(OpKind::Subscribe, None, 1, N);
+        rates.provider_rejected(t0, CONN, None, Some(secs(5)));
+        assert!(rates.charge(t0, CONN, &[unmatched]).unwrap_err().ready_at >= Some(t0 + secs(5)));
+        assert!(rates.charge(t0 + secs(6), CONN, &[unmatched]).is_ok());
+
+        let without_limits = RateLimiter::new(&[], reserve).unwrap();
+        without_limits.provider_rejected(t0, CONN, None, Some(secs(5)));
+        assert!(
+            without_limits
+                .charge(t0, CONN, &[unmatched])
+                .unwrap_err()
+                .ready_at
+                >= Some(t0 + secs(5))
+        );
+        assert!(without_limits.connect(t0).is_ok());
+        assert!(
+            without_limits
+                .charge(t0 + secs(6), CONN, &[unmatched])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn connection_scoped_provider_hold_ends_with_only_its_epoch() {
+        let limits = [limit(LimitScope::Connection, &[OpKind::Place], 10, 60)];
+        let rates = RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap();
+        let other = ConnKey { conn: 2, epoch: 0 };
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        rates.provider_rejected(t0, CONN, Some(place.charge), Some(secs(5)));
+        rates.provider_rejected(t0, other, Some(place.charge), Some(secs(5)));
+        assert!(rates.charge(t0, CONN, &[place]).is_err());
+        rates.closed(CONN);
+        assert!(rates.charge(t0, CONN, &[place]).is_ok());
+        assert!(rates.charge(t0, other, &[place]).is_err());
+    }
+
+    #[test]
+    fn stale_shard_time_cannot_expire_a_newly_admitted_user_request() {
+        let user = RateUserKey::new(0xe5bd_0004);
+        let limits = [limit(LimitScope::User, &[OpKind::Place], 2, 60)];
+        let rates =
+            RateLimiter::for_user(user, &limits, SafetyReserve::percent(0).unwrap()).unwrap();
+        let t0 = Instant::now();
+        let place = req(OpKind::Place, None, 1, N);
+        rates.charge(t0, CONN, &[place]).unwrap();
+        // A later timestamp acquires the lock first and expires the original charge.
+        rates.charge(t0 + secs(61), CONN, &[place]).unwrap();
+        // This shard sampled time earlier, but its charge happens after the above write.
+        rates.charge(t0 + secs(1), CONN, &[place]).unwrap();
+        assert_eq!(rates.used(t0 + secs(62), 0, BucketKey::Shared), 2);
+        assert_eq!(
+            rates
+                .charge(t0 + secs(62), CONN, &[place])
+                .unwrap_err()
+                .ready_at,
+            Some(t0 + secs(121))
+        );
+    }
+
+    #[test]
+    fn delayed_charge_uses_time_after_acquiring_the_shared_lock() {
+        let user = RateUserKey::new(0xe5bd_0005);
+        let reserve = SafetyReserve::percent(0).unwrap();
+        let user_limits = [limit(LimitScope::User, &[OpKind::Place], 2, 60)];
+        let account_limits = [limit(LimitScope::Account, &[OpKind::Place], 2, 60)];
+        for rates in [
+            RateLimiter::for_user(user, &user_limits, reserve).unwrap(),
+            RateLimiter::new(&account_limits, reserve).unwrap(),
+        ] {
+            let sampled = Instant::now();
+            let guard = rates.inner.lock().unwrap();
+            let worker_rates = rates.clone();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                worker_rates
+                    .charge(sampled, CONN, &[req(OpKind::Place, None, 1, N)])
+                    .unwrap();
+            });
+            started_rx.recv().unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let released_at = Instant::now();
+            drop(guard);
+            worker.join().unwrap();
+            let inner = rates.inner.lock().unwrap();
+            let charged_at = inner.buckets[&(0, BucketKey::Shared)].log.back().unwrap().0;
+            assert!(charged_at >= released_at);
+        }
+    }
+
+    #[test]
+    fn a_live_user_key_refuses_an_inconsistent_budget() {
+        let user = RateUserKey::new(0xe5bd_0003);
+        let reserve = SafetyReserve::percent(20).unwrap();
+        let limits = [limit(LimitScope::User, &[OpKind::Place], 10, 60)];
+        let held = RateLimiter::for_user(user, &limits, reserve).unwrap();
+        assert_eq!(
+            RateLimiter::for_user(user, &limits, SafetyReserve::percent(0).unwrap()).unwrap_err(),
+            RateError::UserBudgetMismatch
+        );
+        assert_eq!(
+            RateLimiter::for_user(
+                user,
+                &[limit(LimitScope::User, &[OpKind::Place], 11, 60)],
+                reserve
+            )
+            .unwrap_err(),
+            RateError::UserBudgetMismatch
+        );
+        assert_eq!(
+            RateLimiter::for_user(
+                user,
+                &[limit(LimitScope::Account, &[OpKind::Place], 10, 60)],
+                reserve
+            )
+            .unwrap_err(),
+            RateError::MixedUserScopes
+        );
+        drop(held);
+        assert_eq!(
+            RateLimiter::for_user(
+                user,
+                &[limit(LimitScope::User, &[OpKind::Place], 11, 60)],
+                reserve,
+            )
+            .unwrap_err(),
+            RateError::UserBudgetMismatch
+        );
+    }
+
+    #[test]
+    fn provider_user_configuration_errors_name_the_required_correction() {
+        let user = RateUserKey::new(0xe5bd_0006);
+        assert_eq!(user.get(), 0xe5bd_0006);
+        let reserve = SafetyReserve::percent(20).unwrap();
+        let user_limits = [limit(LimitScope::User, &[OpKind::Place], 10, 60)];
+        assert_eq!(
+            RateLimiter::new(&user_limits, reserve)
+                .unwrap_err()
+                .to_string(),
+            "a user-scoped rate limit needs a provider-user key"
+        );
+        assert_eq!(
+            RateLimiter::for_user(user, &[], reserve)
+                .unwrap_err()
+                .to_string(),
+            "a keyed provider-user limiter needs only user-scoped limits"
+        );
+        let _held = RateLimiter::for_user(user, &user_limits, reserve).unwrap();
+        assert_eq!(
+            RateLimiter::for_user(user, &user_limits, SafetyReserve::percent(0).unwrap())
+                .unwrap_err()
+                .to_string(),
+            "this provider user's live budget has different limits or reserve"
+        );
     }
 }

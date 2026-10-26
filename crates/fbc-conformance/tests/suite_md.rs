@@ -6,6 +6,10 @@
 //! unchained ones, or binary market data and its longer-block sub-case; and fixture
 //! directories missing a directory or a case, holding a stray case, a malformed line, a refused
 //! frame or a case that states nothing.
+//!
+//! FBC-n35m (decision 0124): `continuity` holds a prune or a clear of one side of a broken book as
+//! it holds a level, and counts either as the codec taking the sequence; `book_channels` requires
+//! both on the channel's own book, and reads neither as showing liquidity.
 
 mod toy_setup;
 
@@ -60,6 +64,24 @@ enum Twist {
     /// It keeps a broken book live: each gap it reports on a book is preceded by a level of
     /// that book, and every later frame pushes one too until the book's next snapshot begins.
     KeepsApplying,
+    /// As [`Twist::KeepsApplying`], with a prune of one side of the book for the level.
+    KeepsPruning,
+    /// As [`Twist::KeepsApplying`], with a clear of one side of the book for the level.
+    KeepsClearing,
+    /// As [`Twist::KeepsApplying`], with a both-sides window of the book for the level.
+    KeepsWindowing,
+    /// After each level it pushes, a prune of the level's side to its price and a clear of that
+    /// side, both on the anchored book instead.
+    SidesOnOtherBook,
+    /// After each level it pushes, a prune of the level's side to its price and a clear of that
+    /// side, both on the level's own book.
+    SidesOnOwnBook,
+    /// It pushes the gaps it reports and, for each level, a clear of that level's side, and
+    /// nothing else.
+    OnlyGapsAndClears,
+    /// It pushes the gaps it reports and, for each level, a prune of that level's side to the
+    /// level's price, and nothing else.
+    OnlyGapsAndPrunes,
     /// Each gap it reports on a book is followed by `Live` on that book, and so is each
     /// snapshot's begin: it tells the consumer to trust a book still broken.
     LiveTooSoon,
@@ -226,16 +248,46 @@ fn stray_level(inst: InstrumentId, book: BookId) -> MdEvent {
     }
 }
 
+/// A prune of `book`'s bids on `inst`, as a codec that keeps a broken book live would push.
+fn stray_prune(inst: InstrumentId, book: BookId) -> MdEvent {
+    MdEvent::SidePrune {
+        inst,
+        book,
+        side: BookSide::Bid,
+        lo: Ticks(1),
+        hi: Ticks(2),
+    }
+}
+
+/// A clear of `book`'s asks on `inst`, as a codec that keeps a broken book live would push.
+fn stray_clear(inst: InstrumentId, book: BookId) -> MdEvent {
+    MdEvent::SideClear {
+        inst,
+        book,
+        side: BookSide::Ask,
+    }
+}
+
+/// A both-sides window of `book` on `inst`, as a codec that keeps a broken book live would push.
+fn stray_window(inst: InstrumentId, book: BookId) -> MdEvent {
+    MdEvent::Window {
+        inst,
+        book,
+        lo: Ticks(1),
+        hi: Ticks(2),
+    }
+}
+
 impl Twisted {
-    /// [`Twist::KeepsApplying`]'s frame: the toy's events, a level before each gap on a book,
-    /// and a level of every book still broken from an earlier frame.
+    /// [`Twist::KeepsApplying`]'s frame, and its kin's: the toy's events, a `stray` event of the
+    /// book before each gap on it, and one of every book still broken from an earlier frame.
     fn keep_applying(
         &mut self,
         f: RawFrame<'_>,
-        scope: &DecodeScope<'_>,
-        specs: &SpecTable,
+        (scope, specs): (&DecodeScope<'_>, &SpecTable),
         sink: &mut dyn MdSink,
         fx: &mut Effects,
+        stray: fn(InstrumentId, BookId) -> MdEvent,
     ) -> Result<(), DecodeError> {
         let mut toy = Collect(Vec::new());
         let outcome = self.inner.on_frame(f, scope, specs, &mut toy, fx);
@@ -247,7 +299,7 @@ impl Twisted {
                     feed: Feed::Book(book),
                     h: FeedHealth::Gap,
                 } => {
-                    sink.push(meta, stray_level(inst, book));
+                    sink.push(meta, stray(inst, book));
                     self.broken.insert((inst, book));
                 }
                 MdEvent::BookSnapshotBegin { inst, book, .. } => {
@@ -258,7 +310,7 @@ impl Twisted {
             sink.push(meta, ev);
         }
         for &(inst, book) in before.intersection(&self.broken) {
-            sink.push(VenueMeta::NONE, stray_level(inst, book));
+            sink.push(VenueMeta::NONE, stray(inst, book));
         }
         outcome
     }
@@ -280,6 +332,33 @@ impl MdSink for Rewrite<'_> {
             }
         );
         if self.twist == Twist::OnlyGaps && !gap {
+            return;
+        }
+        if matches!(
+            self.twist,
+            Twist::OnlyGapsAndClears | Twist::OnlyGapsAndPrunes
+        ) && !gap
+        {
+            if let MdEvent::Level {
+                inst,
+                book,
+                side,
+                px,
+                ..
+            } = ev
+            {
+                let ev = match self.twist {
+                    Twist::OnlyGapsAndClears => MdEvent::SideClear { inst, book, side },
+                    _ => MdEvent::SidePrune {
+                        inst,
+                        book,
+                        side,
+                        lo: px,
+                        hi: px,
+                    },
+                };
+                self.sink.push(meta, ev);
+            }
             return;
         }
         if let (
@@ -336,6 +415,35 @@ impl MdSink for Rewrite<'_> {
             _ => {}
         }
         self.sink.push(meta, ev);
+        if let (
+            Twist::SidesOnOtherBook | Twist::SidesOnOwnBook,
+            MdEvent::Level {
+                inst,
+                book,
+                side,
+                px,
+                ..
+            },
+        ) = (self.twist, ev)
+        {
+            let book = match self.twist {
+                Twist::SidesOnOtherBook => ANCHORED_BOOK,
+                _ => book,
+            };
+            let (lo, hi) = (px, px);
+            self.sink.push(
+                meta,
+                MdEvent::SidePrune {
+                    inst,
+                    book,
+                    side,
+                    lo,
+                    hi,
+                },
+            );
+            self.sink
+                .push(meta, MdEvent::SideClear { inst, book, side });
+        }
         if let (
             Twist::LiveTooSoon,
             MdEvent::Health {
@@ -448,8 +556,15 @@ impl MdCodec for Twisted {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let twist = self.twist;
-        if twist == Twist::KeepsApplying {
-            return self.keep_applying(f, scope, specs, sink, fx);
+        let stray: Option<fn(InstrumentId, BookId) -> MdEvent> = match twist {
+            Twist::KeepsApplying => Some(stray_level),
+            Twist::KeepsPruning => Some(stray_prune),
+            Twist::KeepsClearing => Some(stray_clear),
+            Twist::KeepsWindowing => Some(stray_window),
+            _ => None,
+        };
+        if let Some(stray) = stray {
+            return self.keep_applying(f, (scope, specs), sink, fx, stray);
         }
         let text;
         let f = match (twist, f) {
@@ -813,6 +928,106 @@ fn continuity_fails_a_toy_that_keeps_a_broken_book_live_until_its_snapshot() {
             broken(17, "TOYA-PERP"),
         ]
     );
+}
+
+#[test]
+fn continuity_fails_a_toy_that_prunes_clears_or_windows_a_broken_book_until_its_snapshot() {
+    // FBC-n35m (0124): a prune or a clear of one side of a broken book changes it, as a level
+    // does, so a consumer that applies it trusts a broken book; a window, held the same way
+    // before, is named as one.
+    for (twist, kind) in [
+        (Twist::KeepsPruning, "side prune"),
+        (Twist::KeepsClearing, "side clear"),
+        (Twist::KeepsWindowing, "window"),
+    ] {
+        let failure = failed(Variant::twisted(twist).run(suite::continuity));
+        assert_eq!(named(&failure), [PLUS_ONE; 5], "{twist:?}");
+        let broken = |line: u32, sym: &str| {
+            format!(
+                "continuity/book.frames line {line} pushes a {kind} of {sym}'s book while its \
+                 sequence is broken: a broken book takes nothing until its next snapshot"
+            )
+        };
+        assert_eq!(
+            said(&failure, PLUS_ONE),
+            [
+                broken(10, "TOYA-PERP"),
+                broken(12, "TOYA-PERP"),
+                broken(16, "TOYA-PERP"),
+                broken(17, "TOYB-PERP"),
+                broken(17, "TOYA-PERP"),
+            ],
+            "{twist:?}"
+        );
+    }
+}
+
+#[test]
+fn continuity_counts_a_side_prune_or_clear_as_the_codec_taking_the_sequence() {
+    // FBC-n35m (0124): a frame in sequence whose only events of the book are prunes, or clears,
+    // of one side shows the codec taking the sequence, as one pushing a level does.
+    let scratch = Scratch::toy("clears-in-sequence");
+    scratch.write(
+        "continuity/book.frames",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
+         gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
+    );
+    let only_gaps = Variant::twisted(Twist::OnlyGaps);
+    let failure = failed(only_gaps.run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, "continuity/book.frames"),
+        [
+            "no frame in sequence pushes an event of book: a case must show the codec taking \
+             the sequence, not only breaking it"
+        ]
+    );
+    for twist in [Twist::OnlyGapsAndClears, Twist::OnlyGapsAndPrunes] {
+        let read = probed(Variant::twisted(twist).run_in(suite::continuity, &scratch.0));
+        assert!(
+            read.contains(&"continuity/book.frames: 1 of 2 frames break the sequence".to_owned()),
+            "{twist:?}: {read:#?}"
+        );
+    }
+}
+
+#[test]
+fn book_channels_requires_a_side_prune_or_clear_on_the_books_own_channel() {
+    // FBC-n35m (0124): the runtime routes a prune or a clear by its book, as it routes a level.
+    let failure = failed(Variant::twisted(Twist::SidesOnOtherBook).run(suite::book_channels));
+    // Two for each of the six levels the case's frames push.
+    assert_eq!(named(&failure), ["BookCaps.channel"; 12]);
+    let said = said(&failure, "BookCaps.channel");
+    assert_eq!(
+        said[..2],
+        [
+            "book_channels/book.frames line 3, a frame of book (book 0), decoded onto book 1",
+            "book_channels/book.frames line 3, a frame of book (book 0), decoded onto book 1",
+        ]
+    );
+    // On the book's own channel they pass.
+    probed(Variant::twisted(Twist::SidesOnOwnBook).run(suite::book_channels));
+}
+
+#[test]
+fn book_channels_reads_a_side_prune_or_clear_as_showing_no_liquidity() {
+    // FBC-n35m (0124): only a level shows liquidity, so a frame whose only book events are
+    // prunes, or clears, of one side needs no order channel tag. These frames state none, and
+    // the twists push no level: the case shows no channel the book declares, and nothing else
+    // is wrong with it.
+    let scratch = Scratch::toy("sides-show-nothing");
+    scratch.write(
+        "book_channels/book.frames",
+        "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3,98:5|ask=101:2\n\
+         text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=\n",
+    );
+    for twist in [Twist::OnlyGapsAndClears, Twist::OnlyGapsAndPrunes] {
+        let failure = failed(Variant::twisted(twist).run_in(suite::book_channels, &scratch.0));
+        assert_eq!(
+            named(&failure),
+            ["BookCaps.includes_channels has Public"],
+            "{twist:?}: {failure}"
+        );
+    }
 }
 
 #[test]

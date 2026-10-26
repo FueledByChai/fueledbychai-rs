@@ -8,15 +8,16 @@
 //! instrument or feed from it (Codex r4217682431, r4217839174), and no gap from any other
 //! frame: a break missed or put elsewhere leaves a broken book trusted, and a gap reported in
 //! sequence throws a good one away. From the frame that breaks a book, its first event
-//! included, until a snapshot of that book begins, the codec must push no level or window of it
-//! (Codex r4218167354): the consumer applies events as they come, so a delta of a broken book
-//! is trusted. Nor may it report the book [`FeedHealth::Live`] before that snapshot ends (Codex
-//! r4218492690): `Live` says no gap since the last snapshot, and a gap discards a snapshot
-//! begun before it in its frame (Codex r4218744557). A case that marks no break proves nothing
-//! and fails, and so does one none of whose frames in sequence pushes an event of the book
-//! (Codex r4218744571): it must show the codec taking the sequence too. A channel declared
-//! [`Continuity::Windowed`] or [`Continuity::Unsequenced`] has nothing to chain and is skipped
-//! by name.
+//! included, until a snapshot of that book begins, the codec must push no level, window, or
+//! prune or clear of one side of it (Codex r4218167354, decision 0124): the consumer applies
+//! events as they come, so a delta of a broken book is trusted. Nor may it report the book
+//! [`FeedHealth::Live`] before that snapshot ends (Codex r4218492690): `Live` says no gap
+//! since the last snapshot, and a gap discards a snapshot begun before it in its frame (Codex
+//! r4218744557). A case that marks no break proves nothing and fails, and so does one none of
+//! whose frames in sequence pushes an event of the book (Codex r4218744571; a prune or a clear
+//! of one side counts, decision 0124): it must show the codec taking the sequence too. A
+//! channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`] has nothing to
+//! chain and is skipped by name.
 //!
 //! # The longer-block sub-case
 //!
@@ -273,14 +274,34 @@ struct Broken {
     healing: BTreeSet<InstrumentId>,
 }
 
-/// Whether `ev` is an event of `book`'s levels: a snapshot's begin or end, a level or a window.
+/// Whether `ev` is an event of `book`'s levels: a snapshot's begin or end, a level, a window, or
+/// a prune or a clear of one side (decision 0124). The match names every event, so a new one
+/// is judged here by choice.
 fn on_book(ev: &MdEvent, book: &Book) -> bool {
     match *ev {
         MdEvent::BookSnapshotBegin { book: b, .. }
         | MdEvent::BookSnapshotEnd { book: b, .. }
         | MdEvent::Level { book: b, .. }
-        | MdEvent::Window { book: b, .. } => b == book.id,
-        _ => false,
+        | MdEvent::Window { book: b, .. }
+        | MdEvent::SidePrune { book: b, .. }
+        | MdEvent::SideClear { book: b, .. } => b == book.id,
+        MdEvent::Health { .. }
+        | MdEvent::Touch { .. }
+        | MdEvent::Trade { .. }
+        | MdEvent::Mark { .. }
+        | MdEvent::Index { .. }
+        | MdEvent::Funding { .. }
+        | MdEvent::Stats { .. } => false,
+    }
+}
+
+/// What a change to a book's levels is called in a breach.
+fn kind(ev: &MdEvent) -> &'static str {
+    match ev {
+        MdEvent::Window { .. } => "window",
+        MdEvent::SidePrune { .. } => "side prune",
+        MdEvent::SideClear { .. } => "side clear",
+        _ => "level",
     }
 }
 
@@ -290,11 +311,12 @@ struct Held<'a> {
     broke: &'a [InstrumentId],
 }
 
-/// Holds `step` to the books broken before it or by it: none takes a level or window until a
-/// snapshot of it begins, the snapshot's own levels being the recovery (Codex r4218167354), nor
-/// is reported `Live` until that snapshot ends (Codex r4218492690). The frame that breaks a book
-/// is held from its first event, as a level pushed before the gap reaches the consumer first,
-/// and held again at its gap, which discards a snapshot begun before it (Codex r4218744557).
+/// Holds `step` to the books broken before it or by it: none takes a level, a window, or a prune
+/// or a clear of one side until a snapshot of it begins, the snapshot's own levels being the
+/// recovery (Codex r4218167354, decision 0124), nor is reported `Live` until that snapshot ends
+/// (Codex r4218492690). The frame that breaks a book is held from its first event, as a level
+/// pushed before the gap reaches the consumer first, and held again at its gap, which discards
+/// a snapshot begun before it (Codex r4218744557).
 fn kept_live(
     broken: &mut Broken,
     held: &Held<'_>,
@@ -326,12 +348,16 @@ fn kept_live(
             MdEvent::BookSnapshotEnd { inst, book: b } if b == book.id => {
                 broken.healing.remove(&inst);
             }
-            MdEvent::Level { inst, book: b, .. } | MdEvent::Window { inst, book: b, .. }
+            MdEvent::Level { inst, book: b, .. }
+            | MdEvent::Window { inst, book: b, .. }
+            | MdEvent::SidePrune { inst, book: b, .. }
+            | MdEvent::SideClear { inst, book: b, .. }
                 if b == book.id && broken.held.contains(&inst) =>
             {
                 let what = format!(
-                    "{file} line {line} pushes a level of {}'s book while its sequence is \
+                    "{file} line {line} pushes a {} of {}'s book while its sequence is \
                      broken: a broken book takes nothing until its next snapshot",
+                    kind(ev),
                     symbol(inst)
                 );
                 breaches.push(Breach::new(capability, what));

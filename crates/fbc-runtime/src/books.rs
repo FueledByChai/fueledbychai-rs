@@ -4,8 +4,9 @@
 //! One instrument may be subscribed to several book channels on one connection (design §10: a
 //! recorder keeps a public and an interactive book), and every book event names its
 //! [`BookId`] (decision 0014 item 7), so each channel builds a book of its own: a snapshot,
-//! level, window or `Health { feed: Feed::Book(id), h: Gap }` reaches only the book of its
-//! instrument and channel ([`fbc_book::Books`]).
+//! level, window, prune or clear of one side (decision 0124) or
+//! `Health { feed: Feed::Book(id), h: Gap }` reaches only the book of its instrument and
+//! channel ([`fbc_book::Books`]).
 //!
 //! Which channel an instrument trades on is the consumer's configuration ([`TradingBooks`];
 //! design §7.2 records it in the journal header and treats a change of it as a strategy change),
@@ -114,9 +115,10 @@ impl MdBooks {
     }
 
     /// Applies one event, which came from connection epoch `from`, to the book of its
-    /// instrument and channel, and remembers `from` as the epoch that last fed that book; an
-    /// event about no book changes nothing. A refused event (a snapshot end with no snapshot
-    /// begun, an inverted window) is counted.
+    /// instrument and channel, and remembers `from` as the epoch that last fed that book,
+    /// whether the book took the event, dropped it or refused it; an event about no book
+    /// changes nothing. A refused event (a snapshot end with no snapshot begun, an inverted
+    /// window or prune) is counted.
     pub fn apply(&mut self, from: ConnKey, ev: &MdEvent) -> Result<Applied, BookError> {
         if let Some(book) = book_of(ev) {
             self.fed.insert(book, from);
@@ -221,18 +223,27 @@ impl<H: BookHandler> MdHandler for BookKeeper<H> {
     }
 }
 
-/// The book an event is about, if it is about one.
+/// The book an event is about, if it is about one. The match names every event, so a new book
+/// event cannot fall through to `None` and escape an epoch's end (decision 0124).
 fn book_of(ev: &MdEvent) -> Option<(InstrumentId, BookId)> {
     match *ev {
         MdEvent::BookSnapshotBegin { inst, book, .. }
         | MdEvent::BookSnapshotEnd { inst, book }
         | MdEvent::Level { inst, book, .. }
         | MdEvent::Window { inst, book, .. }
+        | MdEvent::SidePrune { inst, book, .. }
+        | MdEvent::SideClear { inst, book, .. }
         | MdEvent::Health {
             inst,
             feed: Feed::Book(book),
             ..
         } => Some((inst, book)),
-        _ => None,
+        MdEvent::Health { .. }
+        | MdEvent::Touch { .. }
+        | MdEvent::Trade { .. }
+        | MdEvent::Mark { .. }
+        | MdEvent::Index { .. }
+        | MdEvent::Funding { .. }
+        | MdEvent::Stats { .. } => None,
     }
 }
