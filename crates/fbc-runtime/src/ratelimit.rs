@@ -1174,4 +1174,31 @@ mod tests {
             RateError::UserBudgetMismatch
         );
     }
+
+    #[test]
+    fn provider_user_configuration_errors_name_the_required_correction() {
+        let user = RateUserKey::new(0xe5bd_0006);
+        assert_eq!(user.get(), 0xe5bd_0006);
+        let reserve = SafetyReserve::percent(20).unwrap();
+        let user_limits = [limit(LimitScope::User, &[OpKind::Place], 10, 60)];
+        assert_eq!(
+            RateLimiter::new(&user_limits, reserve)
+                .unwrap_err()
+                .to_string(),
+            "a user-scoped rate limit needs a provider-user key"
+        );
+        assert_eq!(
+            RateLimiter::for_user(user, &[], reserve)
+                .unwrap_err()
+                .to_string(),
+            "a keyed provider-user limiter needs only user-scoped limits"
+        );
+        let _held = RateLimiter::for_user(user, &user_limits, reserve).unwrap();
+        assert_eq!(
+            RateLimiter::for_user(user, &user_limits, SafetyReserve::percent(0).unwrap())
+                .unwrap_err()
+                .to_string(),
+            "this provider user's live budget has different limits or reserve"
+        );
+    }
 }

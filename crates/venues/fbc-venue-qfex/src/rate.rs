@@ -77,18 +77,47 @@ fn parse_retry(message: &str) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// Redact the entire inbound frame whenever a QFEX rate error may echo the original request.
-/// Parsing catches escaped JSON strings; the byte check also catches malformed envelopes.
+/// Redact the entire inbound frame whenever it may echo the original request, even when the
+/// envelope is malformed. A malformed frame can still spell the field with JSON Unicode
+/// escapes, so looking only for its literal bytes would leave echoed credentials in the journal.
 pub fn echoed_frame_spans(bytes: &[u8]) -> Option<InboundSpans> {
-    let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|part| part == needle);
-    let parsed_echo = serde_json::from_slice::<Value>(bytes)
-        .ok()
-        .is_some_and(|value| refusal(&value).is_some() && value.get("incoming_message").is_some());
-    if parsed_echo || contains(b"RateLimited") && contains(b"incoming_message") {
+    if contains_ascii_after_json_escapes(bytes, b"incoming_message") {
         let end = u32::try_from(bytes.len()).ok()?;
         return Some(InboundSpans::frame(std::iter::once(0..end).collect()));
     }
     None
+}
+
+fn contains_ascii_after_json_escapes(bytes: &[u8], needle: &[u8]) -> bool {
+    let contains = |haystack: &[u8]| haystack.windows(needle.len()).any(|part| part == needle);
+    if contains(bytes) {
+        return true;
+    }
+    if !bytes.contains(&b'\\') {
+        return false;
+    }
+    // This is a conservative redaction scan, not a second JSON parser. Decode ASCII Unicode
+    // escapes anywhere in the frame so it still finds the marker in malformed JSON. A false
+    // positive only redacts more; a malformed escape is copied unchanged.
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'\\'
+            && bytes.get(at + 1) == Some(&b'u')
+            && let Some(hex) = bytes.get(at + 2..at + 6)
+            && let Ok(hex) = std::str::from_utf8(hex)
+            && let Ok(code) = u16::from_str_radix(hex, 16)
+            && let Ok(ascii) = u8::try_from(code)
+            && ascii.is_ascii()
+        {
+            decoded.push(ascii);
+            at += 6;
+        } else {
+            decoded.push(bytes[at]);
+            at += 1;
+        }
+    }
+    contains(&decoded)
 }
 
 #[cfg(test)]
@@ -193,6 +222,16 @@ mod tests {
         assert_eq!(
             echoed_frame_spans(escaped).unwrap().body()[0],
             0..escaped.len() as u32
+        );
+        let malformed_escaped = br#"{"type":"Err","error_code":"RateLimit\u0065d","incoming_mess\u0061ge":{"signature":"secret"}"#;
+        assert_eq!(
+            echoed_frame_spans(malformed_escaped).unwrap().body()[0],
+            0..malformed_escaped.len() as u32
+        );
+        let entirely_escaped = br#"{"type":"Err","error_code":"RateLimited","\u0069\u006e\u0063\u006f\u006d\u0069\u006e\u0067\u005f\u006d\u0065\u0073\u0073\u0061\u0067\u0065":{"signature":"secret"}"#;
+        assert_eq!(
+            echoed_frame_spans(entirely_escaped).unwrap().body()[0],
+            0..entirely_escaped.len() as u32
         );
     }
 
