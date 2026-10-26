@@ -7,6 +7,7 @@ use fbc_core::{
     AccountKey, ConfigError, EncodeCtx, InboundSpans, Secret, SignError, VenueConfig, WireSlice,
     WireUrl,
 };
+use serde_json::Value;
 
 use crate::sign;
 
@@ -202,16 +203,36 @@ pub fn frame(
         .map_err(|_| SignError::Backend("auth frame redaction"))
 }
 
-/// An error may echo the authentication payload. Keep any frame carrying a known account
-/// identifier or a signature field out of the journal. Such a frame replays as undecodable,
-/// leaving the connection unready.
+/// An error may echo the authentication payload. Keep errors, diagnostics, malformed frames,
+/// and any frame carrying an account credential out of the journal. Raw scanning retains
+/// duplicate fields that a JSON parser would overwrite; parsing finds sensitive decoded
+/// values and field names. Any JSON escape is redacted conservatively. A redacted frame
+/// replays as undecodable and leaves the connection unready.
 pub fn inbound_spans(bytes: &[u8], public: &Secret, subaccount: Option<&str>) -> InboundSpans {
     let contains = |needle: &[u8]| {
         !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
     };
-    let sensitive = contains(public.expose().as_bytes())
+    let raw_sensitive = contains(public.expose().as_bytes())
         || subaccount.is_some_and(|id| contains(id.as_bytes()))
-        || contains(b"\"signature\"");
+        || bytes.contains(&b'\\');
+    let sensitive = raw_sensitive
+        || match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) => {
+                let error = value.as_object().is_some_and(|fields| {
+                    fields.contains_key("error")
+                        || fields.contains_key("err")
+                        || fields.contains_key("error_code")
+                        || fields.get("type").and_then(Value::as_str) == Some("Err")
+                        || (fields.get("type").and_then(Value::as_str) == Some("auth")
+                            && fields.get("result").and_then(Value::as_str) != Some("success"))
+                        || fields.get("authenticated").and_then(Value::as_bool) == Some(false)
+                });
+                error || contains_account_material(&value, public.expose(), subaccount)
+            }
+            // No malformed private reply has a safe, replayable interpretation. In particular,
+            // a truncated echo can contain escaped credential bytes that a literal scan misses.
+            Err(_) => true,
+        };
     if sensitive
         && let Ok(end) = u32::try_from(bytes.len())
         && end > 0
@@ -219,6 +240,32 @@ pub fn inbound_spans(bytes: &[u8], public: &Secret, subaccount: Option<&str>) ->
         return InboundSpans::frame(std::iter::once(0..end).collect());
     }
     InboundSpans::NONE
+}
+
+fn contains_account_material(value: &Value, public: &str, subaccount: Option<&str>) -> bool {
+    match value {
+        Value::Object(fields) => fields.iter().any(|(key, field)| {
+            matches!(
+                key.as_str(),
+                "signature"
+                    | "public_key"
+                    | "account_id"
+                    | "api_key"
+                    | "secret_key"
+                    | "hmac"
+                    | "message"
+                    | "error_code"
+            ) || contains_account_material(field, public, subaccount)
+        }),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| contains_account_material(item, public, subaccount)),
+        Value::String(text) => {
+            (!public.is_empty() && text.contains(public))
+                || subaccount.is_some_and(|id| !id.is_empty() && text.contains(id))
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -308,5 +355,41 @@ mod tests {
         );
         let plain = br#"{"type":"auth","result":"success"}"#;
         assert!(inbound_spans(plain, &public, None).body().is_empty());
+        let subscribed = br#"{"subscribed":"fills"}"#;
+        assert!(inbound_spans(subscribed, &public, None).body().is_empty());
+
+        for escaped in [
+            br#"{"echo":"qfex_\u0070ub_synthetic_1"}"#.as_slice(),
+            br#"{"echo":{"public_\u006bey":"another-account"}}"#,
+            br#"{"signatur\u0065":"synthetic-value"}"#,
+            br#"{"message":"abcdefab-cdef-abcd-efab-cdefabcdefa\u0062"}"#,
+            br#"{"type":"Err","message":"unclassified"}"#,
+            br#"{"type":"auth","result":"failure","detail":"opaque"}"#,
+            br#"{"echo":"qfex_pub_synthetic_1","echo":"ok"}"#,
+            br#"{"echo":"qfex_\u0070ub_synthetic_1","echo":"ok"}"#,
+            br#"{"broken":"\u0061""#,
+        ] {
+            let spans = inbound_spans(escaped, &public, Some(subaccount));
+            assert_eq!(spans.body().len(), 1);
+            assert_eq!(spans.body()[0], 0..escaped.len() as u32);
+        }
+
+        for diagnostic in [
+            br#"{"signature":"another-account"}"#.as_slice(),
+            br#"{"data":[{"account_id":"another-account"}]}"#,
+            br#"{"data":["qfex_pub_synthetic_1"]}"#,
+            br#"{"type":"Err","detail":"opaque"}"#,
+            br#"{"authenticated":false}"#,
+            br#"{"truncated":"value""#,
+        ] {
+            let spans = inbound_spans(diagnostic, &public, None);
+            assert_eq!(spans.body().len(), 1);
+            assert_eq!(spans.body()[0], 0..diagnostic.len() as u32);
+        }
+        assert!(
+            inbound_spans(br#"{"data":1}"#, &public, None)
+                .body()
+                .is_empty()
+        );
     }
 }
