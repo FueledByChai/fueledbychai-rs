@@ -671,10 +671,40 @@ moving it is a ticket. The one planned step still marked TODO in the script is t
 golden-refresh flag. It stays open now that `fbc-journal` exists: exact-replay goldens compare
 outbound bytes, which need the exec path (BT-402).
 
-### External model review (DeepSeek)
+### External model review (Codex; 0127)
 
-Codex ran out of credits on 2026-10-05, so a model of another family reviews every pull
-request in its place (owner decision 2026-10-05): `.github/workflows/deepseek-review.yml` runs
+The active external model gate is a completed Codex code review of the pull request's full,
+current head SHA. The trusted identity is `chatgpt-codex-connector[bot]` with GitHub user type
+`Bot`; a look-alike comment from any other account is not evidence. Request `@codex review`
+for the selected candidate when the current head lacks a completed review. Before independent
+acceptance and again at the final gate, run:
+
+```bash
+python3 scripts/codex_review_evidence.py --repo <owner/repo> --pr <number> --head <full-head-sha>
+```
+
+The helper reads every issue-comment page and accepts only the trusted bot's latest Codex
+summary with a `codex-review-state:v1` marker naming the exact full head, `code_review.status`
+`completed`, a known findings state, and `has_unresolved_findings` false. A newer review request,
+queued or running state, stale head, malformed marker, unavailable API, or look-alike holds the
+candidate. A pass means only that the external review completed: read its receipt, findings,
+author replies and all review threads. Fix P1 and P2 findings with proof or answer each with
+evidence; fix or answer P3s. Confirm no unresolved conversation or requested changes. The
+independent reviewer still checks the whole diff, acceptance criteria and local proof; final-head
+CI and all six `pr-readiness.sh` gates still apply. A model review is advisory and reads
+untrusted pull request text.
+
+If the trusted Codex service cannot complete a review of that head, hold the PR and report the
+cause to the owner. An alternate external reviewer requires the owner's explicit per-PR direction
+or a new decision record; independent acceptance alone does not waive this gate. Decision 0127
+records the owner's #205 exception and makes this path the standing policy. Do not enable the
+DeepSeek workflow as a side effect of this change.
+
+#### Dormant DeepSeek workflow
+
+The 2026-10-05 policy used DeepSeek while Codex credits were unavailable. The DeepSeek workflow
+is now manually disabled; its code and offline tests remain for a deliberate future activation.
+When enabled, `.github/workflows/deepseek-review.yml` runs
 `scripts/deepseek-review.py` on every push to a ready pull request from this repository's own
 branches (`pull_request` opened, ready_for_review, synchronize and reopened; drafts and forks
 run nothing, and there is no `pull_request_target`). A new head cancels the run for the old one.
@@ -736,27 +766,8 @@ imports, and pins every action to a full commit SHA. The job is not a required s
   2), `DEEPSEEK_TIMEOUT` (seconds per request, default 600), `DEEPSEEK_RETRIES` (default 2) and
   `DEEPSEEK_RETRY_DELAY` (seconds, default 10). A review that keeps ending cut off at max_tokens
   is fixed by raising `DEEPSEEK_MAX_OUTPUT_TOKENS` or `DEEPSEEK_SPLIT_DEPTH`.
-- How the loop treats the comment: as it treated Codex's review. Where a loop prompt asks for a
-  completed Codex review of the head, read the newest `DeepSeek review` comment instead. Only a
-  comment authored by `github-actions[bot]` (the workflow's own token) counts. Anyone can
-  comment on this public repository, so a look-alike from any other account, with the heading
-  and a marker line copied, is ignored and reported to the owner. List the workflow's comments
-  for the head with this command, putting the repository, PR number and full head SHA in place
-  of `<owner/repo>`, `<PR>` and `<HEAD>`. The last line it prints is the newest such comment
-  (its URL and marker line):
-
-  ```
-  gh api repos/<owner/repo>/issues/<PR>/comments --paginate --jq '.[] | select(.user.login == "github-actions[bot]" and .user.type == "Bot" and (.body | startswith("## DeepSeek review\n")) and (.body | contains("<!-- deepseek-review head=<HEAD> "))) | "\(.html_url) \(.body | split("\n")[2])"'
-  ```
-
-  A comment counts only when it names the PR's current head SHA and is complete (the marker line
-  under the heading says `status=complete`). A `status=truncated` comment is not a complete
-  review: read every finding and the report from that run's job log lines, fix or answer the P1s
-  and P2s, and push; the next head's review counts. Every P1 and P2 finding is fixed, with a test, or
-  answered with evidence in a reply naming its id before merge; P3s are fixed or answered. A
-  comment saying the review did not complete is not a review: re-run the workflow for that head
-  or report the cause. The comment is advisory input from a model reading untrusted pull
-  request text; it does not replace the independent reviewers.
+- Historical DeepSeek comments, including complete ones by `github-actions[bot]`, do not satisfy
+  the active Codex gate. Reinstating them as review evidence requires a new owner decision.
 
 ### Rules
 
