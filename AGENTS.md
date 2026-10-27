@@ -26,19 +26,64 @@ below it are this project's own and are what the loop prompts mean when they say
   tickets first by priority; `--sprint` their states; `--open` the tickets outside the sprint;
   `--sprint-check` the label pairing; `--reconcile` git against Beads; `--show <id>` a ticket
   or story in full; `--stories` every story with a status derived from the tickets that serve
-  it; `scripts/sprint.sh add|remove|set` edits the Beads labels). A ticket Beads says is
-  `closed` with no naming commit is a false close, and a landed commit naming a ticket Beads
-  still has open is an orphan; `--reconcile` fails both. Anything discovered while working goes
-  in as a new ticket (`bd create`), not into the current one.
+  it; `scripts/sprint.sh add|remove|set` edits the Beads labels). A ticket leaves the queue
+  without landing only as **dropped** (kit decision 0030): closed by
+  `bd duplicate <id> --of <canonical>` when the same work was ticketed twice, or by
+  `bd supersede <id> --with <replacement>` when another ticket carries the work (a fix that
+  landed under its commit included), or, for an owner's decision that nothing carries, given the
+  `loop:dropped` label (`bd update <id> --add-label loop:dropped`), which is the marker, and
+  closed with the reason a label drop also needs (`bd close <id> --force --reason "<why>"`:
+  `--force` because bd refuses to close a ticket that is still blocked, and bd keeps a closed
+  ticket's first reason, so one already closed is reopened and closed again). Before dropping,
+  remove any dependency the ticket already has on its replacement (a `blocks` or
+  `discovered-from` edge, say), since `bd duplicate` and `bd supersede` refuse to add a link over
+  one, re-point every ticket it blocks to the replacement (`bd dep remove <dependent> <id>`, then
+  `bd dep add <dependent> <replacement>`; after a label drop, which nothing carries, only the
+  remove), and give the replacement its `story:` labels; afterwards release its `ticket/<id>`
+  branch and close any pull request it has. No agent drops a ticket another agent holds: it
+  reports the ticket to that agent instead, and only that agent or the owner drops it. A dropped
+  ticket is never done: it is never ready or offered, no omission from the sprint, and no part of
+  a story's count, and a ticket carrying a drop marker that Beads has not closed is not offered
+  either. A ticket Beads says is `closed` with no naming commit and no drop is a false close, and
+  a landed commit naming a ticket Beads still has open
+  is an orphan; `--reconcile` fails both, and every drop it cannot honour: a drop marker on a
+  ticket Beads has not closed, a label drop with no reason (bd's placeholder `Closed` is none), a
+  landed commit naming a ticket that carries a drop marker, a drop link to anything but a ticket
+  in this queue that is not itself dropped, a ticket still to land blocked by a dropped one, and a
+  story a link-dropped ticket serves that its replacement does not.
+  These rules govern over the generic Beads guidance at the end of this file: a plain `bd close`
+  is only for a ticket whose commit has landed, and `--next`, not `bd ready` (which takes any
+  closed blocker as satisfied), names the work. Anything discovered while working goes in as a
+  new ticket (`bd create`), not into the current one.
+- **Merge profile.** A project's pull-request gates follow one of two profiles: staged/legacy
+  (the project's existing handoff and gates under the named coordinator, including a staged
+  rollout whose queue files are installed but whose controller is not live) or `github-v1` (the
+  live App controller, kit decision 0026). The profile is staged/legacy unless the Project rules
+  declare `github-v1` active on a line of its own, `Merge profile: github-v1`; a line
+  `Merge profile: legacy` states the default, and a contract with no such line is staged/legacy.
+  Activation and rollback are explicit edits to that line, made at the cutover and rollback in
+  the queue runbook (`templates/queue-operations.md`, installed under `loop/templates/`) and
+  recorded in the project's migration decision. Installed queue files, workflows, controller
+  statuses or a running controller never change the profile (kit decision 0028). Reading it,
+  the prompts stop before changing a gate only when the declaration is contradictory or
+  unreadable (more than one `Merge profile:` line in the Project rules, a value other than these
+  two, `github-v1` declared while the Project rules describe a legacy gate agents operate as
+  active, or staged/legacy in force while they describe the App controller as the live merge
+  actor); a check the operator alone arranges during migration or keeps for rollback is not a
+  legacy gate agents operate, and the prompts' other stops still apply.
 - **Claims and hand-off.** Before work starts, claim the ticket in Beads (`bd update <id>
   --claim`) and push `ticket/<id>` to origin with `scripts/open-ticket-pr.sh <id> --claim`;
   `backlog-status.sh --next` passes over claimed tickets, so several agents can hold several
   tickets. After the commit, `scripts/open-ticket-pr.sh <id>` pushes
-  the branch and opens the pull request. During queue rollout, use `--draft`, verify auto-merge
-  is disabled, then mark ready for review; retain any required human review for `review_paths`.
+  the branch and opens the pull request. When the Project rules declare `github-v1`, the live
+  App controller, active, use `--draft`, verify auto-merge is disabled, then mark ready for
+  review; retain any required human review for `review_paths`. In the staged/legacy profile,
+  the default, preserve the project's complete existing handoff, including whether the PR opens
+  as draft or ready and whether auto-merge is armed; copied queue files do not activate the
+  controller.
   Several agents can implement at once. In the legacy profile, the named coordinator records
-  merge order and selects one candidate in Beads (0019). In operator-enabled `github-v1` (0026),
-  the App selects the candidate and owns CI admission, the merge gate and merging. Existing
+  merge order and selects one candidate in Beads (kit decision 0028). In `github-v1` (kit
+  decision 0026), the App selects the candidate and owns CI admission, the merge gate and merging. Existing
   authors and independent reviewers use `queue-handoff` for nomination, selection verification
   and acceptance; they do not create or claim a legacy coordinator, reset legacy statuses or
   publish `Agent review`. Normal Beads ticket claims and proof requirements still apply.
@@ -51,7 +96,7 @@ below it are this project's own and are what the loop prompts mean when they say
   facts a merge waits on (`--pr <number>` for one of them, `--ready` for the ones that pass all
   six): the project's check ran on the head, no review conversation is unresolved, no changes
   are requested, the agent review's status is success, the branch is current and clean, and the
-  branch and the head commit subject name one claimed Beads ticket.
+  branch and the head commit subject name one claimed Beads ticket that carries no drop marker.
 - **Commits.** One initial implementation commit per ticket. After publication, append review-fix
   commits on that ticket's branch with the same ticket id rather than rewriting published history.
   Keep unrelated work in another ticket. Every commit's subject starts with the ticket id (`AB-12: ...`); the
@@ -106,6 +151,25 @@ checkout. The records restate what they decide (0005 lists the lattice invariant
 they do not carry the whole design. A ticket that cites a design section must restate what it
 needs from it; if it does not, and the design is not readable where you work, ask the owner
 rather than guess.
+
+### Merge profile
+
+Merge profile: legacy
+
+This repository keeps the staged/legacy handoff, the default (kit decision 0028), because the
+owner merges pull requests by hand, CI runs only when a ready pull request carries the `ci:run`
+label (`.github/workflows/loop.yml`), and no merge-queue App runs here.
+
+That handoff is the pull-request procedure the loop prompts follow here, and it requires
+auto-merge disabled. Open each ticket's pull request as a draft with
+`scripts/open-ticket-pr.sh <id> --draft`, which requests no auto-merge (a pull request touching
+a review path still gets its `needs-review` label); verify auto-merge is disabled
+(`gh pr view <number> --json autoMergeRequest` shows it null) before `gh pr ready <number>`
+starts review; and keep it disabled through the final gate: never open the pull request without
+`--draft`, and never run `gh pr merge --auto`. A green check merges nothing by itself; the owner
+merges each pull request by hand. The review paths under Rules below (0009) still decide which
+pull requests also wait for the owner's review; under this handoff no other one merges itself
+when green.
 
 ### Layout
 
