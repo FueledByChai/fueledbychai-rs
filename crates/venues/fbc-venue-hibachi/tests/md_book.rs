@@ -142,9 +142,12 @@ fn a_level_the_window_removes_that_the_frame_does_not_zero_gaps_the_book() {
     let mut d = eth();
     d.feed("eth_s0");
     // The same window without the zero: 2000.10 would go unstated, what a lost frame leaves.
+    assert!(d.codec.book_copy(ETH).is_some());
     assert_eq!(d.feed("eth_u1_without_zero"), [book_gap(ETH)]);
     assert_eq!(d.counts().bounds_failures, 1);
     assert!(!d.valid(ETH));
+    // The codec no longer holds a copy it trusts either.
+    assert_eq!(d.codec.book_copy(ETH), None);
     assert!(d.book(ETH).touch().is_err(), "no touch on a gapped book");
 }
 
@@ -306,17 +309,63 @@ fn a_frame_one_side_of_which_alone_would_cross_emits_every_removal_of_both_sides
 }
 
 #[test]
+fn a_zero_strictly_inside_a_sides_range_empties_its_level_before_the_prune_on_bids_and_asks() {
+    let mut d = eth();
+    d.feed("eth_s0");
+    let mut books = d.books.clone();
+    // The frame empties the bid's 1999.90, inside 2000.00 down to 1999.70, and the ask's 2000.20,
+    // inside 2000.10..2000.40: neither at its side's best end nor past its deep end, so the
+    // window keeps each, and only a zero Level removes it from a consumer's book (0124 item 6).
+    let events = d.feed("eth_u_inside_zeros");
+    // Applied one event at a time, as MdBooks does, the consumer's book ends as the codec's own
+    // copy, and is never crossed between two events.
+    for ev in &events {
+        books.apply(ev).unwrap();
+        let touch = books.get(ETH, BOOK_ORDERBOOK).unwrap().touch().unwrap();
+        if let (Some(bid), Some(ask)) = (touch.bid, touch.ask) {
+            assert!(bid.px < ask.px, "crossed after {ev:?}");
+        }
+    }
+    let top = books.get(ETH, BOOK_ORDERBOOK).unwrap().top(10).unwrap();
+    let copy = d.codec.book_copy(ETH).expect("a valid copy");
+    assert_eq!((top.bids, top.asks), copy);
+    assert_eq!(
+        sides(&d),
+        (
+            vec![(200_000, 1_250), (199_980, 500), (199_970, 800)],
+            vec![(200_010, 1_500), (200_030, 750), (200_040, 1_100)]
+        )
+    );
+    assert_eq!(
+        events,
+        [
+            // Each side's emptied level as a zero Level before that side's prune...
+            level(Bid, 199_990, 0),
+            prune(Bid, 199_970, 200_000),
+            level(Ask, 200_020, 0),
+            prune(Ask, 200_010, 200_040),
+            // ...and every removal of both sides before any level the frame sets.
+            level(Bid, 199_970, 800),
+            level(Ask, 200_040, 1_100),
+        ]
+    );
+    assert_eq!(d.counts(), Default::default());
+}
+
+#[test]
 fn an_update_arriving_with_no_book_is_ignored() {
     let mut d = eth();
     // Before any Snapshot.
     assert!(d.feed("eth_unchanged").is_empty());
     assert_eq!(d.counts().updates_without_book, 1);
     assert_eq!(d.state(ETH), BookState::AwaitingSnapshot);
+    assert_eq!(d.codec.book_copy(ETH), None);
     // After the subscription is removed, its frames are passed over too.
     d.feed("eth_s0");
     d.remove(&[book_sub(ETH)]);
     assert!(d.feed("eth_unchanged").is_empty());
     assert_eq!(d.counts().unsubscribed_frames, 1);
+    assert_eq!(d.codec.book_copy(ETH), None);
 }
 
 #[test]
@@ -338,9 +387,67 @@ fn the_bounds_check_runs_before_any_event_and_catches_a_dropped_frame() {
 }
 
 #[test]
-fn a_side_thinner_than_depth_fails_the_check_and_is_counted_apart() {
+fn a_side_thinner_than_depth_fails_the_check_and_is_counted_apart_wherever_its_end_price_lies() {
+    // Two asks against a depth of 3, best at startPrice: endPrice at the deeper of them, past it
+    // where a third level would sit, and farther still. What endPrice names on a thin side is
+    // unknown, so the codec guesses nothing: thin each time, and the book gapped.
+    let past = frame("eth_snapshot_thin_end_past");
+    let farther = past.replacen(r#""endPrice":"2000.30""#, r#""endPrice":"2000.90""#, 1);
+    assert_ne!(farther, past);
+    for (what, text) in [
+        ("at the deepest", frame("eth_snapshot_thin")),
+        ("past it", past.clone()),
+        ("farther", farther),
+    ] {
+        let mut d = eth();
+        let pushed = d.try_text(&text).unwrap();
+        assert_eq!(pushed, [(VenueMeta::NONE, book_gap(ETH))], "{what}");
+        let counts = d.counts();
+        assert_eq!(
+            (counts.thin_sides, counts.bounds_failures),
+            (1, 0),
+            "{what}"
+        );
+        assert!(!d.valid(ETH), "{what}");
+        assert_eq!(d.codec.book_copy(ETH), None, "{what}");
+    }
+    // A thin side still needs its best at startPrice and every level within its bounds: either
+    // broken is a failed check, not a thin side.
+    for (what, from, to) in [
+        (
+            "best",
+            r#""startPrice":"2000.10""#,
+            r#""startPrice":"2000.05""#,
+        ),
+        (
+            "outside",
+            r#""endPrice":"2000.30""#,
+            r#""endPrice":"2000.15""#,
+        ),
+    ] {
+        let mut d = eth();
+        let text = past.replacen(from, to, 1);
+        assert_ne!(text, past, "{what}");
+        let pushed = d.try_text(&text).unwrap();
+        assert_eq!(pushed, [(VenueMeta::NONE, book_gap(ETH))], "{what}");
+        let counts = d.counts();
+        assert_eq!(
+            (counts.thin_sides, counts.bounds_failures),
+            (0, 1),
+            "{what}"
+        );
+    }
+    // An Update's side sent thin with its endPrice past its deeper level: thin too.
     let mut d = eth();
-    assert_eq!(d.feed("eth_snapshot_thin"), [book_gap(ETH)]);
+    d.feed("eth_s0");
+    d.feed("eth_null_bid");
+    let restore = frame("eth_bid_restore_thin");
+    let text = restore.replacen(r#""endPrice":"1999.90""#, r#""endPrice":"1999.80""#, 1);
+    assert_ne!(text, restore);
+    assert_eq!(
+        d.try_text(&text).unwrap(),
+        [(VenueMeta::NONE, book_gap(ETH))]
+    );
     let counts = d.counts();
     assert_eq!((counts.thin_sides, counts.bounds_failures), (1, 0));
     assert!(!d.valid(ETH));

@@ -55,6 +55,11 @@ downward:
   unstated: a dropped frame.
 - `eth_u3`: the ask's new best, 2000.02, would cross the bid's 2000.05 until the bid's zero
   for 2000.05 applies.
+- `eth_u_inside_zeros`: an Update after `eth_s0` that empties a level strictly inside each
+  side's range after the frame, neither at its best end nor past its deep end (the bid's
+  1999.90 in 2000.00 down to 1999.70, the ask's 2000.20 in 2000.10..2000.40), while a level
+  scrolls in at each deep end (bid 1999.70, ask 2000.40): a level emptied mid-window, where
+  the window alone would keep it.
 - `eth_unchanged`: both sides `levels: []` with `eth_s0`'s bounds; also the Update that arrives
   with no book.
 - `eth_null_bid`: `"bid": null` beside an ask change (WS's example sends a null side beside the
@@ -67,9 +72,10 @@ downward:
 - Snapshots that never make a book valid: `eth_snapshot_empty` (both sides null),
   `eth_snapshot_empty_levels` (both sides `levels: []` with bounds), `eth_snapshot_empty_data`
   (`data: {}`), `eth_snapshot_absent_side`, `eth_snapshot_unbounded_side` (no `endPrice`),
-  `eth_snapshot_thin` (two asks against a depth of 3) and `eth_snapshot_crossed` (best bid
-  2000.20 above best ask 2000.10). `eth_snapshot_locked` (best bid equal to best ask, 2000.10)
-  passes.
+  `eth_snapshot_thin` (two asks against a depth of 3, `endPrice` at the deeper of them),
+  `eth_snapshot_thin_end_past` (the same two asks, `endPrice` 2000.30, past the deeper of them
+  where a third level would sit) and `eth_snapshot_crossed` (best bid 2000.20 above best ask
+  2000.10). `eth_snapshot_locked` (best bid equal to best ask, 2000.10) passes.
 - Parameters not the subscription's: `eth_granularity_differs` (`0.1`), `eth_depth_differs`
   (5), `eth_granularity_missing`, `eth_depth_missing`.
 - `eth_off_granularity`: a bid level at 1999.905, on the tick but off the 0.01 granularity.

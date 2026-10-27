@@ -12,7 +12,8 @@
 //!   come back empty or thin;
 //! - an Update whose bounds disagree with the book (a frame lost) gaps that book only and brings
 //!   the same resubscribe; a populated Snapshot then makes the book equal to it and the Updates
-//!   after it;
+//!   after it, one of them emptying a level strictly inside each side's range, after which the
+//!   book equals the codec's own copy;
 //! - a resubscribe answered by no Snapshot within the interval brings one reconnect, paced by
 //!   `ReconnectPacing`, after which every subscription is replayed and the populated Snapshot
 //!   makes the book valid; so does a close by the venue;
@@ -268,8 +269,10 @@ fn script() -> Script {
     s.push(0, &["ack", "eth_s0", "eth_u1", "eth_u3"]);
     s.mark(0); // 3: ETH was S0 and U1 until the gap; then the interval.
     s.read(0, 2);
-    s.push(0, &["ack", "eth_s0", "eth_u2"]);
-    s.mark(0); // 4: ETH was S0 until U2 (U1 lost) gapped it; then the interval.
+    // The populated Snapshot, an Update emptying a level inside each side's range, then U2,
+    // whose bid window removes 1999.70 unstated.
+    s.push(0, &["ack", "eth_s0", "eth_u_inside_zeros", "eth_u2"]);
+    s.mark(0); // 4: ETH was S0 and that Update until U2 gapped it; then the interval.
     s.read(0, 2);
     s.mark(0); // 5: no Snapshot answers; then the interval: the codec's reconnect.
     // Connection 1: every subscription replayed; populated Snapshots; the venue closes it.
@@ -386,6 +389,22 @@ fn s0_u1() -> (Vec<Lvl>, Vec<Lvl>) {
     (bids, asks)
 }
 
+/// S0 then the Update emptying 1999.90 and 2000.20, best first.
+fn s0_inside_zeros() -> (Vec<Lvl>, Vec<Lvl>) {
+    (
+        vec![
+            eth_lvl(200_000, 1_250),
+            eth_lvl(199_980, 500),
+            eth_lvl(199_970, 800),
+        ],
+        vec![
+            eth_lvl(200_010, 1_500),
+            eth_lvl(200_030, 750),
+            eth_lvl(200_040, 1_100),
+        ],
+    )
+}
+
 fn is_gap(ev: &MdEvent) -> bool {
     matches!(ev, MdEvent::Health { .. })
 }
@@ -451,9 +470,16 @@ async fn the_codec_recovers_broken_books_by_resubscribing_then_reconnecting_and_
         assert!(!watch.valid(ETH));
         assert!(watch.valid(SOL));
         advance(INTERVAL).await;
-        // 4: the resubscribe's Snapshot: the book was that Snapshot until the next lost frame.
+        // 4: the resubscribe's Snapshot and an Update emptying a level inside each side's
+        // range: until the next lost frame the book was the codec's own copy of them, as a
+        // fresh codec fed the same two frames holds it.
         at(4).await;
-        assert_eq!(watch.before_last_gap(ETH), s0());
+        let mut fresh = common::Driver::new(&[book_sub(ETH)]);
+        fresh.feed("eth_s0");
+        fresh.feed("eth_u_inside_zeros");
+        let copy = fresh.codec.book_copy(ETH).unwrap();
+        assert_eq!(watch.before_last_gap(ETH), copy);
+        assert_eq!(copy, s0_inside_zeros());
         assert!(!watch.valid(ETH));
         advance(INTERVAL).await;
         // 5: resubscribed; no Snapshot answers within the interval.

@@ -193,7 +193,18 @@ impl Driver {
         }
         result?;
         self.apply(&sink.0);
+        self.check_copies();
         Ok(sink.0)
+    }
+
+    /// Every book the codec holds a valid copy of is that copy, as the events it pushed built it.
+    fn check_copies(&self) {
+        for inst in [ETH, SOL, SEI] {
+            if let Some(copy) = self.codec.book_copy(inst) {
+                let top = self.book(inst).top(usize::MAX).expect("a valid book");
+                assert_eq!((top.bids, top.asks), copy, "{inst:?}");
+            }
+        }
     }
 
     /// Hands the codec frame `name`, which it must take: what it pushed.

@@ -50,7 +50,8 @@
 //! topic not subscribed (one still in flight after an unsubscribe) is passed over.
 //!
 //! What the codec counts ([`HibachiMdCounts`]) is read on the concrete [`HibachiMd`]: the
-//! `MdCodec` interface has no counter of its own beyond refused frames.
+//! `MdCodec` interface has no counter of its own beyond refused frames. So is its own copy of each
+//! orderbook ([`HibachiMd::book_copy`]), which a book built from its events equals.
 
 mod book;
 
@@ -252,6 +253,15 @@ impl HibachiMd {
     /// What it counted so far.
     pub fn counts(&self) -> HibachiMdCounts {
         self.shared.counts
+    }
+
+    /// Its own copy of `inst`'s orderbook, the bids and the asks each best first: the levels the
+    /// last frame it took left, which passed the bounds check. A book built from the events it
+    /// pushed holds the same levels. `None` while it holds no valid copy: before a Snapshot, from
+    /// a gap until a Snapshot passes, or with no orderbook subscription of `inst`.
+    pub fn book_copy(&self, inst: InstrumentId) -> Option<(Vec<Lvl>, Vec<Lvl>)> {
+        let book = self.books.get(&inst)?;
+        (book.phase == Phase::Valid).then(|| book.levels.best_first())
     }
 
     /// `frame` has no topic: an acknowledgement, or refused.

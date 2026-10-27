@@ -10,7 +10,9 @@
 use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
-use fbc_core::{BookSide, InstrumentId, InstrumentSpec, Lots, MdEvent, PxExact, Ticks, TimerTag};
+use fbc_core::{
+    BookSide, InstrumentId, InstrumentSpec, Lots, Lvl, MdEvent, PxExact, Ticks, TimerTag,
+};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Map, Value};
@@ -70,12 +72,14 @@ pub(super) enum Broken {
     /// A Snapshot with no level on either side.
     Empty,
     /// The bounds check failed: a level the window removes that the frame does not set to
-    /// zero, a best level not at `startPrice`, a deepest one not at `endPrice`, more levels than
-    /// the depth, a level outside the bounds, or a crossed book.
+    /// zero, a best level not at `startPrice`, the deepest of a side holding the depth's levels
+    /// not at `endPrice`, more levels than the depth, a level outside the bounds, or a crossed
+    /// book.
     Bounds,
-    /// A side holding fewer levels than the depth, its best at `startPrice` and its deepest at
-    /// `endPrice`, or none at all within its bounds, in a frame failing the check by nothing
-    /// else: an assumption no frame has shown, counted apart.
+    /// A side holding fewer levels than the depth, its best at `startPrice` and every level
+    /// within its bounds, wherever its `endPrice` lies (what `endPrice` names on a thin side is
+    /// unknown), or none at all, in a frame failing the check by nothing else: an assumption no
+    /// frame has shown, counted apart.
     Thin,
 }
 
@@ -119,6 +123,15 @@ pub(super) struct OrderBook {
 pub(super) struct Levels {
     bids: BTreeMap<Ticks, Lots>,
     asks: BTreeMap<Ticks, Lots>,
+}
+
+impl Levels {
+    /// The bids from the highest and the asks from the lowest.
+    pub fn best_first(&self) -> (Vec<Lvl>, Vec<Lvl>) {
+        let lvl = |(&px, &qty): (&Ticks, &Lots)| Lvl { px, qty };
+        let bids = self.bids.iter().rev().map(lvl).collect();
+        (bids, self.asks.iter().map(lvl).collect())
+    }
 }
 
 impl OrderBook {
@@ -369,9 +382,11 @@ impl OrderBook {
     }
 }
 
-/// One side's check, its prices best first: whether the side is thin (fewer levels than the
-/// depth, its best and deepest at its bounds, or none at all), any other failure an error. A
-/// null side is not checked.
+/// One side's check, its prices best first: whether the side is thin, any other failure an
+/// error. A thin side holds fewer levels than the depth, its best at `startPrice` and every level
+/// within its bounds, or none at all; what `endPrice` names on it is unknown, so it is thin
+/// wherever `endPrice` lies. A full side's deepest level must be at `endPrice`. A null side is
+/// not checked.
 fn check_side(best_first: Vec<Ticks>, stated: &Stated, depth: usize) -> Result<bool, Broken> {
     let Stated::Bounded { start, end, .. } = stated else {
         return Ok(false);
@@ -383,10 +398,16 @@ fn check_side(best_first: Vec<Ticks>, stated: &Stated, depth: usize) -> Result<b
     let (Some(best), Some(deepest)) = (best_first.first(), best_first.last()) else {
         return Ok(true);
     };
-    if best != start || deepest != end || best_first.len() > depth {
+    if best != start || best_first.len() > depth {
         return Err(Broken::Bounds);
     }
-    Ok(best_first.len() < depth)
+    if best_first.len() < depth {
+        return Ok(true);
+    }
+    if deepest != end {
+        return Err(Broken::Bounds);
+    }
+    Ok(false)
 }
 
 /// A side's bound: a price on the tick.

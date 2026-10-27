@@ -659,7 +659,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     reconnect if no Snapshot answers; `ask_bid_price` a Touch only when fully sized and not
     crossed, a stale one gapped on its touch feed; both `trades` shapes, `mark_price`,
     `spot_price` as the index and `funding_rate_estimation` exactly in 1e-12 units with no
-    interval or next time; what it counts on `HibachiMd::counts`; held to the hand-built
+    interval or next time; what it counts on `HibachiMd::counts`, and its own copy of each book,
+    which the book built from its events equals, on `HibachiMd::book_copy`; held to the hand-built
     `fixtures/hibachi/md/` (`tests/md_book.rs`, `tests/md_topics.rs`), the named conformance suite
     on `fixtures/hibachi/conformance/` (`tests/conformance.rs`), and a stub test on a paused clock
     with decoder replay of its journal (`tests/md_stub.rs`, `fbc-runtime`, `fbc-conformance`,
