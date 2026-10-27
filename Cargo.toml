@@ -55,6 +55,12 @@ rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
 # through the Paradex signer's tree.
 hmac = { version = "=0.12.1", default-features = false }
 sha2 = { version = "=0.10.9", default-features = false }
+# The Hibachi signer (FBC-8mzv): ECDSA over secp256k1, its nonce by RFC 6979 and its s low, pinned
+# exactly, since a silent change here changes signatures; the owner reviews any move (0009).
+# Apache-2.0 OR MIT, on the licence gate's allowlist (0017), where rust-secp256k1 (CC0-1.0) is
+# not. Its SHA-256 is the sha2 pinned above. The precomputed tables speed the k x G of every
+# signature, a protective cancel's included; they need std.
+k256 = { version = "=0.13.4", default-features = false, features = ["ecdsa", "precomputed-tables", "std"] }
 # The journal's closed segments are zstd-compressed (FBC-g67, decision 0026): pinned exactly,
 # default features off (no legacy formats, no dictionary builder). zstd-safe and zstd-sys are
 # BSD-3-Clause; zstd-sys builds the bundled C libzstd (BSD-3-Clause).
@@ -89,4 +95,13 @@ opt-level = 3
 [profile.dev.package.sha2]
 opt-level = 3
 [profile.dev.package.hmac]
+opt-level = 3
+# secp256k1 likewise: the Hibachi signer's tests sign a thousand Java vectors.
+[profile.dev.package.k256]
+opt-level = 3
+[profile.dev.package.ecdsa]
+opt-level = 3
+[profile.dev.package.elliptic-curve]
+opt-level = 3
+[profile.dev.package.rfc6979]
 opt-level = 3

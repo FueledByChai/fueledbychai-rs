@@ -1,6 +1,6 @@
 [package]
 name = "fbc-venue-hibachi"
-description = "Hibachi venue adapter: instrument discovery and market data; order entry is not enabled."
+description = "Hibachi venue adapter: instrument discovery, market data and the offline order signer; order entry is not enabled."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,11 @@ publish = false
 
 [dependencies]
 fbc-core = { path = "../../fbc-core" }
+k256.workspace = true
 rust_decimal.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
 
 # Test-only: the conformance suite (tests/conformance.rs), and the stub test (tests/md_stub.rs),
 # which runs the codec in fbc-runtime's market-data session against the conformance kit's stub
@@ -22,4 +25,6 @@ fbc-book = { path = "../../fbc-book" }
 fbc-conformance = { path = "../../fbc-conformance" }
 fbc-journal = { path = "../../fbc-journal" }
 fbc-runtime = { path = "../../fbc-runtime" }
+# The signer's leak test reads every record the log facade emits, at TRACE (FBC-8mzv).
+log = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
