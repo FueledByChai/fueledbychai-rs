@@ -45,10 +45,12 @@ order; how Hibachi's codec uses them, and how it recovers, was left to FBC-2kmp.
    ask). A level the window removes that the frame does not itself set to zero fails it: that is
    what a lost frame leaves. A locked book (best bid equal to best ask) passes and is counted
    apart, since two buckets can share a label while no order crosses. A side thinner than the
-   depth, its best and deepest at its bounds, fails and is counted apart: an assumption no frame
-   has shown. It is counted so only when the frame fails the check by nothing else: both sides and
-   the crossed test are checked first, so a crossed book beside a thin side counts as a failed
-   check.
+   depth, its best level at `startPrice` and every level within its bounds, fails and is counted
+   apart wherever its `endPrice` lies: what `endPrice` names on a thin side is unknown, so the
+   codec guesses nothing. That is an assumption no frame has shown. It is counted so only when
+   the frame fails the check by nothing else: both sides and the crossed test are checked first,
+   so a crossed book beside a thin side counts as a failed check. A lost frame that leaves a side
+   short is counted as thin too, since the two cannot be told apart; the book gaps either way.
 3. **The gaps the codec finds itself.** Each of these is counted under its own name, reports
    `MdEvent::Health { feed: Feed::Book(BOOK_ORDERBOOK), h: Gap }` for that book only, and pushes
    nothing else of the frame: a Snapshot with no level on either side (the empty-Snapshot rule:
