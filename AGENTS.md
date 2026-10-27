@@ -157,8 +157,9 @@ rather than guess.
 Merge profile: legacy
 
 This repository keeps the staged/legacy handoff, the default (kit decision 0028), because the
-owner merges pull requests by hand, CI runs only when a ready pull request carries the `ci:run`
-label (`.github/workflows/loop.yml`), and no merge-queue App runs here.
+owner merges pull requests by hand, CI runs when the `ci:run` label is added to a ready pull
+request (`.github/workflows/loop.yml`; a new head needs the label removed and added again), and no
+merge-queue App runs here.
 
 That handoff is the pull-request procedure the loop prompts follow here, and it requires
 auto-merge disabled. Open each ticket's pull request as a draft with
@@ -169,7 +170,8 @@ starts review; and keep it disabled through the final gate: never open the pull 
 `--draft`, and never run `gh pr merge --auto`. A green check merges nothing by itself; the owner
 merges each pull request by hand. The review paths under Rules below (0009) still decide which
 pull requests also wait for the owner's review; under this handoff no other one merges itself
-when green.
+when green. This paragraph governs over the Rules line's "every other pull request auto-merges
+when green" (from 0009) until a record settles that clause (FBC-ftg0).
 
 ### Layout
 
