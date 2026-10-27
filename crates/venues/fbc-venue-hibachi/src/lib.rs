@@ -1,9 +1,13 @@
-//! The Hibachi venue adapter: so far instrument discovery and market data, with no order entry.
+//! The Hibachi venue adapter: so far instrument discovery, market data and the offline order
+//! signer, with no order entry.
 //!
 //! Its capabilities declare `exec: None` (decision 0015) and
 //! [`Readiness::Record`](fbc_core::Readiness): [`Hibachi`] builds no order-entry codec, plans no
 //! order-entry connection and takes no credential. Order entry waits for its own decision record
-//! (BT-604). What it does:
+//! (BT-604). [`sign`] packs and signs every order command offline (ECDSA over secp256k1, held to
+//! the Java library's vectors), and [`auth::order_signer`] builds that signer from the consumer's
+//! credentials for the order-entry codec to come (FBC-x7bi); nothing calls them yet. What the
+//! factory does:
 //!
 //! - [`caps`](VenueFactory::caps): the matching, market-data and rate-limit values, each citing
 //!   Hibachi's documentation, its SDK or the Java library (decision 0003; the citations are in
@@ -94,10 +98,12 @@
 //! Hibachi's market-maker-partner book topic is not planned, decoded or named here: it stays out
 //! of this public repository until its entitlement is clear.
 
+pub mod auth;
 mod caps;
 mod config;
 pub mod discover;
 mod md;
+pub mod sign;
 
 use core::time::Duration;
 use std::collections::BTreeSet;

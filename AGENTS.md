@@ -199,7 +199,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
   `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps and
-  `/ws/market` codec (0129), and `crates/fbc-examples` with the owner-run samples; the
+  `/ws/market` codec (0129) and its offline signer (`src/sign`, built from `Secrets` by
+  `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -664,7 +665,22 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `fixtures/hibachi/md/` (`tests/md_book.rs`, `tests/md_topics.rs`), the named conformance suite
     on `fixtures/hibachi/conformance/` (`tests/conformance.rs`), and a stub test on a paused clock
     with decoder replay of its journal (`tests/md_stub.rs`, `fbc-runtime`, `fbc-conformance`,
-    `fbc-journal`, `fbc-book` and tokio as dev-dependencies)).
+    `fbc-journal`, `fbc-book` and tokio as dev-dependencies); and its offline signer, FBC-8mzv:
+    `src/sign` (a review path) packs a place, a modify (as a place, under its own nonce), a
+    cancel by order id or placement nonce and a cancel-all big-endian as Java's
+    `HibachiPayloadPacker` and the SDK do, and the cancel-on-disconnect arm's nonce as
+    cancel-all's (neither Java nor the SDK signs the arm; FBC-xvtr's probe decides which form
+    Hibachi takes), the contract id from
+    `native_id` and the decimals from `SigningParams::AssetDecimals`, a price off the tick or a
+    quantity off the step refused before packing, quantity and max fees scaled exactly (fees x
+    10^8 only) and the price truncated toward zero, every field at most 2^63 - 1, the JSON-only
+    fields never packed, max fees an input of each place and modify; and signs SHA-256 of the
+    payload with ECDSA over secp256k1 (k256, pinned exactly), its nonce RFC 6979, r || s || v
+    with v 0 or 1, no HMAC path and no client-id cancel; `src/auth` reads the key from `Secrets`
+    and hands over an initialized `HibachiSigner` (`auth::order_signer`), which no codec calls
+    yet (FBC-x7bi); held to the Java oracle's vectors and the docs' worked examples in
+    `fixtures/hibachi/signing/`, with no key or signed payload in a log line or error
+    (`tests/no_leak.rs`)).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
     crates only. Nothing here depends on the private consumer. `scripts/check-deps.sh` holds
@@ -692,6 +708,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   owner's capture showed in words only, its README citing each shape; and
   `fixtures/hibachi/conformance/` (marked `SYNTHETIC`) the conformance suite's cases built from
   them.
+  `fixtures/hibachi/signing/` (marked `SYNTHETIC`) holds the Java oracle
+  (`HibachiSignOracle.java`, `run-oracle.sh`) and the vectors it wrote on a synthetic key, its
+  README saying how it was run and which buffers Hibachi's docs print.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs

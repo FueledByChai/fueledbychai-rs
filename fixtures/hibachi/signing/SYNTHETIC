@@ -1,0 +1,22 @@
+Synthetic signing fixtures (decision 0009). Nothing in this directory belongs to an account.
+
+- The secp256k1 signing key in the header of hibachi-vectors.tsv is SHA-256 of the made-up
+  phrase on its key_phrase line, "fueledbychai-rs FBC-8mzv synthetic Hibachi signing key,
+  belonging to no account", chosen for these vectors alone (HibachiSignOracle.java computes it
+  from the phrase, and the Rust tests check that it does). It is no key of the owner's or of any
+  Hibachi account, it was never derived from any account's seed, and it is neither the EIP-155
+  example key the Java library's EcdsaHibachiSignerTest uses nor the web3 documentation key in
+  fixtures/paradex/signing/signbench. The public_key line is that key's public key.
+- The orders, cancels and nonces are made-up inputs. Contract id 1 with decimals 9 and 6 and
+  ETH/USDT-P's tick and step are the public example values of api-doc.hibachi.xyz and the SDK's
+  test data; the docs_* rows are the worked examples printed on Hibachi's public signing pages
+  (README.md cites them); the java_test_* rows are the inputs of the public Java library's
+  HibachiPayloadPackerTest; the random_* rows are drawn from java.util.Random with the seed in
+  the header. Apart from the docs' printed examples, no order id, nonce or contract here was
+  seen on Hibachi.
+- Every other long hex value (payloads, SHA-256 digests, signatures) is computed from those
+  inputs by the Java library's packer and signer. hibachi-vectors.tsv repeats the key in its
+  header so the Rust tests read it from here and no key-shaped value sits in crates/.
+
+This marker covers fixtures/hibachi/signing/ only. Recorded Hibachi frames or answers never go
+here; fixtures/hibachi/rest/ has its own marker.

@@ -2,23 +2,36 @@
 //! from `fixtures/hibachi/rest/exchange_info.json` (ETH/USDT-P, SOL/USDT-P and SEI/USDT-P), the
 //! hand-built frames of `fixtures/hibachi/md/`, and a driver that hands a [`HibachiMd`] frames
 //! and timers and keeps an `fbc-book` book of what it pushes, as a consumer's `MdBooks` would.
+//!
+//! What the signer's tests share: a reader of `fixtures/hibachi/signing/hibachi-vectors.tsv`, the
+//! file `HibachiSignOracle.java` writes from the Java FueledByChaiTrading packer and signer. Every
+//! value in it is synthetic (the directory's `SYNTHETIC` file says where each comes from), and the
+//! signing key the tests use is read from its header, so that no key-shaped value sits in this
+//! crate. Each row's instrument is built here as an `InstrumentSpec` with the row's contract id,
+//! asset decimals, tick and step.
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use fbc_book::{BookState, Books, L2Book};
 use fbc_core::{
-    AliasTable, BookSide, DecodeError, Effect, Effects, Feed, InstrumentId, InstrumentResolver,
-    Listing, Lots, Lvl, MdCodec, MdEvent, MdSink, MonoNs, RawFrame, SpecTable, StreamId,
-    Subscription, Ticks, TimerTag, UnderlyingId, VenueConfig, VenueFactory, VenueId, VenueMeta,
-    WallNs, dispatch_market_data,
+    AliasTable, AssetSym, BookSide, DecodeError, Effect, Effects, Feed, FundingSpec, InstrumentId,
+    InstrumentKind, InstrumentResolver, InstrumentSpec, Listing, Lots, Lvl, MdCodec, MdEvent,
+    MdSink, MonoNs, PriceGrid, RawFrame, Side, SigningParams, SizeStep, SpecTable, StreamId,
+    Subscription, Ticks, TimerTag, TradingStatus, UnderlyingId, VenueConfig, VenueFactory, VenueId,
+    VenueMeta, VenueNativeId, VenueOrderId, WallNs, dispatch_market_data,
 };
 use fbc_venue_hibachi::discover::EXCHANGE_INFO_TAG;
+use fbc_venue_hibachi::sign::{EcdsaKey, HibachiSigner, JsonOnly, OrderMessage};
 use fbc_venue_hibachi::{
     BOOK_ORDERBOOK, Hibachi, HibachiMd, HibachiMdCounts, KEY_DATA_REST_URL, KEY_DATA_WS_URL,
     KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, TOUCH_ASK_BID_PRICE,
 };
+use rust_decimal::Decimal;
 
 pub const ETH: InstrumentId = InstrumentId::new(1);
 pub const SOL: InstrumentId = InstrumentId::new(2);
@@ -308,5 +321,209 @@ pub fn prune(side: BookSide, lo: i64, hi: i64) -> MdEvent {
         side,
         lo: eth_px(lo),
         hi: eth_px(hi),
+    }
+}
+
+pub fn vectors_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../fixtures/hibachi/signing/hibachi-vectors.tsv")
+}
+
+pub fn dec(text: &str) -> Decimal {
+    Decimal::from_str_exact(text).unwrap_or_else(|e| panic!("{text}: {e}"))
+}
+
+/// Lowercase hex of `bytes`.
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The bytes `text` (hex) holds.
+pub fn unhex(text: &str) -> Vec<u8> {
+    assert!(text.len().is_multiple_of(2), "odd hex length");
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// One row of the vectors file, by column name.
+pub struct Row(HashMap<String, String>);
+
+impl Row {
+    pub fn get(&self, column: &str) -> &str {
+        self.0
+            .get(column)
+            .unwrap_or_else(|| panic!("no column {column}"))
+    }
+
+    pub fn name(&self) -> &str {
+        self.get("name")
+    }
+
+    pub fn u64(&self, column: &str) -> u64 {
+        self.get(column)
+            .parse()
+            .unwrap_or_else(|_| panic!("{}: {column}", self.name()))
+    }
+
+    pub fn dec(&self, column: &str) -> Decimal {
+        dec(self.get(column))
+    }
+
+    pub fn price(&self) -> Option<Decimal> {
+        match self.get("price") {
+            "" => None,
+            text => Some(dec(text)),
+        }
+    }
+
+    pub fn side(&self) -> Side {
+        match self.get("side") {
+            "BID" => Side::Buy,
+            "ASK" => Side::Sell,
+            other => panic!("{}: side {other}", self.name()),
+        }
+    }
+
+    pub fn signed(&self) -> bool {
+        match self.get("outcome") {
+            "signed" => true,
+            "refused" => false,
+            other => panic!("{}: outcome {other}", self.name()),
+        }
+    }
+
+    /// The row's instrument: its contract id, decimals, tick and step.
+    pub fn spec(&self) -> InstrumentSpec {
+        spec(
+            self.u64("contract_id"),
+            u8::try_from(self.u64("underlying_decimals")).unwrap(),
+            u8::try_from(self.u64("settlement_decimals")).unwrap(),
+            self.get("tick_size"),
+            self.get("step_size"),
+        )
+    }
+
+    /// The place or modify the row states, for `spec` (the row's own).
+    pub fn order<'a>(&self, spec: &'a InstrumentSpec) -> OrderMessage<'a> {
+        OrderMessage {
+            spec,
+            nonce: self.u64("nonce"),
+            side: self.side(),
+            quantity: self.dec("quantity"),
+            price: self.price(),
+            max_fees: self.dec("max_fees"),
+            json_only: JsonOnly::NONE,
+        }
+    }
+}
+
+/// A synthetic perpetual with contract id `contract`, the asset decimals given, and a `tick`
+/// price grid and `step` size step.
+pub fn spec(
+    contract: u64,
+    underlying: u8,
+    settlement: u8,
+    tick: &str,
+    step: &str,
+) -> InstrumentSpec {
+    let caps = Hibachi.caps(&config()).unwrap();
+    let venue_symbol = dispatch_market_data(&caps, |scope| scope.venue_symbol("SYNTH/USDT-P"))
+        .expect("a venue symbol");
+    let usdt = AssetSym::new("USDT").unwrap();
+    InstrumentSpec {
+        id: InstrumentId::new(1),
+        venue: VenueId::new(6),
+        venue_symbol,
+        native_id: Some(VenueNativeId::Number(contract)),
+        underlying: UnderlyingId::new(1),
+        kind: InstrumentKind::Perpetual,
+        price_grid: PriceGrid::fixed(dec(tick)).unwrap(),
+        quote_grid: None,
+        size_step: SizeStep::new(dec(step)).unwrap(),
+        min_size: Lots::new(1).unwrap(),
+        min_notional: None,
+        max_order_size: None,
+        position_limit: None,
+        price_band: None,
+        max_open_orders: None,
+        multiplier: Decimal::ONE,
+        quote_ccy: usdt,
+        settle_ccy: usdt,
+        funding: FundingSpec::Known {
+            interval: Duration::from_secs(3_600),
+            cap: None,
+        },
+        public_fees: None,
+        status: TradingStatus::Trading,
+        sessions: None,
+        signing: Some(SigningParams::AssetDecimals {
+            underlying,
+            settlement,
+        }),
+        version: 1,
+        fetched_at: WallNs(0),
+    }
+}
+
+/// The venue order id `text`, as a decode scope makes one.
+pub fn venue_id(text: &str) -> VenueOrderId {
+    let caps = Hibachi.caps(&config()).unwrap();
+    dispatch_market_data(&caps, |scope| scope.venue_order_id(text)).expect("a venue order id")
+}
+
+pub struct Vectors {
+    pub header: HashMap<String, String>,
+    pub rows: Vec<Row>,
+}
+
+impl Vectors {
+    /// The file: `# name=value` header lines, one pair each, then a row of column names and a
+    /// tab-separated row per vector.
+    pub fn read() -> Vectors {
+        let text = fs::read_to_string(vectors_path()).expect("the Java vectors file");
+        let mut header = HashMap::new();
+        let mut columns: Option<Vec<String>> = None;
+        let mut rows = Vec::new();
+        for line in text.lines() {
+            if let Some(comment) = line.strip_prefix("# ") {
+                if let Some((k, v)) = comment.split_once('=')
+                    && k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+                {
+                    header.insert(k.to_owned(), v.to_owned());
+                }
+                continue;
+            }
+            let cells: Vec<&str> = line.split('\t').collect();
+            match &columns {
+                None => columns = Some(cells.iter().map(|c| (*c).to_owned()).collect()),
+                Some(names) => {
+                    assert_eq!(cells.len(), names.len(), "row width: {line}");
+                    rows.push(Row(names
+                        .iter()
+                        .cloned()
+                        .zip(cells.iter().map(|c| (*c).to_owned()))
+                        .collect()));
+                }
+            }
+        }
+        Vectors { header, rows }
+    }
+
+    /// The synthetic key's text, `0x` and 64 hex digits.
+    pub fn key(&self) -> &str {
+        &self.header["key"]
+    }
+
+    pub fn signer(&self) -> HibachiSigner {
+        HibachiSigner::new(EcdsaKey::from_hex(self.key()).unwrap())
+    }
+
+    pub fn row(&self, name: &str) -> &Row {
+        let mut found = self.rows.iter().filter(|r| r.name() == name);
+        let row = found.next().unwrap_or_else(|| panic!("no vector {name}"));
+        assert!(found.next().is_none(), "vector {name} twice");
+        row
     }
 }
