@@ -418,7 +418,7 @@ fn decimal(m: &Map<String, Value>, key: &'static str) -> Result<Decimal, PlanErr
 /// `s` read exactly when it is plain decimal digits with at most one decimal point and a digit on
 /// each side of it; `None` for anything else, a sign, an exponent, a digit separator, a space or
 /// a bare leading or trailing point included, though `Decimal`'s own parser reads some of them.
-fn plain_decimal(s: &str) -> Option<Decimal> {
+pub(crate) fn plain_decimal(s: &str) -> Option<Decimal> {
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
     let plain = match s.split_once('.') {
         Some((whole, fraction)) => digits(whole) && digits(fraction),

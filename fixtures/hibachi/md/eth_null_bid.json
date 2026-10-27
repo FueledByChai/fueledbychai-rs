@@ -1,0 +1,1 @@
+{"data":{"ask":{"endPrice":"2000.30","levels":[{"price":"2000.20","quantity":"1.800000000"}],"startPrice":"2000.10"},"bid":null},"depth":3,"granularity":"0.01","messageType":"Update","symbol":"ETH/USDT-P","topic":"orderbook"}

@@ -1,0 +1,15 @@
+# The orderbook channel shows public liquidity (BookCaps.includes_channels).
+# Frames from fixtures/hibachi/md (hand-built, SYNTHETIC): ETH/USDT-P and SOL/USDT-P.
+# The ETH Snapshot: levels on both sides.
+public text {"data":{"ask":{"endPrice":"2000.30","levels":[{"price":"2000.10","quantity":"1.500000000"},{"price":"2000.20","quantity":"2.000000000"},{"price":"2000.30","quantity":"0.750000000"}],"startPrice":"2000.10"},"bid":{"endPrice":"1999.80","levels":[{"price":"2000.00","quantity":"1.250000000"},{"price":"1999.90","quantity":"3.000000000"},{"price":"1999.80","quantity":"0.500000000"}],"startPrice":"2000.00"}},"depth":3,"granularity":"0.01","messageType":"Snapshot","symbol":"ETH/USDT-P","topic":"orderbook"}
+# An Update with both sides unchanged: two one-side prunes, no level.
+text {"data":{"ask":{"endPrice":"2000.30","levels":[],"startPrice":"2000.10"},"bid":{"endPrice":"1999.80","levels":[],"startPrice":"2000.00"}},"depth":3,"granularity":"0.01","messageType":"Update","symbol":"ETH/USDT-P","topic":"orderbook"}
+# A null bid beside an ask change: the bid's one-side clear, then the ask's level.
+public text {"data":{"ask":{"endPrice":"2000.30","levels":[{"price":"2000.20","quantity":"1.800000000"}],"startPrice":"2000.10"},"bid":null},"depth":3,"granularity":"0.01","messageType":"Update","symbol":"ETH/USDT-P","topic":"orderbook"}
+# The Snapshot again, then an Update: a stated zero and a scroll-in on the ask.
+public text {"data":{"ask":{"endPrice":"2000.30","levels":[{"price":"2000.10","quantity":"1.500000000"},{"price":"2000.20","quantity":"2.000000000"},{"price":"2000.30","quantity":"0.750000000"}],"startPrice":"2000.10"},"bid":{"endPrice":"1999.80","levels":[{"price":"2000.00","quantity":"1.250000000"},{"price":"1999.90","quantity":"3.000000000"},{"price":"1999.80","quantity":"0.500000000"}],"startPrice":"2000.00"}},"depth":3,"granularity":"0.01","messageType":"Snapshot","symbol":"ETH/USDT-P","topic":"orderbook"}
+public text {"data":{"ask":{"endPrice":"2000.40","levels":[{"price":"2000.10","quantity":"0.000000000"},{"price":"2000.40","quantity":"1.100000000"}],"startPrice":"2000.20"},"bid":{"endPrice":"1999.80","levels":[],"startPrice":"2000.00"}},"depth":3,"granularity":"0.01","messageType":"Update","symbol":"ETH/USDT-P","topic":"orderbook"}
+# The SOL Snapshot.
+public text {"data":{"ask":{"endPrice":"150.105","levels":[{"price":"150.101","quantity":"10.00000000"},{"price":"150.102","quantity":"10.00000000"},{"price":"150.105","quantity":"10.00000000"}],"startPrice":"150.101"},"bid":{"endPrice":"150.095","levels":[{"price":"150.100","quantity":"10.00000000"},{"price":"150.099","quantity":"10.00000000"},{"price":"150.095","quantity":"10.00000000"}],"startPrice":"150.100"}},"depth":3,"granularity":"0.001","messageType":"Snapshot","symbol":"SOL/USDT-P","topic":"orderbook"}
+# A Snapshot with no level on either side: the book's gap, no level.
+text {"data":{"ask":null,"bid":null},"depth":3,"granularity":"0.01","messageType":"Snapshot","symbol":"ETH/USDT-P","topic":"orderbook"}

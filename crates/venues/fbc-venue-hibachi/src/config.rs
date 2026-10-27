@@ -1,6 +1,7 @@
-//! The configuration Hibachi reads: where its public market-data REST API is, how long a request
-//! there waits, and how many levels each orderbook subscription asks for. Every key is required
-//! and none has a default.
+//! The configuration Hibachi reads: where its public market-data REST API and WebSocket are, how
+//! long a REST request waits, how many levels each orderbook subscription asks for, and how long
+//! the market-data codec waits before it asks again for an orderbook it found broken. Every key
+//! is required and none has a default.
 
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -16,6 +17,19 @@ pub const KEY_DATA_REST_URL: &str = "hibachi.data_rest_url";
 /// How long a request to the market-data REST API waits for its answer, in whole milliseconds
 /// (`5000ms`).
 pub const KEY_REST_TIMEOUT: &str = "hibachi.rest_timeout";
+/// The market-data WebSocket origin, such as `wss://data-api.hibachi.xyz` (the origin the
+/// WebSocket market docs give `/ws/market` on, and the SDK's `api_ws_market.py` and the Java
+/// library's `HibachiConfiguration.java` connect to): scheme, host and optional port, nothing
+/// more. WSS, or plain WS to a loopback host for a test stub. The market-data codec's one
+/// connection is `/ws/market` on it. Not derived from [`KEY_DATA_REST_URL`]: a test stub serves
+/// its WebSocket and its HTTP on two ports.
+pub const KEY_DATA_WS_URL: &str = "hibachi.data_ws_url";
+/// How long the market-data codec waits, in whole milliseconds (`<n>ms`, zero refused), after it
+/// finds an orderbook broken (a Snapshot with no level, a frame failing the bounds check or
+/// malformed) before it unsubscribes and subscribes that instrument's orderbook again on the same
+/// connection, and how long it then waits for that Snapshot before it asks for a reconnect
+/// (decision 0129). No default, as `binance_usdm.depth_snapshot_retry` has none.
+pub const KEY_ORDERBOOK_RESUBSCRIBE: &str = "hibachi.orderbook_resubscribe";
 /// The levels per side each orderbook subscription asks for, a whole number from 1 to 100: the
 /// bound the SDK puts on the REST orderbook's `depth` (`api.py` `get_orderbook`), which the
 /// WebSocket market docs refer the topic's `depth` to. No default, so the venue's undocumented
@@ -47,38 +61,96 @@ pub(crate) const SCHEMA: &[FieldSpec] = &[
         unit: FieldUnit::Count,
         doc: "levels per side each orderbook subscription asks for: a whole number from 1 to 100",
     },
+    FieldSpec {
+        key: KEY_DATA_WS_URL,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Dimensionless,
+        doc: "market-data WebSocket origin (wss://host[:port], or ws:// to a loopback host for a \
+              test stub, e.g. wss://data-api.hibachi.xyz); the market-data connection is \
+              /ws/market on it",
+    },
+    FieldSpec {
+        key: KEY_ORDERBOOK_RESUBSCRIBE,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Duration,
+        doc: "how long, in whole milliseconds (e.g. 2000ms; zero refused), the market-data codec \
+              waits after finding an orderbook broken before it resubscribes it, and then for \
+              that Snapshot before it reconnects",
+    },
 ];
 
+/// The path of the market-data WebSocket on [`KEY_DATA_WS_URL`]'s origin (the WebSocket market
+/// docs; SDK `api_ws_market.py`).
+const WS_MARKET_PATH: &str = "/ws/market";
+
 /// A configuration read and checked.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct Settings {
     /// The orderbook subscriptions' depth, 1 to 100.
     pub depth: u16,
+    /// The market-data WebSocket's URL: `/ws/market` on the configured origin.
+    pub ws_market: String,
+    /// How long the codec waits before resubscribing a broken orderbook, and then for its
+    /// Snapshot before reconnecting.
+    pub resubscribe: Duration,
 }
 
 impl Settings {
-    /// Every key, each checked: the REST origin and timeout as discovery reads them, and the
-    /// orderbook depth.
+    /// Every key, each checked: the REST origin and timeout as discovery reads them, the
+    /// orderbook depth, the WebSocket origin and the resubscribe interval.
     pub fn read(cfg: &VenueConfig) -> Result<Settings, ConfigError> {
         rest_origin(cfg)?;
         rest_timeout(cfg)?;
-        Ok(Settings { depth: depth(cfg)? })
+        let depth = depth(cfg)?;
+        let ws_origin = origin(cfg, KEY_DATA_WS_URL, WS_SCHEMES)?;
+        Ok(Settings {
+            depth,
+            ws_market: format!("{ws_origin}{WS_MARKET_PATH}"),
+            resubscribe: millis(cfg, KEY_ORDERBOOK_RESUBSCRIBE)?,
+        })
     }
 }
 
+/// An origin's secure scheme, its plain one (loopback only), and why a value is refused.
+struct Schemes {
+    secure: &'static str,
+    plain: &'static str,
+    refused: &'static str,
+}
+
+const REST_SCHEMES: Schemes = Schemes {
+    secure: "https://",
+    plain: "http://",
+    refused: "not an https:// origin, or an http:// origin on a loopback host",
+};
+
+const WS_SCHEMES: Schemes = Schemes {
+    secure: "wss://",
+    plain: "ws://",
+    refused: "not a wss:// origin, or a ws:// origin on a loopback host",
+};
+
 /// The market-data REST origin without a trailing slash.
 pub(crate) fn rest_origin(cfg: &VenueConfig) -> Result<&str, ConfigError> {
-    let raw = cfg
-        .get(KEY_DATA_REST_URL)
-        .ok_or(ConfigError::Missing(KEY_DATA_REST_URL))?;
+    origin(cfg, KEY_DATA_REST_URL, REST_SCHEMES)
+}
+
+/// The origin under `key` without a trailing slash: the secure scheme, or the plain one to a
+/// loopback host, then `host[:port]` and nothing more.
+fn origin<'a>(
+    cfg: &'a VenueConfig,
+    key: &'static str,
+    schemes: Schemes,
+) -> Result<&'a str, ConfigError> {
+    let raw = cfg.get(key).ok_or(ConfigError::Missing(key))?;
     let bad = ConfigError::Invalid {
-        key: KEY_DATA_REST_URL,
-        reason: "not an https:// origin, or an http:// origin on a loopback host",
+        key,
+        reason: schemes.refused,
     };
     let origin = raw.strip_suffix('/').unwrap_or(raw);
-    let (authority, plain) = match origin.strip_prefix("https://") {
+    let (authority, plain) = match origin.strip_prefix(schemes.secure) {
         Some(authority) => (authority, false),
-        None => (origin.strip_prefix("http://").ok_or(bad)?, true),
+        None => (origin.strip_prefix(schemes.plain).ok_or(bad)?, true),
     };
     let host = host_of(authority).ok_or(bad)?;
     if plain && !is_loopback(host) {
@@ -90,9 +162,12 @@ pub(crate) fn rest_origin(cfg: &VenueConfig) -> Result<&str, ConfigError> {
 /// How long a market-data REST request waits: a positive whole number of milliseconds written
 /// `<n>ms`.
 pub(crate) fn rest_timeout(cfg: &VenueConfig) -> Result<Duration, ConfigError> {
-    let raw = cfg
-        .get(KEY_REST_TIMEOUT)
-        .ok_or(ConfigError::Missing(KEY_REST_TIMEOUT))?;
+    millis(cfg, KEY_REST_TIMEOUT)
+}
+
+/// The duration under `key`: a positive whole number of milliseconds written `<n>ms`.
+fn millis(cfg: &VenueConfig, key: &'static str) -> Result<Duration, ConfigError> {
+    let raw = cfg.get(key).ok_or(ConfigError::Missing(key))?;
     let millis = raw
         .strip_suffix("ms")
         .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
@@ -101,7 +176,7 @@ pub(crate) fn rest_timeout(cfg: &VenueConfig) -> Result<Duration, ConfigError> {
     millis
         .map(Duration::from_millis)
         .ok_or(ConfigError::Invalid {
-            key: KEY_REST_TIMEOUT,
+            key,
             reason: "not a positive whole number of milliseconds (<n>ms)",
         })
 }

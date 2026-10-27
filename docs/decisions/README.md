@@ -130,3 +130,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0126](0126-websocket-rate-refusals-hold-the-shared-provider-budget-with.md) WebSocket rate refusals hold the shared provider budget without settling requests — accepted
 - [0127](0127-exact-head-codex-review-is-the-external-model-gate-while-dee.md) Exact-head Codex review is the external model gate while DeepSeek is disabled — accepted
 - [0128](0128-separate-public-market-data-and-private-execution-rate-decla.md) Separate public market-data and private execution rate declarations — accepted
+- [0129](0129-hibachi-s-orderbook-codec-bounds-checks-every-frame-on-its-o.md) Hibachi's orderbook codec bounds-checks every frame on its own copy, gaps a book it finds wrong and recovers it by its own resubscribe and then a reconnect, augmenting 0022 and 0124 — accepted

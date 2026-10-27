@@ -1,5 +1,4 @@
-//! The Hibachi venue adapter: so far instrument discovery and the market-data capabilities,
-//! with no order entry.
+//! The Hibachi venue adapter: so far instrument discovery and market data, with no order entry.
 //!
 //! Its capabilities declare `exec: None` (decision 0015) and
 //! [`Readiness::Record`](fbc_core::Readiness): [`Hibachi`] builds no order-entry codec, plans no
@@ -10,15 +9,22 @@
 //!   Hibachi's documentation, its SDK or the Java library (decision 0003; the citations are in
 //!   `caps.rs`).
 //! - [`config_schema`](VenueFactory::config_schema): the market-data REST origin and its timeout
-//!   ([`KEY_DATA_REST_URL`], [`KEY_REST_TIMEOUT`]) and the orderbook subscriptions' depth
-//!   ([`KEY_ORDERBOOK_DEPTH`], 1 to 100), each required with no default.
+//!   ([`KEY_DATA_REST_URL`], [`KEY_REST_TIMEOUT`]), the orderbook subscriptions' depth
+//!   ([`KEY_ORDERBOOK_DEPTH`], 1 to 100), the market-data WebSocket origin
+//!   ([`KEY_DATA_WS_URL`]) and how long the codec waits before resubscribing a broken orderbook
+//!   ([`KEY_ORDERBOOK_RESUBSCRIBE`]), each required with no default.
 //! - [`discover`](VenueFactory::discover): one `GET /market/exchange-info`, read into an
 //!   instrument draft per contract, and
 //!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol), FBC's rule that
 //!   `X/USDT` is `X/USDT-P` ([`discover`](crate::discover) says what is read and how).
-//! - [`plan_md`](VenueFactory::plan_md) plans no endpoint yet: the `/ws/market` codec comes with
-//!   FBC-2kmp, so every subscription is refused as an unsupported feed, and
-//!   [`md_codec`](VenueFactory::md_codec) is a codec that decodes nothing.
+//! - [`plan_md`](VenueFactory::plan_md): one connection to `/ws/market` on the WebSocket origin
+//!   carrying every subscription, and [`md_codec`](VenueFactory::md_codec): its codec,
+//!   [`HibachiMd`], which decodes the `orderbook` ([`BOOK_ORDERBOOK`]), `ask_bid_price`
+//!   ([`TOUCH_ASK_BID_PRICE`]), `trades`, `mark_price`, `spot_price` (as the index) and
+//!   `funding_rate_estimation` topics. The orderbook has no sequence number, so the codec checks
+//!   every frame against the bounds the venue states on its own copy of the book before pushing
+//!   any of its events, and recovers a book it finds broken from a fresh Snapshot, resubscribing
+//!   on the same connection (decision 0129; the `md` module says what each topic becomes).
 //!
 //! # The quote grid, and what the book's levels are
 //!
@@ -30,20 +36,21 @@
 //! finest listed granularity at or above the tick, exactly as listed, where that is coarser than
 //! the tick (the Java library's `HibachiRestApi.resolveEffectiveTickSize`), and `None` where the
 //! book can be on the acceptance grid itself. The orderbook is subscribed at
-//! `quote_grid.unwrap_or(tick)` (FBC-2kmp), so where the quote grid is coarser than the tick its
-//! levels are buckets of the quote grid while orders rest on the finer tick: a level's price is a
-//! bucket's label rather than a price an order rests at, its size is the bucket's sum, and the
-//! touch can sit up to one granularity from the venue's own. No capability says so yet (FBC-jwn9
-//! adds one); meanwhile the orderbook channel declares `max_depth` the configured depth,
-//! `windowed` and `QueueModelQuality::BracketOnly`.
+//! `quote_grid.unwrap_or(tick)`, so where the quote grid is coarser than the tick its levels are
+//! buckets of the subscription's granularity while orders rest on the finer tickSize: a level's
+//! price is a bucket's label rather than a price an order rests at, its size is the bucket's sum,
+//! and the touch can sit up to one granularity from the venue's own. No capability says so yet
+//! (FBC-jwn9 adds one); meanwhile the orderbook channel declares `max_depth` the configured
+//! depth, `windowed` and `QueueModelQuality::BracketOnly`.
 //!
 //! `quote_grid` is `None` in two cases, both quoted on the tick: a contract that lists its tick
 //! among its granularities, and a contract with no granularity at or above its tick (none listed,
 //! none well formed, or all finer), which `resolveEffectiveTickSize` also falls back to the tick
 //! for. The second is not refused, since refusing it would refuse the whole discovery answer
 //! (decision 0035). Its orderbook subscription then names a granularity Hibachi does not list, so
-//! FBC-2kmp counts a level whose price is off the tick and gaps that book, as it does a frame
-//! failing its bounds check, never trusting the venue's default.
+//! the codec counts a level whose price is off that granularity and gaps that book, as it does a
+//! frame failing its bounds check, never trusting the venue's default; every subscription's
+//! levels are held to its granularity the same way.
 //!
 //! # Trading status
 //!
@@ -97,17 +104,27 @@ use std::collections::BTreeSet;
 
 use fbc_core::{
     AccountSummary, AssetKey, BookId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint,
-    FieldSpec, HttpPlan, InstrumentSpecDraft, MdCodec, Secrets, SpecTable, Subscription,
-    SymbolError, VenueCaps, VenueConfig, VenueError, VenueFactory,
+    FieldSpec, HttpPlan, InstrumentSpecDraft, MdCodec, MdTransport, Secrets, SpecTable, StreamId,
+    Subscription, SymbolError, TouchSourceId, VenueCaps, VenueConfig, VenueError, VenueFactory,
+    WireUrl,
 };
 
-pub use config::{KEY_DATA_REST_URL, KEY_ORDERBOOK_DEPTH, KEY_REST_TIMEOUT};
+pub use config::{
+    KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE,
+    KEY_REST_TIMEOUT,
+};
+pub use md::{HibachiMd, HibachiMdCounts};
 
 use crate::config::Settings;
-use crate::md::NoFeeds;
 
 /// The `orderbook` channel: [`MdCaps::books`](fbc_core::MdCaps)`[0]`.
 pub const BOOK_ORDERBOOK: BookId = BookId(0);
+
+/// The `ask_bid_price` channel: [`MdCaps::touch_sources`](fbc_core::MdCaps)`[0]`.
+pub const TOUCH_ASK_BID_PRICE: TouchSourceId = TouchSourceId(0);
+
+/// The one market-data connection's stream.
+const MD_STREAM: StreamId = StreamId(0);
 
 /// The interval between Hibachi's funding settlements: one hour.
 ///
@@ -160,24 +177,36 @@ impl VenueFactory for Hibachi {
         discover::plan(cfg)
     }
 
-    /// No endpoint: no feed is decoded yet (FBC-2kmp), so the configuration is checked and every
-    /// subscription refused as an unsupported feed. An empty set plans nothing.
+    /// One endpoint, `/ws/market` on the WebSocket origin, carrying every subscription: the
+    /// topics share one connection with no stated cap (Hibachi's WebSocket market docs, cited in
+    /// `caps.rs`). Each subscription is checked first: a feed the codec does not decode, or an
+    /// instrument missing from `specs`, is refused. An empty set plans nothing.
     fn plan_md(
         &self,
         cfg: &VenueConfig,
-        _specs: &SpecTable,
+        specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
-        Settings::read(cfg)?;
-        match subs.first() {
-            Some(sub) => Err(VenueError::UnsupportedFeed(*sub)),
-            None => Ok(Vec::new()),
+        let settings = Settings::read(cfg)?;
+        for sub in subs {
+            md::plannable(&settings, specs, *sub)?;
         }
+        if subs.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![EndpointPlan {
+            stream: MD_STREAM,
+            transport: MdTransport::Socket {
+                url: WireUrl::plain(settings.ws_market),
+            },
+            subs: subs.iter().copied().collect(),
+        }])
     }
 
-    /// A codec that refuses every subscription and decodes nothing, until FBC-2kmp's.
-    fn md_codec(&self, _cfg: &VenueConfig, _ep: &EndpointPlan) -> Box<dyn MdCodec> {
-        Box::new(NoFeeds)
+    /// A [`HibachiMd`] for `ep`. A configuration [`plan_md`](VenueFactory::plan_md) would refuse
+    /// gives a codec that refuses every subscription with the same error.
+    fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        Box::new(HibachiMd::new(ep.stream, cfg))
     }
 
     /// None: no order entry (decision 0015).

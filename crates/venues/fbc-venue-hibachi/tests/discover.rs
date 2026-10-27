@@ -15,7 +15,10 @@ use fbc_core::{
     VenueFactory, VenueId, VenueNativeId, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
 use fbc_venue_hibachi::discover::{EXCHANGE_INFO_TAG, FX_UNDERLYINGS, FX_WEEKEND};
-use fbc_venue_hibachi::{Hibachi, KEY_DATA_REST_URL, KEY_ORDERBOOK_DEPTH, KEY_REST_TIMEOUT};
+use fbc_venue_hibachi::{
+    Hibachi, KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE,
+    KEY_REST_TIMEOUT,
+};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
@@ -43,6 +46,8 @@ fn cfg() -> VenueConfig {
     cfg.insert(KEY_DATA_REST_URL, "https://data-api.hibachi.xyz");
     cfg.insert(KEY_REST_TIMEOUT, "5000ms");
     cfg.insert(KEY_ORDERBOOK_DEPTH, "25");
+    cfg.insert(KEY_DATA_WS_URL, "wss://data-api.hibachi.xyz");
+    cfg.insert(KEY_ORDERBOOK_RESUBSCRIBE, "2000ms");
     cfg
 }
 

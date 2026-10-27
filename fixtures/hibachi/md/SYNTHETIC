@@ -1,0 +1,18 @@
+Synthetic market-data frames (decision 0009). Nothing in this directory was received from
+Hibachi.
+
+- Every file is one frame hand-built in the shapes Hibachi publishes for its anonymous
+  /ws/market WebSocket (its WebSocket market docs, its Market API spec and its SDK) or, where
+  the docs show no example, the shape the public Java library reads; README.md cites the source
+  of each shape.
+- Every price, size, bound, rate and timestamp is a made-up value; the symbols ETH/USDT-P,
+  SOL/USDT-P and SEI/USDT-P are the contracts of fixtures/hibachi/rest/exchange_info.json, whose
+  ticks, steps and granularities the frames follow.
+- The order-book sequences are shaped after what the owner's capture of the public feed of
+  2026-10-22 showed, as FBC-2kmp's notes state it in words (bounds describing the book after the
+  frame, the bid's bounds running downward, an unchanged side sent as levels [] with both
+  bounds, scroll-ins and scroll-outs stated): none is a frame of that capture, and no count,
+  rate or timing measured on it is here.
+- No file holds an account id, an address, a key or a credential.
+
+This marker covers fixtures/hibachi/md/ only. Recorded Hibachi frames never go here.

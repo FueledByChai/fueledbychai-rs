@@ -1,0 +1,6 @@
+# Java-era tickers for Hibachi (FBC's rule: X/USDT is the X/USDT-P perpetual), made up.
+ETH/USDT
+BTC/USDT
+SOL/USDT
+eth/usdt
+ETH/USDT-P
