@@ -24,7 +24,7 @@ trailer_required = true
 # The loop kit: a git URL and a tag, or a directory inside this checkout.
 # scripts/loop-kit-sync.sh --check fails when the copied scripts and prompts drift from it.
 kit = "https://github.com/FueledByChai/coding-agent-loop"
-kit_ref = "v0.22.0"
+kit_ref = "v0.23.0"
 # The proof gate (scripts/proof-gate.sh): a change under code_paths must come with a change
 # under proof_paths, or add a line matching proof_pattern (a test function beside the code),
 # or say why in the commit body: `No new test: <reason>`. Empty code_paths: gate off.

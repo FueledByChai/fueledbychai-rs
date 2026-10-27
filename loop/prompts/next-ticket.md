@@ -6,7 +6,22 @@ The queue is Beads (`bd`), so `bd` is a hard dependency. Settings come from `.lo
 check), `default_branch` (the branch pull requests target), `sprint_label` (the Beads label that
 marks the sprint) and `trailer_required` (whether commits sign with an agent trailer).
 
-In the operator-enabled github-v1 profile, skip legacy coordination bootstrap in step 1;
+Before changing a pull-request gate, read the merge profile from the entire retained `AGENTS.md`
+contract, both its shared loop section and its Project rules. The profile is staged/legacy
+unless the Project rules declare `github-v1`, the live App controller, active (a line
+`Merge profile: github-v1`); with no declaration, follow the staged/legacy handoff. Stop before
+mutating gates only when the declaration is contradictory or unreadable: more than one
+`Merge profile:` line in the Project rules, a `Merge profile:` value other than `legacy` or
+`github-v1`, `github-v1` declared while the Project rules describe a legacy gate agents operate
+(a coordinator-posted required status, armed auto-merge) as active, or staged/legacy in force
+while they describe the App controller as the live merge actor. A check the operator alone
+arranges during migration or keeps for rollback is not a legacy gate agents operate. Then
+update the project's migration decision and standing contract before using this prompt. That is
+the only stop the profile adds; every other stop below still applies.
+Do not infer activation from installed queue files, workflows or statuses: only that declaration
+activates `github-v1`, and only changing it rolls back.
+
+In the declared github-v1 profile, skip legacy coordination bootstrap in step 1;
 keep the normal Beads ticket and Git branch claims. Follow `respond-to-review.md` to nominate
 reviewed work and verify App selection before a refresh. The App owns selection, CI admission
 and merging; hand off to the independent reviewer without creating or claiming a legacy coordinator.
@@ -32,7 +47,7 @@ Steps:
    update or rollback publication is an explicit reconciliation blocker; report the actual
    branch/claim state and responsible actor rather than leaving a silent published claim.
    In legacy mode, read the merge order recorded in the coordinating Beads ticket's notes and the named
-   coordinator's current selection (0019 in the kit). Ticket claim order is implementation
+   coordinator's current selection (0028 in the kit). Ticket claim order is implementation
    scheduling, not merge admission. A shadow plan is not admission. If selection is missing or
    ambiguous, leave admission pending with that coordinator; do not select yourself.
    In legacy mode only, for a standalone, existing or first-project ticket with no coordination link, bootstrap
@@ -55,6 +70,28 @@ Steps:
    reconcile the shared record before retrying rather than creating another local-only epic.
 2. Read the ticket's **Done when** line first. Decide what test, fixture, or output proves it, and
    write that test before the implementation.
+   If the ticket needs no work of its own - another ticket's landed commit already meets its
+   **Done when** line, or the same work is ticketed twice - drop it rather than implement it
+   (0030 in the kit): `bd supersede <id> --with <replacement>` names the ticket that carries or
+   carried the work. Of two tickets for the same work, the one ticketed first is the canonical
+   one: when the other was first, drop this one with `bd duplicate <id> --of <canonical>`; when
+   this one was first, drop the other with `bd duplicate <other> --of <id>` (report it instead
+   when another agent holds its claim) and go on implementing this one. Before a drop, remove any
+   dependency the dropped ticket already has on its replacement (a `blocks` or `discovered-from`
+   edge, say), since `bd duplicate` and `bd supersede` refuse to add a link over one, re-point
+   every ticket it blocks to the replacement (`bd dep remove <dependent> <dropped>`, then
+   `bd dep add <dependent> <replacement>`), and give the replacement the `story:` labels it
+   serves; `scripts/backlog-status.sh --reconcile` fails a drop left otherwise. Publish with
+   `bd dolt push` and report the drop. Only when the ticket dropped is this one, release the
+   `ticket/<id>` branch this run pushed (`scripts/open-ticket-pr.sh <id> --release`), close any
+   pull request it opened, and run `--next` again; when it is the other, keep this ticket's
+   claim and continue with it.
+   A `loop:dropped` label drop, with nothing carrying the work, only records an owner decision
+   its close reason quotes (`bd update <id> --add-label loop:dropped`, then
+   `bd close <id> --force --reason "<why>"`, forced because bd refuses to close a ticket that is
+   still blocked, and each ticket it blocks loses that dependency with `bd dep remove`, since
+   nothing carries its work); it is never your own judgement. A plain `bd close` is
+   only for a ticket whose commit has landed.
 3. Work in an isolated worktree when the harness offers one; otherwise on a branch named after the
    ticket id. Keep the change to that ticket. Anything else you notice becomes a new ticket with
    `bd create` - a paragraph of context, its acceptance criteria in `--acceptance`, its blockers as
@@ -65,10 +102,14 @@ Steps:
    "<what fails and what you tried>"`) and stop.
 5. Commit with the ticket id first in the subject, a body that says what changed and how the done
    line is proven, and, when the config requires it, a `Co-Authored-By: <agent> <email>` trailer
-   naming the agent and model that did the work. Then `scripts/open-ticket-pr.sh <id> --draft` pushes the
-   branch and opens the pull request against the default branch (`--body-file` for a fuller report
-   than the commit body). Verify auto-merge is disabled before `gh pr ready <number>` starts
-   review, and keep it disabled through the final gate handoff. Never push the default branch.
+   naming the agent and model that did the work. Then follow the Project rules' pull-request
+   procedure (`--body-file` gives a fuller report than the commit body). When the Project rules
+   declare the live App controller active, use `scripts/open-ticket-pr.sh <id> --draft`, verify
+   auto-merge is disabled before `gh pr ready <number>` starts review, and keep it disabled
+   through the final gate handoff. During staged rollout or legacy mode, preserve the project's
+   complete legacy handoff, including whether the PR opens as draft or ready and whether auto-merge
+   is armed; this is the default, and staging queue files alone does not activate the controller.
+   Never push the default branch.
    The ticket stays claimed while the work is in flight; once its commit is on the default branch it is done, and it is closed in Beads
    (`bd close <id> --reason ...`) - `scripts/backlog-status.sh --reconcile` fails while a landed
    commit names a ticket Beads still has open. `scripts/release-notes.sh --archive` closes a

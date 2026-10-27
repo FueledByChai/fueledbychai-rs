@@ -10,6 +10,21 @@ The Project rules name the product backlog when the project keeps one; without o
 stories at the top of the product backlog you write, not in Beads, because stories are intent and
 Beads holds tickets.
 
+Before changing a pull-request gate, read the merge profile from the entire retained `AGENTS.md`
+contract, both its shared loop section and its Project rules. The profile is staged/legacy
+unless the Project rules declare `github-v1`, the live App controller, active (a line
+`Merge profile: github-v1`); with no declaration, follow the staged/legacy handoff. Stop before
+mutating gates only when the declaration is contradictory or unreadable: more than one
+`Merge profile:` line in the Project rules, a `Merge profile:` value other than `legacy` or
+`github-v1`, `github-v1` declared while the Project rules describe a legacy gate agents operate
+(a coordinator-posted required status, armed auto-merge) as active, or staged/legacy in force
+while they describe the App controller as the live merge actor. A check the operator alone
+arranges during migration or keeps for rollback is not a legacy gate agents operate. Then
+update the project's migration decision and standing contract before using this prompt. That is
+the only stop the profile adds; every other stop below still applies.
+Do not infer activation from installed queue files, workflows or statuses: only that declaration
+activates `github-v1`, and only changing it rolls back.
+
 ## 1. Ground yourself before asking anything
 
 Before anything else, check that this repository is loop-managed: it must have the settings file
@@ -174,11 +189,14 @@ Never write to the default branch. From the main checkout:
 3. Commit the stories, records, and wireframes with the subject `Backlog: <XX-nn..XX-mm> <one-line
    summary>` and, when the config requires it, a `Co-Authored-By: <agent> <email>` trailer naming
    the agent and model.
-4. `git push -u origin backlog/<short-slug>` and open the PR as a draft with
-   `gh pr create --draft --fill`. Use the same selected-candidate handoff as code PRs:
-   verify auto-merge is disabled, then mark it ready for review. Follow
-   `respond-to-review.md` and `review-prs.md`; a documentation PR does not bypass admission,
-   completed review, independent acceptance or CI.
+4. `git push -u origin backlog/<short-slug>` and follow the Project rules' pull-request procedure.
+   When those rules declare the live App controller active, open the PR as a draft with
+   `gh pr create --draft --fill`, verify auto-merge is disabled, then mark it ready for review.
+   During staged rollout or legacy mode, preserve the project's complete backlog-PR handoff (the
+   default), including whether the PR opens as draft or ready and whether auto-merge is armed.
+   Use the same selected-candidate handoff as code PRs. Follow `respond-to-review.md` and
+   `review-prs.md`; a documentation PR does not bypass admission, completed review, independent
+   acceptance or CI.
 5. Report: the PR URL, the story ids and ticket ids added, the decision records written or
    superseded, what the first next-ticket run will pick up, and any question the owner deferred
    (record those as `bd update <id> --status blocked --append-notes "<the question>"` on the ticket

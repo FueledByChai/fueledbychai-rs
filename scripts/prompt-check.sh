@@ -25,10 +25,38 @@ next-ticket.md	bd dolt pull
 next-ticket.md	bd dolt push
 next-ticket.md	bootstrap coordination
 next-ticket.md	github-v1 profile, skip legacy coordination bootstrap in step 1
+next-ticket.md	In the declared github-v1 profile, skip legacy coordination bootstrap
 next-ticket.md	In legacy mode only, for a standalone
 next-ticket.md	loop:coordination
 next-ticket.md	selected candidate
 next-ticket.md	shadow plan is not admission
+next-ticket.md	During staged rollout or legacy mode, preserve
+next-ticket.md	Do not infer activation from installed queue files
+next-ticket.md	The profile is staged/legacy unless the Project rules declare `github-v1`, the live App controller, active
+next-ticket.md	with no declaration, follow the staged/legacy handoff
+next-ticket.md	Stop before mutating gates only when the declaration is contradictory or unreadable
+next-ticket.md	(a line `Merge profile: github-v1`)
+next-ticket.md	more than one `Merge profile:` line in the Project rules
+next-ticket.md	a `Merge profile:` value other than `legacy` or `github-v1`
+next-ticket.md	`github-v1` declared while the Project rules describe a legacy gate agents operate
+next-ticket.md	or staged/legacy in force while they describe the App controller as the live merge actor
+next-ticket.md	A check the operator alone arranges during migration or keeps for rollback is not a legacy gate agents operate
+next-ticket.md	only that declaration activates `github-v1`, and only changing it rolls back
+next-ticket.md	every other stop below still applies
+next-ticket.md	including whether the PR opens as draft or ready and whether auto-merge is armed
+next-ticket.md	When the Project rules declare the live App controller active, use `scripts/open-ticket-pr.sh <id> --draft`
+next-ticket.md	bd duplicate
+next-ticket.md	bd supersede
+next-ticket.md	re-point every ticket it blocks
+next-ticket.md	only records an owner decision
+next-ticket.md	is only for a ticket whose commit has landed
+next-ticket.md	refuse to add a link over one
+next-ticket.md	the one ticketed first is the canonical one
+next-ticket.md	bd close <id> --force --reason
+next-ticket.md	loop:dropped
+next-ticket.md	Only when the ticket dropped is this one
+next-ticket.md	when it is the other, keep this ticket
+next-ticket.md	bd update <id> --add-label loop:dropped
 respond-to-review.md	full head SHA
 respond-to-review.md	all pages
 respond-to-review.md	fix, dispute, or separate ticket
@@ -42,6 +70,7 @@ respond-to-review.md	completed review
 respond-to-review.md	never post a passing review status
 respond-to-review.md	waiting PRs do not rebase or request CI
 respond-to-review.md	verified stopped
+respond-to-review.md	In the declared `github-v1` profile (a `Merge profile: github-v1` line in the Project rules
 grill-me.md	at least three rounds
 grill-me.md	proofs and edge cases
 grill-me.md	docs/decisions
@@ -64,8 +93,24 @@ grill-me.md	waiting PRs do not rebase or request CI
 grill-me.md	--stories
 grill-me.md	settings file and the Beads queue
 grill-me.md	this repository, a new one, or a sibling
+grill-me.md	During staged rollout or legacy mode, preserve
+grill-me.md	Do not infer activation from installed queue files
+grill-me.md	The profile is staged/legacy unless the Project rules declare `github-v1`, the live App controller, active
+grill-me.md	with no declaration, follow the staged/legacy handoff
+grill-me.md	Stop before mutating gates only when the declaration is contradictory or unreadable
+grill-me.md	(a line `Merge profile: github-v1`)
+grill-me.md	more than one `Merge profile:` line in the Project rules
+grill-me.md	a `Merge profile:` value other than `legacy` or `github-v1`
+grill-me.md	`github-v1` declared while the Project rules describe a legacy gate agents operate
+grill-me.md	or staged/legacy in force while they describe the App controller as the live merge actor
+grill-me.md	A check the operator alone arranges during migration or keeps for rollback is not a legacy gate agents operate
+grill-me.md	only that declaration activates `github-v1`, and only changing it rolls back
+grill-me.md	every other stop below still applies
+grill-me.md	including whether the PR opens as draft or ready and whether auto-merge is armed
+grill-me.md	When those rules declare the live App controller active, open the PR as a draft
 review-prs.md	four questions
 review-prs.md	github-v1 skips legacy coordination and gate reconciliation
+review-prs.md	In the declared `github-v1` profile, use the existing independent review role
 review-prs.md	App selection replaces legacy coordinator selection
 review-prs.md	**Synchronize legacy coordination.** In legacy mode only
 review-prs.md	**Legacy bootstrap coordination when needed.** In legacy mode only
@@ -92,6 +137,26 @@ review-prs.md	selected candidate
 review-prs.md	missing CI leaves the status unposted
 review-prs.md	same-head evidence changes
 review-prs.md	respond-to-review.md
+review-prs.md	If the Project rules name a project-owned readiness or status wrapper, use it exactly as documented
+review-prs.md	During staged rollout or legacy mode, preserve
+review-prs.md	Pending invalidations use that wrapper too
+review-prs.md	Do not infer activation from installed queue files
+review-prs.md	The profile is staged/legacy unless the Project rules declare `github-v1`, the live App controller, active
+review-prs.md	with no declaration, follow the staged/legacy handoff
+review-prs.md	Stop before mutating gates only when the declaration is contradictory or unreadable
+review-prs.md	(a line `Merge profile: github-v1`)
+review-prs.md	more than one `Merge profile:` line in the Project rules
+review-prs.md	a `Merge profile:` value other than `legacy` or `github-v1`
+review-prs.md	`github-v1` declared while the Project rules describe a legacy gate agents operate
+review-prs.md	or staged/legacy in force while they describe the App controller as the live merge actor
+review-prs.md	A check the operator alone arranges during migration or keeps for rollback is not a legacy gate agents operate
+review-prs.md	only that declaration activates `github-v1`, and only changing it rolls back
+review-prs.md	every other stop below still applies
+review-prs.md	If that wrapper cannot express the required pending reset, or if any required wrapper/API reset fails, disable any armed auto-merge request
+review-prs.md	Only when the Project rules require disabled auto-merge for this active handoff, disable each armed request
+review-prs.md	Otherwise use `scripts/review-status.sh <sha> fail "<question and defect>" --url <findings-url>`
+review-prs.md	`scripts/review-status.sh <sha> pass "<independent proof>" --url <evidence-url>` when no wrapper is required
+review-prs.md	when the Project rules require one. Otherwise use `gh api -X POST
 grill-project.md	in a sentence
 grill-project.md	Who and where
 grill-project.md	The data
@@ -105,7 +170,12 @@ grill-project.md	node.sh
 grill-project.md	java.sh
 grill-project.md	go.sh
 grill-project.md	wireframe
-grill-project.md	toolchain'
+grill-project.md	toolchain
+grill-project.md	also settles the merge profile
+grill-project.md	`Merge profile: legacy` (the default)
+grill-project.md	the merge profile from area 3 as a line of its own
+grill-project.md	exactly one such line
+grill-project.md	Recommend the default;'
 
 prompts_dir() {
   if [ -d "$ROOT/loop/prompts" ]; then echo "$ROOT/loop/prompts"
@@ -147,7 +217,10 @@ self_test() {
   local file phrase
   while IFS=$'\t' read -r file phrase; do
     case "$file:$phrase" in
-      respond-to-review.md:*|next-ticket.md:*|review-prs.md:*|grill-me.md:loop:coordination|grill-me.md:--type*|grill-me.md:merge\ order|grill-me.md:N*|grill-me.md:nine*|grill-me.md:ordering*|grill-me.md:single*|grill-me.md:waiting*) ;;
+      respond-to-review.md:*|next-ticket.md:*|review-prs.md:*|grill-me.md:loop:coordination|grill-me.md:--type*|grill-me.md:merge\ order|grill-me.md:N*|grill-me.md:nine*|grill-me.md:ordering*|grill-me.md:single*|grill-me.md:waiting*|grill-me.md:including\ whether*) ;;
+      grill-me.md:During\ staged*|grill-me.md:Do\ not\ infer*|grill-me.md:The\ profile*|grill-me.md:with\ no\ declaration*|grill-me.md:Stop\ before*|grill-me.md:only\ that*|grill-me.md:every\ other*|grill-me.md:When\ those*) ;;
+      grill-me.md:*Merge\ profile*|grill-me.md:*legacy\ gate\ agents\ operate*|grill-me.md:or\ staged/legacy*) ;;
+      grill-project.md:also\ settles*|grill-project.md:*Merge\ profile*|grill-project.md:the\ merge\ profile*|grill-project.md:exactly\ one*|grill-project.md:Recommend*) ;;
       *) continue ;;
     esac
     # Remove this phrase independent of capitalization or line wrapping.
@@ -164,6 +237,45 @@ PY
     [ "$rc" = 1 ] && echo "$out" | grep -qF "$file no longer says \"$phrase\"" || { echo "self-test: missing handoff or planning rule should fail: $phrase (rc $rc):"; echo "$out"; exit 1; }
     cp "$src/$file" "$dir/loop/prompts/$file"
   done <<< "$RULES"
+  # The activation conditions and the kit-command fallback are rules as well (LK-ddt): the
+  # v0.22.0 behaviour returning beside the preserve sentence - an unconditional draft or
+  # auto-merge change, or a status path with no kit fallback - fails naming the rule it broke.
+  # So does a stop list emptied or cut short (the live-App condition is the one that keeps a
+  # legacy default from arming auto-merge beside the App), an author prompt that takes an
+  # enabled controller for a declaration, and a first-day interview that recommends github-v1
+  # or more than one profile line.
+  # Each line is file|text|its replacement|the rule that must then be reported missing.
+  local from to expect
+  while IFS='|' read -r file from to expect; do
+    [ -n "$file" ] || continue
+    tr -s '[:space:]' ' ' < "$src/$file" > "$dir/loop/prompts/$file"
+    FROM="$from" TO="$to" python3 - "$dir/loop/prompts/$file" <<'PY'
+import os, pathlib, re, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+rule = re.compile(re.escape(os.environ['FROM']), re.IGNORECASE)
+assert rule.search(s), os.environ['FROM']
+p.write_text(rule.sub(lambda m: os.environ['TO'], s, count=1))
+PY
+    rc=0; out="$("$me" 2>&1)" || rc=$?
+    [ "$rc" = 1 ] && echo "$out" | grep -qF "$file no longer says \"$expect" \
+      || { echo "self-test: mutant should fail naming its rule: $file: $from -> $to (rc $rc):"; echo "$out"; exit 1; }
+    cp "$src/$file" "$dir/loop/prompts/$file"
+  done <<'MUTANTS'
+next-ticket.md|When the Project rules declare the live App controller active, use|Always use|When the Project rules declare the live App controller active, use
+review-prs.md|Only when the Project rules require disabled auto-merge for this active handoff, disable|Always disable|Only when the Project rules require disabled auto-merge
+review-prs.md| or through `scripts/review-status.sh <sha> pass "<independent proof>" --url <evidence-url>` when no wrapper is required,||`scripts/review-status.sh <sha> pass
+review-prs.md|Otherwise use `scripts/review-status.sh <sha> fail "<question and defect>" --url <findings-url>`.|Otherwise use the wrapper.|Otherwise use `scripts/review-status.sh <sha> fail
+grill-me.md|When those rules declare the live App controller active, open the PR as a draft|Always open the PR as a draft|When those rules declare the live App controller active
+next-ticket.md|with no declaration, follow the staged/legacy handoff|with no declaration, stop|with no declaration, follow the staged/legacy handoff
+next-ticket.md|, or staged/legacy in force while they describe the App controller as the live merge actor|.|or staged/legacy in force while they describe the App controller as the live merge actor
+review-prs.md|, or staged/legacy in force while they describe the App controller as the live merge actor|.|or staged/legacy in force while they describe the App controller as the live merge actor
+grill-me.md|, or staged/legacy in force while they describe the App controller as the live merge actor|.|or staged/legacy in force while they describe the App controller as the live merge actor
+next-ticket.md|contradictory or unreadable: more than one `Merge profile:` line in the Project rules, a `Merge profile:` value other than `legacy` or `github-v1`, `github-v1` declared while the Project rules describe a legacy gate agents operate (a coordinator-posted required status, armed auto-merge) as active, or staged/legacy in force while they describe the App controller as the live merge actor.|contradictory or unreadable: never.|more than one `Merge profile:` line in the Project rules
+respond-to-review.md|In the declared `github-v1` profile|In the operator-enabled `github-v1` profile|In the declared `github-v1` profile
+grill-project.md|Recommend the default;|Recommend github-v1;|Recommend the default;
+grill-project.md|exactly one such line|one or more such lines|exactly one such line
+MUTANTS
   rm "$dir/loop/prompts/respond-to-review.md"
   rc=0; out="$("$me" 2>&1)" || rc=$?
   [ "$rc" = 1 ] && echo "$out" | grep -q 'respond-to-review.md is missing' || { echo "self-test: missing author prompt should fail (rc $rc):"; echo "$out"; exit 1; }
