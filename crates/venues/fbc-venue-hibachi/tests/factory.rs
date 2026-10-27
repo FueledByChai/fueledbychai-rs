@@ -1,30 +1,34 @@
-//! FBC-jyyl's done line, the factory half: Hibachi is declared market data only (`exec: None`,
-//! `Readiness::Record`, no order-entry codec or endpoint), its capabilities state the orderbook
-//! channel at the configured depth with an unknown cadence, no sequence, a window and brackets
-//! only, the funding stream with no interval, JSON and one-second timestamps, the REST limit and
-//! the taker speed bump; every configuration key is required and checked, the orderbook depth
-//! refused when absent or outside 1 to 100; and until the codec lands no feed is planned.
+//! FBC-jyyl's done line, the factory half, as FBC-2kmp extends it: Hibachi is declared market
+//! data only (`exec: None`, `Readiness::Record`, no order-entry codec or endpoint), its
+//! capabilities state the orderbook channel at the configured depth with an unknown cadence, no
+//! sequence, a window and brackets only, the `ask_bid_price` touch, the trades with their taker
+//! side, the mark and the spot price as the index, the funding stream with no interval, JSON and
+//! one-second timestamps, the REST limit and the taker speed bump; every configuration key is
+//! required and checked, the orderbook depth refused when absent or outside 1 to 100 and the
+//! resubscribe interval when absent or zero; and `plan_md` plans one `/ws/market` connection
+//! carrying every feed the codec decodes.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 use fbc_core::{
     BookCaps, BookId, Cadence, Channel, ConfigError, ConfigScope, ConnTopology, Continuity,
-    DecodeError, Effects, Encoding, EndpointPlan, Feed, FeedSource, FieldUnit, FundingCaps,
-    HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, LimitScope, MdEvent,
-    MdSink, MdTransport, MonoNs, OpKind, QueueModelQuality, RateLimit, RawFrame, Readiness,
-    Secrets, SpecTable, SpeedBump, SpeedBumpScope, StpScope, StreamId, Subscription, SymbolError,
-    TagSet, TimerTag, TouchSourceId, TradeCaps, VenueConfig, VenueError, VenueFactory, VenueMeta,
-    WallNs, WireUrl, dispatch_market_data,
+    Encoding, EndpointPlan, ExchTsKind, Feed, FeedSource, FieldUnit, FundingCaps, InstrumentId,
+    LimitScope, MdTransport, OpKind, QueueModelQuality, RateLimit, Readiness, Secrets, SeqDomain,
+    SpecTable, SpeedBump, SpeedBumpScope, StpScope, StreamId, Subscription, SymbolError, TagSet,
+    TouchSourceCaps, TouchSourceId, TradeCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 use fbc_venue_hibachi::{
-    BOOK_ORDERBOOK, Hibachi, KEY_DATA_REST_URL, KEY_ORDERBOOK_DEPTH, KEY_REST_TIMEOUT,
+    BOOK_ORDERBOOK, Hibachi, KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH,
+    KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, TOUCH_ASK_BID_PRICE,
 };
 
-const CONFIG: [(&str, &str); 3] = [
+const CONFIG: [(&str, &str); 5] = [
     (KEY_DATA_REST_URL, "https://data-api.hibachi.xyz"),
     (KEY_REST_TIMEOUT, "5000ms"),
     (KEY_ORDERBOOK_DEPTH, "25"),
+    (KEY_DATA_WS_URL, "wss://data-api.hibachi.xyz"),
+    (KEY_ORDERBOOK_RESUBSCRIBE, "2000ms"),
 ];
 
 const ETH: InstrumentId = InstrumentId::new(1);
@@ -119,18 +123,30 @@ fn the_market_data_caps_declare_json_the_funding_stream_and_second_timestamps() 
     );
     // The coarsest exchange timestamp the frames carry: a trade's whole seconds.
     assert_eq!(md.ts_precision, Duration::from_secs(1));
-    // Declared with the codec that decodes them (FBC-2kmp).
-    assert!(md.touch_sources.is_empty());
+    // ask_bid_price, TOUCH_ASK_BID_PRICE: cadence Unknown, no sequence, no timestamp.
+    assert_eq!(
+        md.touch_sources,
+        [TouchSourceCaps {
+            channel: "ask_bid_price",
+            cadence: Cadence::Unknown,
+            seq_domain: SeqDomain::None,
+            ts_kind: ExchTsKind::Unknown,
+            includes_channels: TagSet::of(&[Channel::Public]),
+        }]
+    );
+    assert_eq!(TOUCH_ASK_BID_PRICE, TouchSourceId(0));
+    // Trades streamed with their taker side and no trade id; mark and spot (as the index)
+    // streamed.
     assert_eq!(
         md.trades,
         TradeCaps {
-            source: FeedSource::None,
-            aggressor: false,
+            source: FeedSource::Stream,
+            aggressor: true,
             trade_id: false,
         }
     );
-    assert_eq!(md.mark, FeedSource::None);
-    assert_eq!(md.index, FeedSource::None);
+    assert_eq!(md.mark, FeedSource::Stream);
+    assert_eq!(md.index, FeedSource::Stream);
     assert_eq!(md.stats, FeedSource::None);
     assert_eq!(
         md.topology,
@@ -169,7 +185,13 @@ fn the_schema_names_every_key_the_venue_reads() {
     let keys: Vec<_> = schema.iter().map(|f| f.key).collect();
     assert_eq!(
         keys,
-        [KEY_DATA_REST_URL, KEY_REST_TIMEOUT, KEY_ORDERBOOK_DEPTH]
+        [
+            KEY_DATA_REST_URL,
+            KEY_REST_TIMEOUT,
+            KEY_ORDERBOOK_DEPTH,
+            KEY_DATA_WS_URL,
+            KEY_ORDERBOOK_RESUBSCRIBE
+        ]
     );
     let units: Vec<_> = schema.iter().map(|f| f.unit).collect();
     assert_eq!(
@@ -177,7 +199,9 @@ fn the_schema_names_every_key_the_venue_reads() {
         [
             FieldUnit::Dimensionless,
             FieldUnit::Duration,
-            FieldUnit::Count
+            FieldUnit::Count,
+            FieldUnit::Dimensionless,
+            FieldUnit::Duration
         ]
     );
     assert!(schema.iter().all(|f| f.scope == ConfigScope::Process));
@@ -203,7 +227,78 @@ fn every_key_is_required_with_no_default() {
             Some(VenueError::Config(ConfigError::Missing(key)))
         );
     }
-    assert!(Hibachi.discover(&without(KEY_ORDERBOOK_DEPTH)).is_ok());
+    for key in [
+        KEY_ORDERBOOK_DEPTH,
+        KEY_DATA_WS_URL,
+        KEY_ORDERBOOK_RESUBSCRIBE,
+    ] {
+        assert!(Hibachi.discover(&without(key)).is_ok(), "{key}");
+    }
+}
+
+#[test]
+fn the_resubscribe_interval_is_whole_milliseconds_and_never_zero() {
+    for value in [
+        "0ms", "", "ms", "2s", "2000", "-1ms", "+1ms", "1.5ms", " 1ms",
+    ] {
+        let mut cfg = config();
+        cfg.insert(KEY_ORDERBOOK_RESUBSCRIBE, value);
+        assert_eq!(
+            Hibachi.caps(&cfg),
+            Err(ConfigError::Invalid {
+                key: KEY_ORDERBOOK_RESUBSCRIBE,
+                reason: "not a positive whole number of milliseconds (<n>ms)",
+            }),
+            "{value:?}"
+        );
+    }
+    let mut cfg = config();
+    cfg.insert(KEY_ORDERBOOK_RESUBSCRIBE, "1ms");
+    assert!(Hibachi.caps(&cfg).is_ok());
+}
+
+#[test]
+fn the_websocket_origin_is_wss_or_ws_to_a_loopback_host() {
+    for value in [
+        "https://data-api.hibachi.xyz",
+        "data-api.hibachi.xyz",
+        "wss://",
+        "wss://data-api.hibachi.xyz/ws/market",
+        "wss://data-api.hibachi.xyz?hibachiClient=x",
+        "ws://data-api.hibachi.xyz",
+        "ws://10.0.0.1:8080",
+    ] {
+        let mut cfg = config();
+        cfg.insert(KEY_DATA_WS_URL, value);
+        assert_eq!(
+            Hibachi.caps(&cfg),
+            Err(ConfigError::Invalid {
+                key: KEY_DATA_WS_URL,
+                reason: "not a wss:// origin, or a ws:// origin on a loopback host",
+            }),
+            "{value}"
+        );
+    }
+    for (origin, url) in [
+        (
+            "wss://data-api.hibachi.xyz/",
+            "wss://data-api.hibachi.xyz/ws/market",
+        ),
+        ("ws://127.0.0.1:9001", "ws://127.0.0.1:9001/ws/market"),
+        ("ws://localhost", "ws://localhost/ws/market"),
+    ] {
+        let mut cfg = config();
+        cfg.insert(KEY_DATA_WS_URL, origin);
+        let plans = Hibachi
+            .plan_md(&cfg, &specs(), &BTreeSet::from([sub(Feed::Trades)]))
+            .unwrap();
+        assert_eq!(
+            plans[0].transport,
+            MdTransport::Socket {
+                url: WireUrl::plain(url)
+            }
+        );
+    }
 }
 
 #[test]
@@ -281,110 +376,120 @@ fn an_invalid_origin_or_timeout_is_refused() {
     }
 }
 
+/// ETH/USDT-P alone, as a spec table the factory can spell.
+fn specs() -> SpecTable {
+    use fbc_core::{
+        AssetSym, FundingSpec, InstrumentKind, InstrumentSpec, Lots, PriceGrid, SizeStep,
+        TradingStatus, UnderlyingId, VenueId, WallNs, dispatch_market_data,
+    };
+    let caps = Hibachi.caps(&config()).unwrap();
+    let venue_symbol =
+        dispatch_market_data(&caps, |scope| scope.venue_symbol("ETH/USDT-P")).unwrap();
+    let usdt = AssetSym::new("USDT").unwrap();
+    let mut table = SpecTable::new();
+    table.insert(InstrumentSpec {
+        id: ETH,
+        venue: VenueId::new(6),
+        venue_symbol,
+        native_id: None,
+        underlying: UnderlyingId::new(1),
+        kind: InstrumentKind::Perpetual,
+        price_grid: PriceGrid::fixed("0.000001".parse().unwrap()).unwrap(),
+        quote_grid: Some("0.01".parse().unwrap()),
+        size_step: SizeStep::new("0.000000001".parse().unwrap()).unwrap(),
+        min_size: Lots::new(1).unwrap(),
+        min_notional: None,
+        max_order_size: None,
+        position_limit: None,
+        price_band: None,
+        max_open_orders: None,
+        multiplier: rust_decimal::Decimal::ONE,
+        quote_ccy: usdt,
+        settle_ccy: usdt,
+        funding: FundingSpec::Unknown,
+        public_fees: None,
+        status: TradingStatus::Trading,
+        sessions: None,
+        signing: None,
+        version: 1,
+        fetched_at: WallNs(0),
+    });
+    table
+}
+
 #[test]
-fn plan_md_plans_nothing_and_refuses_every_feed_until_the_codec_lands() {
+fn plan_md_plans_one_ws_market_connection_carrying_every_feed_the_codec_decodes() {
     let cfg = config();
-    let specs = SpecTable::new();
+    let specs = specs();
     assert_eq!(
         Hibachi.plan_md(&cfg, &specs, &BTreeSet::new()),
         Ok(Vec::new())
     );
-    for feed in [
+    let feeds = [
         Feed::Book(BOOK_ORDERBOOK),
-        Feed::Touch(TouchSourceId(0)),
+        Feed::Touch(TOUCH_ASK_BID_PRICE),
         Feed::Trades,
         Feed::Mark,
         Feed::Index,
         Feed::Funding,
+    ];
+    let subs: BTreeSet<Subscription> = feeds.into_iter().map(sub).collect();
+    assert_eq!(
+        Hibachi.plan_md(&cfg, &specs, &subs),
+        Ok(vec![EndpointPlan {
+            stream: StreamId(0),
+            transport: MdTransport::Socket {
+                url: WireUrl::plain("wss://data-api.hibachi.xyz/ws/market"),
+            },
+            subs: subs.iter().copied().collect(),
+        }])
+    );
+    // Stats, another book or touch channel, and an instrument missing from the table are
+    // refused, nothing planned.
+    for feed in [
         Feed::Stats,
+        Feed::Book(BookId(1)),
+        Feed::Touch(TouchSourceId(1)),
     ] {
         let s = sub(feed);
+        let mut with = subs.clone();
+        with.insert(s);
         assert_eq!(
-            Hibachi.plan_md(&cfg, &specs, &BTreeSet::from([s])),
+            Hibachi.plan_md(&cfg, &specs, &with),
             Err(VenueError::UnsupportedFeed(s)),
             "{feed:?}"
         );
     }
-}
-
-/// A sink that keeps what it is handed.
-#[derive(Default)]
-struct Kept(Vec<MdEvent>);
-
-impl MdSink for Kept {
-    fn push(&mut self, _meta: VenueMeta, event: MdEvent) {
-        self.0.push(event);
-    }
+    let missing = InstrumentId::new(9);
+    let s = Subscription {
+        inst: missing,
+        feed: Feed::Trades,
+    };
+    assert_eq!(
+        Hibachi.plan_md(&cfg, &specs, &BTreeSet::from([s])),
+        Err(VenueError::UnknownInstrument(missing))
+    );
 }
 
 #[test]
-fn the_codec_refuses_every_subscription_and_decodes_nothing() {
+fn the_factorys_codec_takes_the_planned_endpoints_stream() {
     let cfg = config();
-    let ep = EndpointPlan {
-        stream: StreamId(0),
-        transport: MdTransport::Socket {
-            url: WireUrl::plain("wss://data-api.hibachi.xyz/ws/market"),
-        },
-        subs: Vec::new(),
-    };
-    let mut codec = Hibachi.md_codec(&cfg, &ep);
-    let specs = SpecTable::new();
-    let mut fx = Effects::new();
+    let specs = specs();
+    let subs = BTreeSet::from([sub(Feed::Trades)]);
+    let plan = Hibachi.plan_md(&cfg, &specs, &subs).unwrap().remove(0);
+    let mut codec = Hibachi.md_codec(&cfg, &plan);
+    let mut fx = fbc_core::Effects::new();
     codec.on_open(&mut fx);
-    assert!(fx.is_empty());
-    assert_eq!(codec.subscribe(&[], &[], &specs, &mut fx), Ok(()));
-    let book = sub(Feed::Book(BOOK_ORDERBOOK));
-    let funding = sub(Feed::Funding);
-    assert_eq!(
-        codec.subscribe(&[book, funding], &[], &specs, &mut fx),
-        Err(VenueError::UnsupportedFeed(book))
-    );
-    assert_eq!(
-        codec.subscribe(&[], &[funding], &specs, &mut fx),
-        Err(VenueError::UnsupportedFeed(funding))
-    );
-    assert!(fx.is_empty());
-    let caps = Hibachi.caps(&cfg).unwrap();
-    let mut sink = Kept::default();
-    let frame = r#"{"topic":"orderbook","symbol":"ETH/USDT-P","data":{}}"#;
-    let decoded = dispatch_market_data(&caps, |scope| {
-        codec.on_frame(RawFrame::Text(frame), scope, &specs, &mut sink, &mut fx)
-    });
-    assert_eq!(
-        decoded,
-        Err(DecodeError::Malformed("no Hibachi feed is decoded yet"))
-    );
-    let answered = dispatch_market_data(&caps, |scope| {
-        codec.on_http(
-            HttpTag(1),
-            Err(HttpFailure::NotSent),
-            scope,
-            &specs,
-            &mut sink,
-            &mut fx,
-        )
-    });
-    assert_eq!(
-        answered,
-        Err(DecodeError::Malformed(
-            "no Hibachi market-data request is made"
-        ))
-    );
-    codec.on_timer(TimerTag(1), MonoNs(1), WallNs(1), &mut sink, &mut fx);
-    assert!(sink.0.is_empty());
-    assert!(fx.is_empty());
-    assert_eq!(codec.keepalive(), None);
-    let response = HttpResponse {
-        status: 200,
-        headers: &[],
-        body: b"{}",
+    codec.subscribe(&plan.subs, &[], &specs, &mut fx).unwrap();
+    let [fbc_core::Effect::Send { stream, .. }] = fx.as_slice() else {
+        panic!("{fx:?}")
     };
+    assert_eq!(*stream, plan.stream);
+    // A configuration plan_md refuses gives a codec that refuses every subscription the same.
+    let bad = without(KEY_DATA_WS_URL);
+    let mut codec = Hibachi.md_codec(&bad, &plan);
     assert_eq!(
-        codec.redact_inbound(Inbound::Frame(RawFrame::Text(frame))),
-        InboundSpans::NONE
-    );
-    assert_eq!(
-        codec.redact_inbound(Inbound::Http(HttpTag(1), response)),
-        InboundSpans::NONE
+        codec.subscribe(&plan.subs, &[], &specs, &mut fx),
+        Err(VenueError::Config(ConfigError::Missing(KEY_DATA_WS_URL)))
     );
 }

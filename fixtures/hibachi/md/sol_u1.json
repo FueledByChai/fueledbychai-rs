@@ -1,0 +1,1 @@
+{"data":{"ask":{"endPrice":"150.105","levels":[{"price":"150.101","quantity":"12.00000000"}],"startPrice":"150.101"},"bid":{"endPrice":"150.095","levels":[],"startPrice":"150.100"}},"depth":3,"granularity":"0.001","messageType":"Update","symbol":"SOL/USDT-P","topic":"orderbook"}

@@ -1,0 +1,13 @@
+Synthetic market-data frames and tickers (decision 0009). Nothing in this directory was
+received from Hibachi.
+
+- Every frame is a copy of one in fixtures/hibachi/md/, hand-built in the shapes Hibachi
+  publishes for its anonymous /ws/market WebSocket; that directory's README.md cites the source
+  of each shape and its SYNTHETIC file where the values come from.
+- Every price, size, bound and timestamp is a made-up value; the tickers are made-up Java-era
+  forms of fixtures/hibachi/rest/exchange_info.json's contracts.
+- None is a frame of the owner's capture of the public feed, and no count, rate or timing
+  measured on it is here.
+- No file holds an account id, an address, a key or a credential.
+
+This marker covers fixtures/hibachi/conformance/ only. Recorded Hibachi frames never go here.

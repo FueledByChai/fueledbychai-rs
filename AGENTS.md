@@ -198,8 +198,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   (`src/factory.rs`, market data and order entry, 0072),
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
   `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
-  `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery and caps (no
-  codec yet), and `crates/fbc-examples` with the owner-run samples; the
+  `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps and
+  `/ws/market` codec (0129), and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -643,8 +643,27 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     and, for the FX underlyings the docs name, the New York weekend (0125); only `LIVE` on a
     `NORMAL` exchange trading, every other listed status `Halted`, an absent, null or
     undocumented one refused; `FUNDING_SETTLEMENT_INTERVAL` one hour and funding `Unknown` until
-    FBC-204c; `X/USDT` is `X/USDT-P`; `plan_md` refuses every feed until FBC-2kmp's `/ws/market`
-    codec; held to the hand-built `fixtures/hibachi/rest/`).
+    FBC-204c; `X/USDT` is `X/USDT-P`; held to the hand-built `fixtures/hibachi/rest/`; and, in
+    `src/md/` (FBC-2kmp, 0129), the `/ws/market` codec `HibachiMd`: `plan_md` one connection to
+    `/ws/market` on the required `hibachi.data_ws_url` origin, one frame per subscription under
+    the `parameters` key charged to its instrument, each orderbook naming `granularity`
+    (`quote_grid.unwrap_or(tick)`) and `depth`; the `orderbook` applied to the codec's own copy
+    and bounds-checked before any event (each bounded side's best at `startPrice`, exactly the
+    depth's levels within min..max with the last at `endPrice`, none outside, not crossed, a
+    pruned level the frame does not zero failing; a locked book and a thin side counted apart),
+    a side's window a `SidePrune` and a null side a `SideClear` with the removals of both sides
+    before any set (0124), and every gap it finds itself (an empty Snapshot, an absent or
+    unbounded side, a frame failing the check, a granularity or depth not the subscription's, a
+    level off its granularity) a `Health` gap of that book alone, recovered after the required
+    `hibachi.orderbook_resubscribe` by the codec's own unsubscribe and subscribe, then one paced
+    reconnect if no Snapshot answers; `ask_bid_price` a Touch only when fully sized and not
+    crossed, a stale one gapped on its touch feed; both `trades` shapes, `mark_price`,
+    `spot_price` as the index and `funding_rate_estimation` exactly in 1e-12 units with no
+    interval or next time; what it counts on `HibachiMd::counts`; held to the hand-built
+    `fixtures/hibachi/md/` (`tests/md_book.rs`, `tests/md_topics.rs`), the named conformance suite
+    on `fixtures/hibachi/conformance/` (`tests/conformance.rs`), and a stub test on a paused clock
+    with decoder replay of its journal (`tests/md_stub.rs`, `fbc-runtime`, `fbc-conformance`,
+    `fbc-journal`, `fbc-book` and tokio as dev-dependencies)).
   - Dependency direction (design §3): `fbc-core`, `fbc-book`, `fbc-oms`, `fbc-journal` and
     `fbc-sim` never depend on a venue crate; a venue crate depends on `fbc-core` and protocol
     crates only. Nothing here depends on the private consumer. `scripts/check-deps.sh` holds
@@ -667,7 +686,11 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/hibachi/rest/` (marked `SYNTHETIC`) holds hand-built `/market/exchange-info` answers,
   with a variant for each status and timestamp refusal, and a funding-history answer, its README
-  citing each field's source.
+  citing each field's source; `fixtures/hibachi/md/` (marked `SYNTHETIC`) hand-built `/ws/market`
+  frames, one per file, shaped as Hibachi's docs, SDK and the Java library show them and as the
+  owner's capture showed in words only, its README citing each shape; and
+  `fixtures/hibachi/conformance/` (marked `SYNTHETIC`) the conformance suite's cases built from
+  them.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs

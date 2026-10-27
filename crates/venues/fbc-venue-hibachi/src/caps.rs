@@ -21,30 +21,40 @@
 //!   <https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/implementations/market-data-api/hibachi-market-data-impl/src/main/java/com/fueledbychai/marketdata/hibachi/HibachiQuoteEngine.java>:
 //!   L100-L104, "No sequence number is available"; L108-L114 and L561-L567, Hibachi's word,
 //!   recorded when the L1 sanity checker was removed on 2026-05-27, that "both L1 and trades
-//!   pulse on the same 250ms heartbeat".
+//!   pulse on the same 250ms heartbeat"; L581, the mark read from `markPrice` or `price`; L865,
+//!   a trade's side read from `takerSide` or `side`.
 //! - [LIMITS] <https://docs.hibachi.xyz/hibachi-docs/trading/limits>: "an overall rate limit of
 //!   350 requests / 10 seconds per IP".
 //! - [BUMP] <https://docs.hibachi.xyz/hibachi-docs/trading/taker-speed-bump>: a 25 millisecond
 //!   speed bump on liquidity-taking orders across all markets; resting and post-only orders and
 //!   cancels are not delayed; "This value may change".
+//! - [SDKT] Hibachi's Python SDK at 14a76b9, `types.py`:
+//!   <https://github.com/hibachi-xyz/hibachi_sdk/blob/14a76b95230869dd622c31a1fc4132a6eac1a9fa/python/hibachi_xyz/types.py#L233-L249>:
+//!   a trade's `takerSide` is `Buy` or `Sell`, and the WebSocket topics; and
+//!   <https://github.com/hibachi-xyz/hibachi_sdk/blob/14a76b95230869dd622c31a1fc4132a6eac1a9fa/python/hibachi_xyz/types.py#L969-L975>:
+//!   the `Trade` shape, `price`, `quantity`, `takerSide` and `timestamp`, with no trade id (as
+//!   the Market API spec's `Trade` schema).
+//! - [FUND] <https://docs.hibachi.xyz/hibachi-docs/trading/funding>: funding computed from "the
+//!   bounded per-second premium of the contract over the spot index", the spot index price at
+//!   settlement being "the median across oracle sources".
 //!
-//! The orderbook and funding entries describe those feeds as Hibachi documents them, as this
-//! crate's first done line (FBC-jyyl) requires; `plan_md` plans neither until the codec that
-//! decodes them lands (FBC-2kmp), refusing each as an unsupported feed. The touch, trade, mark
-//! and index feeds are declared with that codec.
+//! Every feed declared here is planned and decoded by the `/ws/market` codec (`md`, FBC-2kmp,
+//! decision 0129).
 
 use core::time::Duration;
 
 use fbc_core::{
-    BookCaps, Cadence, Channel, ConnTopology, Continuity, Encoding, FeedSource, FundingCaps,
-    LimitScope, MatchingCaps, MdCaps, OpKind, QueueModelQuality, RateLimit, Readiness, SpeedBump,
-    SpeedBumpScope, StpScope, TagSet, TradeCaps, VenueCaps,
+    BookCaps, Cadence, Channel, ConnTopology, Continuity, Encoding, ExchTsKind, FeedSource,
+    FundingCaps, LimitScope, MatchingCaps, MdCaps, OpKind, QueueModelQuality, RateLimit, Readiness,
+    SeqDomain, SpeedBump, SpeedBumpScope, StpScope, TagSet, TouchSourceCaps, TradeCaps, VenueCaps,
 };
 
 use crate::config::Settings;
 
 /// The orderbook topic's name [WS].
 pub(crate) const ORDERBOOK_CHANNEL: &str = "orderbook";
+/// The `ask_bid_price` topic's name [WS].
+pub(crate) const ASK_BID_PRICE_CHANNEL: &str = "ask_bid_price";
 
 /// Hibachi's capabilities under `settings`.
 pub(crate) fn caps(settings: &Settings) -> VenueCaps {
@@ -64,8 +74,23 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
         md: MdCaps {
             // Every frame is JSON [WS].
             encoding: Encoding::Json,
-            // `ask_bid_price` [WS] is declared with the codec that decodes it (FBC-2kmp).
-            touch_sources: Vec::new(),
+            // TOUCH_ASK_BID_PRICE: `ask_bid_price` [WS]. A Touch only from a frame carrying each
+            // side's price and size, the sizes read where the Java library reads them
+            // (`bidSize`, `askSize`; [QE] L548-L575), since [WS]'s example shows prices only
+            // (decision 0129).
+            touch_sources: vec![TouchSourceCaps {
+                channel: ASK_BID_PRICE_CHANNEL,
+                // Unknown, as the orderbook's is (the owner's decision of 2026-10-25): Hibachi
+                // support's 250 ms heartbeat for L1 ([QE] L108-L114) is not taken, and nothing
+                // measured on the owner's capture is declared.
+                cadence: Cadence::Unknown,
+                // No sequence number in any frame [WS].
+                seq_domain: SeqDomain::None,
+                // Its frames carry no timestamp [WS]; no source says which instant one would mark.
+                ts_kind: ExchTsKind::Unknown,
+                // The public book's best prices; no other order channel is documented.
+                includes_channels: TagSet::of(&[Channel::Public]),
+            }],
             // BOOK_ORDERBOOK.
             books: vec![BookCaps {
                 channel: ORDERBOOK_CHANNEL,
@@ -95,10 +120,13 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
                 // says a book's levels are buckets).
                 queue_model: QueueModelQuality::BracketOnly,
             }],
-            // The `trades` topic [WS] is declared with the codec that decodes it (FBC-2kmp).
             trades: TradeCaps {
-                source: FeedSource::None,
-                aggressor: false,
+                // The `trades` topic [WS].
+                source: FeedSource::Stream,
+                // Each trade's `takerSide`, `Buy` or `Sell` [WS] [SDKT] (its alias `side` read
+                // where it is absent [QE] L865).
+                aggressor: true,
+                // No trade id in any public shape [WS] [SDKT].
                 trade_id: false,
             },
             funding: FundingCaps {
@@ -107,16 +135,21 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
                 // Its frames carry no interval [WS].
                 interval_reported: false,
                 // They carry `nextFundingTimestamp`, but no public source states its unit (the
-                // Market API spec types it int64 with none), so it is not declared reported
-                // until a fixture shaped after evidence pins it (FBC-2kmp).
+                // Market API spec types it int64 with none), so it is not declared reported,
+                // and the codec pushes `next: None`, until a fixture shaped after evidence pins
+                // it (FBC-204c).
                 next_time_reported: false,
             },
             // REST /market/data/stats is not polled.
             stats: FeedSource::None,
-            // `mark_price` and `spot_price` [WS] are declared with the codec that decodes them
-            // (FBC-2kmp).
-            mark: FeedSource::None,
-            index: FeedSource::None,
+            // The `mark_price` topic's `markPrice` [WS] (its alias `price` read where it is
+            // absent [QE] L581).
+            mark: FeedSource::Stream,
+            // The `spot_price` topic's `spotPrice` [WS]: the nearest feed `fbc-core` has to a
+            // spot price is the index, so it is decoded as `MdEvent::Index`. Hibachi computes
+            // funding from a spot index, the median across oracle sources [FUND]; no source says
+            // the `spot_price` topic is that index (decision 0129).
+            index: FeedSource::Stream,
             // The coarsest exchange timestamp the streamed frames carry: a trade's `timestamp`
             // is whole seconds [WS]. No public example frame shows a timestamp on the orderbook,
             // `ask_bid_price` or `mark_price` topics [WS], so the value rests on the trade's
