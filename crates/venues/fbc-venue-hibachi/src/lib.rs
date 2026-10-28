@@ -81,19 +81,31 @@
 //!
 //! # Funding
 //!
-//! Hibachi settles funding every hour: [`FUNDING_SETTLEMENT_INTERVAL`]. docs.hibachi.xyz's
-//! Funding page (<https://docs.hibachi.xyz/hibachi-docs/trading/funding>, Formulas) defines the
-//! rate of each hourly settlement as `Funding Rate = (1/8) × mean(ρ_t)` over the trailing hour's
-//! premium samples and its payment as `Funding Payment = Q × Funding Rate × S_settlement`: the
-//! rate it defines is the hour's, paid unscaled. No public source shows that the rates Hibachi
-//! publishes, the settled history's `fundingRate` and the `funding_rate_estimation` topic's
-//! `estimatedFundingRate`, are that rate, and the Java library at b4188a5 reads them two ways:
-//! its quote engine divides the estimate by the instrument descriptor's interval, eight hours by
-//! default (`HibachiQuoteEngine.java` L904-L918, linked from `caps.rs`; `HibachiRestApi.java`
-//! L388), while `FundingSources.java` annualizes each settled rate over the hour it derives
-//! (L139-L158 and L173, linked from [`FUNDING_SETTLEMENT_INTERVAL`]). So each perpetual's
-//! funding is [`FundingSpec::Unknown`](fbc_core::FundingSpec) until the owner's evidence settles
-//! it (FBC-204c).
+//! Hibachi settles funding every hour: [`FUNDING_SETTLEMENT_INTERVAL`]. What its published rates
+//! are rates for is the owner's conclusion of 2026-10-28 (FBC-204c, decision 0131): compute
+//! funding the way the public Java library does at b4188a5.
+//!
+//! - The settled history's `fundingRate` (`GET /market/data/funding-rates`) is a rate per
+//!   one-hour settlement: `FundingSources.java` annualizes it over the interval it derives from
+//!   consecutive `fundingTimestamp`s, 3600 s apart (L139-L159, linked from
+//!   [`FUNDING_SETTLEMENT_INTERVAL`]; its `build` takes that interval, L172-L173).
+//! - The `funding_rate_estimation` topic's `estimatedFundingRate` is an eight-hour rate
+//!   ([`FUNDING_ESTIMATE_PERIOD`]) whose hourly equivalent is the estimate divided by 8: the
+//!   quote engine divides it by the ticker's funding interval, eight for every Hibachi ticker
+//!   (`HibachiQuoteEngine.java` L914-L918, linked from [`FUNDING_ESTIMATE_PERIOD`]).
+//!
+//! So discovery states each perpetual's funding as
+//! [`FundingSpec::Known`](fbc_core::FundingSpec) every [`FUNDING_SETTLEMENT_INTERVAL`], capped at
+//! [`FUNDING_RATE_CAP`] per interval (the docs' -10% to 10%, stated for eight hours, rescaled to
+//! one), and the codec's [`MdEvent::Funding`](fbc_core::MdEvent) carries the estimate's exact
+//! eighth, the rate per that hour, with `interval: Some(FUNDING_SETTLEMENT_INTERVAL)` (the `md`
+//! module says why an estimate whose eighth is finer than 1e-12 is refused, never rounded).
+//! Supporting documentation, not the evidence: docs.hibachi.xyz's Funding page
+//! (<https://docs.hibachi.xyz/hibachi-docs/trading/funding>, Formulas) pays each hourly settlement
+//! `Funding Payment = Q × Funding Rate × S_settlement` at `Funding Rate = (1/8) × mean(ρ_t)`. The
+//! owner noted that Hibachi's UI may show something different from the API; this crate reads
+//! the API. `nextFundingTimestamp`'s unit is still unevidenced, so no event carries a next
+//! funding time and the caps do not declare one reported.
 //!
 //! Hibachi's market-maker-partner book topic is not planned, decoded or named here: it stays out
 //! of this public repository until its entitlement is clear.
@@ -109,7 +121,7 @@ use core::time::Duration;
 use std::collections::BTreeSet;
 
 use fbc_core::{
-    AccountSummary, AssetKey, BookId, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint,
+    AccountSummary, AssetKey, BookId, Bps, ConfigError, EndpointPlan, ExecCodec, ExecEndpoint,
     FieldSpec, HttpPlan, InstrumentSpecDraft, MdCodec, MdTransport, Secrets, SpecTable, StreamId,
     Subscription, SymbolError, TouchSourceId, VenueCaps, VenueConfig, VenueError, VenueFactory,
     WireUrl,
@@ -138,17 +150,65 @@ const MD_STREAM: StreamId = StreamId(0);
 /// market-data host (documented on <https://api-doc.hibachi.xyz/>, Market API, but not in the
 /// published Market API spec), read by the owner on 2026-10-22, lists consecutive settlements,
 /// each `fundingTimestamp` (epoch seconds) on the UTC hour and 3600 s after the one before; the
-/// Java library derives an hourly interval from the same spacing (`market-data-collector`
-/// `FundingSources.java` L139-L158,
-/// <https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/market-data-collector/src/main/java/com/fueledbychai/datacollector/FundingSources.java#L139-L158>),
-/// and docs.hibachi.xyz's Funding page says "funding payments are made every hour"
+/// Java library derives an hourly interval from the same spacing and annualizes each settled
+/// `fundingRate` over it, a rate per one-hour settlement (`market-data-collector`
+/// `FundingSources.java` L139-L159,
+/// <https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/market-data-collector/src/main/java/com/fueledbychai/datacollector/FundingSources.java#L139-L159>,
+/// and L172-L173, the owner's conclusion of 2026-10-28: the payment interval is one hour), and
+/// docs.hibachi.xyz's Funding page says "funding payments are made every hour"
 /// (<https://docs.hibachi.xyz/hibachi-docs/trading/funding>).
 ///
 /// Contradicted: the redocly trading page says "every 8 hours—at midnight UTC, 8:00 AM UTC, and
 /// 4:00 PM UTC" (<https://hibachi-docs.redocly.app/docs/trading>, Funding), as the Java library's
-/// instrument descriptor default of 8 hours (`HibachiRestApi.java` L388) does; the settled
-/// history and the Funding page both show hourly settlements.
+/// instrument descriptor default of 8 hours (`HibachiRestApi.java` L388) does when read as a
+/// settlement interval; the settled history and the Funding page both show hourly settlements.
+/// The same eight hours are the period the streamed estimate is a rate for
+/// ([`FUNDING_ESTIMATE_PERIOD`]).
 pub const FUNDING_SETTLEMENT_INTERVAL: Duration = Duration::from_secs(3_600);
+
+/// The period a streamed `estimatedFundingRate` is a rate for: eight hours.
+///
+/// The owner's conclusion of 2026-10-28 (FBC-204c, decision 0131): its hourly equivalent is the
+/// estimate divided by 8, as the Java library's quote engine computes it, dividing the estimate
+/// by the ticker's funding interval and falling back to 8 where a ticker has none
+/// (`HibachiQuoteEngine.java` L914-L918,
+/// <https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/implementations/market-data-api/hibachi-market-data-impl/src/main/java/com/fueledbychai/marketdata/hibachi/HibachiQuoteEngine.java#L914-L918>);
+/// no Hibachi ticker sets another, its instrument descriptor stating 8
+/// (`HibachiRestApi.java` L388,
+/// <https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/commons/hibachi-common-api/src/main/java/com/fueledbychai/hibachi/common/api/HibachiRestApi.java#L388>).
+/// The redocly trading page computes its Predicted Funding Rate over the same eight hours, "28,800
+/// seconds in an 8-hour interval" (<https://hibachi-docs.redocly.app/docs/trading>, Funding).
+/// The codec divides each estimate by [`FUNDING_ESTIMATE_PERIOD`] over
+/// [`FUNDING_SETTLEMENT_INTERVAL`], 8.
+pub const FUNDING_ESTIMATE_PERIOD: Duration = Duration::from_secs(28_800);
+
+/// How many settlement intervals an estimate's period spans: 8, the divisor of every streamed
+/// estimate.
+pub(crate) const ESTIMATE_INTERVALS: u64 =
+    FUNDING_ESTIMATE_PERIOD.as_secs() / FUNDING_SETTLEMENT_INTERVAL.as_secs();
+
+// An estimate's period is a whole number of settlement intervals.
+const _: () = assert!(
+    FUNDING_ESTIMATE_PERIOD
+        .as_secs()
+        .is_multiple_of(FUNDING_SETTLEMENT_INTERVAL.as_secs())
+);
+
+/// The docs' funding rate limit, 10% either way, in basis points, for the eight-hour period the
+/// page defines its rate over ([`FUNDING_RATE_CAP`]).
+const DOCS_FUNDING_LIMIT_BPS: f64 = 1_000.0;
+
+/// The largest funding rate per [`FUNDING_SETTLEMENT_INTERVAL`], either way: 125 bps.
+///
+/// The redocly trading page limits the funding rate to "-10% to 10%" (Limits, Funding Rate,
+/// <https://hibachi-docs.redocly.app/docs/trading>) and names no interval for it. The one funding
+/// rate that page defines is for its eight-hour period (Funding: "There are 28,800 seconds in an
+/// 8-hour interval", the Final Funding Rate computed at its end), the period the streamed
+/// estimate is a rate for ([`FUNDING_ESTIMATE_PERIOD`]), so the limit is read as 10% per eight
+/// hours and rescaled to the one-hour interval as the estimate is: 1000 bps / 8 = 125 bps
+/// (decision 0131). docs.hibachi.xyz's Funding page caps each per-second premium at ±100% and
+/// states no cap on the rate itself.
+pub const FUNDING_RATE_CAP: Bps = Bps(DOCS_FUNDING_LIMIT_BPS / ESTIMATE_INTERVALS as f64);
 
 /// The Hibachi venue: discovery and market-data capabilities, no order entry.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]

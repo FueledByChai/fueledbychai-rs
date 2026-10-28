@@ -83,11 +83,13 @@
 //!   minutes in its EUR/USD example, no fixed duration stated), which trades nothing.
 //! - Not stated, so `None`: the largest order, the position limit (free margin times leverage,
 //!   per account, [LIMITS]), a price band (the 50 bps limit on [LIMITS] is market orders'), the
-//!   open-order limit and the fee schedule (`feeConfig` is not read). Funding is
-//!   [`FundingSpec::Unknown`] until FBC-204c shows that the rates Hibachi publishes are the
-//!   hourly rate its Funding page defines (the crate docs' Funding section; the settlement
-//!   interval is [`FUNDING_SETTLEMENT_INTERVAL`](crate::FUNDING_SETTLEMENT_INTERVAL)).
-//!   `displayName`, the margin and risk factors, `marketCreationTimestamp`, `feeConfig` and
+//!   open-order limit and the fee schedule (`feeConfig` is not read).
+//! - Funding, which no field of the answer states, is the same for every contract, each a
+//!   perpetual: [`FundingSpec::Known`] every [`FUNDING_SETTLEMENT_INTERVAL`], one hour, capped
+//!   at [`FUNDING_RATE_CAP`], 125 bps, per interval: the owner's conclusion of 2026-10-28 and
+//!   the docs' limit rescaled from eight hours to one (the crate docs' Funding section; decision
+//!   0131).
+//! - `displayName`, the margin and risk factors, `marketCreationTimestamp`, `feeConfig` and
 //!   `instantWithdrawalLimit` are not read.
 //!
 //! [`parse_fbc_common_symbol`] is FBC's Java-era rule: `X/USDT` is `X/USDT-P`, as is the Java
@@ -124,6 +126,7 @@ use rust_decimal::prelude::ToPrimitive;
 use serde_json::{Map, Value};
 
 use crate::config::{rest_origin, rest_timeout};
+use crate::{FUNDING_RATE_CAP, FUNDING_SETTLEMENT_INTERVAL};
 
 /// The tag of discovery's one request.
 pub const EXCHANGE_INFO_TAG: HttpTag = HttpTag(1);
@@ -311,7 +314,10 @@ fn draft(
         max_open_orders: None,
         multiplier: Decimal::ONE,
         settle_ccy,
-        funding: FundingSpec::Unknown,
+        funding: FundingSpec::Known {
+            interval: FUNDING_SETTLEMENT_INTERVAL,
+            cap: Some(FUNDING_RATE_CAP),
+        },
         public_fees: None,
         status,
         sessions,

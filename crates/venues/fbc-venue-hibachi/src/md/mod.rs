@@ -39,9 +39,17 @@
 //!   library, `HibachiQuoteEngine.java` L581), as [`MdEvent::Mark`], and `spot_price`'s
 //!   `spotPrice` as [`MdEvent::Index`], exact. No other alias the Java library reads (a trade's
 //!   `size` for `quantity`) is read.
-//! - `funding_rate_estimation`: `estimatedFundingRate`, flat or under `fundingRateEstimation`, as
-//!   [`MdEvent::Funding`] exactly as the frame carries it in units of 1e-12 (a finer rate is
-//!   malformed), `interval: None` and `next: None` (FBC-204c).
+//! - `funding_rate_estimation`: `estimatedFundingRate`, flat or under `fundingRateEstimation`, an
+//!   eight-hour rate ([`FUNDING_ESTIMATE_PERIOD`](crate::FUNDING_ESTIMATE_PERIOD)), as
+//!   [`MdEvent::Funding`] per the one-hour settlement interval: its eighth, in units of 1e-12,
+//!   its `interval` [`FUNDING_SETTLEMENT_INTERVAL`] (the owner's conclusion of 2026-10-28,
+//!   FBC-204c, decision 0131; the crate docs' Funding section). Nothing is rounded: the
+//!   estimate's eighth must be a whole number of 1e-12, and an estimate whose eighth is finer,
+//!   one finer than 1e-12 itself included, is refused as malformed, so every pushed rate is
+//!   exactly an eighth of what the frame states. An estimate stated to nine decimal places or
+//!   fewer always divides (1e-9 is 1000 units of 1e-12), and Hibachi's example frame states six
+//!   (`-0.000040`). `next` is `None`: the frame's `nextFundingTimestamp` is not read until a
+//!   fixture shaped after evidence pins its unit.
 //!
 //! No exchange timestamp is synthesized: an event carries one only from its frame's root
 //! `timestamp_ms` (epoch milliseconds) or its trade's `timestamp` (epoch seconds), and none of
@@ -72,7 +80,7 @@ use serde_json::{Map, Value, json};
 use self::book::{BookParams, Broken, OrderBook, Phase};
 use crate::config::Settings;
 use crate::discover::plain_decimal;
-use crate::{BOOK_ORDERBOOK, TOUCH_ASK_BID_PRICE};
+use crate::{BOOK_ORDERBOOK, ESTIMATE_INTERVALS, FUNDING_SETTLEMENT_INTERVAL, TOUCH_ASK_BID_PRICE};
 
 /// Nanoseconds in a second and in a millisecond.
 const NANOS_PER_SEC: i64 = 1_000_000_000;
@@ -631,9 +639,11 @@ fn trades(
         .collect()
 }
 
-/// A `funding_rate_estimation` frame's rate in units of 1e-12, exactly: flat
-/// (`estimatedFundingRate`) or nested (`fundingRateEstimation.estimatedFundingRate`), one of the
-/// two.
+/// A `funding_rate_estimation` frame's rate per settlement interval, in units of 1e-12: the
+/// eight-hour estimate, flat (`estimatedFundingRate`) or nested
+/// (`fundingRateEstimation.estimatedFundingRate`), one of the two, divided by
+/// [`ESTIMATE_INTERVALS`] exactly. Malformed where that is not a whole number of 1e-12: never
+/// rounded.
 fn funding_rate(data: &Map<String, Value>) -> Result<i64, DecodeError> {
     let bad = DecodeError::Malformed("estimatedFundingRate");
     let rate = match (
@@ -653,13 +663,21 @@ fn funding_rate(data: &Map<String, Value>) -> Result<i64, DecodeError> {
     let e12 = magnitude
         .checked_mul(Decimal::from(1_000_000_000_000_i64))
         .ok_or(bad)?;
+    // The estimate in units of 1e-12, exactly, then its share of one interval, exactly.
     let e12 = e12
         .fract()
         .is_zero()
         .then(|| e12.to_i64())
         .flatten()
         .ok_or(bad)?;
-    Ok(if negative { -e12 } else { e12 })
+    let intervals = ESTIMATE_INTERVALS as i64;
+    let per_interval = (e12 % intervals == 0).then_some(e12 / intervals);
+    let per_interval = per_interval.ok_or(bad)?;
+    Ok(if negative {
+        -per_interval
+    } else {
+        per_interval
+    })
 }
 
 impl MdCodec for HibachiMd {
@@ -794,8 +812,8 @@ impl MdCodec for HibachiMd {
             Topic::FundingRateEstimation => {
                 let meta = root_meta(&frame)?;
                 let rate_e12 = funding_rate(data(&frame)?)?;
-                // Never rescaled by an interval, and no next time, until FBC-204c.
-                let (interval, next) = (None, None);
+                // The rate per settlement interval; no next time until its unit is evidenced.
+                let (interval, next) = (Some(FUNDING_SETTLEMENT_INTERVAL), None);
                 let funding = MdEvent::Funding {
                     inst,
                     rate_e12,

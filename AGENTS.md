@@ -638,16 +638,20 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `hibachi.orderbook_depth` (1 to 100, no default), `Cadence::Unknown` (the owner's decision of
     2026-10-25, support's 250 ms cited as not taken), `Continuity::Unsequenced`, windowed and
     bracket-only, its levels buckets of the quote grid (FBC-jwn9 adds the capability), the
-    funding stream with no interval, one-second timestamps, the per-IP REST limit and the taker
-    speed bump; discovery in `src/discover.rs` from `GET /market/exchange-info`: the contract id
+    funding stream stating its one-hour interval and no next time (0131), one-second timestamps,
+    the per-IP REST limit and the taker speed bump; discovery in `src/discover.rs` from
+    `GET /market/exchange-info`: the contract id
     as native id, `tickSize` as price grid and the finest listed granularity at or above it as
     quote grid where it is coarser (`None`, fbc-core's meaning, where it is the tick or there is
     none: quoted on the tick), the sizes,
     `SigningParams::AssetDecimals` and a session calendar from the advertised open and close
     and, for the FX underlyings the docs name, the New York weekend (0125); only `LIVE` on a
     `NORMAL` exchange trading, every other listed status `Halted`, an absent, null or
-    undocumented one refused; `FUNDING_SETTLEMENT_INTERVAL` one hour and funding `Unknown` until
-    FBC-204c; `X/USDT` is `X/USDT-P`; held to the hand-built `fixtures/hibachi/rest/`; and, in
+    undocumented one refused; `FUNDING_SETTLEMENT_INTERVAL` one hour and every perpetual's
+    funding `FundingSpec::Known` at it, capped at `FUNDING_RATE_CAP`, 125 bps an hour (the docs'
+    -10% to 10% read for eight hours and rescaled), on the owner's conclusion of 2026-10-28
+    (FBC-204c, 0131); `X/USDT` is `X/USDT-P`; held to the hand-built
+    `fixtures/hibachi/rest/`; and, in
     `src/md/` (FBC-2kmp, 0129), the `/ws/market` codec `HibachiMd`: `plan_md` one connection to
     `/ws/market` on the required `hibachi.data_ws_url` origin, one frame per subscription under
     the `parameters` key charged to its instrument, each orderbook naming `granularity`
@@ -662,8 +666,10 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `hibachi.orderbook_resubscribe` by the codec's own unsubscribe and subscribe, then one paced
     reconnect if no Snapshot answers; `ask_bid_price` a Touch only when fully sized and not
     crossed, a stale one gapped on its touch feed; both `trades` shapes, `mark_price`,
-    `spot_price` as the index and `funding_rate_estimation` exactly in 1e-12 units with no
-    interval or next time; what it counts on `HibachiMd::counts`, and its own copy of each book,
+    `spot_price` as the index and `funding_rate_estimation`'s eight-hour estimate
+    (`FUNDING_ESTIMATE_PERIOD`) as its exact eighth per hour in 1e-12 units with the one-hour
+    interval, one whose eighth is finer refused and never rounded, and no next time (0131); what
+    it counts on `HibachiMd::counts`, and its own copy of each book,
     which the book built from its events equals, on `HibachiMd::book_copy`; held to the hand-built
     `fixtures/hibachi/md/` (`tests/md_book.rs`, `tests/md_topics.rs`), the named conformance suite
     on `fixtures/hibachi/conformance/` (`tests/conformance.rs`), and a stub test on a paused clock

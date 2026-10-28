@@ -131,3 +131,4 @@ the old one. Cite a decision by its number. `scripts/decisions.sh new "<title>"`
 - [0127](0127-exact-head-codex-review-is-the-external-model-gate-while-dee.md) Exact-head Codex review is the external model gate while DeepSeek is disabled — accepted
 - [0128](0128-separate-public-market-data-and-private-execution-rate-decla.md) Separate public market-data and private execution rate declarations — accepted
 - [0129](0129-hibachi-s-orderbook-codec-bounds-checks-every-frame-on-its-o.md) Hibachi's orderbook codec bounds-checks every frame on its own copy, gaps a book it finds wrong and recovers it by its own resubscribe and then a reconnect, augmenting 0022 and 0124 — accepted
+- [0131](0131-hibachi-funding-is-hourly-on-the-owner-s-conclusion-discover.md) Hibachi funding is hourly on the owner's conclusion: discovery states it Known at one hour capped at 125 bps, and the codec carries the streamed eight-hour estimate's exact eighth per hour, amending 0129 — accepted

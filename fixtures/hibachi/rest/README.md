@@ -82,4 +82,6 @@ A `GET /market/data/funding-rates?symbol=ETH%2FUSDT-P` answer, `{"data": [...]}`
 The JSON types are a choice no public source pins: whole-number `contractId` and
 `fundingTimestamp`, decimal strings `fundingRate` and `indexPrice`, as Hibachi writes its other
 decimals. Six consecutive settlements, each on the UTC hour and 3600 s after the one before; the
-rates and prices are made up.
+rates and prices are made up. Each `fundingRate` is a rate for its one-hour settlement, as JAVA
+annualizes it (the owner's conclusion of 2026-10-28, FBC-204c), so the crate states funding
+`Known` at the spacing the test derives from them.

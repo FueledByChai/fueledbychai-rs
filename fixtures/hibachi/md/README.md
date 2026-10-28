@@ -28,8 +28,8 @@ Sources, cited below by name:
   `implementations/market-data-api/hibachi-market-data-impl/src/main/java/com/fueledbychai/marketdata/hibachi/HibachiQuoteEngine.java`:
   `onAskBidUpdate` L548-L575 (`bidSize`, `askSize`), `onOrderBookUpdate` L588-L640,
   `onTradesUpdate` L840-L856 (`{"trade":{..}}` or `{"trades":[..]}`) and `onFundingRateUpdate`
-  L904-L909 (`estimatedFundingRate` flat, else under `fundingRateEstimation`); it reads a root
-  `timestamp_ms` (L550, L629).
+  L904-L918 (`estimatedFundingRate` flat, else under `fundingRateEstimation`, divided by the
+  ticker's funding interval, 8); it reads a root `timestamp_ms` (L550, L629).
 
 The instruments are `fixtures/hibachi/rest/exchange_info.json`'s: ETH/USDT-P (tick 0.000001,
 step 0.000000001, quote grid 0.01, so subscribed at granularity `0.01`), SOL/USDT-P (tick 0.001,
@@ -107,9 +107,14 @@ carry `price` in place of `markPrice`, the alias JAVA reads (L581).
 ## funding_rate_estimation (WS example frame; SPEC; JAVA for the flat shape)
 
 `funding_nested` is WS's shape (`fundingRateEstimation.estimatedFundingRate`); `funding_flat`
-is JAVA's first read (`estimatedFundingRate` under `data`). `funding_finest` carries a rate of
-1e-12, the finest `MdEvent::Funding` holds; `funding_too_fine` one of 5e-13. Each carries a
-`nextFundingTimestamp`, which the codec does not read (FBC-204c).
+is JAVA's first read (`estimatedFundingRate` under `data`). Each estimate is an eight-hour rate,
+and the codec pushes its eighth as the rate per the one-hour interval (the owner's conclusion of
+2026-10-28, FBC-204c; JAVA's `onFundingRateUpdate` L914-L918 divides it by 8), so the rates are
+chosen against that division: `funding_nested`'s 0.000012 and `funding_flat`'s -0.000007 divide
+exactly, `funding_finest` carries 8e-12, whose eighth, 1e-12, is the finest `MdEvent::Funding`
+holds, `funding_indivisible` 12e-12, whose eighth, 1.5e-12, is finer and so refused, and
+`funding_too_fine` 5e-13, finer than 1e-12 itself. Each carries a `nextFundingTimestamp`, which
+the codec does not read: no source pins its unit.
 
 ## Control
 

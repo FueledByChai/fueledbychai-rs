@@ -2,7 +2,8 @@
 //! data only (`exec: None`, `Readiness::Record`, no order-entry codec or endpoint), its
 //! capabilities state the orderbook channel at the configured depth with an unknown cadence, no
 //! sequence, a window and brackets only, the `ask_bid_price` touch, the trades with their taker
-//! side, the mark and the spot price as the index, the funding stream with no interval, JSON and
+//! side, the mark and the spot price as the index, the funding stream stating its one-hour
+//! interval and no next time (FBC-204c, decision 0131), JSON and
 //! one-second timestamps, the REST limit and the taker speed bump; every configuration key is
 //! required and checked, the orderbook depth refused when absent or outside 1 to 100 and the
 //! resubscribe interval when absent or zero; and `plan_md` plans one `/ws/market` connection
@@ -111,13 +112,14 @@ fn the_orderbook_channel_is_declared_at_the_configured_depth() {
 fn the_market_data_caps_declare_json_the_funding_stream_and_second_timestamps() {
     let md = Hibachi.caps(&config()).unwrap().md;
     assert_eq!(md.encoding, Encoding::Json);
-    // The funding_rate_estimation stream: no interval, and no next time until its unit is
-    // pinned; MdCaps carries no funding interval.
+    // The funding_rate_estimation stream: each event states the one-hour interval its rate is
+    // per (the codec's, on the owner's conclusion, since the frames carry none), and no next
+    // time until its unit is evidenced.
     assert_eq!(
         md.funding,
         FundingCaps {
             source: FeedSource::Stream,
-            interval_reported: false,
+            interval_reported: true,
             next_time_reported: false,
         }
     );
@@ -406,7 +408,10 @@ fn specs() -> SpecTable {
         multiplier: rust_decimal::Decimal::ONE,
         quote_ccy: usdt,
         settle_ccy: usdt,
-        funding: FundingSpec::Unknown,
+        funding: FundingSpec::Known {
+            interval: fbc_venue_hibachi::FUNDING_SETTLEMENT_INTERVAL,
+            cap: Some(fbc_venue_hibachi::FUNDING_RATE_CAP),
+        },
         public_fees: None,
         status: TradingStatus::Trading,
         sessions: None,
