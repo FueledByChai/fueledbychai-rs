@@ -6,14 +6,22 @@ use rust_decimal::Decimal;
 
 /// The help text `--help` prints.
 pub const USAGE: &str = "\
-md_watch: prints live Paradex and Binance USD-M touches and top-of-book through fbc-runtime.
-It never sends an order and never reads a credential.
+md_watch: prints live Paradex, Binance USD-M and Hibachi touches and top-of-book through
+fbc-runtime. It never sends an order and never reads a credential.
 
 Usage: cargo run -p fbc-examples --example md_watch -- [OPTIONS]
+
+Examples:
+  cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --binance BTCUSDT
+  cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance ETHUSDT
 
 Markets (at least one):
   --paradex <MARKET>      Paradex market, e.g. BTC-USD-PERP: its bbo, trades and deltas book
   --binance <SYMBOL>      Binance USD-M symbol, e.g. BTCUSDT: its bookTicker and diff-depth book
+  --hibachi <SYMBOL>      Hibachi contract, e.g. ETH/USDT-P: its ask_bid_price touch, trades and
+                          orderbook book from the anonymous /ws/market feed; its tick, step,
+                          book granularity, status and session calendar are read first from
+                          GET /market/exchange-info on --hibachi-rest
 
 Options:
   --socks5 <HOST:PORT>    connect through this SOCKS5 proxy, which resolves the venues' names
@@ -35,15 +43,33 @@ Options:
   --paradex-step <DEC>    size step the Paradex market is decoded on (default 0.00000001)
   --binance-tick <DEC>    price grid the Binance symbol is decoded on (default 0.00000001)
   --binance-step <DEC>    size step the Binance symbol is decoded on (default 0.00000001)
+  --hibachi-rest <URL>    Hibachi market-data REST origin, read once for the contract
+                          (default https://data-api.hibachi.xyz)
+  --hibachi-ws <URL>      Hibachi market-data WebSocket origin; md_watch connects to /ws/market
+                          on it (default wss://data-api.hibachi.xyz)
+  --hibachi-timeout <MS>  how long the contract's REST read waits, in milliseconds
+                          (default 5000)
+  --hibachi-depth <N>     levels per side the orderbook subscription asks for, 1 to 100
+                          (default 15, the deepest --top prints)
+  --hibachi-granularity <DEC>
+                          the orderbook subscription's granularity, in place of the contract's
+                          quote grid (its finest listed orderbookGranularity at or above its
+                          tick, or the tick): a whole number of its ticks, sent in its shortest
+                          spelling (0.10 as 0.1); for checking that Hibachi honours the field
+  --hibachi-retry <MS>    how long after finding the orderbook broken the codec subscribes it
+                          again, and then waits for its Snapshot before reconnecting, in
+                          milliseconds (default 2000)
   -h, --help              print this help
 
 A market is spelled as the venue spells it: a Paradex market in ASCII letters, digits and
 '-', as typed (BTC-USD-PERP, kBONK-USD-PERP), a Binance symbol in capitals, digits and '-'
-(BTCUSDT); a frame for any other spelling would be refused, so md_watch refuses the spelling
-instead. A price or size off its grid is refused as a decode error, and its frame prints
-nothing. The default grids are the finest either venue publishes (8 decimal places), so every
-market decodes without looking its grid up; giving the market's own tick and step only makes
-the refusal stricter.
+(BTCUSDT), a Hibachi contract in ASCII letters, digits, '/' and '-', as typed (ETH/USDT-P); a
+frame for any other spelling would be refused, so md_watch refuses the spelling instead. A
+price or size off its grid is refused as a decode error, and its frame prints nothing. The
+default Paradex and Binance grids are the finest either venue publishes (8 decimal places), so
+every market decodes without looking its grid up; giving the market's own tick and step only
+makes the refusal stricter. A Hibachi contract's grids are its own, as Hibachi lists it, and a
+contract it does not list is refused before anything connects.
 
 Lines:
   TOUCH <venue> <market> <channel> bid <px> x <size> ask <px> x <size> mid <px> spread <bps>bps
@@ -51,6 +77,17 @@ Lines:
     <rank> bid <px> x <size> | ask <px> x <size>   under it, the book's best levels with --top
   TRADE <venue> <market> <buy|sell|unknown> <size> @ <px>
   HEALTH <venue> <market> <channel> <live|gap|stale|refused>
+  MARKET <venue> <market> <open|closed ...>    a Hibachi contract's state: once its read is
+                                               in, then whenever its session calendar opens or
+                                               closes it (whether a closed contract's feed
+                                               falls silent, and so reads stale, is not known
+                                               yet: see the crate's README)
+  COUNTS <venue> <market> <counter> <n> ...    what the Hibachi codec counted on the current
+                                               connection (frames and sides it passed over or
+                                               found wrong, resubscribes, reconnects): a kind
+                                               as it is first counted, then all of them before
+                                               each RECONNECT or CLOSED line (none when
+                                               nothing was counted)
   RECONNECT <venue> conn <n> epoch <e> ended   the connection dropped; its books are invalid
                                                until their next snapshot
   CLOSED <venue> conn <n> epoch <e> ended      md_watch stopped and closed the connection
@@ -66,6 +103,20 @@ pub const FINEST: &str = "0.00000001";
 pub const PARADEX_URL: &str = "wss://ws.api.prod.paradex.trade/v1";
 pub const BINANCE_WS: &str = "wss://fstream.binance.com";
 pub const BINANCE_REST: &str = "https://fapi.binance.com";
+/// Hibachi's market-data origins: the host its Market API spec names as its server, and the
+/// origin its WebSocket market docs give `/ws/market` on (`fbc-venue-hibachi`'s config keys).
+pub const HIBACHI_REST: &str = "https://data-api.hibachi.xyz";
+pub const HIBACHI_WS: &str = "wss://data-api.hibachi.xyz";
+/// How long the contract's REST read waits, as md_watch waits for Binance's snapshot.
+pub const HIBACHI_TIMEOUT_MS: u64 = 5_000;
+/// The orderbook subscription's depth: the deepest `--top`, so every level `--top` can print is
+/// in the book.
+pub const HIBACHI_DEPTH: u16 = 15;
+/// The deepest orderbook subscription Hibachi takes (`fbc-venue-hibachi`'s
+/// `hibachi.orderbook_depth`).
+pub const HIBACHI_MAX_DEPTH: u16 = 100;
+/// How long a broken orderbook waits for its resubscribe, as md_watch's Binance snapshot retry.
+pub const HIBACHI_RETRY_MS: u64 = 2_000;
 
 /// The deepest `--top`: Paradex's book channel carries 15 levels per side.
 pub const MAX_TOP: usize = 15;
@@ -89,12 +140,27 @@ pub enum ParadexTouch {
     Both,
 }
 
+/// A Hibachi contract and how its market data is read: everything `fbc-venue-hibachi`'s
+/// configuration requires, and the orderbook granularity when the command line overrides the
+/// contract's own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HibachiOpts {
+    pub symbol: String,
+    pub rest: String,
+    pub ws: String,
+    pub timeout_ms: u64,
+    pub depth: u16,
+    pub granularity: Option<Decimal>,
+    pub retry_ms: u64,
+}
+
 /// What to watch and how.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     pub paradex: Option<Market>,
     pub paradex_touch: ParadexTouch,
     pub binance: Option<Market>,
+    pub hibachi: Option<HibachiOpts>,
     pub proxy: ProxyConfig,
     pub seconds: Option<u64>,
     pub top: usize,
@@ -121,6 +187,13 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut paradex_url = PARADEX_URL.to_owned();
     let mut binance_ws = BINANCE_WS.to_owned();
     let mut binance_rest = BINANCE_REST.to_owned();
+    let mut hibachi = None;
+    let mut hibachi_rest = HIBACHI_REST.to_owned();
+    let mut hibachi_ws = HIBACHI_WS.to_owned();
+    let mut hibachi_timeout_ms = HIBACHI_TIMEOUT_MS;
+    let mut hibachi_depth = HIBACHI_DEPTH;
+    let mut hibachi_granularity = None;
+    let mut hibachi_retry_ms = HIBACHI_RETRY_MS;
     let finest: Decimal = FINEST.parse().expect("a decimal");
     let mut grids = [finest; 4];
     let mut args = args.into_iter();
@@ -137,6 +210,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         match flag.as_str() {
             "--paradex" => paradex = Some(symbol(&flag, value()?, Spelling::Paradex)?),
             "--binance" => binance = Some(symbol(&flag, value()?, Spelling::Binance)?),
+            "--hibachi" => hibachi = Some(symbol(&flag, value()?, Spelling::Hibachi)?),
             "--paradex-touch" => {
                 paradex_touch = match value()?.as_str() {
                     "bbo" => ParadexTouch::Bbo,
@@ -171,18 +245,48 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--paradex-step" => grids[1] = positive(&flag, &value()?)?,
             "--binance-tick" => grids[2] = positive(&flag, &value()?)?,
             "--binance-step" => grids[3] = positive(&flag, &value()?)?,
+            "--hibachi-rest" => hibachi_rest = value()?,
+            "--hibachi-ws" => hibachi_ws = value()?,
+            "--hibachi-timeout" => hibachi_timeout_ms = millis(&flag, &value()?)?,
+            "--hibachi-depth" => {
+                let n = value()?;
+                match n.parse::<u16>() {
+                    Ok(n) if (1..=HIBACHI_MAX_DEPTH).contains(&n) => hibachi_depth = n,
+                    _ => {
+                        return Err(format!(
+                            "--hibachi-depth {n}: not a whole number from 1 to {HIBACHI_MAX_DEPTH}"
+                        ));
+                    }
+                }
+            }
+            "--hibachi-granularity" => hibachi_granularity = Some(positive(&flag, &value()?)?),
+            "--hibachi-retry" => hibachi_retry_ms = millis(&flag, &value()?)?,
             _ => return Err(format!("unknown argument {flag}; --help lists them")),
         }
     }
-    if paradex.is_none() && binance.is_none() {
-        return Err("name a market: --paradex <MARKET>, --binance <SYMBOL> or both".to_owned());
+    if paradex.is_none() && binance.is_none() && hibachi.is_none() {
+        return Err(
+            "name a market: --paradex <MARKET>, --binance <SYMBOL>, --hibachi <SYMBOL>, or more \
+             than one"
+                .to_owned(),
+        );
     }
     let market =
         |symbol: Option<String>, tick, step| symbol.map(|symbol| Market { symbol, tick, step });
+    let hibachi = hibachi.map(|symbol| HibachiOpts {
+        symbol,
+        rest: hibachi_rest,
+        ws: hibachi_ws,
+        timeout_ms: hibachi_timeout_ms,
+        depth: hibachi_depth,
+        granularity: hibachi_granularity,
+        retry_ms: hibachi_retry_ms,
+    });
     Ok(Parsed::Watch(Box::new(Options {
         paradex: market(paradex, grids[0], grids[1]),
         paradex_touch,
         binance: market(binance, grids[2], grids[3]),
+        hibachi,
         proxy,
         seconds,
         top,
@@ -202,6 +306,10 @@ enum Spelling {
     /// subscription said, and the spec table matches the name exactly, so `btcusdt` would
     /// subscribe and then have every frame refused unseen.
     Binance,
+    /// ASCII letters, digits, `/` and `-`, passed through as typed: Hibachi spells every
+    /// perpetual `<underlying>/<quote>-P` (`ETH/USDT-P`), and the contract's read refuses a
+    /// spelling it does not list before anything subscribes.
+    Hibachi,
 }
 
 /// A market as its venue spells it on the wire, or why it is not.
@@ -214,6 +322,10 @@ fn symbol(flag: &str, value: String, spelling: Spelling) -> Result<String, Strin
         Spelling::Binance => (
             u8::is_ascii_uppercase,
             "capitals, digits and '-', e.g. BTCUSDT",
+        ),
+        Spelling::Hibachi => (
+            |b: &u8| b.is_ascii_alphabetic() || *b == b'/',
+            "letters, digits, '/' and '-', e.g. ETH/USDT-P",
         ),
     };
     if value
@@ -251,5 +363,15 @@ fn positive(flag: &str, value: &str) -> Result<Decimal, String> {
     match value.parse::<Decimal>() {
         Ok(d) if d > Decimal::ZERO => Ok(d),
         _ => Err(format!("{flag} {value}: not a positive decimal")),
+    }
+}
+
+/// A positive whole number of milliseconds.
+fn millis(flag: &str, value: &str) -> Result<u64, String> {
+    match value.parse::<u64>() {
+        Ok(ms) if ms > 0 => Ok(ms),
+        _ => Err(format!(
+            "{flag} {value}: not a positive whole number of milliseconds"
+        )),
     }
 }

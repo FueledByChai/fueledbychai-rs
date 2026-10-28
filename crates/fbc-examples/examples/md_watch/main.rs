@@ -1,16 +1,18 @@
-//! md_watch: subscribes to a Paradex market and a Binance USD-M symbol through fbc-runtime and
-//! prints their live touches and top-of-book, a line per update, until Ctrl-C or `--seconds`.
-//! An owner-run sample: CI builds it, and its wiring is tested against the conformance stub
-//! (`tests/md_watch.rs`), but nothing runs it against a venue. It never sends an order and never
-//! reads a credential.
+//! md_watch: subscribes to a Paradex market, a Binance USD-M symbol and a Hibachi contract
+//! through fbc-runtime and prints their live touches and top-of-book, a line per update, until
+//! Ctrl-C or `--seconds`. An owner-run sample: CI builds it, and its wiring is tested against
+//! the conformance stub (`tests/md_watch.rs`), but nothing runs it against a venue. It never
+//! sends an order and never reads a credential.
 //!
 //! ```text
 //! cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --binance BTCUSDT
 //! cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --paradex-touch both
+//! cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance ETHUSDT
 //! cargo run -p fbc-examples --example md_watch -- --help
 //! ```
 
 mod args;
+mod hibachi;
 mod watch;
 
 use std::cell::RefCell;

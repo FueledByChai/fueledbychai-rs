@@ -545,6 +545,7 @@ dependencies = [
  "fbc-oms",
  "fbc-runtime",
  "fbc-venue-binance-usdm",
+ "fbc-venue-hibachi",
  "fbc-venue-paradex",
  "log",
  "rust_decimal",

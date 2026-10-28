@@ -535,8 +535,11 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is
     an example target whose wiring a test in `tests/` includes by path and runs against the
     conformance stub. So far `examples/md_watch/`: a Paradex market's bbo, trades and `deltas`
-    book and a Binance USD-M symbol's `bookTicker` and diff-depth book through `MdVenue`, one
-    `MdBooks` per venue, a line per update; no order, no credential (`tests/md_watch.rs`); and
+    book, a Binance USD-M symbol's `bookTicker` and diff-depth book, and a Hibachi contract's
+    `ask_bid_price` touch, trades and `orderbook` book (FBC-9o7e: the contract read first
+    through the venue's discovery, its open or closed state and its codec's counts printed,
+    `examples/md_watch/hibachi.rs`) through `MdVenue`, one `MdBooks` per venue, a line per
+    update; no order, no credential (`tests/md_watch.rs`); and
     `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs, exactly the testnet's
     or a loopback stub's at `/v1`, and the chain id checked before anything connects), an
     fbc-oms registry declared an owner-assisted testnet run (decision 0067) behind one
