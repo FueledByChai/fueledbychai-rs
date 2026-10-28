@@ -39,12 +39,17 @@ public Java library does at b4188a5.
    divisor is 8 either way.
 3. The payment interval is one hour. `nextFundingTimestamp`'s unit is still unevidenced.
 
+The owner then settled the cap, given in chat on 2026-10-28 in answer to PR #212, which asked
+whether the docs' limit is 10% per eight hours (125 bps per hour) or 10% per hour (1000 bps):
+"funding cap of 125 bps/hr".
+
 Supporting documentation: docs.hibachi.xyz's Funding page
 (<https://docs.hibachi.xyz/hibachi-docs/trading/funding>) says payments are made every hour, with
 `Funding Rate = (1/8) × mean(ρ_t)` and `Funding Payment = Q × Funding Rate × S_settlement` at each
 hourly settlement. No account id, position, rate or price is recorded (0009).
 
-Two choices the conclusion leaves to this record. The cap: the redocly trading page
+Two choices the conclusion left open. The cap, which the owner has since settled at 125 bps per
+hour (above): the redocly trading page
 (<https://hibachi-docs.redocly.app/docs/trading>, read 2026-10-28) states "Funding Rate Limits:
 -10% to 10%" under Limits, naming no interval, and the one funding rate that page defines is
 for its eight-hour period ("There are 28,800 seconds in an 8-hour interval"; its Predicted and
@@ -62,6 +67,7 @@ is not always a whole number of 1e-12.
 2. **The cap.** The docs' -10% to 10% is read as a limit on the eight-hour rate the page defines,
    the period the streamed estimate is a rate for (`FUNDING_ESTIMATE_PERIOD`), and rescaled to
    the one-hour interval as the estimate is: 1000 bps / 8 = **125 bps per hour**, either way.
+   The owner confirmed this value (OWNER, above).
 3. **The codec.** `funding_rate_estimation`'s `estimatedFundingRate` becomes `MdEvent::Funding`
    with `rate_e12` its exact eighth, the rate per one-hour interval, and `interval:
    Some(FUNDING_SETTLEMENT_INTERVAL)`. This amends 0129's item 9, whose other rules stand.
@@ -80,7 +86,8 @@ is not always a whole number of 1e-12.
 
 ## Alternatives
 
-- Read the docs' limit as 10% per hour (a cap of 1000 bps per interval): not done. The page that
+- Read the docs' limit as 10% per hour (a cap of 1000 bps per interval): not done, and the owner
+  chose 125 bps per hour (OWNER, above). The page that
   states the limit defines no hourly rate; its only funding rate is the eight-hour one, the same
   period the owner's conclusion gives the streamed estimate. If the venue's settled rates show
   otherwise, this record is reopened (below).
