@@ -132,6 +132,9 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
             stats: FeedSource::None,
             mark: FeedSource::None,
             index: FeedSource::None,
+            // Reference data only: no codec here decodes a symbol's trading status, so none is
+            // reported and discovery's snapshot stands (decision 0130).
+            status: FeedSource::None,
             // `E` and `T` are milliseconds [TICKER], [PARTIAL].
             ts_precision: Duration::from_millis(1),
             topology: ConnTopology::Shared {

@@ -139,6 +139,8 @@ pub fn synthetic_caps() -> VenueCaps {
             stats: FeedSource::None,
             mark: FeedSource::Stream,
             index: FeedSource::Poll,
+            // The synthetic venue reports no trading status (decision 0130).
+            status: FeedSource::None,
             ts_precision: Duration::from_micros(1),
             topology: ConnTopology::Shared {
                 max_subscriptions: Some(200),

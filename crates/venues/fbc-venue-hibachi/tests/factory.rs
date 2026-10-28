@@ -158,6 +158,8 @@ fn the_market_data_caps_declare_json_the_funding_stream_and_second_timestamps() 
     assert_eq!(md.mark, FeedSource::Stream);
     assert_eq!(md.index, FeedSource::Stream);
     assert_eq!(md.stats, FeedSource::None);
+    // The trading status re-read by the status poll on REST (decision 0130).
+    assert_eq!(md.status, FeedSource::Poll);
     assert_eq!(
         md.topology,
         ConnTopology::Shared {

@@ -228,7 +228,8 @@ pub enum MdEvent {
     /// venue's own schedule included (decision 0130). It replaces the snapshot its
     /// [`InstrumentSpec::status`](crate::InstrumentSpec) holds from discovery, which the
     /// consumer passes on (to `fbc-oms`'s planner, for one) until the first of these arrives.
-    /// It is no book event and no feed's health.
+    /// [`MdCaps::status`](crate::MdCaps) says whether the venue's market data reports it, and
+    /// from where. It is no book event and no feed's health.
     Status {
         inst: InstrumentId,
         status: TradingStatus,

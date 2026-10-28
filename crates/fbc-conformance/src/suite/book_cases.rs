@@ -11,7 +11,9 @@
 //! [`ConnTopology`](fbc_core::ConnTopology): the first alone for `PerInstrument`, the first
 //! `max_subscriptions` for a capped shared connection, every one otherwise. A case's frames
 //! name those instruments only: an event on another instrument, or a `gap=` tag naming one, is
-//! a breach (Codex r4217991939). A channel whose
+//! a breach (Codex r4217991939). So is a trading status ([`MdEvent::Status`]) from a venue whose
+//! [`MdCaps::status`](fbc_core::MdCaps) declares it reports none, `FeedSource::None`
+//! (decision 0130). A channel whose
 //! [`BookCaps::rest_anchor`] is true is skipped by name, saying why: its snapshot comes in an
 //! HTTP answer, which these case files do not carry (FBC-fhk4).
 //!
@@ -47,8 +49,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use fbc_core::{
-    BookCaps, BookId, Channel, DecodeError, Effects, InstrumentId, MdEvent, MdSink, RawFrame,
-    SpecTable, VenueMeta,
+    BookCaps, BookId, Channel, DecodeError, Effects, FeedSource, InstrumentId, MdEvent, MdSink,
+    RawFrame, SpecTable, VenueMeta,
 };
 
 use super::frames::{self, EXT, unhex};
@@ -233,6 +235,26 @@ pub(crate) fn decode(h: &Harness<'_>, book: &Book, case: &[Line]) -> Result<Vec<
     }))
 }
 
+/// What `step`, of the case read from `file`, breaks of the status source the venue declares,
+/// `declared` ([`MdCaps::status`](fbc_core::MdCaps)): one breach per trading status it pushed
+/// when that is `FeedSource::None`, none otherwise (decision 0130).
+fn undeclared_statuses(declared: FeedSource, file: &str, step: &Step) -> Vec<Breach> {
+    if declared != FeedSource::None {
+        return Vec::new();
+    }
+    let statuses = step.events.iter().map(|(_, ev)| ev);
+    statuses
+        .filter(|ev| matches!(ev, MdEvent::Status { .. }))
+        .map(|ev| {
+            let what = format!(
+                "{file} line {}: {ev:?}, a trading status the venue declares it does not report",
+                step.line
+            );
+            Breach::new("MdCaps.status is FeedSource::None", what)
+        })
+        .collect()
+}
+
 /// The instrument `ev` is on.
 fn inst_of(ev: &MdEvent) -> InstrumentId {
     match *ev {
@@ -328,6 +350,8 @@ impl PerBook<'_> {
                     );
                     breaches.push(Breach::new(&file, what));
                 }
+                // Only a status the caps say the venue reports (decision 0130).
+                breaches.extend(undeclared_statuses(h.caps.md.status, &file, step));
             }
             probed.push((self.judge)(book, &file, &steps, h.specs(), &mut breaches));
         }
@@ -405,6 +429,41 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_trading_status_breaches_only_a_venue_whose_caps_declare_it_reports_none() {
+        use fbc_core::TradingStatus;
+        // The toy declares none, so a status from it is a breach, one per status; a venue
+        // declaring a source may report one, and no other event is a status.
+        assert_eq!(crate::toy::caps().md.status, FeedSource::None);
+        let status = MdEvent::Status {
+            inst: crate::toy::INST_A,
+            status: TradingStatus::Halted,
+        };
+        let health = MdEvent::Health {
+            inst: crate::toy::INST_A,
+            feed: fbc_core::Feed::Trades,
+            h: fbc_core::FeedHealth::Gap,
+        };
+        let step = Step {
+            line: 4,
+            binary: false,
+            tags: Tags::default(),
+            result: Ok(()),
+            events: vec![(VenueMeta::NONE, health), (VenueMeta::NONE, status)],
+        };
+        let breaches = undeclared_statuses(FeedSource::None, "continuity/book.frames", &step);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
+        assert_eq!(breaches[0].capability, "MdCaps.status is FeedSource::None");
+        assert!(
+            (breaches[0].what).starts_with("continuity/book.frames line 4: Status {"),
+            "{breaches:?}"
+        );
+        for declared in [FeedSource::Poll, FeedSource::Stream] {
+            let none = undeclared_statuses(declared, "continuity/book.frames", &step);
+            assert!(none.is_empty(), "{declared:?}: {none:?}");
+        }
     }
 
     #[test]

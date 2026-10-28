@@ -181,6 +181,8 @@ fn the_factory_declares_market_data_with_its_cited_limits() {
     );
     assert_eq!(md.touch_sources[0].channel, "bbo");
     assert_eq!(md.trades.source, FeedSource::Stream);
+    // No market's trading status is reported (decision 0130).
+    assert_eq!(md.status, FeedSource::None);
     assert_eq!(
         md.books.len(),
         2,

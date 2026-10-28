@@ -191,6 +191,8 @@ fn stood_caps() -> VenueCaps {
             stats: FeedSource::None,
             mark: FeedSource::None,
             index: FeedSource::None,
+            // The stood-in venue reports no trading status (decision 0130).
+            status: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
             topology: ConnTopology::PerInstrument,
             max_conn_lifetime: None,

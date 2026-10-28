@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use fbc_book::{Books, Top};
 use fbc_core::{
     Aggressor, AssetSym, BookSide, Cadence, DecodeError, Effect, Effects, ExchNs, ExchTsKind, Feed,
-    FeedHealth, FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId,
+    FeedHealth, FeedSource, FundingSpec, HttpFailure, HttpTag, Inbound, InboundSpans, InstrumentId,
     InstrumentKind, InstrumentSpec, Lots, Lvl, MdCodec, MdEvent, MdSink, MdTransport, MonoNs,
     PriceGrid, RawFrame, Readiness, Secrets, SizeStep, SpecTable, Subscription, Ticks, TimerTag,
     TradingStatus, UnderlyingId, VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta, WallNs,
@@ -247,6 +247,8 @@ fn public_factory_plans_one_read_only_mds_connection() {
     assert_eq!(caps.exec, None);
     assert_eq!(caps.readiness_ceiling, Readiness::Record);
     assert!(!caps.md.trades.aggressor);
+    // No market's trading status is reported (decision 0130).
+    assert_eq!(caps.md.status, FeedSource::None);
     assert_eq!(caps.md.books[0].max_depth, 20);
     assert!(Qfex.plan_exec(&cfg()).unwrap().is_empty());
     assert!(Qfex.exec_codec(&cfg(), Secrets::new()).is_none());

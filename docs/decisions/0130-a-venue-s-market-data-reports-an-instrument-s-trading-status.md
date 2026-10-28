@@ -51,12 +51,14 @@ comes, after any timer that fired meanwhile (0027).
    firings gives the same events (0006).
 2. **What it means to the consumer.** The status the consumer passes `PlanVenue::status` is the
    spec's until the venue reports one, then the latest reported. A venue that reports none
-   leaves the spec's snapshot standing. A codec reports a status only through this event, to
-   the consumer's handler.
+   leaves the spec's snapshot standing, and its capabilities say so (point 6). A codec reports a
+   status only through this event, to the consumer's handler.
 3. **The calendar answers when it next closes.** `SessionCalendar::next_closed(from)` gives the
    first instant at or after `from` at which some part of the calendar closes the instrument
    (`from` itself while it is closed), reading no clock, so a codec can ask the runtime for a
-   timer at a session's end (0125 gave the calendar only `is_open`).
+   timer at a session's end (0125 gave the calendar only `is_open`). It never gives an instant
+   `is_open` holds open: a weekly occurrence wholly inside a skipped daylight-saving stretch
+   closes nothing (0125), so it is passed over for the next that closes something.
 4. **Hibachi's status poll.** `plan_md` plans, beside `/ws/market`, a poll endpoint (0027) on the
    market-data REST origin carrying the same subscriptions, its stream `STATUS_STREAM`. Its
    codec sends `GET /market/exchange-info` from a timer every `hibachi.status_interval` (whole
@@ -82,10 +84,26 @@ comes, after any timer that fired meanwhile (0027).
    contract shows during the call auction that follows a scheduled maintenance and the FX
    reopening. Until FBC-vg2n settles it from evidence, a market stays halted for the required
    `hibachi.auction_halt` (whole seconds, no default, zero refused) after every reopening the
-   codec knows of: a published window's end, a reopening of its calendar, and an advertised
-   open. A maintenance the exchange status shows with no published window has no end the codec
-   knows, so no window follows it; the status alone halts the market until a read shows the
-   exchange `NORMAL`.
+   codec knows of. A scheduled one is a published window's end, a reopening of its calendar or
+   an advertised open, at its instant. One its reads show follows a read that showed the market
+   halted by its contract's status or the exchange's: a maintenance with no published window or
+   past the end of the one published, an FX pair still `PAUSED` after its calendar reopens. The
+   venue reopened it after that read and no later than the judged time of the first read that
+   can lift it (sent after every halt of it) and shows it trading again, so the window is
+   counted from that judged time; a read sent before that halt is not such a read, since it may
+   show the venue before the halt. What this guarantees: no read whose span may meet a reopening
+   the codec knows of, or the window after it, reports the market trading. What it does not: a
+   halt and a reopening that no schedule announces and no read shows, both between two reads,
+   are never reported and start no window, and neither does a reopening before the first read.
+6. **The capability.** `MdCaps` gains a mandatory `status: FeedSource`, as `trades.source`,
+   `funding.source`, `stats`, `mark` and `index` say where their kinds of market data come
+   from (0003, 0014): `None` where the adapter's market data reports no status, so a consumer
+   knows from the capabilities alone that the spec's discovery snapshot is all it will have;
+   `Poll` where it re-reads it from REST, Hibachi's; `Stream` where a streamed channel carries
+   it. No subscription asks for it: a venue declaring a source reports it for every instrument
+   its market data is subscribed to. Every adapter and toy declares it with its source, each
+   venue's tests pin it, and the conformance kit's market-data checks count a status from a
+   venue that declares `None` as a breach.
 
 ## Alternatives
 
@@ -96,10 +114,18 @@ comes, after any timer that fired meanwhile (0027).
   trusted, not whether orders are accepted; a halted market's book is still the venue's book.
 - A side channel from the codec to the consumer: rejected for the reasons above (unstamped,
   outside ingest order and replay).
-- A status feed in `Feed` and a capability for it (0003): not taken now. The event says what the
-  venue reported; a consumer passes the spec's status until one arrives, so it needs no flag to
-  read it. If a consumer must know in advance whether a venue re-reads its status, the
-  capability is a new mandatory field and a record.
+- A status feed in `Feed`, subscribed per instrument: not taken. A status concerns every
+  instrument the venue's market data is subscribed to, as the planner reads it, not a channel a
+  consumer chooses; the capability (point 6) says where it comes from.
+- No capability, the event alone telling a consumer that a venue reports status: rejected
+  (Reviewer B RB214-2 on PR #214). Every other kind of non-book market data declares its source
+  as a `FeedSource`, and without one a consumer could not tell, before any event, a live status
+  from a discovery snapshot that never refreshes except by the venue's name (0003), nor could the
+  conformance kit hold an adapter to it.
+- Counting the window after a reopening the reads show from the judged time of the last read
+  that showed the market halted (Reviewer A RA214-2's first form): rejected. The venue may
+  reopen any time up to the judged time of the first read showing it trading again, so a window
+  counted from the earlier read can end while the auction still runs.
 - Judging an answer at the latest wall time any timer gave before it arrived: rejected (FBC-1632
   notes, 2026-10-22). No timer need fire between a read's send and its answer, and an advertised
   open judged at that later time would read a read sent before the open as made after it.
@@ -108,6 +134,12 @@ comes, after any timer that fired meanwhile (0027).
 ## Consequences
 
 - Every exhaustive match on `MdEvent` grows an arm; a consumer's handler sees a new event.
+- Every `MdCaps` literal states `status`; Paradex, Binance USD-M, QFEX and the toys declare
+  `None`, Hibachi `Poll`.
+- A market a read shows halted by status stays halted until a read sent one reopening window
+  after the first read showing it trading again is judged. The reopening's instant is known
+  only to lie between two reads, so this can hold it up to an interval and an answer's delay
+  longer than a scheduled reopening would.
 - A consumer that quotes on Hibachi passes each reported status into `PlanVenue::status`; a
   command it authorizes through the registry directly is still not checked against status.
 - A change no schedule announces (a pair paused early, an unscheduled maintenance) reaches the
@@ -122,5 +154,6 @@ comes, after any timer that fired meanwhile (0027).
 - Evidence (FBC-vg2n) that a call auction shows its own status, or none of these, which would
   change the window after a reopening.
 - A venue whose status changes faster than a REST interval can follow, or one that streams it,
-  which would want a feed and a capability for it.
-- A consumer that needs, before any event, to know whether a venue reports status at all.
+  which would want a streamed codec declaring `FeedSource::Stream`.
+- A venue whose status source differs by instrument, which one `FeedSource` per venue cannot
+  say.

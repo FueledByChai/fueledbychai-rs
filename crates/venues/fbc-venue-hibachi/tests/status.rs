@@ -131,7 +131,6 @@ fn reads_go_out_from_timers_at_the_interval_and_each_answer_is_judged_at_the_tim
     assert_eq!(sink.0, expected);
     assert_eq!(codec.counts().reads, 1);
     assert_eq!(codec.counts().judged, 1);
-    assert_eq!(codec.reported(ETH), Some(TRADING));
     // A frame is refused: a poll endpoint receives none.
     let refused = fbc_core::dispatch_market_data(&caps, |scope| {
         codec.on_frame(
@@ -163,48 +162,49 @@ fn only_a_live_contract_on_a_normal_exchange_is_trading_each_reported_once_when_
     let t = WEDNESDAY;
     let mut sim = Sim::new(t);
     sim.answer_next("live");
-    let script: [(i64, Vec<u8>); 15] = [
-        (60, answer("live")),
-        (120, answer("eth_paused")),
-        (180, answer("eth_paused")),
-        (240, answer("live")),
-        (300, eth_status(json!("LISTED"))),
-        (360, answer("live")),
-        (420, eth_status(json!("PRE_OPEN"))),
-        (480, answer("live")),
-        (540, eth_status(json!("CLOSED"))),
-        (600, answer("live")),
-        (660, answer("unscheduled_maintenance")),
-        (720, answer("unscheduled_maintenance")),
-        (780, answer("live")),
-        (840, answer("scheduled_maintenance")),
-        (900, answer("live")),
+    // Each halt by status: its answers, then LIVE and NORMAL again. The first of those shows the
+    // venue reopened the market by then, so it and every read sent within the window after it
+    // (AFTER, two intervals) leave the market halted, and the third lifts it (RA214-2).
+    let halts: [(Vec<Vec<u8>>, &[fbc_core::InstrumentId]); 6] = [
+        (vec![answer("eth_paused"), answer("eth_paused")], &[ETH]),
+        (vec![eth_status(json!("LISTED"))], &[ETH]),
+        (vec![eth_status(json!("PRE_OPEN"))], &[ETH]),
+        (vec![eth_status(json!("CLOSED"))], &[ETH]),
+        (
+            vec![
+                answer("unscheduled_maintenance"),
+                answer("unscheduled_maintenance"),
+            ],
+            &MARKETS,
+        ),
+        // The scheduled maintenance's window (1792584290 to 1792584330, t+290 to t+330) has
+        // ended, with the window after it, long before: the exchange's status alone halts.
+        (vec![answer("scheduled_maintenance")], &MARKETS),
     ];
+    assert_eq!(AFTER, 2 * INTERVAL);
+    let mut script: Vec<(i64, Vec<u8>)> = vec![(60, answer("live"))];
+    let mut expected: Seen = each(0.0, &MARKETS, TRADING);
+    for (bodies, markets) in halts {
+        let halted = (script.len() as i64 + 1) * INTERVAL;
+        for body in bodies {
+            script.push(((script.len() as i64 + 1) * INTERVAL, body));
+        }
+        for _ in 0..3 {
+            script.push(((script.len() as i64 + 1) * INTERVAL, answer("live")));
+        }
+        let lifted = script.len() as i64 * INTERVAL;
+        // The exchange in either maintenance halts every market, LIVE as each is listed.
+        expected.extend(each(halted as f64, markets, HALTED));
+        expected.extend(each(lifted as f64, markets, TRADING));
+    }
+    let reads = script.len();
     for (at, body) in script {
         sim.advance_to((t + at) as f64);
         let tag = sim.next_read();
         sim.answer(tag, &body).unwrap();
     }
-    let mut expected: Seen = each(0.0, &MARKETS, TRADING);
-    for (halted, lifted) in [
-        (120.0, 240.0),
-        (300.0, 360.0),
-        (420.0, 480.0),
-        (540.0, 600.0),
-    ] {
-        expected.push((halted, ETH, HALTED));
-        expected.push((lifted, ETH, TRADING));
-    }
-    // The exchange in either maintenance halts every market, LIVE as each is listed.
-    expected.extend(each(660.0, &MARKETS, HALTED));
-    expected.extend(each(780.0, &MARKETS, TRADING));
-    expected.extend(each(840.0, &MARKETS, HALTED));
-    // The scheduled maintenance's window (1792584290 to 1792584330, t+290 to t+330) had ended,
-    // with the window after it, before t+840: the exchange's status alone halted, and the next
-    // read lifts.
-    expected.extend(each(900.0, &MARKETS, TRADING));
     assert_eq!(sim.since(0, t), expected);
-    assert_eq!(sim.codec.counts().judged, 16);
+    assert_eq!(sim.codec.counts().judged, 1 + reads as u64);
 }
 
 #[test]
@@ -397,23 +397,33 @@ fn a_window_bound_reads_alike_as_a_number_and_as_a_string() {
 
 #[test]
 fn an_fx_session_end_halts_the_pair_at_its_time_and_a_read_in_flight_never_lifts_it() {
-    let t = FRIDAY;
+    // The close falls strictly between two reads, at t+630, the reads sent at t+600 and t+660
+    // (RA214-1): only the calendar's timer halts the pair at its instant.
+    let t = FX_CLOSE - 630;
     let mut sim = Sim::new(t);
     sim.answer_next("live");
-    for k in 1..=8 {
+    for k in 1..=9 {
         sim.read_at(t + k * INTERVAL, "live");
     }
-    // A read sent before the close (t+600), answered after the pair's halt, LIVE and NORMAL.
-    sim.advance_to((t + 540) as f64);
-    assert_eq!(FX_CLOSE, t + 600);
+    // The read sent at t+600, before the close, held across it and answered at t+645, LIVE and
+    // NORMAL: the pair stays halted from the close's own instant.
+    sim.advance_to((t + 600) as f64);
+    let held = sim.next_read();
     sim.advance_to(FX_CLOSE as f64);
-    sim.answer_next("live");
+    assert_eq!(
+        sim.last(EUR),
+        Some(HALTED),
+        "halted at the close, no read due"
+    );
+    sim.advance_to((t + 645) as f64);
+    sim.answer(held, &answer("live")).unwrap();
     // The weekend: a read listing it LIVE does not lift it either.
     sim.read_at(t + 660, "live");
     let mut expected = each(0.0, &MARKETS, TRADING);
-    expected.push((600.0, EUR, HALTED));
+    expected.push((630.0, EUR, HALTED));
     assert_eq!(sim.since(0, t), expected);
     assert_eq!(sim.codec.counts().scheduled_halts, 1);
+    assert!(sim.armed.iter().any(|(due, _)| *due == FX_CLOSE * NS));
 }
 
 #[test]
@@ -519,10 +529,14 @@ fn a_halt_another_reads_answer_reports_is_not_lifted_by_a_read_sent_before_it() 
     sim.answer(later, &answer("eth_paused")).unwrap();
     sim.advance_to((t + 130) as f64);
     sim.answer(earlier, &answer("live")).unwrap();
-    sim.read_at(t + 180, "live");
+    // The read sent at t+180 shows ETH reopened, so it and the one sent inside the window after
+    // that (to t+300) leave it halted; the read sent at t+300 lifts it.
+    for at in [180, 240, 300] {
+        sim.read_at(t + at, "live");
+    }
     let mut expected = each(0.0, &MARKETS, TRADING);
     expected.push((125.0, ETH, HALTED));
-    expected.push((180.0, ETH, TRADING));
+    expected.push((300.0, ETH, TRADING));
     assert_eq!(sim.since(0, t), expected);
 }
 
@@ -811,7 +825,17 @@ fn a_market_trades_again_while_every_answer_comes_after_the_next_read_is_sent() 
     let t = WEDNESDAY;
     let mut sim = Sim::new(t);
     sim.answer_next("live");
-    let bodies = ["eth_paused", "live", "live", "live", "live"];
+    let bodies = [
+        "eth_paused",
+        "live",
+        "live",
+        "live",
+        "live",
+        "live",
+        "live",
+        "live",
+        "live",
+    ];
     for (k, name) in (1..).zip(bodies) {
         let sent = t + k * INTERVAL;
         sim.advance_to((sent + 90) as f64);
@@ -820,9 +844,94 @@ fn a_market_trades_again_while_every_answer_comes_after_the_next_read_is_sent() 
         sim.answer(tag, &answer(name)).unwrap();
     }
     // PAUSED, judged at t+150; the read sent at t+120, before that halt, lifts nothing; the one
-    // sent at t+180, after it, lifts it when judged at t+270.
+    // sent at t+180, after it, shows ETH reopened when judged at t+270, so every read sent
+    // before t+390 leaves it halted, the last of them (sent at t+360) when judged at t+450; the
+    // read sent at t+480, after that, lifts it when judged at t+570.
     let mut expected = each(0.0, &MARKETS, TRADING);
     expected.push((150.0, ETH, HALTED));
-    expected.push((270.0, ETH, TRADING));
+    expected.push((570.0, ETH, TRADING));
+    assert_eq!(sim.since(0, t), expected);
+}
+
+#[test]
+fn a_maintenance_the_exchange_shows_past_its_window_holds_every_market_after_its_observed_end() {
+    // RA214-2, probe 1: the window t+290 to t+330, first published at t+300, and the window
+    // after it to t+450; the exchange still in SCHEDULED_MAINTENANCE at the read sent at t+480,
+    // past both, and NORMAL at t+540. The venue reopened at some instant after the first and no
+    // later than the second's judged time, so its call auction may run to t+660.
+    let t = WEDNESDAY;
+    let mut sim = Sim::new(t);
+    sim.answer_next("live");
+    for at in [60, 120, 180, 240] {
+        sim.read_at(t + at, "live");
+    }
+    for at in [300, 360, 420, 480] {
+        sim.read_at(t + at, "scheduled_maintenance");
+    }
+    for at in [540, 600, 660] {
+        sim.read_at(t + at, "live");
+    }
+    let mut expected = each(0.0, &MARKETS, TRADING);
+    expected.extend(each(300.0, &MARKETS, HALTED));
+    assert_eq!(540 + AFTER, 660);
+    expected.extend(each(660.0, &MARKETS, TRADING));
+    assert_eq!(sim.since(0, t), expected);
+}
+
+#[test]
+fn a_late_fx_reopening_holds_the_pair_for_the_window_after_the_read_that_shows_it() {
+    // RA214-2, probe 2: the calendar reopens EUR at t+120 and its window ends at t+240, but the
+    // venue lists EUR PAUSED through the read sent at t+300 and LIVE from t+360: halted until a
+    // read sent the window after that one, at t+480.
+    let t = FX_REOPEN - 120;
+    let paused = with_contract(answer_json("live"), "EUR/USDT-P", |c| {
+        c["status"] = json!("PAUSED")
+    });
+    let mut sim = Sim::new(t);
+    let tag = sim.next_read();
+    sim.answer(tag, &paused).unwrap();
+    for k in 1..=5 {
+        sim.advance_to((t + k * INTERVAL) as f64);
+        let tag = sim.next_read();
+        sim.answer(tag, &paused).unwrap();
+    }
+    for at in [360, 420, 480] {
+        sim.read_at(t + at, "live");
+    }
+    let expected = vec![
+        (0.0, EUR, HALTED),
+        (0.0, ETH, TRADING),
+        (0.0, WIF, TRADING),
+        (480.0, EUR, TRADING),
+    ];
+    assert_eq!(sim.since(0, t), expected);
+}
+
+#[test]
+fn a_read_sent_before_a_status_halt_and_showing_trading_after_it_shows_no_reopening() {
+    // The read sent at t+60 is answered LIVE at t+130, after the one sent at t+120 showed ETH
+    // PAUSED at t+125: which of the two shows the venue later is not known, so it shows no
+    // reopening. The read sent at t+180, judged at t+230, does: the window after it runs to
+    // t+350, so the read sent at t+300 still leaves ETH halted and the one sent at t+360 lifts
+    // it. (Counted from t+130, the window would end at t+250, and t+300 would lift it.)
+    let t = WEDNESDAY;
+    let mut sim = Sim::new(t);
+    sim.answer_next("live");
+    sim.advance_to((t + 60) as f64);
+    sim.advance_to((t + 120) as f64);
+    let (earlier, later) = (sim.next_read(), sim.next_read());
+    sim.advance_to((t + 125) as f64);
+    sim.answer(later, &answer("eth_paused")).unwrap();
+    sim.advance_to((t + 130) as f64);
+    sim.answer(earlier, &answer("live")).unwrap();
+    for (sent, answered) in [(180, 230), (240, 245), (300, 300), (360, 360)] {
+        sim.advance_to((t + sent) as f64);
+        let tag = sim.next_read();
+        sim.advance_to((t + answered) as f64);
+        sim.answer(tag, &answer("live")).unwrap();
+    }
+    let mut expected = each(0.0, &MARKETS, TRADING);
+    expected.push((125.0, ETH, HALTED));
+    expected.push((360.0, ETH, TRADING));
     assert_eq!(sim.since(0, t), expected);
 }
