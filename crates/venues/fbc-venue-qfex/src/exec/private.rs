@@ -8,8 +8,21 @@ use fbc_core::{DecodeScope, FillId, VenueOrderId};
 use rust_decimal::Decimal;
 use serde_json::Value;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum OrderPulseStatus {
+    Ack,
+    Cancelled,
+}
+
 #[derive(Debug, PartialEq)]
 pub(super) enum PrivateTruth {
+    /// An observed order status with an identity; it is not evidence that one of our
+    /// commands caused the transition or that a complete account state was read.
+    OrderPulse {
+        order: VenueOrderId,
+        status: OrderPulseStatus,
+        remaining: Decimal,
+    },
     Fill {
         trade: FillId,
         order: VenueOrderId,
@@ -37,6 +50,7 @@ pub(super) fn inspect(
 ) -> Result<PrivateTruth, &'static str> {
     let object = value.as_object().ok_or("private envelope")?;
     let recognized = [
+        "order_response",
         "fill_response",
         "all_orders_response",
         "user_trades",
@@ -48,6 +62,29 @@ pub(super) fn inspect(
     .count();
     if recognized > 1 {
         return Err("ambiguous private envelope");
+    }
+    if let Some(pulse) = object.get("order_response") {
+        symbol(pulse)?;
+        side(pulse)?;
+        positive_decimal(pulse, "price")?;
+        let quantity = positive_decimal(pulse, "quantity")?;
+        let remaining = nonnegative_decimal(pulse, "quantity_remaining")?;
+        if remaining > quantity {
+            return Err("remaining exceeds quantity");
+        }
+        if pulse.get("trade_id").is_some_and(|id| !id.is_null()) {
+            return Err("order pulse carries trade id");
+        }
+        let status = match pulse.get("status").and_then(Value::as_str) {
+            Some("ACK") => OrderPulseStatus::Ack,
+            Some("CANCELLED") => OrderPulseStatus::Cancelled,
+            _ => return Err("unverified order status"),
+        };
+        return Ok(PrivateTruth::OrderPulse {
+            order: order_id(pulse, "order_id", scope)?,
+            status,
+            remaining,
+        });
     }
     if let Some(fill) = object.get("fill_response") {
         positive_decimal(fill, "price")?;
@@ -192,7 +229,7 @@ mod tests {
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
 
-    use super::{PrivateTruth, inspect};
+    use super::{OrderPulseStatus, PrivateTruth, inspect};
     use crate::{KEY_MDS_URL, Qfex};
 
     fn with_scope<T>(f: impl for<'a> FnOnce(&fbc_core::DecodeScope<'a>) -> T) -> T {
@@ -204,6 +241,56 @@ mod tests {
 
     fn fixture(raw: &str) -> Value {
         serde_json::from_str(raw).unwrap()
+    }
+
+    #[test]
+    fn observed_order_lifecycle_keeps_one_identity_without_emitting_order_truth() {
+        let ack = fixture(include_str!(
+            "../../../../../fixtures/qfex/private/order_ack_full.json"
+        ));
+        let cancelled = fixture(include_str!(
+            "../../../../../fixtures/qfex/private/order_cancelled.json"
+        ));
+        with_scope(|scope| {
+            let id = scope
+                .venue_order_id("11111111-1111-4111-8111-111111111111")
+                .unwrap();
+            assert_eq!(
+                inspect(&ack, scope),
+                Ok(PrivateTruth::OrderPulse {
+                    order: id.clone(),
+                    status: OrderPulseStatus::Ack,
+                    remaining: Decimal::ONE,
+                })
+            );
+            assert_eq!(
+                inspect(&cancelled, scope),
+                Ok(PrivateTruth::OrderPulse {
+                    order: id,
+                    status: OrderPulseStatus::Cancelled,
+                    remaining: Decimal::ONE,
+                })
+            );
+
+            let mut bad = cancelled.clone();
+            bad["order_response"]["order_id"] = json!("not-a-uuid");
+            assert_eq!(inspect(&bad, scope), Err("invalid UUID"));
+            bad = cancelled.clone();
+            bad["order_response"]["quantity_remaining"] = json!(2);
+            assert_eq!(inspect(&bad, scope), Err("remaining exceeds quantity"));
+            bad = cancelled.clone();
+            bad["order_response"]["status"] = json!("FILLED");
+            assert_eq!(inspect(&bad, scope), Err("unverified order status"));
+            bad = cancelled.clone();
+            bad["order_response"]["trade_id"] = json!("22222222-2222-4222-8222-222222222222");
+            assert_eq!(inspect(&bad, scope), Err("order pulse carries trade id"));
+            bad = cancelled.clone();
+            bad["fill_response"] = fixture(include_str!(
+                "../../../../../fixtures/qfex/private/fill_response.json"
+            ))["fill_response"]
+                .clone();
+            assert_eq!(inspect(&bad, scope), Err("ambiguous private envelope"));
+        });
     }
 
     #[test]

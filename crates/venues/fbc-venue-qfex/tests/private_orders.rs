@@ -276,11 +276,16 @@ fn selected_commands_encode_exact_wire_and_documented_weights() {
     assert_eq!(class, fbc_core::TrafficClass::Safety);
 
     let mut sink = Sink::default();
-    let replacement = include_str!("../../../../fixtures/qfex/private/modified_new_id.json");
+    let mut replacement: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/qfex/private/order_ack_full.json"
+    ))
+    .unwrap();
+    replacement["order_response"]["order_id"] = json!("22222222-2222-4222-8222-222222222222");
+    let replacement = replacement.to_string();
     dispatch_market_data(&Qfex.caps(&cfg()).unwrap(), |scope| {
         codec.on_frame(
             StreamId(0),
-            RawFrame::Text(replacement),
+            RawFrame::Text(&replacement),
             scope,
             &specs(),
             &mut sink,

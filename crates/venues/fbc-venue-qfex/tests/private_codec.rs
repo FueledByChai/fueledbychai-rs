@@ -274,7 +274,9 @@ fn primary_auth_omits_subaccount_and_private_events_stay_unsettled() {
     let decoded = dispatch_market_data(&caps, |scope| {
         codec.on_frame(
             StreamId(0),
-            RawFrame::Text(r#"{"order_response":{"status":"ACK"}}"#),
+            RawFrame::Text(include_str!(
+                "../../../../fixtures/qfex/private/order_ack_full.json"
+            )),
             scope,
             &SpecTable::new(),
             &mut sink,
@@ -291,6 +293,8 @@ fn documented_fill_and_partial_resync_frames_never_emit_unproven_truth() {
     let cfg = config("primary", "4");
     let caps = Qfex.caps(&cfg).unwrap();
     for raw in [
+        include_str!("../../../../fixtures/qfex/private/order_ack_full.json"),
+        include_str!("../../../../fixtures/qfex/private/order_cancelled.json"),
         include_str!("../../../../fixtures/qfex/private/fill_response.json"),
         include_str!("../../../../fixtures/qfex/private/open_orders_page.json"),
         include_str!("../../../../fixtures/qfex/private/user_trades_page.json"),
