@@ -10,10 +10,11 @@
 //!
 //! - the exchange entering SCHEDULED_MAINTENANCE and staying in it past its published window
 //!   and the window after that, a contract going LIVE to PAUSED and back, a failed read and a
-//!   refused answer, each reported once at the poll that sees it, every market a read's status
-//!   halted kept halted for the window after the read that shows it trading again, and a
-//!   consumer's handler passing each status it is told into `PlanVenue::status`, the execution
-//!   planner then planning no place or amend on the halted market and still its cancel;
+//!   refused answer, each reported once at the poll that sees it, every market a read's status,
+//!   a failed read or a refused answer halted kept halted for the window after the first read
+//!   sent after that halt to show it trading again, and a consumer's handler passing each status
+//!   it is told into `PlanVenue::status`, the execution planner then planning no place or amend
+//!   on the halted market and still its cancel;
 //! - a maintenance window starting strictly between two reads and an FX session ending strictly
 //!   between two reads, each reported halted at its own instant, a read sent before each and
 //!   answered after its halt LIVE and NORMAL still halted, and none trading again before a read
@@ -22,9 +23,22 @@
 //!   after a reopening (the FX pair's, and an advertised open) ends, answered after it, halted;
 //! - a close between two reads reported at that instant, a read sent before it and the next
 //!   read, both showing the contract LIVE with that close, still halted, a read answered after a
-//!   close it is the first to advertise halted, and a market a read leaves out halted;
+//!   close it is the first to advertise halted, kept halted for the window after the first read
+//!   that no longer advertises that close, and a market a read leaves out halted, kept halted for
+//!   the window after the first read to list it trading again;
 //! - a close in milliseconds, one not a number and a window bound in milliseconds each refused,
-//!   every market halted at the poll that refused it.
+//!   every market halted at the poll that refused it and for the window after the first read
+//!   taken after it;
+//! - the status poll run by `fbc-runtime`'s `MdVenue` from Hibachi's own plans (its `/ws/market`
+//!   endpoint left out): every subscription removed and one taken back, the endpoint kept open
+//!   on its one connection with its codec, so the market taken back, halted by a close before,
+//!   is held halted for the window after the first read sent after it (Verifier VE3-1); and the
+//!   endpoint opened on an empty plan, which sends no read until a market is subscribed, a market
+//!   subscribed, removed and taken again before its first read subscribed afresh, the reads
+//!   beginning with the first read sent (Verifier VE4-1); and a market subscribed for the first
+//!   time once the reads have begun, while a read sent before is in flight, held halted from its
+//!   subscription, that read lifting nothing, for the window after the first read sent after it
+//!   (Verifier VE5-1).
 
 mod common;
 
@@ -38,20 +52,22 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use common::status::{
-    AFTER, ETH, EUR, FRIDAY, FX_CLOSE, FX_REOPEN, INTERVAL, MARKETS, NS, WEDNESDAY, WIF, answer,
-    each, poll_plan, specs, subs,
+    AFTER, ETH, EUR, FRIDAY, FX_CLOSE, FX_REOPEN, INTERVAL, MARKETS, NS, WEDNESDAY, WIF, WIF_MARK,
+    answer, each, poll_plan, specs, subs,
 };
 use fbc_conformance::{HttpReply, HttpRouter, PathPattern, StubServer, WsScript};
 use fbc_core::{
-    AccountKey, AccountLease, AckLevel, AmendAck, AmendCaps, AmendQty, Bps, Channel, CidMint,
-    EndpointPlan, Envelope, InstrumentId, ItemRef, Lots, MarketLease, MdEvent, MonoNs, Namespace,
-    NamespaceLease, OrderCaps, RefKind, Side, SignedLots, SubmitOutcome, TagSet, Ticks, Tif,
-    TradingStatus, TrafficClass, VenueCommand, VenueConfig, VenueFactory, VenueMode, WallNs,
+    AccountKey, AccountLease, AccountSummary, AckLevel, AmendAck, AmendCaps, AmendQty, AssetKey,
+    Bps, Channel, CidMint, ConfigError, EndpointPlan, Envelope, ExecCodec, ExecEndpoint, FieldSpec,
+    HttpPlan, InstrumentId, InstrumentSpecDraft, ItemRef, Lots, MarketLease, MdCodec, MdEvent,
+    MonoNs, Namespace, NamespaceLease, OrderCaps, RefKind, Secrets, Side, SignedLots, SpecTable,
+    SubmitOutcome, Subscription, SymbolError, TagSet, Ticks, Tif, TradingStatus, TrafficClass,
+    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMode, WallNs,
     dispatch_market_data,
 };
 use fbc_journal::{
-    JournalReader, JournalSink, JournalWriter, QueueSink, Record, RecordRef, Recorded,
-    RedactionKey, SinkConfig, journal_queue,
+    ControlEvent, JournalReader, JournalSink, JournalWriter, QueueSink, Record, RecordRef,
+    Recorded, RedactionKey, SinkConfig, journal_queue,
 };
 use fbc_oms::{
     Batching, DesiredBook, DesiredQuote, ExecutionPlanner, LadderConfig, LeaseKeys, Leases,
@@ -61,10 +77,11 @@ use fbc_oms::{
 use fbc_runtime::http::Method;
 use fbc_runtime::{
     Connector, IngestClock, Journal, Liveness, MdHandler, MdReplay, MdReplayConfig, MdSession,
-    MdSessionConfig, ProxyConfig, RateLimiter, ReconnectPacing, SafetyReserve, WriteStall,
+    MdSessionConfig, MdVenue, MdVenueConfig, MdVenueControl, ProxyConfig, RateLimiter,
+    ReconnectPacing, SafetyReserve, WriteStall,
 };
 use fbc_venue_hibachi::discover::EXCHANGE_INFO_PATH;
-use fbc_venue_hibachi::{Hibachi, KEY_DATA_REST_URL, KEY_REST_TIMEOUT};
+use fbc_venue_hibachi::{Hibachi, KEY_DATA_REST_URL, KEY_REST_TIMEOUT, STATUS_STREAM};
 use tokio::time::advance;
 
 const CONN: u16 = 6;
@@ -409,12 +426,27 @@ where
     drop(run);
     writer.close().unwrap();
 
-    // Decoder replay of the journal: the same events, stamps included, every time.
+    replays_the_same(name, &root, &Hibachi, &cfg, &plan, &consumer);
+    fs::remove_dir_all(&root).unwrap();
+    (consumer, decode_errors)
+}
+
+/// Decoder replay of the journal under `root`, twice, with `venue`'s codec for the poll endpoint
+/// first planned as `plan` under `cfg`: the same events `consumer` saw, stamps included, every
+/// time.
+fn replays_the_same(
+    name: &str,
+    root: &Path,
+    venue: &'static dyn VenueFactory,
+    cfg: &VenueConfig,
+    plan: &EndpointPlan,
+    consumer: &Consumer,
+) {
     let live = consumer.events.borrow().clone();
     for _ in 0..2 {
         let replayed = Consumer::default();
         let config = MdReplayConfig {
-            venue: &Hibachi,
+            venue,
             cfg: cfg.clone(),
             plan: plan.clone(),
             specs: specs(),
@@ -422,13 +454,148 @@ where
         };
         let mut replay = MdReplay::new(config, replayed.clone()).unwrap();
         replay
-            .run(JournalReader::open(&root, SHARD).unwrap())
+            .run(JournalReader::open(root, SHARD).unwrap())
             .unwrap();
         drop(replay);
         assert_eq!(*replayed.events.borrow(), live, "{name}: replay");
     }
+}
+
+/// Hibachi's factory with its `/ws/market` endpoint left out of each plan: the status poll as
+/// `fbc-runtime`'s `MdVenue` opens, keeps and closes it from Hibachi's own plans, with no
+/// socket for the stub to serve (Verifier VE3-1).
+struct PollOnly;
+
+static POLL_ONLY: PollOnly = PollOnly;
+
+impl VenueFactory for PollOnly {
+    fn id(&self) -> &'static str {
+        Hibachi.id()
+    }
+    fn config_schema(&self) -> &'static [FieldSpec] {
+        Hibachi.config_schema()
+    }
+    fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
+        Hibachi.caps(cfg)
+    }
+    fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {
+        Hibachi.parse_fbc_common_symbol(s)
+    }
+    fn discover(
+        &self,
+        cfg: &VenueConfig,
+    ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        Hibachi.discover(cfg)
+    }
+    /// Hibachi's plan, its status poll alone.
+    fn plan_md(
+        &self,
+        cfg: &VenueConfig,
+        specs: &SpecTable,
+        subs: &BTreeSet<Subscription>,
+    ) -> Result<Vec<EndpointPlan>, VenueError> {
+        let mut plans = Hibachi.plan_md(cfg, specs, subs)?;
+        plans.retain(|p| p.stream == STATUS_STREAM);
+        Ok(plans)
+    }
+    fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        Hibachi.md_codec(cfg, ep)
+    }
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        Hibachi.plan_exec(cfg)
+    }
+    fn exec_codec(
+        &self,
+        cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
+        Hibachi.exec_codec(cfg, creds)
+    }
+    fn test_connection(
+        &self,
+        cfg: &VenueConfig,
+        creds: Secrets,
+    ) -> Option<Result<HttpPlan<AccountSummary>, VenueError>> {
+        Hibachi.test_connection(cfg, creds)
+    }
+}
+
+/// The status poll as `MdVenue` runs it ([`PollOnly`]) from `origin` (Unix seconds), `first`
+/// desired, through `drive`, which may change the desired set through the venue's control;
+/// journaled under `name`, then replayed as [`timeline`] replays. What the consumer saw, and
+/// every control record the endpoints journaled.
+async fn venue_timeline<F>(
+    name: &str,
+    origin: i64,
+    first: &BTreeSet<Subscription>,
+    drive: F,
+) -> (Consumer, Vec<ControlEvent>)
+where
+    F: AsyncFnOnce(&Run, &MdVenueControl),
+{
+    let frozen = freeze();
+    let venue = Venue::start();
+    let cfg = config(&venue);
+    let plan = poll_plan(&cfg, first);
+    let root = fresh_dir(name);
+    let sink_config = SinkConfig {
+        budget_bytes: 1 << 22,
+        soft_limit_pct: 85,
+    };
+    let (sink, drain) = journal_queue(sink_config, key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, key()).unwrap())
+        .unwrap();
+    let kept = Rc::new(RefCell::new(Vec::new()));
+    let tee = Tee {
+        sink,
+        kept: kept.clone(),
+    };
+    let consumer = Consumer::default();
+    let clock = IngestClock::replayed(WallNs(origin * NS));
+    let session = session_config(&cfg, plan.clone(), clock);
+    let config = MdVenueConfig {
+        venue: &POLL_ONLY,
+        cfg: cfg.clone(),
+        specs: specs(),
+        connector: session.connector,
+        pacing: session.pacing,
+        clock: session.clock,
+        http_max_body: session.http_max_body,
+        // Room for the endpoint to be opened a second time.
+        conns: CONN..CONN + 2,
+        limiter: session.limiter,
+        liveness: session.liveness,
+        write_stall: session.write_stall,
+    };
+    let (mut md, control) = MdVenue::new(config, consumer.clone()).unwrap();
+    md.set_journal(Journal::new(Rc::new(RefCell::new(tee))));
+    control.set_desired(first.iter().copied()).unwrap();
+    let run = Run {
+        venue,
+        kept: kept.clone(),
+        consumer: consumer.clone(),
+        at: RefCell::new(0),
+    };
+    let script = async {
+        drive(&run, &control).await;
+        drop(control);
+    };
+    let (ran, ()) = tokio::join!(md.run(), script);
+    ran.unwrap();
+    drop(frozen);
+    drop(md);
+    drop(run);
+    writer.close().unwrap();
+    let controls = (kept.borrow().iter())
+        .filter_map(|r| match r {
+            Record::Control { ev, .. } => Some(ev.clone()),
+            _ => None,
+        })
+        .collect();
+    replays_the_same(name, &root, &POLL_ONLY, &cfg, &plan, &consumer);
     fs::remove_dir_all(&root).unwrap();
-    (consumer, decode_errors)
+    (consumer, controls)
 }
 
 /// What the planner built for ETH under a status: the kinds of command, and why it refused
@@ -659,19 +826,25 @@ async fn each_change_is_reported_once_at_the_poll_that_sees_it_and_the_planner_f
         for at in [840, 900, 960] {
             run.read(at, "live").await;
         }
-        // A failed read, twice, then one that succeeds.
+        // A failed read, twice, then reads that succeed: they showed nothing of the venue, so
+        // every market stays halted until a read sent the window after the first that succeeds
+        // (Verifier V-1).
         run.to(1_020).await;
         run.asked().await;
         run.refuse(503, Vec::new()).await;
         run.to(1_080).await;
         run.asked().await;
         run.refuse(503, Vec::new()).await;
-        run.read(1_140, "live").await;
-        // A refused answer (ETH's status null), then one taken.
-        run.to(1_200).await;
+        for at in [1_140, 1_200, 1_260] {
+            run.read(at, "live").await;
+        }
+        // A refused answer (ETH's status null), then answers taken, the same.
+        run.to(1_320).await;
         run.asked().await;
         run.refuse(200, answer("status_null")).await;
-        run.read(1_260, "live").await;
+        for at in [1_380, 1_440, 1_500] {
+            run.read(at, "live").await;
+        }
         assert_eq!(run.consumer.count(), 23);
     })
     .await;
@@ -680,7 +853,8 @@ async fn each_change_is_reported_once_at_the_poll_that_sees_it_and_the_planner_f
     expected.extend(each(660.0, &MARKETS, TRADING));
     expected.push((720.0, ETH, HALTED));
     expected.push((960.0, ETH, TRADING));
-    for (halted, lifted) in [(1_020.0, 1_140.0), (1_200.0, 1_260.0)] {
+    assert_eq!(1_140 + AFTER, 1_260);
+    for (halted, lifted) in [(1_020.0, 1_260.0), (1_320.0, 1_500.0)] {
         expected.extend(each(halted, &MARKETS, HALTED));
         expected.extend(each(lifted, &MARKETS, TRADING));
     }
@@ -857,15 +1031,23 @@ async fn a_close_between_reads_and_a_market_a_read_leaves_out_are_halted() {
         run.asked().await;
         run.to(260).await;
         run.answer("eth_close_first").await;
-        // A read leaving EUR out.
+        // A read leaving EUR out, then reads listing it LIVE again (WIF still with its close):
+        // EUR stays halted until a read sent the window after the first of them (Verifier V-1).
+        // The read leaving EUR out no longer advertises ETH's close, which halted ETH: ETH stays
+        // halted until a read sent the window after it (V1C-2).
         run.read(300, "eur_left_out").await;
+        for at in [360, 420, 480] {
+            run.read(at, "wif_close").await;
+        }
     })
     .await;
     let mut expected = each(0.0, &MARKETS, TRADING);
     expected.push((150.0, WIF, HALTED));
     expected.push((260.0, ETH, HALTED));
-    expected.push((300.0, ETH, TRADING));
     expected.push((300.0, EUR, HALTED));
+    assert_eq!((300 + AFTER, 360 + AFTER), (420, 480));
+    expected.push((420.0, ETH, TRADING));
+    expected.push((480.0, EUR, TRADING));
     assert_eq!(consumer.statuses(t), expected);
 }
 
@@ -877,22 +1059,227 @@ async fn a_close_in_milliseconds_or_not_a_number_and_a_window_bound_in_milliseco
         run.asked().await;
         run.answer("live").await;
         for (k, name) in refused.iter().enumerate() {
-            let at = 120 * k as i64 + 60;
+            let at = 240 * k as i64 + 60;
             run.to(at).await;
             run.asked().await;
             run.refuse(200, answer(name)).await;
-            run.read(at + 60, "live").await;
+            // Every market halted until a read sent the window after the first read taken
+            // (Verifier V-1).
+            for after in [60, 120, 180] {
+                run.read(at + after, "live").await;
+            }
         }
     })
     .await;
+    assert_eq!(AFTER, 120);
     let mut expected = each(0.0, &MARKETS, TRADING);
     for k in 0..3 {
-        let at = (120 * k + 60) as f64;
+        let at = (240 * k + 60) as f64;
         expected.extend(each(at, &MARKETS, HALTED));
-        expected.extend(each(at + 60.0, &MARKETS, TRADING));
+        expected.extend(each(at + 180.0, &MARKETS, TRADING));
     }
     assert_eq!(consumer.statuses(t), expected);
     assert_eq!(errors, 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_status_poll_stays_open_with_no_subscription_so_a_market_subscribed_again_is_held_by_the_same_codec()
+ {
+    // Verifier VE3-1's probe, as the runtime runs it: the consumer holds only WIF's mark, and the
+    // first read advertises WIF's close at t+30, which halts it. At t+40 the consumer removes
+    // every subscription, then takes WIF's back. The status poll is planned for the empty set
+    // too, so `MdVenue` keeps its endpoint, on its one connection number, and its codec, which
+    // holds WIF as across a failed read: halted when it is taken back, no read until the next
+    // interval, and the read sent at t+60, the first after that, starting the window after a
+    // reopening: trading from the read sent at t+180. (Closed with the empty set, the endpoint
+    // would be opened again with a fresh codec, whose read at t+40, listing WIF LIVE, would
+    // report it trading at once.)
+    let t = WEDNESDAY;
+    let mut doc: serde_json::Value = serde_json::from_slice(&answer("live")).unwrap();
+    let contracts = doc["futureContracts"].as_array_mut().unwrap();
+    let wif = contracts
+        .iter_mut()
+        .find(|c| c["symbol"] == "WIF/USDT-P")
+        .unwrap();
+    wif["marketCloseTimestamp"] = serde_json::json!((t + 30).to_string());
+    let closes = doc.to_string().into_bytes();
+    let closes = &closes;
+    let first = BTreeSet::from([WIF_MARK]);
+    let drive = async move |run: &Run, control: &MdVenueControl| {
+        run.asked().await;
+        run.answer_body("the close at t+30", closes.clone()).await;
+        run.to(30).await;
+        run.to(40).await;
+        control.set_desired(BTreeSet::new()).unwrap();
+        churn().await;
+        control.set_desired([WIF_MARK]).unwrap();
+        churn().await;
+        // Halted when taken back, and no read sent before the next interval.
+        let held = vec![
+            (0.0, WIF, TRADING),
+            (30.0, WIF, HALTED),
+            (40.0, WIF, HALTED),
+        ];
+        assert_eq!(run.consumer.statuses(t), held);
+        assert!(run.venue.asked.try_recv().is_err(), "a read sent at t+40");
+        for at in [60, 120, 180] {
+            run.read(at, "live").await;
+        }
+    };
+    let (consumer, controls) =
+        venue_timeline("hibachi_status_subscribed_again", t, &first, drive).await;
+    assert_eq!(60 + AFTER, 180);
+    let expected = vec![
+        (0.0, WIF, TRADING),
+        (30.0, WIF, HALTED),
+        (40.0, WIF, HALTED),
+        (180.0, WIF, TRADING),
+    ];
+    assert_eq!(consumer.statuses(t), expected);
+    // One endpoint throughout: every status on its connection, opened once, and its codec told
+    // of every subscription removed and of WIF's taken back.
+    let events = consumer.events.borrow();
+    assert!(events.iter().all(|env| env.stamp.conn.conn == CONN));
+    let opened = (controls.iter())
+        .filter(|ev| matches!(ev, ControlEvent::Opened(_)))
+        .count();
+    assert_eq!(opened, 1);
+    let subscribed: Vec<(Vec<Subscription>, Vec<Subscription>)> = (controls.iter())
+        .filter_map(|ev| match ev {
+            ControlEvent::Subscribe { add, remove, .. } => Some((add.clone(), remove.clone())),
+            _ => None,
+        })
+        .collect();
+    let expected = [
+        (vec![WIF_MARK], vec![]),
+        (vec![], vec![WIF_MARK]),
+        (vec![WIF_MARK], vec![]),
+    ];
+    assert_eq!(subscribed, expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_market_subscribed_removed_and_taken_again_before_the_poll_sends_a_read_is_subscribed_afresh()
+ {
+    // Verifier VE4-1's probe, as the runtime runs it: the venue's first plan is empty, so the
+    // status poll opens carrying no subscription and its first timer, at t, sends no read. WIF's
+    // mark is desired at t+5, no longer at t+6 and again at t+7, all before the first read is sent
+    // at t+60. The reads begin with the first read sent, so none had begun: no read was ever sent,
+    // the codec knows nothing of WIF a first subscription would not, and WIF is subscribed afresh,
+    // with no halt at t+7 and no window. The read sent at t+60 reports it trading. (Taken to begin
+    // at the first timer, the reads would hold WIF from t+7 to the read sent at t+180.)
+    let t = WEDNESDAY;
+    let drive = async move |run: &Run, control: &MdVenueControl| {
+        churn().await;
+        for (at, desired) in [(5, vec![WIF_MARK]), (6, vec![]), (7, vec![WIF_MARK])] {
+            run.to(at).await;
+            control.set_desired(desired).unwrap();
+            churn().await;
+        }
+        run.to(INTERVAL - 1).await;
+        assert_eq!(
+            run.consumer.statuses(t),
+            Seen::new(),
+            "a status before t+60"
+        );
+        assert!(
+            run.venue.asked.try_recv().is_err(),
+            "a read sent before t+60"
+        );
+        for at in [60, 120, 180] {
+            run.read(at, "live").await;
+        }
+    };
+    let (consumer, controls) = venue_timeline(
+        "hibachi_status_afresh_before_reads",
+        t,
+        &BTreeSet::new(),
+        drive,
+    )
+    .await;
+    assert_eq!(consumer.statuses(t), [(60.0, WIF, TRADING)]);
+    // One endpoint throughout, opened with the empty plan, and its codec told of each change.
+    let events = consumer.events.borrow();
+    assert!(events.iter().all(|env| env.stamp.conn.conn == CONN));
+    let opened = (controls.iter())
+        .filter(|ev| matches!(ev, ControlEvent::Opened(_)))
+        .count();
+    assert_eq!(opened, 1);
+    let subscribed: Vec<(Vec<Subscription>, Vec<Subscription>)> = (controls.iter())
+        .filter_map(|ev| match ev {
+            ControlEvent::Subscribe { add, remove, .. } => Some((add.clone(), remove.clone())),
+            _ => None,
+        })
+        .collect();
+    let expected = [
+        (vec![WIF_MARK], vec![]),
+        (vec![], vec![WIF_MARK]),
+        (vec![WIF_MARK], vec![]),
+    ];
+    assert_eq!(subscribed, expected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_market_first_subscribed_once_the_reads_have_begun_is_held_and_a_read_in_flight_lifts_nothing()
+ {
+    // Verifier VE5-1, as the runtime runs it: the consumer holds only ETH's trades. The read sent
+    // at t shows WIF paused; the read sent at t+60 is held, and WIF's mark is desired for the first
+    // time at t+62. That read, answered LIVE at t+63, may show the venue at t+60, so WIF may have
+    // reopened between the two reads and its call auction still run: it lifts nothing. WIF is held
+    // from its subscription, halted at t+62, and the read sent at t+120, the first after it,
+    // starts the window: trading from the read sent at t+240. (Subscribed afresh, as before, the
+    // read answered at t+63 reported WIF trading.)
+    let t = WEDNESDAY;
+    let mut doc: serde_json::Value = serde_json::from_slice(&answer("live")).unwrap();
+    let contracts = doc["futureContracts"].as_array_mut().unwrap();
+    let wif = contracts
+        .iter_mut()
+        .find(|c| c["symbol"] == "WIF/USDT-P")
+        .unwrap();
+    wif["status"] = serde_json::json!("PAUSED");
+    let paused = doc.to_string().into_bytes();
+    let paused = &paused;
+    let eth = Subscription {
+        inst: ETH,
+        feed: fbc_core::Feed::Trades,
+    };
+    let first = BTreeSet::from([eth]);
+    let drive = async move |run: &Run, control: &MdVenueControl| {
+        run.asked().await;
+        run.answer_body("WIF paused", paused.clone()).await;
+        run.to(60).await;
+        run.asked().await;
+        run.to(62).await;
+        control.set_desired([eth, WIF_MARK]).unwrap();
+        churn().await;
+        let held = vec![(0.0, ETH, TRADING), (62.0, WIF, HALTED)];
+        assert_eq!(run.consumer.statuses(t), held);
+        run.to(63).await;
+        run.answer("live").await;
+        assert_eq!(
+            run.consumer.statuses(t),
+            held,
+            "lifted by the read sent at t+60"
+        );
+        for at in [120, 180, 240] {
+            run.read(at, "live").await;
+        }
+    };
+    let (consumer, controls) =
+        venue_timeline("hibachi_status_first_subscribed_held", t, &first, drive).await;
+    assert_eq!(120 + AFTER, 240);
+    let expected = vec![
+        (0.0, ETH, TRADING),
+        (62.0, WIF, HALTED),
+        (240.0, WIF, TRADING),
+    ];
+    assert_eq!(consumer.statuses(t), expected);
+    let events = consumer.events.borrow();
+    assert!(events.iter().all(|env| env.stamp.conn.conn == CONN));
+    let opened = (controls.iter())
+        .filter(|ev| matches!(ev, ControlEvent::Opened(_)))
+        .count();
+    assert_eq!(opened, 1);
 }
 
 #[test]

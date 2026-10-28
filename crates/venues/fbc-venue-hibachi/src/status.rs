@@ -9,12 +9,22 @@
 //! them names is a market it reports. It opens no connection; its codec, [`HibachiStatus`],
 //! asks the runtime for each read and each timer (decision 0002).
 //!
+//! It is planned for every set of subscriptions, alone and carrying none for the empty set, on
+//! the same stream and transport, and `fbc-runtime`'s `MdVenue` keeps an endpoint planned again
+//! on the same stream and transport, so the endpoint stays open while the venue's market data
+//! runs (Verifier VE3-1); a poll endpoint's one epoch ends only when its session stops. One codec
+//! thus serves every subscription taken meanwhile, and what it knows (that the reads have begun,
+//! and the schedule, below) outlives the removal of every subscription. With no market subscribed
+//! it sends no read and keeps its read timer. A codec of a newly opened endpoint (the venue's
+//! market data started again) knows nothing an earlier one read or held.
+//!
 //! # Reads
 //!
 //! A codec learns the wall time only from [`MdCodec::on_timer`] (`on_open` and `on_http` carry
-//! none), so every read is sent from a timer: the first from one it asks for in `on_open`, each
-//! later one [`KEY_STATUS_INTERVAL`](crate::KEY_STATUS_INTERVAL) after the one before, whether
-//! or not the one before has been answered. Each is one public `GET` with no header, the REST
+//! none), so every read is sent from a timer, its read timer: the first it asks for in `on_open`,
+//! each later one [`KEY_STATUS_INTERVAL`](crate::KEY_STATUS_INTERVAL) after the one before,
+//! whether or not the read sent from that one has been answered. A read timer sends a read only
+//! while some market is subscribed. Each read is one public `GET` with no header, the REST
 //! timeout, one request against the IP's REST limit (`caps.rs`), as discovery's. An answer that
 //! arrives is read at once and judged at the wall time of a timer the codec asks for then, after
 //! no delay: a read shows the venue at some instant between its send and its answer, and only a
@@ -38,7 +48,8 @@
 //!
 //! Each market's [`TradingStatus`] is reported each time it differs from the status last
 //! reported for it, and only then: the first report of a market is the first read judged, read
-//! failed, or scheduled halt after it is subscribed. It is reported only through
+//! failed, or scheduled halt after it is subscribed, and a market subscribed once the reads have
+//! begun (below) is reported halted at once. It is reported only through
 //! [`MdEvent::Status`], to the consumer's handler; nothing else here reports it. A market is
 //! [`TradingStatus::Trading`] after a read only if it was trading throughout the read's span,
 //! from its send to the timer its answer is judged at:
@@ -47,22 +58,35 @@
 //! - it advertises no open later than the read's send, less the reopening window below, and no
 //!   close at or before the answer's judged time;
 //! - no scheduled closure below, nor the reopening window after one, meets the span, and the
-//!   read was sent no earlier than the reopening window after the latest reopening its reads
-//!   showed ends (below);
-//! - and no halt of that market came after the read's send, whether or not it changed the status
-//!   reported: on a schedule, by another read's answer, or by a read that failed or was refused.
-//!   So a read in flight across a halt never lifts it; only a read sent after it can.
+//!   read was sent no earlier than the end of the reopening window counted from the latest
+//!   reopening a read's judged time marks (below);
+//! - and the read was sent after the market was subscribed, and no halt of that market came after
+//!   the read's send, whether or not it changed the status reported: on a schedule, by another
+//!   read's answer, or by a read that failed or was refused. So a read in flight across a halt, or
+//!   across the market's subscription, never lifts it; only a read sent after them can (Verifier
+//!   VE5-1).
 //!
-//! A read that meets every condition but the last shows the market trading no later than a halt
-//! after its send, so it changes nothing: it neither lifts that halt nor is one, and a read sent
-//! after the halt still lifts it however many reads are in flight.
+//! A read that meets every condition but the last shows the market trading at an instant that may
+//! come before that halt or that subscription, so it changes nothing: it neither lifts the market
+//! nor halts it, and a read sent after them still lifts it however many reads are in flight.
 //!
 //! Any other read reports it [`TradingStatus::Halted`]: a read listing it in any other status
 //! (`PAUSED` for an FX weekend, the exchange in either maintenance), a read sent before its
 //! advertised open or judged at or after its advertised close, whatever its status, and a read
 //! that no longer lists it. A read that fails (no response, or a status other than 2xx) or whose
-//! answer is refused reports every market halted at once, until a read sent after it succeeds.
-//! Nothing makes a market trading but a read: never a schedule alone.
+//! answer is refused reports every market halted at once, and only a read sent after it can lift
+//! one, after the window that follows a reopening (below). The reads begin with the first read
+//! the endpoint sends, for whichever markets are subscribed then, not with its first timer: a
+//! read timer that fires while no market is subscribed sends no read (above) and begins nothing.
+//! A market subscribed once the reads have begun, for the first time on the endpoint or again,
+//! however long no market was subscribed meanwhile (the endpoint stays open, above), is held the
+//! same way: the reads judged before showed its contract while no market of it was subscribed, so
+//! none was judged for it, and the venue may have halted and reopened it meanwhile (Verifier
+//! VE5-1). It is reported halted at the check asked for when it is subscribed, and only a read
+//! sent after that can lift it, after that window. A market subscribed before the reads began,
+//! however many timers had fired, is subscribed afresh, its status reported from the first read
+//! judged: no read had been sent, so none showed anything of it. Nothing makes a market trading
+//! but a read: never a schedule alone.
 //!
 //! # Halts on a schedule
 //!
@@ -79,15 +103,22 @@
 //!   the calendar's end.
 //!
 //! A market a scheduled closure holds stays halted until a read sent after it, and after the
-//! window that follows its reopening, shows it trading.
+//! window that follows its reopening, shows it trading. A halt by an advertised close, or before
+//! an advertised open, ends on the schedule only through an open the venue advertises (below);
+//! one that ends otherwise is then a halt no schedule announces, and its window is counted as
+//! one's (below).
 //!
-//! The schedule is the last read's: each market's advertised open and close, and the published
-//! windows, of the latest-sent read judged. A read's answer replaces the schedule of every read
-//! sent before it. Reads overlap when answers take longer than the interval, and the runtime hands
-//! each answer over as it comes, so a read sent earlier can be answered after one sent later.
-//! Which of the two shows the venue later is then not known, so the earlier read's answer removes
-//! nothing from the schedule and adds what it publishes: the earlier of its close and the one
-//! standing, and its windows. Its own answer, and the windows standing, judge its span.
+//! The schedule is what the judged answers advertise: each contract's open and close, and the
+//! published windows. It is the endpoint's, kept whichever markets are subscribed, so a market
+//! subscribed later is checked against it at once. An answer shows the venue at some instant
+//! between its read's send and its judged time, so a read sent no earlier than an answer was
+//! judged shows the venue no earlier than that answer does, and its answer replaces that one's.
+//! Reads overlap when answers take longer than the interval, and the runtime hands each answer
+//! over as it comes. Of two answers whose spans overlap (the later read sent before the earlier
+//! answer was judged), in whichever order they come, which shows the venue later is not known, so
+//! the schedule keeps both (Verifier VE5-2): for each contract the earliest close any answer in it
+//! advertises and the latest open (each holding every span another holds; below), and every
+//! window any publishes. Each read's own answer, and the windows standing, judge its span.
 //!
 //! # The window after a reopening
 //!
@@ -100,19 +131,62 @@
 //!
 //! - a scheduled one: a published maintenance window's end, a reopening of its calendar (the FX
 //!   weekend's end, and its first open), and an advertised open, each at its instant;
-//! - and one its reads show: once a read has shown the market halted by its contract's status or
-//!   the exchange's (a maintenance with or without a published window, one that overruns it, an
-//!   FX pair still `PAUSED` past its calendar's reopening), the first read that can lift it
-//!   (sent after every halt of it) and shows it trading again shows the venue reopened it at some
-//!   instant no later than that read's judged time, so the window is counted from that time.
-//!   A read sent before that halt and answered after it is not that read: it may show the venue
-//!   before the halt.
+//! - and one after a halt no schedule announces: once a read has shown the market halted by its
+//!   contract's status or the exchange's (a maintenance with or without a published window, one
+//!   that overruns it, an FX pair still `PAUSED` past its calendar's reopening), a read has left
+//!   it out, a read has failed or been refused (which shows nothing of the venue, so it may have
+//!   halted and reopened the market meanwhile), a read has ended a halt by an advertised close
+//!   or open other than through an open the venue advertises (below), or the market has been
+//!   subscribed once the reads had begun (above; likewise), the first read that can lift it (sent
+//!   after every halt of it and after its subscription) and shows it trading again shows the
+//!   venue reopened it, if it halted it, at some instant no later than that read's judged time,
+//!   so the window is counted from that time. A read sent before that halt and answered after it
+//!   is not that read: it may show the venue before the halt. Each of these starts that window
+//!   whatever already halts the market (a window, a calendar, a close or an open, the window
+//!   after an earlier reopening).
 //!
-//! What is guaranteed, then: no read whose span may meet such a reopening or the window after it
-//! reports the market trading, so a market is never reported trading while an auction after one
-//! may still run. What is not: a halt and a reopening that no schedule announces and no read
-//! shows, both falling between two reads, are never reported and start no window, and neither
-//! does a reopening before the poll's first read.
+//! An advertised close holds a read's span when it is at or before the read's judged time, and an
+//! advertised open when the window after it ends after the read's send. A close or an open by
+//! which a read halts a market, whichever read advertised it, stays in the schedule, or one
+//! holding every span it holds does, until an answer replaces the one that advertised it (above).
+//! Each such halt also shows the market halted at an instant that any reopening after it follows:
+//! a close the schedule holds the market by, at that close; a read whose own close holds its span,
+//! at its judged time (it may show the venue as late as that); a read whose own open holds its
+//! span, at that open or, if earlier, its judged time. The codec keeps the latest of these since a
+//! read last showed the market reopened, and a halt by an advertised close or open ends in one of
+//! two ways:
+//!
+//! - on the schedule, through an open: an answer replacing one of the schedule's advertises an
+//!   open that holds its read's span, no earlier than that latest instant, and no close that holds
+//!   it. That open is the venue's reopening (an open the venue moves stays one while it is no
+//!   earlier), and a read sent once the window after it has ended, held by no other close or open,
+//!   can lift the market whether or not it still advertises that open;
+//! - or otherwise, at an answer replacing one of the schedule's that advertises no close holding
+//!   its read's span and, while the schedule before it held the span by a close or an open, no
+//!   open holding it either (no close or open, a close after its judged time, an open whose window
+//!   ended no later than its send), or an open holding it earlier than that latest instant. The
+//!   codec cannot tell a close or an open the venue withdrew from one it passed and then reopened
+//!   the market after, and an open earlier than an instant the market was shown halted is not the
+//!   reopening after that halt, so that halt ends as one no schedule announces.
+//!
+//! The answer's own close and open judge this, not the schedule after it: an answer of the
+//! schedule it does not replace may show the venue before it does, so what that one still
+//! advertises may be gone. A read advertising a close that holds its span keeps the market halted,
+//! by that close, and an answer that replaces none of the schedule's (its read was sent before
+//! every answer in it was judged, as one answered after a later-sent read's is) ends no halt. A
+//! close or an open an answer stops advertising when it no longer holds, or never held, its read's
+//! span changes nothing.
+//!
+//! What is guaranteed, then: no read whose span may meet a reopening the codec knows of, or the
+//! window after it, reports the market trading, so a market is never reported trading while an
+//! auction after one may still run. The codec knows what its own endpoint's reads showed and its
+//! schedule held, and that endpoint stays open while the venue's market data runs (above). What
+//! is not guaranteed is one reopening the codec may not know of: one after a halt that no
+//! schedule announces and no read shows, when no read leaves the market out, fails or is
+//! refused, and the market is not subscribed once the reads have begun (above), from the halt's
+//! begin until a read reports the market trading again. Such a halt begins and ends between what
+//! two reads show, or ends before what the first read judged shows of a market subscribed before
+//! the reads began (above); it is never reported and may start no window.
 //!
 //! # Limits
 //!
@@ -195,6 +269,30 @@ struct Read {
     answer: Option<(Answer, TimerTag)>,
 }
 
+/// What one judged answer advertised, as the schedule keeps it (the module docs).
+struct Advertised {
+    /// The wall time it was judged at: a read sent no earlier shows the venue no earlier.
+    judged: WallNs,
+    /// Each contract's advertised open and close, by symbol.
+    contracts: BTreeMap<String, (Option<WallNs>, Option<WallNs>)>,
+    /// Its published maintenance windows.
+    windows: Vec<Window>,
+}
+
+/// The open and close the answers in `schedule` advertise for `symbol`: the latest open and the
+/// earliest close, each holding every span any other holds (`None` orders before every open, and
+/// a close is kept over none).
+fn advertised_of<'a>(
+    schedule: impl IntoIterator<Item = &'a Advertised>,
+    symbol: &str,
+) -> (Option<WallNs>, Option<WallNs>) {
+    let mut kept = (None, None);
+    for (open, close) in schedule.into_iter().filter_map(|a| a.contracts.get(symbol)) {
+        kept = (kept.0.max(*open), earlier(kept.1, *close));
+    }
+    kept
+}
+
 /// One subscribed market.
 struct Market {
     /// Its venue symbol, as the answer lists it.
@@ -203,23 +301,31 @@ struct Market {
     sessions: Option<SessionCalendar>,
     /// The status last reported, `None` before the first.
     reported: Option<TradingStatus>,
-    /// The halt count at its last halt; 0 for none.
+    /// The halt count at its last halt, a halt counted when it was subscribed included: only a
+    /// read sent after that can lift it.
     last_halt: u64,
-    /// The open and close of its schedule (the module docs).
-    open: Option<WallNs>,
-    close: Option<WallNs>,
-    /// The read (its `HttpTag`'s number) whose open and close those are, or the latest-sent of
-    /// the reads they were gathered from; 0 for none.
-    schedule_of: u64,
-    /// Whether the last read to show its status, by its contract's or the exchange's, showed it
-    /// halted, and no read that can lift it has shown it trading since.
-    status_halted: bool,
+    /// Whether a halt no schedule announces may have held it since a read that can lift it last
+    /// showed it trading: a read showed it halted by its contract's status or the exchange's,
+    /// left it out, or failed or was refused, a read ended a halt by an advertised close or open
+    /// other than through an open no earlier than `shown_halted`, or it was subscribed once the
+    /// reads had begun (the module docs).
+    unannounced: bool,
     /// The judged time of the latest read that showed it reopened: the first read that could
-    /// lift it to show it trading after one showed it halted by status (the module docs).
+    /// lift it to show it trading after such a halt (the module docs).
     reopened: Option<WallNs>,
+    /// The latest instant an advertised close or open showed it halted since a read last showed
+    /// it reopened (the module docs): any reopening after that halt is no earlier, so an open
+    /// before it is not one. `None` for none. A read showing it trading leaves it as it is: it is
+    /// then no later than that read's send less the window after a reopening, so before every
+    /// open that can hold a later read.
+    shown_halted: Option<WallNs>,
+    /// Subscribed once the reads had begun, and not yet reported halted for it.
+    held: bool,
 }
 
-/// The codec of the status poll endpoint: one epoch, which the endpoint's life is.
+/// The codec of the status poll endpoint: one epoch, which the endpoint's life is. The endpoint
+/// is planned for every set of subscriptions, the empty one included, so it lives while the
+/// venue's market data runs (the module docs).
 pub struct HibachiStatus {
     settings: Result<Settings, ConfigError>,
     /// The subscriptions taken on the endpoint; every instrument they name is a market.
@@ -227,12 +333,12 @@ pub struct HibachiStatus {
     markets: BTreeMap<InstrumentId, Market>,
     /// The reads sent and not yet judged, failed or refused.
     reads: BTreeMap<HttpTag, Read>,
-    /// The maintenance windows of the schedule (the module docs), and every earlier one that
-    /// has begun while its end and the reopening window may still meet a read in flight.
-    windows: Vec<Window>,
-    /// The read whose windows those are, or the latest-sent of the reads they were gathered
-    /// from; 0 for none.
-    windows_of: u64,
+    /// The schedule (the module docs): every judged answer not yet replaced by the answer of a
+    /// read sent no earlier than its judged time, whichever markets were subscribed.
+    schedule: Vec<Advertised>,
+    /// The windows of answers replaced that had begun, kept while their end and the reopening
+    /// window after it may still meet a read in flight.
+    begun: Vec<Window>,
     /// Halts counted so far, each a market's.
     halts: u64,
     last_timer: u64,
@@ -240,10 +346,14 @@ pub struct HibachiStatus {
     /// The timer the next read is sent from.
     read_timer: Option<TimerTag>,
     /// The schedule check armed, and the instant it was armed for (`None`: at once).
-    schedule: Option<(Option<WallNs>, TimerTag)>,
-    /// Whether a timer has fired: the first read's timer checks the schedule of every market
-    /// subscribed before it.
+    check: Option<(Option<WallNs>, TimerTag)>,
+    /// Whether a timer has fired: a market subscribed before the first has its schedule checked
+    /// at that timer, one subscribed after at once.
     started: bool,
+    /// Whether a read has been sent, for whichever markets: the reads have begun (the module
+    /// docs). A timer that fires with no market subscribed sends none, so begins nothing
+    /// (Verifier VE4-1).
+    read_sent: bool,
     counts: HibachiStatusCounts,
 }
 
@@ -257,14 +367,15 @@ impl HibachiStatus {
             subs: BTreeSet::new(),
             markets: BTreeMap::new(),
             reads: BTreeMap::new(),
-            windows: Vec::new(),
-            windows_of: 0,
+            schedule: Vec::new(),
+            begun: Vec::new(),
             halts: 0,
             last_timer: 0,
             last_read: 0,
             read_timer: None,
-            schedule: None,
+            check: None,
             started: false,
+            read_sent: false,
             counts: HibachiStatusCounts::default(),
         }
     }
@@ -320,23 +431,26 @@ impl HibachiStatus {
             };
             self.reads.insert(tag, read);
             self.counts.reads += 1;
+            self.read_sent = true;
         }
         self.read_timer = Some(self.arm(interval, fx));
     }
 
-    /// Every market halted: a read failed or its answer was refused.
+    /// Every market halted: a read failed or its answer was refused. It shows nothing of the
+    /// venue, which may have halted and reopened any market meanwhile, so the first read that
+    /// can lift one and shows it trading starts the window after a reopening (Verifier V-1).
     fn halt_all(&mut self, sink: &mut dyn MdSink) {
         let halts = &mut self.halts;
         for (&inst, market) in &mut self.markets {
+            market.unannounced = true;
             halt(halts, inst, market, sink);
         }
     }
 
-    /// The answer of read `read`, sent at `sent` when `at_send` halts had been counted, judged
-    /// at `at`, the wall time of the timer asked for when it came.
+    /// The answer of a read sent at `sent` when `at_send` halts had been counted, judged at `at`,
+    /// the wall time of the timer asked for when it came.
     fn judge(
         &mut self,
-        read: u64,
         (sent, at_send, answer): (WallNs, u64, Answer),
         at: WallNs,
         sink: &mut dyn MdSink,
@@ -344,46 +458,88 @@ impl HibachiStatus {
     ) {
         self.counts.judged += 1;
         let after = self.reopening();
-        let mut known = self.windows.clone();
-        known.extend(answer.windows.iter().copied());
         let span = Span {
             from: sent,
             to: at,
             after,
         };
+        // The windows standing judge the span too, those of the answers it replaces included.
+        let mut known = self.schedule_windows();
+        known.extend(answer.windows.iter().copied());
+        // This answer replaces every answer of the schedule judged no later than its send: those
+        // show the venue no later than it does. The others were judged after its send, so which
+        // of the two shows the venue later is not known: it joins them (Verifier VE5-2).
+        let advertised = Advertised {
+            judged: at,
+            contracts: (answer.contracts.iter())
+                .map(|(symbol, l)| (symbol.clone(), (l.open, l.close)))
+                .collect(),
+            windows: answer.windows.clone(),
+        };
+        let (replaced, standing): (Vec<Advertised>, Vec<Advertised>) =
+            core::mem::take(&mut self.schedule)
+                .into_iter()
+                .partition(|a| a.judged <= sent);
         let halts = &mut self.halts;
         for (&inst, market) in &mut self.markets {
             let listed = answer.contracts.get(&market.symbol);
-            // Sent after every halt of the market: a read that can lift it.
+            // Sent after every halt of the market, its subscription's included: a read that can
+            // lift it.
             let lifts = market.last_halt <= at_send;
             let trading = listed.map(|l| l.status == TradingStatus::Trading);
-            match trading {
-                // Its contract's or the exchange's status halts it ...
-                Some(false) => market.status_halted = true,
-                // ... and the first read that can lift it to show it trading again shows the
-                // venue reopened it by the time it is judged, no later (RA214-2).
-                Some(true) if lifts && market.status_halted => {
-                    market.status_halted = false;
-                    market.reopened = Some(at);
-                }
-                _ => {}
-            }
             let (open, close) = listed.map_or((None, None), |l| (l.open, l.close));
+            let (opens, closes) = (span.opens(open), span.closes(close));
+            // An answer that replaces one or more of the schedule's (its read was sent once each
+            // was judged), while its own answer holds its span by no close, ends a halt by an
+            // advertised close or open as one no schedule announces when:
+            // - the schedule before it held the span by a close or an open and its answer by no
+            //   open either: it no longer advertises that close or open, and the codec cannot
+            //   tell one the venue withdrew from one it passed and reopened the market after
+            //   (V1C-2);
+            // - or its answer holds the span by an open earlier than an instant a close or an
+            //   open showed the market halted: no reopening after that halt, so not the venue's
+            //   (Verifier VE2-1, VE2-2).
+            // Its own answer judges this, not the schedule after it: an answer of the schedule it
+            // does not replace may show the venue before it does, so what that one still
+            // advertises may be gone (Verifier VE5-2). An answer that replaces none was sent
+            // before every answer of the schedule was judged, so may show the venue before them
+            // all: it ends no halt, and adds what it advertises (VE-1, VE2-2).
+            if !replaced.is_empty() && !closes {
+                let was = advertised_of(replaced.iter().chain(&standing), &market.symbol);
+                let dropped = !opens && span.advertised(was.0, was.1);
+                let early = opens && open.zip(market.shown_halted).is_some_and(|(o, h)| o < h);
+                if dropped || early {
+                    market.unannounced = true;
+                }
+            }
+            match trading {
+                // Its contract's or the exchange's status halts it, or the read leaves it out
+                // (Verifier V-1) ...
+                Some(false) | None => market.unannounced = true,
+                // ... and the first read that can lift it to show it trading again shows the
+                // venue reopened it, if it halted it, by the time it is judged, no later
+                // (RA214-2): the window after that covers every halt shown before it.
+                Some(true) if lifts && market.unannounced => {
+                    market.unannounced = false;
+                    market.reopened = Some(at);
+                    market.shown_halted = None;
+                }
+                Some(true) => {}
+            }
+            // What its own answer shows: the market halted by a close at its judged time, and by
+            // an open until that open or, if earlier, its judged time (it may show the venue as
+            // late as that).
+            if closes {
+                market.shown_halted = market.shown_halted.max(Some(at));
+            }
+            if opens {
+                market.shown_halted = market.shown_halted.max(open.map(|o| o.min(at)));
+            }
             // The window after the reopening the reads showed, as after a scheduled one.
             let auction = market.reopened.is_some_and(|r| sent < later(r, after));
             let shown = trading == Some(true)
                 && !auction
                 && !span.meets(market.sessions.as_ref(), open, close, &known);
-            if read > market.schedule_of {
-                (market.open, market.close) = (open, close);
-                market.schedule_of = read;
-            } else {
-                // A read sent before the one whose schedule stands: the earlier close stands,
-                // and nothing is removed. (An open it advertises matters only while its send
-                // precedes that open and the window after it; it has then just halted the
-                // market, and that halt holds every read sent before now.)
-                market.close = earlier(market.close, close);
-            }
             if !shown {
                 halt(halts, inst, market, sink);
             } else if lifts {
@@ -392,26 +548,33 @@ impl HibachiStatus {
             // Otherwise the read shows the market trading but was sent before a halt of it: it
             // neither lifts that halt nor is one, so a read sent after that halt still can.
         }
-        let windows: Vec<Window> = if read > self.windows_of {
-            self.windows_of = read;
-            // The answer's windows, and every earlier one begun whose end and the window after
-            // it may still meet a read in flight (sent no later than `horizon`).
-            let horizon = self.reads.values().map(|r| r.sent).fold(at, WallNs::min);
-            (self.windows.iter().copied())
-                .filter(|w| w.begin <= at && horizon < later(w.end, after))
-                .chain(answer.windows)
-                .collect()
-        } else {
-            // A read sent before the one whose windows stand: its windows are added.
-            known
-        };
-        self.windows = windows;
-        self.windows.sort_unstable();
-        self.windows.dedup();
+        // The windows of the answers replaced that have begun stay while their end and the
+        // window after it may still meet a read in flight (sent no later than `horizon`) or one
+        // sent later; so do those kept before.
+        let horizon = self.reads.values().map(|r| r.sent).fold(at, WallNs::min);
+        let begun = (self.begun.iter())
+            .chain(replaced.iter().flat_map(|a| a.windows.iter()))
+            .copied()
+            .filter(|w| w.begin <= at && horizon < later(w.end, after));
+        self.begun = begun.collect();
+        self.begun.sort_unstable();
+        self.begun.dedup();
+        self.schedule = standing;
+        self.schedule.push(advertised);
         self.check_schedule(at, sink, fx);
     }
 
-    /// Halts every market a scheduled closure holds at `at`, and arms the check of the next
+    /// The published windows the schedule holds: every answer's in it, and those kept once begun.
+    fn schedule_windows(&self) -> Vec<Window> {
+        let mut windows = self.begun.clone();
+        windows.extend(self.schedule.iter().flat_map(|a| a.windows.iter().copied()));
+        windows.sort_unstable();
+        windows.dedup();
+        windows
+    }
+
+    /// Reports halted every market subscribed once the reads had begun and not yet reported so,
+    /// halts every market a scheduled closure holds at `at`, and arms the check of the next
     /// instant one starts.
     fn check_schedule(&mut self, at: WallNs, sink: &mut dyn MdSink, fx: &mut Effects) {
         let after = self.reopening();
@@ -420,23 +583,38 @@ impl HibachiStatus {
             to: at,
             after,
         };
-        let (halts, windows) = (&mut self.halts, &self.windows);
+        let windows = self.schedule_windows();
+        let (halts, schedule) = (&mut self.halts, &self.schedule);
+        let mut next: Option<WallNs> = None;
         for (&inst, market) in &mut self.markets {
-            if span.meets(market.sessions.as_ref(), market.open, market.close, windows) {
+            // Its halt was counted when it was subscribed (`subscribe`).
+            if core::mem::take(&mut market.held) {
+                report(market, inst, TradingStatus::Halted, sink);
+            }
+            let (open, close) = advertised_of(schedule, &market.symbol);
+            // A close the schedule holds it by shows it halted from that close's instant.
+            if span.closes(close) {
+                market.shown_halted = market.shown_halted.max(close);
+            }
+            if span.meets(market.sessions.as_ref(), open, close, &windows) {
                 if market.reported != Some(TradingStatus::Halted) {
                     self.counts.scheduled_halts += 1;
                 }
                 halt(halts, inst, market, sink);
             }
-        }
-        let next = (self.markets.values())
-            .filter_map(|m| next_halt(m, &self.windows, at))
+            next = [
+                next,
+                next_halt(market.sessions.as_ref(), close, &windows, at),
+            ]
+            .into_iter()
+            .flatten()
             .min();
-        let armed = self.schedule.map(|(when, _)| when);
+        }
+        let armed = self.check.map(|(when, _)| when);
         if let Some(next) = next.filter(|next| armed != Some(Some(*next))) {
             let wait = u64::try_from(next.0.saturating_sub(at.0)).unwrap_or(0);
             let tag = self.arm(Duration::from_nanos(wait), fx);
-            self.schedule = Some((Some(next), tag));
+            self.check = Some((Some(next), tag));
         }
     }
 }
@@ -480,12 +658,26 @@ impl Span {
             let closed = cal.next_closed(WallNs(from.0.saturating_sub(after)));
             closed.is_some_and(|closed| closed <= to)
         });
-        let closes = close.is_some_and(|close| close <= to);
-        let opens = open.is_some_and(|open| from < later(open, after));
         let maintained = windows
             .iter()
             .any(|w| w.begin <= to && from < later(w.end, after));
-        calendar || closes || opens || maintained
+        calendar || self.advertised(open, close) || maintained
+    }
+
+    /// Whether an advertised close or open holds the market over the span.
+    fn advertised(self, open: Option<WallNs>, close: Option<WallNs>) -> bool {
+        self.opens(open) || self.closes(close)
+    }
+
+    /// Whether an advertised close holds the market over the span: it is at or before its end.
+    fn closes(self, close: Option<WallNs>) -> bool {
+        close.is_some_and(|close| close <= self.to)
+    }
+
+    /// Whether an advertised open holds the market over the span: the window after it ends
+    /// after its start.
+    fn opens(self, open: Option<WallNs>) -> bool {
+        open.is_some_and(|open| self.from < later(open, self.after))
     }
 }
 
@@ -502,13 +694,18 @@ fn later(at: WallNs, by: i64) -> WallNs {
     WallNs(at.0.saturating_add(by))
 }
 
-/// The first instant after `at` a scheduled closure of `market` starts, while it is not held by
+/// The first instant after `at` a scheduled closure of a market starts, while it is not held by
 /// one already: its calendar's next close, its advertised close, a window's begin.
-fn next_halt(market: &Market, windows: &[Window], at: WallNs) -> Option<WallNs> {
-    let calendar = (market.sessions.as_ref())
+fn next_halt(
+    sessions: Option<&SessionCalendar>,
+    close: Option<WallNs>,
+    windows: &[Window],
+    at: WallNs,
+) -> Option<WallNs> {
+    let calendar = sessions
         .filter(|cal| cal.is_open(at))
         .and_then(|cal| cal.next_closed(at));
-    let close = market.close.filter(|close| *close > at);
+    let close = close.filter(|close| *close > at);
     let window = windows.iter().map(|w| w.begin).filter(|b| *b > at).min();
     [calendar, close, window].into_iter().flatten().min()
 }
@@ -587,9 +784,12 @@ impl MdCodec for HibachiStatus {
     }
 
     /// Takes the difference: every instrument a subscription names is a market, refused as
-    /// [`plan_md`](crate::Hibachi) refuses it. Nothing is sent; a market subscribed once the
-    /// reads have begun has its schedule checked at once, its status reported from the next
-    /// read judged.
+    /// [`plan_md`](crate::Hibachi) refuses it. Nothing is sent; a market subscribed once a timer
+    /// has fired has its schedule checked at once (one subscribed before, at the first timer),
+    /// and only a read sent after it is subscribed can lift it. One subscribed before the reads
+    /// began has its status reported from the first read judged; one subscribed once they had
+    /// begun (a read was sent), for the first time or again, is reported halted at that check and
+    /// held as across a failed read (the module docs).
     fn subscribe(
         &mut self,
         add: &[Subscription],
@@ -617,16 +817,26 @@ impl MdCodec for HibachiStatus {
             }
             // Checked above: every subscription's instrument is in `specs`.
             if let Some(spec) = specs.get(inst) {
+                // A halt is counted now, so only a read sent after this can lift the market or
+                // report it trading: one sent before may show the venue before anything the
+                // reads judged since showed of it (Verifier VE5-1).
+                self.halts += 1;
+                // Subscribed once the reads had begun (a read was sent), for the first time or
+                // again: what the reads judged before showed of its contract was judged for no
+                // market of it, so the venue may have halted and reopened it meanwhile, as across
+                // a failed read. It is marked so and reported halted at the check asked for
+                // below (Verifier VE2-4, VE5-1). Before the reads began, nothing was read, and it
+                // is subscribed afresh (VE3-2, VE4-1).
+                let held = self.read_sent;
                 let market = Market {
                     symbol: spec.venue_symbol.as_wire().to_owned(),
                     sessions: spec.sessions.clone(),
                     reported: None,
-                    last_halt: 0,
-                    open: None,
-                    close: None,
-                    schedule_of: 0,
-                    status_halted: false,
+                    last_halt: self.halts,
+                    unannounced: held,
                     reopened: None,
+                    shown_halted: None,
+                    held,
                 };
                 self.markets.insert(inst, market);
                 added = true;
@@ -634,7 +844,7 @@ impl MdCodec for HibachiStatus {
         }
         if added && self.started {
             let tag = self.arm(Duration::ZERO, fx);
-            self.schedule = Some((None, tag));
+            self.check = Some((None, tag));
         }
         Ok(())
     }
@@ -715,21 +925,18 @@ impl MdCodec for HibachiStatus {
             let (_, timer) = read.answer.as_ref()?;
             (*timer == tag).then_some(http)
         });
-        let read = judged.and_then(|http| Some((http, self.reads.remove(&http)?)));
-        if let Some((
-            http,
-            Read {
-                sent,
-                halts,
-                answer: Some((answer, _)),
-            },
-        )) = read
+        let read = judged.and_then(|http| self.reads.remove(&http));
+        if let Some(Read {
+            sent,
+            halts,
+            answer: Some((answer, _)),
+        }) = read
         {
-            self.judge(http.0, (sent, halts, answer), wall, sink, fx);
+            self.judge((sent, halts, answer), wall, sink, fx);
             return;
         }
-        if self.schedule.is_some_and(|(_, armed)| armed == tag) {
-            self.schedule = None;
+        if self.check.is_some_and(|(_, armed)| armed == tag) {
+            self.check = None;
             self.check_schedule(wall, sink, fx);
             return;
         }

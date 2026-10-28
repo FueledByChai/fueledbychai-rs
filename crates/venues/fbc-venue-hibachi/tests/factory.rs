@@ -10,7 +10,8 @@
 //! carrying every feed the codec decodes.
 //!
 //! FBC-1632's factory half (decision 0130): `plan_md` also plans the status poll, a poll
-//! endpoint on the REST origin carrying the same subscriptions, whose codec is the status poll's;
+//! endpoint on the REST origin carrying the same subscriptions, whose codec is the status poll's,
+//! and plans it alone, with none, for an empty set, so its endpoint stays open (Verifier VE3-1);
 //! its interval and the window after a reopening are required whole seconds, each with no
 //! default and zero refused.
 
@@ -479,10 +480,6 @@ fn specs() -> SpecTable {
 fn plan_md_plans_one_ws_market_connection_carrying_every_feed_the_codec_decodes() {
     let cfg = config();
     let specs = specs();
-    assert_eq!(
-        Hibachi.plan_md(&cfg, &specs, &BTreeSet::new()),
-        Ok(Vec::new())
-    );
     let feeds = [
         Feed::Book(BOOK_ORDERBOOK),
         Feed::Touch(TOUCH_ASK_BID_PRICE),
@@ -538,6 +535,39 @@ fn plan_md_plans_one_ws_market_connection_carrying_every_feed_the_codec_decodes(
     assert_eq!(
         Hibachi.plan_md(&cfg, &specs, &BTreeSet::from([s])),
         Err(VenueError::UnknownInstrument(missing))
+    );
+}
+
+#[test]
+fn plan_md_plans_the_status_poll_alone_for_no_subscription_so_its_endpoint_stays_open() {
+    // Verifier VE3-1: an empty set plans no `/ws/market` connection, and the status poll on the
+    // stream and transport it has with any subscription, carrying none. The runtime's `MdVenue`
+    // keeps an endpoint planned again on the same stream and transport, so the poll's endpoint
+    // and its codec stay open while the consumer holds no subscription, and a market taken back
+    // is one the codec holds as subscribed once the reads have begun (`tests/status.rs`,
+    // `tests/status_stub.rs`).
+    let cfg = config();
+    let specs = specs();
+    let poll = MdTransport::Poll {
+        base_url: WireUrl::plain("https://data-api.hibachi.xyz"),
+    };
+    assert_eq!(
+        Hibachi.plan_md(&cfg, &specs, &BTreeSet::new()),
+        Ok(vec![EndpointPlan {
+            stream: STATUS_STREAM,
+            transport: poll.clone(),
+            subs: Vec::new(),
+        }])
+    );
+    let one = Hibachi.plan_md(&cfg, &specs, &BTreeSet::from([sub(Feed::Trades)]));
+    let status = one.unwrap().into_iter().find(|p| p.stream == STATUS_STREAM);
+    assert_eq!(status.map(|p| p.transport), Some(poll));
+    // A configuration plan_md refuses is refused with no subscription too.
+    assert_eq!(
+        Hibachi.plan_md(&without(KEY_STATUS_INTERVAL), &specs, &BTreeSet::new()),
+        Err(VenueError::Config(ConfigError::Missing(
+            KEY_STATUS_INTERVAL
+        )))
     );
 }
 

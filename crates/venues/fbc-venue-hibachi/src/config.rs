@@ -44,12 +44,19 @@ pub const KEY_ORDERBOOK_DEPTH: &str = "hibachi.orderbook_depth";
 pub const KEY_STATUS_INTERVAL: &str = "hibachi.status_interval";
 /// How long a market stays halted after each reopening the status poll knows of (a published
 /// maintenance window's end, a contract's session reopening in its calendar, an advertised open,
-/// and a reopening its reads show, counted from the judged time of the first read that shows the
-/// market trading again after one showed it halted by status), in whole seconds (`<n>s`, zero
-/// refused). Hibachi runs a call auction then
-/// (its call-auction docs), and no source says which status a contract shows during one, so
-/// until FBC-vg2n records it from evidence the poll reports the market halted for this window
-/// and only a read sent after it ends can report it trading (decision 0130). No default.
+/// and one after a halt no schedule announces, counted from the judged time of the first read that
+/// shows the market trading again after one showed it halted by status, left it out, failed or was
+/// refused, or ended a halt by a close or an open that held it other than through an open the venue
+/// advertises after it, or after the market was subscribed once the reads had begun, that is once
+/// the poll had sent a read, for whichever markets, for the first time or again; the poll stays
+/// open with no subscription), in whole seconds (`<n>s`, zero refused). Hibachi runs a call
+/// auction then (its call-auction docs), and no source says which status a contract shows during
+/// one, so until FBC-vg2n records it from evidence the poll reports the market halted for this
+/// window and only a read sent after it ends can report it trading (decision 0130). The one
+/// reopening it may not know of follows a halt nothing announces and no read shows, when no read
+/// fails, is refused or leaves the market out, and the market is not subscribed once the reads
+/// have begun, from its begin until a read reports the market trading again; what the poll knows
+/// is what its endpoint has read since it opened. No default.
 pub const KEY_AUCTION_HALT: &str = "hibachi.auction_halt";
 
 /// The deepest orderbook subscription (SDK `api.py` `get_orderbook`: "between 1 and 100").
@@ -106,7 +113,11 @@ pub(crate) const SCHEMA: &[FieldSpec] = &[
         unit: FieldUnit::Duration,
         doc: "how long, in whole seconds (e.g. 900s; zero refused), a market is reported halted \
               after a maintenance window's end, a session's reopening, an advertised open or a \
-              reopening the status poll's reads show, for the call auction Hibachi runs then",
+              reopening the status poll's reads show or may hide (a read failed, refused, \
+              leaving the market out, or ending a halt by a close or an open that held it \
+              other than through an open advertised after it; the market subscribed once the \
+              reads had begun, that is once the poll had sent a read, for the first time or \
+              again), for the call auction Hibachi runs then",
     },
 ];
 

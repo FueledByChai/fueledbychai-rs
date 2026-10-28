@@ -94,6 +94,12 @@ pub fn specs() -> SpecTable {
     table
 }
 
+/// WIF's one subscription in [`subs`].
+pub const WIF_MARK: Subscription = Subscription {
+    inst: WIF,
+    feed: Feed::Mark,
+};
+
 /// ETH's trades and orderbook, EUR's trades and WIF's mark: every market subscribed, ETH twice.
 pub fn subs() -> BTreeSet<Subscription> {
     let sub = |inst, feed| Subscription { inst, feed };
@@ -101,7 +107,7 @@ pub fn subs() -> BTreeSet<Subscription> {
         sub(ETH, Feed::Trades),
         sub(ETH, Feed::Book(BOOK_ORDERBOOK)),
         sub(EUR, Feed::Trades),
-        sub(WIF, Feed::Mark),
+        WIF_MARK,
     ])
 }
 
@@ -174,6 +180,13 @@ impl Sim {
     }
 
     pub fn with(cfg: &VenueConfig, subs: &BTreeSet<Subscription>, start: i64) -> Sim {
+        let mut sim = Sim::unstarted(cfg, subs, start);
+        sim.fire_due();
+        sim
+    }
+
+    /// The same before any timer fires: the reads have not begun.
+    pub fn unstarted(cfg: &VenueConfig, subs: &BTreeSet<Subscription>, start: i64) -> Sim {
         let plan = poll_plan(cfg, subs);
         let specs = specs();
         let mut sim = Sim {
@@ -195,8 +208,17 @@ impl Sim {
             .subscribe(&plan.subs, &[], &sim.specs, &mut fx)
             .unwrap();
         sim.take(fx);
-        sim.fire_due();
         sim
+    }
+
+    /// Takes the subscription change, keeping the timers it asks for; none fires until the clock
+    /// is moved ([`Sim::advance_to`], to now included).
+    pub fn subscribe(&mut self, add: &[Subscription], remove: &[Subscription]) {
+        let mut fx = Effects::new();
+        self.codec
+            .subscribe(add, remove, &self.specs, &mut fx)
+            .unwrap();
+        self.take(fx);
     }
 
     fn take(&mut self, mut fx: Effects) {
