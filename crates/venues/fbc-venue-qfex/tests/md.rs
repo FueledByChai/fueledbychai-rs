@@ -181,6 +181,20 @@ fn frame(name: &str) -> &'static str {
 
 #[test]
 fn array_and_contents_envelopes_decode_in_order_and_reject_partial_frames() {
+    for (frame, expected) in [
+        (r#"[null]"#, "object"),
+        (r#"{"contents":{}}"#, "contents"),
+        (r#"{"contents":[null]}"#, "contents"),
+        (
+            r#"{"type":"trade","contents":[{"contents":[]}]}"#,
+            "contents",
+        ),
+    ] {
+        let (result, events) = decode(subscribed().as_mut(), frame);
+        assert_eq!(result, Err(DecodeError::Malformed(expected)));
+        assert!(events.0.is_empty());
+    }
+
     let mut singles = subscribed();
     let mut expected = Vec::new();
     for name in ["bbo", "level2", "trade"] {
@@ -233,6 +247,20 @@ fn array_and_contents_envelopes_decode_in_order_and_reject_partial_frames() {
     assert_eq!(result, Err(DecodeError::Malformed("size")));
     assert!(sink.0.is_empty());
     assert!(effects.as_slice().is_empty());
+    let valid_batch = json!([json!({"err": {"error_code": "RateLimited"}})]);
+    let result = dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            RawFrame::Text(&valid_batch.to_string()),
+            scope,
+            &specs(),
+            &mut sink,
+            &mut effects,
+        )
+    });
+    assert_eq!(result, Ok(()));
+    assert!(sink.0.is_empty());
+    assert!(matches!(effects.as_slice(), [Effect::Reconnect { .. }]));
+    effects.take();
     let (result, after) = decode(codec.as_mut(), frame("level2"));
     result.unwrap();
     let (result, fresh) = decode(subscribed().as_mut(), frame("level2"));
@@ -248,8 +276,8 @@ fn public_factory_plans_one_read_only_mds_connection() {
     assert_eq!(caps.readiness_ceiling, Readiness::Record);
     assert!(!caps.md.trades.aggressor);
     assert_eq!(caps.md.books[0].max_depth, 20);
-    assert!(Qfex.plan_exec(&cfg()).unwrap().is_empty());
-    assert!(Qfex.exec_codec(&cfg(), Secrets::new()).is_none());
+    assert!(Qfex.plan_exec(&cfg()).is_err());
+    assert!(Qfex.exec_codec(&cfg(), Secrets::new()).unwrap().is_err());
     assert!(Qfex.test_connection(&cfg(), Secrets::new()).is_none());
     let subs: BTreeSet<_> = [
         Feed::Touch(TOUCH_BBO),
@@ -542,8 +570,17 @@ fn malformed_or_unsubscribed_frames_never_emit_partial_events() {
     let book: Value = serde_json::from_str(frame("level2")).unwrap();
     let mut bad = book.clone();
     bad["ask"][1][0] = json!("10102.651"); // off the tick grid, after valid levels
+    let mut missing_symbol: Value = serde_json::from_str(frame("trade")).unwrap();
+    missing_symbol.as_object_mut().unwrap().remove("symbol");
+    let mut missing_ask: Value = serde_json::from_str(frame("bbo")).unwrap();
+    missing_ask.as_object_mut().unwrap().remove("ask");
+    let mut missing_side: Value = serde_json::from_str(frame("trade")).unwrap();
+    missing_side.as_object_mut().unwrap().remove("side");
     for raw in [
         bad.to_string(),
+        missing_symbol.to_string(),
+        missing_ask.to_string(),
+        missing_side.to_string(),
         "not json".to_owned(),
         frame("trade").replace("\"side\":\"sell\"", "\"side\":\"neither\""),
     ] {
@@ -590,6 +627,29 @@ fn bad_subscription_is_rejected_before_any_frame_is_sent() {
 
 #[test]
 fn a_rejected_subscription_reports_health_without_retry_or_duplicate_subscribe() {
+    for (channel, feed) in [
+        ("bbo", Feed::Touch(TOUCH_BBO)),
+        ("level2", Feed::Book(BOOK_LEVEL2)),
+    ] {
+        let mut codec = subscribed();
+        let error = json!({"err": {"error_code": "InvalidParameter",
+            "incoming_message": {"type": "subscribe", "channels": [channel],
+                "symbols": ["AAPL-USD"]}}});
+        let (result, sink) = decode(codec.as_mut(), &error.to_string());
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            sink.0,
+            [(
+                VenueMeta::NONE,
+                MdEvent::Health {
+                    inst: AAPL,
+                    feed,
+                    h: FeedHealth::Refused,
+                }
+            )]
+        );
+    }
+
     let mut codec = subscribed();
     let mut fx = Effects::new();
     codec
@@ -937,6 +997,15 @@ fn malformed_subscription_errors_never_change_feed_state() {
     let mut cases = vec![json!({"err": null}), json!({"err": {}})];
     let mut bad = base.clone();
     bad["err"]["incoming_message"]["type"] = json!("ping");
+    cases.push(bad);
+    let mut bad = base.clone();
+    bad["err"]["incoming_message"] = json!(false);
+    cases.push(bad);
+    let mut bad = base.clone();
+    bad["err"]["incoming_message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("type");
     cases.push(bad);
     let mut bad = base.clone();
     bad["err"]["incoming_message"]["channels"] = Value::Null;

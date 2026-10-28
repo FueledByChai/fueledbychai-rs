@@ -611,8 +611,11 @@ dependencies = [
  "fbc-book",
  "fbc-core",
  "fbc-runtime",
+ "getrandom 0.3.4",
+ "hmac",
  "rust_decimal",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
 ]

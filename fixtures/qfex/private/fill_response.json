@@ -1,0 +1,13 @@
+{
+  "fill_response": {
+    "trade_id": "92adf4db-1e48-40cf-9e2a-b0ecf079a16a",
+    "symbol": "AAPL-USD",
+    "price": 200.0,
+    "quantity": 1.0,
+    "side": "SELL",
+    "order_id": "5b309929-206f-40ec-804d-cbe46e81afc1",
+    "fee": 0.002,
+    "client_order_id": "",
+    "timestamp": 1769439642.8484282
+  }
+}
