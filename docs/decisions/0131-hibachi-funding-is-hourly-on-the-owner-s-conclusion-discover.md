@@ -28,11 +28,15 @@ public Java library does at b4188a5.
    interval derived from consecutive `fundingTimestamp`s, which are 3600 s apart
    (<https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/market-data-collector/src/main/java/com/fueledbychai/datacollector/FundingSources.java#L139-L159>).
 2. The streamed `estimatedFundingRate` (`funding_rate_estimation`) is an eight-hour rate whose
-   hourly equivalent is the estimate divided by 8: `HibachiQuoteEngine.java` L914-L918 divides
-   it by the ticker's funding interval, and no Hibachi ticker sets another, so 8 applies
-   (<https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/implementations/market-data-api/hibachi-market-data-impl/src/main/java/com/fueledbychai/marketdata/hibachi/HibachiQuoteEngine.java#L914-L918>;
-   the descriptor states 8, `HibachiRestApi.java` L388, and L915-L917 fall back to 8 where a
-   ticker has none).
+   hourly equivalent is the estimate divided by 8. The notes' words: "HibachiQuoteEngine.java
+   L914-L918 divides by the ticker's funding interval, and no Hibachi ticker sets one, so the
+   default of 8 applies"
+   (<https://github.com/FueledByChai/FueledByChaiTrading/blob/b4188a57f7d5ea4e82260c9f3c4a0a359ad04c27/implementations/market-data-api/hibachi-market-data-impl/src/main/java/com/fueledbychai/marketdata/hibachi/HibachiQuoteEngine.java#L914-L918>).
+   This record reads the same code differently, as the notes' correction of the same day records:
+   `TickerTranslator.java` L14 copies the descriptor's `fundingPeriodHours`, which
+   `HibachiRestApi.java` L388 states as 8, into every Hibachi ticker (`HibachiTickerRegistry.java`
+   L36 builds them through it), and L915-L917 fall back to 8 only where a ticker has none. The
+   divisor is 8 either way.
 3. The payment interval is one hour. `nextFundingTimestamp`'s unit is still unevidenced.
 
 Supporting documentation: docs.hibachi.xyz's Funding page
@@ -70,7 +74,9 @@ is not always a whole number of 1e-12.
 5. **Capabilities.** `FundingCaps::interval_reported` is `true`: every funding event states the
    one-hour interval its rate is per, which the codec supplies from the owner's conclusion since
    Hibachi's frames carry none. `next_time_reported` stays `false` and `next` stays `None`:
-   `nextFundingTimestamp` is not read until a fixture shaped after evidence pins its unit.
+   `nextFundingTimestamp` is not read until a fixture shaped after evidence pins its unit. Which
+   reading fbc-core means by `interval_reported` (the venue's frame states the interval, or the
+   codec states it from cited evidence) is open for every venue: FBC-fppr settles it.
 
 ## Alternatives
 
@@ -101,8 +107,10 @@ is not always a whole number of 1e-12.
 
 ## Consequences
 
-- A consumer and `fbc-sim` can accrue Hibachi funding: each hour's payment is position × the
-  event's rate × the settlement price, with no factor of eight left to guess.
+- A consumer and `fbc-sim` can estimate Hibachi funding per hour with no factor of eight left
+  to guess: the event's rate is per one-hour interval, in the units of the settled rate a payment
+  uses (`Funding Payment = Q × Funding Rate × S_settlement` at each hourly settlement), and it
+  estimates that rate. The rate actually paid is the settled `fundingRate` (next bullet).
 - The settled history's `fundingRate` needs no rescaling, but nothing in this crate decodes it
   yet; a ticket that does states it per its one-hour settlement.
 - A rate beyond 125 bps per hour is not refused: the cap is declared, not enforced, as every
