@@ -248,7 +248,8 @@ fn inst_of(ev: &MdEvent) -> InstrumentId {
         | MdEvent::Index { inst, .. }
         | MdEvent::Funding { inst, .. }
         | MdEvent::Stats { inst, .. }
-        | MdEvent::Health { inst, .. } => inst,
+        | MdEvent::Health { inst, .. }
+        | MdEvent::Status { inst, .. } => inst,
     }
 }
 

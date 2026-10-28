@@ -143,7 +143,10 @@ pub struct PlanVenue<'a> {
     /// The market's venue mode ([`ModeScope::Instrument`](fbc_core::ModeScope)), as the venue
     /// last reported it.
     pub market_mode: VenueMode,
-    /// The market's trading status, from its instrument spec.
+    /// The market's trading status as the consumer last learned it: its instrument spec's,
+    /// a snapshot from discovery, until the venue's market data reports one
+    /// (`MdEvent::Status`, decision 0130), then the latest so reported. Only this planner reads
+    /// it: a command authorized through the registry directly is not checked against it.
     pub status: TradingStatus,
     /// Each rate scope's room, with the consumer's floors.
     pub rates: RateView,

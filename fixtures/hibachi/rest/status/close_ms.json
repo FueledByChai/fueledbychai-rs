@@ -1,0 +1,98 @@
+{
+  "feeConfig": {
+    "depositFees": "0.5",
+    "instantWithdrawalFees": [
+      [
+        1000,
+        0.005
+      ],
+      [
+        0,
+        0.02
+      ]
+    ],
+    "tradeMakerFeeRate": "0.00010000",
+    "tradeTakerFeeRate": "0.00040000",
+    "transferFeeRate": "0.00010000",
+    "withdrawalFees": "0.5"
+  },
+  "futureContracts": [
+    {
+      "displayName": "ETH/USDT Perps",
+      "id": 1,
+      "initialMarginRate": "0.066667",
+      "maintenanceMarginRate": "0.046667",
+      "marketCloseTimestamp": null,
+      "marketCreationTimestamp": "1727701319.73488",
+      "marketOpenTimestamp": null,
+      "minNotional": "1",
+      "minOrderSize": "0.000001",
+      "orderbookGranularities": [
+        "0.01",
+        "0.1",
+        "1",
+        "10"
+      ],
+      "settlementDecimals": 6,
+      "settlementSymbol": "USDT",
+      "status": "LIVE",
+      "stepSize": "0.000000001",
+      "symbol": "ETH/USDT-P",
+      "tickSize": "0.000001",
+      "underlyingDecimals": 9,
+      "underlyingSymbol": "ETH"
+    },
+    {
+      "displayName": "EUR/USDT Perps",
+      "id": 2,
+      "initialMarginRate": "0.020000",
+      "maintenanceMarginRate": "0.010000",
+      "marketCloseTimestamp": null,
+      "marketOpenTimestamp": null,
+      "minNotional": "10",
+      "minOrderSize": "1",
+      "orderbookGranularities": [
+        "0.0001",
+        "0.001",
+        "0.01"
+      ],
+      "settlementDecimals": 6,
+      "settlementSymbol": "USDT",
+      "status": "LIVE",
+      "stepSize": "0.01",
+      "symbol": "EUR/USDT-P",
+      "tickSize": "0.00001",
+      "underlyingDecimals": 2,
+      "underlyingSymbol": "EUR"
+    },
+    {
+      "displayName": "WIF/USDT Perps",
+      "id": 21,
+      "initialMarginRate": "0.333333",
+      "maintenanceMarginRate": "0.200000",
+      "marketCloseTimestamp": "1792584150000",
+      "marketOpenTimestamp": null,
+      "minNotional": "1",
+      "minOrderSize": "1",
+      "orderbookGranularities": [
+        "0.0001",
+        "0.001",
+        "0.01"
+      ],
+      "settlementDecimals": 6,
+      "settlementSymbol": "USDT",
+      "status": "LIVE",
+      "stepSize": "1",
+      "symbol": "WIF/USDT-P",
+      "tickSize": "0.000001",
+      "underlyingDecimals": 6,
+      "underlyingSymbol": "WIF"
+    }
+  ],
+  "instantWithdrawalLimit": {
+    "lowerLimit": "0.1",
+    "upperLimit": "10000"
+  },
+  "maintenanceWindow": [],
+  "status": "NORMAL"
+}

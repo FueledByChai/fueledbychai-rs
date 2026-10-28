@@ -1,0 +1,14 @@
+Synthetic REST answers (decision 0009). Nothing in this directory was received from Hibachi or
+belongs to an account.
+
+- Every file is hand-built in the shape Hibachi publishes for GET /market/exchange-info (its
+  Market API spec and SDK), from the contracts of ../exchange_info.json; README.md says what each
+  changes and why.
+- The contract statuses, the exchange-level statuses, the maintenance windows and the advertised
+  open and close instants are made-up inputs, each chosen for the instant a test of the status
+  poll runs at (crates/venues/fbc-venue-hibachi/tests/status.rs and status_stub.rs). The other
+  values are ../exchange_info.json's, whose SYNTHETIC file says where they come from.
+- No file holds an account id, an address, a key or any other key-shaped value.
+- No value was measured from Hibachi's live feeds or history.
+
+This marker covers fixtures/hibachi/rest/status/ only. Recorded Hibachi answers never go here.

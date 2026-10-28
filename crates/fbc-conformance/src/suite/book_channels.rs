@@ -107,6 +107,7 @@ fn book_of(ev: &MdEvent) -> Option<(BookId, bool)> {
         | MdEvent::Mark { .. }
         | MdEvent::Index { .. }
         | MdEvent::Funding { .. }
-        | MdEvent::Stats { .. } => None,
+        | MdEvent::Stats { .. }
+        | MdEvent::Status { .. } => None,
     }
 }

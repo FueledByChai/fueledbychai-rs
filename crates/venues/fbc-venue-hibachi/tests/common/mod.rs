@@ -12,6 +12,8 @@
 
 #![allow(dead_code)]
 
+pub mod status;
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -28,8 +30,9 @@ use fbc_core::{
 use fbc_venue_hibachi::discover::EXCHANGE_INFO_TAG;
 use fbc_venue_hibachi::sign::{EcdsaKey, HibachiSigner, JsonOnly, OrderMessage};
 use fbc_venue_hibachi::{
-    BOOK_ORDERBOOK, Hibachi, HibachiMd, HibachiMdCounts, KEY_DATA_REST_URL, KEY_DATA_WS_URL,
-    KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, TOUCH_ASK_BID_PRICE,
+    BOOK_ORDERBOOK, Hibachi, HibachiMd, HibachiMdCounts, KEY_AUCTION_HALT, KEY_DATA_REST_URL,
+    KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT,
+    KEY_STATUS_INTERVAL, TOUCH_ASK_BID_PRICE,
 };
 use rust_decimal::Decimal;
 
@@ -40,14 +43,17 @@ pub const SEI: InstrumentId = InstrumentId::new(3);
 /// The codec's stream.
 pub const STREAM: StreamId = StreamId(0);
 
-/// Every key, with the values the tests run under: an orderbook depth of 3, the fixtures', and a
-/// resubscribe interval of two seconds.
-pub const CONFIG: [(&str, &str); 5] = [
+/// Every key, with the values the tests run under: an orderbook depth of 3, the fixtures', a
+/// resubscribe interval of two seconds, a status read every minute and a two-minute window after
+/// a reopening.
+pub const CONFIG: [(&str, &str); 7] = [
     (KEY_DATA_REST_URL, "https://data-api.hibachi.xyz"),
     (KEY_REST_TIMEOUT, "5000ms"),
     (KEY_ORDERBOOK_DEPTH, "3"),
     (KEY_DATA_WS_URL, "wss://data-api.hibachi.xyz"),
     (KEY_ORDERBOOK_RESUBSCRIBE, "2000ms"),
+    (KEY_STATUS_INTERVAL, "60s"),
+    (KEY_AUCTION_HALT, "120s"),
 ];
 
 /// The resubscribe interval [`CONFIG`] states.

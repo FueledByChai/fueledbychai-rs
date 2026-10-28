@@ -2,7 +2,8 @@
 
 Hand-built answers in the shapes Hibachi publishes, for `crates/venues/fbc-venue-hibachi`'s
 discovery and funding tests (FBC-jyyl). Nothing here was recorded from Hibachi, and no test
-sends anything to it; `SYNTHETIC` says where the values come from.
+sends anything to it; `SYNTHETIC` says where the values come from. The status poll's answers
+(FBC-1632) are in [`status/`](status/README.md), with a `SYNTHETIC` file of their own.
 
 Sources, cited below by name:
 

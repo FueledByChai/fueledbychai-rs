@@ -13,6 +13,9 @@
 //! its (instrument, `BookId`), and counts as feeding that book, applied or not, so its
 //! connection epoch's end gaps it (0039); an inverted prune is refused, counted, and still
 //! reaches the handler.
+//!
+//! FBC-1632's routing (decision 0130): a trading status changes no book, feeds none (so its
+//! connection epoch's end gaps nothing it alone reached), and still reaches the handler.
 
 mod common;
 
@@ -118,7 +121,8 @@ fn channel(ev: &MdEvent) -> Option<BookId> {
         | MdEvent::Mark { .. }
         | MdEvent::Index { .. }
         | MdEvent::Funding { .. }
-        | MdEvent::Stats { .. } => None,
+        | MdEvent::Stats { .. }
+        | MdEvent::Status { .. } => None,
     }
 }
 
@@ -866,4 +870,49 @@ fn a_side_prune_or_clear_reaches_only_its_book_and_feeds_it_for_an_epochs_end() 
     };
     keeper.on_md(Envelope::new(stamp, fbc_core::VenueMeta::NONE, inverted));
     assert_eq!(*seen.borrow(), [(inverted, 1)]);
+}
+
+#[test]
+fn a_trading_status_changes_no_book_feeds_none_and_still_reaches_the_handler() {
+    let mut books = MdBooks::new(TradingBooks::new([(inst(A), PUBLIC)]).unwrap());
+    let levels = [(BookSide::Bid, 90, 1), (BookSide::Ask, 110, 1)];
+    snapshot_from(&mut books, from(3, 0), A, PUBLIC, 1, &levels);
+    let before = books.clone();
+    for status in [
+        fbc_core::TradingStatus::Halted,
+        fbc_core::TradingStatus::Trading,
+    ] {
+        let ev = MdEvent::Status {
+            inst: inst(A),
+            status,
+        };
+        // From another connection: were it a book's event, that connection's end would gap it.
+        assert_eq!(books.apply(from(4, 0), &ev), Ok(Applied::Unchanged));
+    }
+    assert_eq!(books, before);
+    assert_eq!(books.end_epoch(from(4, 0)), 0);
+    let state = books.book(inst(A), PUBLIC).unwrap().state();
+    assert_eq!(state, BookState::Valid { epoch: 1 });
+    assert_eq!(books.refused(), 0);
+
+    // The keeper hands it on as it came.
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = seen.clone();
+    let mut keeper = BookKeeper::new(books, move |env: Envelope<MdEvent>, _: &MdBooks| {
+        log.borrow_mut().push(env.body)
+    });
+    let stamp = fbc_core::Stamp {
+        ingest_seq: 9,
+        kernel_rx: None,
+        recv_mono: fbc_core::MonoNs(0),
+        recv_wall: fbc_core::WallNs(0),
+        conn: from(4, 0),
+    };
+    let halted = MdEvent::Status {
+        inst: inst(A),
+        status: fbc_core::TradingStatus::Halted,
+    };
+    keeper.on_md(Envelope::new(stamp, fbc_core::VenueMeta::NONE, halted));
+    assert_eq!(*seen.borrow(), vec![halted]);
+    assert_eq!(keeper.books().book(inst(A), PUBLIC).unwrap().state(), state);
 }

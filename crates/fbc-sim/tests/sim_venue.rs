@@ -6141,6 +6141,29 @@ fn a_side_prune_inside_a_snapshot_leaves_the_snapshots_shrink_credited() {
     assert_eq!(filled, [0, 1]);
 }
 
+// FBC-1632: a trading status the venue's market data reports (decision 0130).
+
+#[test]
+fn a_trading_status_changes_no_book_moves_no_queue_and_feeds_no_book_for_an_epochs_end() {
+    for bracket in [Bracket::Pessimistic, Bracket::Middle, Bracket::Optimistic] {
+        let mut v = Venue::new(bracket);
+        v.snapshot(T0, &[(199, 6), (198, 4)], &[(201, 5), (202, 3)]);
+        let buy = v.rest(limit(cid(), Side::Buy, 198, 2), 1, T0);
+        for status in [TradingStatus::Halted, TradingStatus::Trading] {
+            let ev = MdEvent::Status { inst: INST, status };
+            v.md_from(3, T0 + 20 * MS, ev).unwrap();
+        }
+        assert_eq!(v.ahead(&buy), 4, "{bracket:?}");
+        let got = v.events();
+        assert!(got.is_empty(), "{bracket:?}: {got:?}");
+        // From connection 3, it fed no book: that connection's end gaps nothing, and the book
+        // still places an order on its known side.
+        assert_eq!(v.engine.end_epoch(ConnKey { conn: 3, epoch: 1 }), 0);
+        let sell = v.rest(limit(cid(), Side::Sell, 202, 1), 2, T0 + 30 * MS);
+        assert_eq!(v.ahead(&sell), 3, "{bracket:?}");
+    }
+}
+
 #[test]
 fn a_side_prune_or_clear_feeds_its_book_for_an_epochs_end() {
     let mut v = Venue::new(Bracket::Middle);

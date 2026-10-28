@@ -8,6 +8,11 @@
 //! required and checked, the orderbook depth refused when absent or outside 1 to 100 and the
 //! resubscribe interval when absent or zero; and `plan_md` plans one `/ws/market` connection
 //! carrying every feed the codec decodes.
+//!
+//! FBC-1632's factory half (decision 0130): `plan_md` also plans the status poll, a poll
+//! endpoint on the REST origin carrying the same subscriptions, whose codec is the status poll's;
+//! its interval and the window after a reopening are required whole seconds, each with no
+//! default and zero refused.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -20,16 +25,19 @@ use fbc_core::{
     TouchSourceCaps, TouchSourceId, TradeCaps, VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 use fbc_venue_hibachi::{
-    BOOK_ORDERBOOK, Hibachi, KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH,
-    KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, TOUCH_ASK_BID_PRICE,
+    BOOK_ORDERBOOK, Hibachi, KEY_AUCTION_HALT, KEY_DATA_REST_URL, KEY_DATA_WS_URL,
+    KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, KEY_STATUS_INTERVAL,
+    STATUS_STREAM, TOUCH_ASK_BID_PRICE,
 };
 
-const CONFIG: [(&str, &str); 5] = [
+const CONFIG: [(&str, &str); 7] = [
     (KEY_DATA_REST_URL, "https://data-api.hibachi.xyz"),
     (KEY_REST_TIMEOUT, "5000ms"),
     (KEY_ORDERBOOK_DEPTH, "25"),
     (KEY_DATA_WS_URL, "wss://data-api.hibachi.xyz"),
     (KEY_ORDERBOOK_RESUBSCRIBE, "2000ms"),
+    (KEY_STATUS_INTERVAL, "30s"),
+    (KEY_AUCTION_HALT, "900s"),
 ];
 
 const ETH: InstrumentId = InstrumentId::new(1);
@@ -192,7 +200,9 @@ fn the_schema_names_every_key_the_venue_reads() {
             KEY_REST_TIMEOUT,
             KEY_ORDERBOOK_DEPTH,
             KEY_DATA_WS_URL,
-            KEY_ORDERBOOK_RESUBSCRIBE
+            KEY_ORDERBOOK_RESUBSCRIBE,
+            KEY_STATUS_INTERVAL,
+            KEY_AUCTION_HALT
         ]
     );
     let units: Vec<_> = schema.iter().map(|f| f.unit).collect();
@@ -203,6 +213,8 @@ fn the_schema_names_every_key_the_venue_reads() {
             FieldUnit::Duration,
             FieldUnit::Count,
             FieldUnit::Dimensionless,
+            FieldUnit::Duration,
+            FieldUnit::Duration,
             FieldUnit::Duration
         ]
     );
@@ -233,8 +245,47 @@ fn every_key_is_required_with_no_default() {
         KEY_ORDERBOOK_DEPTH,
         KEY_DATA_WS_URL,
         KEY_ORDERBOOK_RESUBSCRIBE,
+        KEY_STATUS_INTERVAL,
+        KEY_AUCTION_HALT,
     ] {
         assert!(Hibachi.discover(&without(key)).is_ok(), "{key}");
+    }
+}
+
+#[test]
+fn the_status_interval_and_the_reopening_window_are_whole_seconds_and_never_zero() {
+    for key in [KEY_STATUS_INTERVAL, KEY_AUCTION_HALT] {
+        for value in [
+            "0s",
+            "",
+            "s",
+            "30",
+            "30000ms",
+            "-1s",
+            "+1s",
+            "1.5s",
+            " 1s",
+            "1 s",
+            "4294967296s",
+        ] {
+            let mut cfg = config();
+            cfg.insert(key, value);
+            let refused = ConfigError::Invalid {
+                key,
+                reason: "not a positive whole number of seconds (<n>s)",
+            };
+            assert_eq!(Hibachi.caps(&cfg), Err(refused), "{key}={value:?}");
+            assert_eq!(
+                Hibachi.plan_md(&cfg, &specs(), &BTreeSet::from([sub(Feed::Trades)])),
+                Err(VenueError::Config(refused)),
+                "{key}={value:?}"
+            );
+        }
+        for value in ["1s", "007s", "4294967295s"] {
+            let mut cfg = config();
+            cfg.insert(key, value);
+            assert!(Hibachi.caps(&cfg).is_ok(), "{key}={value:?}");
+        }
     }
 }
 
@@ -439,16 +490,28 @@ fn plan_md_plans_one_ws_market_connection_carrying_every_feed_the_codec_decodes(
         Feed::Funding,
     ];
     let subs: BTreeSet<Subscription> = feeds.into_iter().map(sub).collect();
+    // The connection, and the status poll on the REST origin carrying the same subscriptions
+    // (FBC-1632, decisions 0027 and 0130).
     assert_eq!(
         Hibachi.plan_md(&cfg, &specs, &subs),
-        Ok(vec![EndpointPlan {
-            stream: StreamId(0),
-            transport: MdTransport::Socket {
-                url: WireUrl::plain("wss://data-api.hibachi.xyz/ws/market"),
+        Ok(vec![
+            EndpointPlan {
+                stream: StreamId(0),
+                transport: MdTransport::Socket {
+                    url: WireUrl::plain("wss://data-api.hibachi.xyz/ws/market"),
+                },
+                subs: subs.iter().copied().collect(),
             },
-            subs: subs.iter().copied().collect(),
-        }])
+            EndpointPlan {
+                stream: STATUS_STREAM,
+                transport: MdTransport::Poll {
+                    base_url: WireUrl::plain("https://data-api.hibachi.xyz"),
+                },
+                subs: subs.iter().copied().collect(),
+            },
+        ])
     );
+    assert_eq!(STATUS_STREAM, StreamId(1));
     // Stats, another book or touch channel, and an instrument missing from the table are
     // refused, nothing planned.
     for feed in [
@@ -497,4 +560,61 @@ fn the_factorys_codec_takes_the_planned_endpoints_stream() {
         codec.subscribe(&plan.subs, &[], &specs, &mut fx),
         Err(VenueError::Config(ConfigError::Missing(KEY_DATA_WS_URL)))
     );
+}
+
+#[test]
+fn the_status_polls_codec_reads_exchange_info_from_a_timer_on_the_rest_origin() {
+    let cfg = config();
+    let specs = specs();
+    let subs = BTreeSet::from([sub(Feed::Trades)]);
+    let poll = Hibachi.plan_md(&cfg, &specs, &subs).unwrap().remove(1);
+    let mut codec = Hibachi.md_codec(&cfg, &poll);
+    let mut fx = fbc_core::Effects::new();
+    // on_open asks for the timer the first read is sent from, at once; subscribing sends
+    // nothing.
+    codec.on_open(&mut fx);
+    codec.subscribe(&poll.subs, &[], &specs, &mut fx).unwrap();
+    let [fbc_core::Effect::Timer { tag, after }] = fx.take()[..] else {
+        panic!("not one timer")
+    };
+    assert_eq!(after, Duration::ZERO);
+    struct Nothing;
+    impl fbc_core::MdSink for Nothing {
+        fn push(&mut self, _: fbc_core::VenueMeta, ev: fbc_core::MdEvent) {
+            panic!("{ev:?}")
+        }
+    }
+    let wall = fbc_core::WallNs(1_800_000_000_000_000_000);
+    codec.on_timer(tag, fbc_core::MonoNs(0), wall, &mut Nothing, &mut fx);
+    // One GET of /market/exchange-info, then the next read's timer at the interval.
+    let effects = fx.take();
+    let [
+        fbc_core::Effect::Http {
+            req, timeout, rpc, ..
+        },
+        fbc_core::Effect::Timer { after, .. },
+    ] = &effects[..]
+    else {
+        panic!("{effects:?}")
+    };
+    assert_eq!(req.method, fbc_core::HttpMethod::Get);
+    assert_eq!(
+        req.url,
+        WireUrl::plain("https://data-api.hibachi.xyz/market/exchange-info")
+    );
+    assert!(req.headers.is_empty());
+    assert_eq!((*timeout, *rpc), (Duration::from_millis(5_000), None));
+    assert_eq!(*after, Duration::from_secs(30));
+    // A configuration plan_md refuses gives a status codec that refuses every subscription the
+    // same, and reads nothing.
+    let bad = without(KEY_STATUS_INTERVAL);
+    let mut codec = Hibachi.md_codec(&bad, &poll);
+    codec.on_open(&mut fx);
+    assert_eq!(
+        codec.subscribe(&poll.subs, &[], &specs, &mut fx),
+        Err(VenueError::Config(ConfigError::Missing(
+            KEY_STATUS_INTERVAL
+        )))
+    );
+    assert!(fx.is_empty());
 }

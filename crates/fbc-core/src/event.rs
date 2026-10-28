@@ -33,6 +33,7 @@ use crate::codec::Feed;
 use crate::command::{Reject, SubmitOutcome, TerminalReject};
 use crate::fee::{Fee, FeeRate};
 use crate::ids::{CidMatch, ClientOrderId, FillId, InstrumentId, OrderRef, TradeId, VenueOrderId};
+use crate::instrument::TradingStatus;
 use crate::time::{ExchNs, ExchTsKind, Stamp, WallNs};
 use crate::units::{
     Aggressor, BookSide, Channel, Liquidity, Lots, Money, PxExact, Side, SignedLots, Ticks,
@@ -221,6 +222,16 @@ pub enum MdEvent {
         inst: InstrumentId,
         feed: Feed,
         h: FeedHealth,
+    },
+    /// The instrument's trading status, as the venue's market data now shows it: reported each
+    /// time it differs from the status last reported for it, a halt the codec applies on the
+    /// venue's own schedule included (decision 0130). It replaces the snapshot its
+    /// [`InstrumentSpec::status`](crate::InstrumentSpec) holds from discovery, which the
+    /// consumer passes on (to `fbc-oms`'s planner, for one) until the first of these arrives.
+    /// It is no book event and no feed's health.
+    Status {
+        inst: InstrumentId,
+        status: TradingStatus,
     },
 }
 

@@ -331,9 +331,10 @@ async fn churn() {
     }
 }
 
+/// The `/ws/market` connection's endpoint; the status poll beside it is `tests/status_stub.rs`'s.
 fn plan(cfg: &VenueConfig) -> EndpointPlan {
     let mut plans = Hibachi.plan_md(cfg, &specs(), &subs()).unwrap();
-    assert_eq!(plans.len(), 1);
+    assert_eq!(plans.len(), 2);
     plans.remove(0)
 }
 

@@ -1,7 +1,8 @@
 //! The configuration Hibachi reads: where its public market-data REST API and WebSocket are, how
-//! long a REST request waits, how many levels each orderbook subscription asks for, and how long
-//! the market-data codec waits before it asks again for an orderbook it found broken. Every key
-//! is required and none has a default.
+//! long a REST request waits, how many levels each orderbook subscription asks for, how long
+//! the market-data codec waits before it asks again for an orderbook it found broken, how often
+//! the status poll re-reads each market's trading status, and how long a market stays halted
+//! after a scheduled reopening. Every key is required and none has a default.
 
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -35,6 +36,19 @@ pub const KEY_ORDERBOOK_RESUBSCRIBE: &str = "hibachi.orderbook_resubscribe";
 /// WebSocket market docs refer the topic's `depth` to. No default, so the venue's undocumented
 /// one never decides what the book holds; the orderbook channel's `max_depth` is this value.
 pub const KEY_ORDERBOOK_DEPTH: &str = "hibachi.orderbook_depth";
+
+/// How often the status poll re-reads `GET /market/exchange-info` on the market-data REST origin
+/// for each subscribed market's trading status, in whole seconds (`<n>s`, zero refused; FBC-1632,
+/// decision 0130). No default: the interval bounds how late a change no schedule announces
+/// reaches the consumer, which is the consumer's choice against the IP's REST limit.
+pub const KEY_STATUS_INTERVAL: &str = "hibachi.status_interval";
+/// How long a market stays halted after each scheduled reopening the status poll knows of (a
+/// published maintenance window's end, a contract's session reopening in its calendar, an
+/// advertised open), in whole seconds (`<n>s`, zero refused). Hibachi runs a call auction then
+/// (its call-auction docs), and no source says which status a contract shows during one, so
+/// until FBC-vg2n records it from evidence the poll reports the market halted for this window
+/// and only a read sent after it ends can report it trading (decision 0130). No default.
+pub const KEY_AUCTION_HALT: &str = "hibachi.auction_halt";
 
 /// The deepest orderbook subscription (SDK `api.py` `get_orderbook`: "between 1 and 100").
 const MAX_DEPTH: u16 = 100;
@@ -77,6 +91,21 @@ pub(crate) const SCHEMA: &[FieldSpec] = &[
               waits after finding an orderbook broken before it resubscribes it, and then for \
               that Snapshot before it reconnects",
     },
+    FieldSpec {
+        key: KEY_STATUS_INTERVAL,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Duration,
+        doc: "how often, in whole seconds (e.g. 30s; zero refused), the status poll re-reads GET \
+              /market/exchange-info for each subscribed market's trading status",
+    },
+    FieldSpec {
+        key: KEY_AUCTION_HALT,
+        scope: ConfigScope::Process,
+        unit: FieldUnit::Duration,
+        doc: "how long, in whole seconds (e.g. 900s; zero refused), a market is reported halted \
+              after a maintenance window's end, a session's reopening or an advertised open, for \
+              the call auction Hibachi runs then",
+    },
 ];
 
 /// The path of the market-data WebSocket on [`KEY_DATA_WS_URL`]'s origin (the WebSocket market
@@ -93,20 +122,33 @@ pub(crate) struct Settings {
     /// How long the codec waits before resubscribing a broken orderbook, and then for its
     /// Snapshot before reconnecting.
     pub resubscribe: Duration,
+    /// The market-data REST origin, without a trailing slash: the status poll's base.
+    pub rest_origin: String,
+    /// How long a market-data REST request waits.
+    pub rest_timeout: Duration,
+    /// How often the status poll re-reads the exchange information.
+    pub status_interval: Duration,
+    /// How long a market stays halted after a scheduled reopening.
+    pub auction_halt: Duration,
 }
 
 impl Settings {
     /// Every key, each checked: the REST origin and timeout as discovery reads them, the
-    /// orderbook depth, the WebSocket origin and the resubscribe interval.
+    /// orderbook depth, the WebSocket origin, the resubscribe interval, the status interval and
+    /// the window after a scheduled reopening.
     pub fn read(cfg: &VenueConfig) -> Result<Settings, ConfigError> {
-        rest_origin(cfg)?;
-        rest_timeout(cfg)?;
+        let rest = rest_origin(cfg)?.to_owned();
+        let rest_timeout = rest_timeout(cfg)?;
         let depth = depth(cfg)?;
         let ws_origin = origin(cfg, KEY_DATA_WS_URL, WS_SCHEMES)?;
         Ok(Settings {
             depth,
             ws_market: format!("{ws_origin}{WS_MARKET_PATH}"),
             resubscribe: millis(cfg, KEY_ORDERBOOK_RESUBSCRIBE)?,
+            rest_origin: rest,
+            rest_timeout,
+            status_interval: seconds(cfg, KEY_STATUS_INTERVAL)?,
+            auction_halt: seconds(cfg, KEY_AUCTION_HALT)?,
         })
     }
 }
@@ -178,6 +220,22 @@ fn millis(cfg: &VenueConfig, key: &'static str) -> Result<Duration, ConfigError>
         .ok_or(ConfigError::Invalid {
             key,
             reason: "not a positive whole number of milliseconds (<n>ms)",
+        })
+}
+
+/// The duration under `key`: a positive whole number of seconds written `<n>s`, at most
+/// `u32::MAX`, so that it is a whole count of nanoseconds a wall time can be moved by.
+fn seconds(cfg: &VenueConfig, key: &'static str) -> Result<Duration, ConfigError> {
+    let raw = cfg.get(key).ok_or(ConfigError::Missing(key))?;
+    let secs = raw
+        .strip_suffix('s')
+        .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .filter(|secs| *secs > 0);
+    secs.map(|secs| Duration::from_secs(u64::from(secs)))
+        .ok_or(ConfigError::Invalid {
+            key,
+            reason: "not a positive whole number of seconds (<n>s)",
         })
 }
 

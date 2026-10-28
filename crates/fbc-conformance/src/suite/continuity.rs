@@ -158,6 +158,8 @@ fn judge(
                     feed,
                     h: FeedHealth::Gap,
                 } => Some((*inst, *feed)),
+                // A trading status is no feed's health (decision 0130).
+                MdEvent::Status { .. } => None,
                 _ => None,
             })
             .collect();
@@ -291,7 +293,8 @@ fn on_book(ev: &MdEvent, book: &Book) -> bool {
         | MdEvent::Mark { .. }
         | MdEvent::Index { .. }
         | MdEvent::Funding { .. }
-        | MdEvent::Stats { .. } => false,
+        | MdEvent::Stats { .. }
+        | MdEvent::Status { .. } => false,
     }
 }
 
@@ -301,6 +304,8 @@ fn kind(ev: &MdEvent) -> &'static str {
         MdEvent::Window { .. } => "window",
         MdEvent::SidePrune { .. } => "side prune",
         MdEvent::SideClear { .. } => "side clear",
+        // Never a change to a book's levels, so never named in a breach (decision 0130).
+        MdEvent::Status { .. } => "trading status",
         _ => "level",
     }
 }
@@ -376,7 +381,90 @@ fn kept_live(
                 );
                 breaches.push(Breach::new(capability, what));
             }
+            // A trading status is neither a book's event nor its health: a broken book may be
+            // told its market halted (decision 0130).
+            MdEvent::Status { .. } => {}
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fbc_core::{BookSide, Lots, Ticks, TradingStatus, VenueMeta};
+
+    use super::*;
+    use crate::toy;
+
+    /// The toy's chained book channel.
+    fn book() -> Book {
+        Book {
+            id: toy::BOOK,
+            caps: toy::caps().md.books[usize::from(toy::BOOK.0)],
+        }
+    }
+
+    fn step(line: usize, gap: bool, events: Vec<MdEvent>) -> Step {
+        let mut tags = super::book_cases::Tags::default();
+        if gap {
+            tags.gaps.insert(toy::SYMBOL_A.to_owned());
+        }
+        Step {
+            line,
+            binary: false,
+            tags,
+            result: Ok(()),
+            events: events.into_iter().map(|ev| (VenueMeta::NONE, ev)).collect(),
+        }
+    }
+
+    fn status(status: TradingStatus) -> MdEvent {
+        MdEvent::Status {
+            inst: toy::INST_A,
+            status,
+        }
+    }
+
+    /// FBC-1632 (decision 0130): a trading status is neither an event of a book nor its health.
+    /// Pushed while the book's sequence is broken it breaches nothing, and it never shows the
+    /// codec taking the sequence.
+    #[test]
+    fn a_trading_status_is_judged_neither_a_book_event_nor_a_gap() {
+        let (inst, book_id) = (toy::INST_A, toy::BOOK);
+        let level = MdEvent::Level {
+            inst,
+            book: book_id,
+            side: BookSide::Bid,
+            px: Ticks(10),
+            qty: Lots::new(1).unwrap(),
+        };
+        let gap = MdEvent::Health {
+            inst,
+            feed: Feed::Book(book_id),
+            h: FeedHealth::Gap,
+        };
+        let end = MdEvent::BookSnapshotEnd {
+            inst,
+            book: book_id,
+        };
+        let steps = [
+            step(1, false, vec![end, level, status(TradingStatus::Trading)]),
+            step(2, true, vec![gap, status(TradingStatus::Halted)]),
+            step(3, false, vec![status(TradingStatus::Trading)]),
+        ];
+        let mut breaches = Vec::new();
+        judge(&book(), "case", &steps, &toy::specs(), &mut breaches, true);
+        assert!(breaches.is_empty(), "{breaches:?}");
+        assert!(!on_book(&status(TradingStatus::Halted), &book()));
+        assert_eq!(kind(&status(TradingStatus::Halted)), "trading status");
+
+        // A case whose only event in sequence is a status shows no frame taken.
+        let steps = [
+            step(1, false, vec![status(TradingStatus::Trading)]),
+            step(2, true, vec![gap]),
+        ];
+        let mut breaches = Vec::new();
+        judge(&book(), "case", &steps, &toy::specs(), &mut breaches, true);
+        assert_eq!(breaches.len(), 1, "{breaches:?}");
     }
 }

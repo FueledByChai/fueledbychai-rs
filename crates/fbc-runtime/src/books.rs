@@ -238,12 +238,15 @@ fn book_of(ev: &MdEvent) -> Option<(InstrumentId, BookId)> {
             feed: Feed::Book(book),
             ..
         } => Some((inst, book)),
+        // A trading status feeds no book (decision 0130), so it never makes an epoch's end gap
+        // one.
         MdEvent::Health { .. }
         | MdEvent::Touch { .. }
         | MdEvent::Trade { .. }
         | MdEvent::Mark { .. }
         | MdEvent::Index { .. }
         | MdEvent::Funding { .. }
-        | MdEvent::Stats { .. } => None,
+        | MdEvent::Stats { .. }
+        | MdEvent::Status { .. } => None,
     }
 }
