@@ -323,15 +323,25 @@ impl WeeklyClosure {
 
     /// The first instant after `utc_secs` an occurrence starts closing the instrument, in UTC
     /// seconds: the earliest start later than it among the occurrences starting in the local
-    /// week it falls in, the week before and the two after (one of the two after always starts
-    /// later, a closure lasting under a week).
+    /// week it falls in, the week before and the three after that close something, each bounded
+    /// as [`closes`](Self::closes) bounds it. An occurrence wholly inside a skipped stretch
+    /// starts and reopens at the jump, so it closes nothing and is passed over (Codex
+    /// r4397766560, RB214-1). A zone skips at most once a year and a closure lasts under a
+    /// week, so the second and third weeks after both start later and one of them closes
+    /// something.
     fn next_start(&self, utc_secs: i64) -> Option<i64> {
         let local = utc_secs + self.zone.offset_secs(utc_secs);
         let monday =
             (local + 3 * SECS_PER_DAY).div_euclid(SECS_PER_WEEK) * SECS_PER_WEEK - 3 * SECS_PER_DAY;
         let from = self.from.secs();
-        (-1..=2)
-            .map(|week| self.zone.bounds(monday + week * SECS_PER_WEEK + from).0)
+        let length = (self.to.secs() - from).rem_euclid(SECS_PER_WEEK);
+        (-1..=3)
+            .filter_map(|week| {
+                let start = monday + week * SECS_PER_WEEK + from;
+                let (opens_closed, _) = self.zone.bounds(start);
+                let (_, reopens) = self.zone.bounds(start + length);
+                (opens_closed < reopens).then_some(opens_closed)
+            })
             .filter(|start| *start > utc_secs)
             .min()
     }
@@ -428,8 +438,10 @@ impl SessionCalendar {
 
     /// The first instant at or after `from` at which some part of the calendar closes the
     /// instrument: `from` itself while it is closed then, otherwise the earliest later instant
-    /// a part starts closing it (its final close, a window's start, a weekly occurrence's
-    /// start), and `None` when nothing closes it from `from` on. A codec that halts a market on
+    /// a part starts closing it (its final close, a window's start, the start of a weekly
+    /// occurrence that closes something, never one a skipped stretch swallows whole), and
+    /// `None` when nothing closes it from `from` on. So [`is_open`](Self::is_open) is false at
+    /// every instant it gives. A codec that halts a market on
     /// the venue's schedule asks this for the instant to halt it at (decision 0130). Reads no
     /// clock.
     pub fn next_closed(&self, from: WallNs) -> Option<WallNs> {
@@ -1060,6 +1072,39 @@ mod tests {
             let next = calendar.next_closed(reopen).unwrap();
             assert!(next.0 > reopen.0 && next.0 - close.0 <= 7 * DAY * NS + 3_600 * NS);
             assert!(calendar.is_open(before(next)) && !calendar.is_open(next));
+        }
+    }
+
+    #[test]
+    fn next_closed_passes_over_an_occurrence_a_skipped_hour_swallows() {
+        // Codex r4397766560 and RB214-1: Sunday 02:10 to 02:20 in New York does not happen on
+        // 2027-03-14 (the clock jumps from 02:00 to 03:00 at 07:00Z), so that week closes
+        // nothing and the next close is a week later, 02:10 EDT on 2027-03-21 (06:10Z).
+        let calendar = weekly(
+            NEW_YORK,
+            week_time(Weekday::Sunday, hm(2, 10)),
+            week_time(Weekday::Sunday, hm(2, 20)),
+        );
+        let next = at(1_805_609_400);
+        for from in [
+            1_805_000_400,
+            1_805_007_600 - 1,
+            1_805_007_600,
+            1_805_011_200,
+        ] {
+            assert_eq!(calendar.next_closed(at(from)), Some(next), "{from}");
+        }
+        assert!(calendar.is_open(before(next)) && !calendar.is_open(next));
+        // Every instant it gives is closed, every hour for the eight weeks around the change.
+        let from = 1_803_600_000; // 2027-02-26T00:00Z
+        for hour in 0..8 * 7 * 24 {
+            let probe = at(from + hour * 3_600);
+            let next = calendar.next_closed(probe).unwrap();
+            assert!(!calendar.is_open(next), "{probe:?} gave {next:?}");
+            assert!(
+                next.0 - probe.0 <= 2 * 7 * DAY * NS,
+                "{probe:?} gave {next:?}"
+            );
         }
     }
 

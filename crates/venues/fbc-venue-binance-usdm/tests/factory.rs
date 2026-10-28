@@ -126,7 +126,8 @@ fn the_factory_declares_its_market_data_with_each_feed_it_does_not_decode_none()
 
     assert_eq!(md.trades.source, FeedSource::None);
     assert_eq!(md.funding.source, FeedSource::None);
-    for source in [md.stats, md.mark, md.index] {
+    // The trading status included: none is reported (decision 0130).
+    for source in [md.stats, md.mark, md.index, md.status] {
         assert_eq!(source, FeedSource::None);
     }
     assert_eq!(md.ts_precision, Duration::from_millis(1));

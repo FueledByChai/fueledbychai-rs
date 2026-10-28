@@ -44,7 +44,8 @@
 //!   hour; `nextFundingTimestamp`'s unit is still unevidenced.
 //!
 //! Every feed declared here is planned and decoded by the `/ws/market` codec (`md`, FBC-2kmp,
-//! decision 0129).
+//! decision 0129), but the trading status, which the status poll re-reads (`status`, FBC-1632,
+//! decision 0130).
 
 use core::time::Duration;
 
@@ -165,6 +166,11 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
             // funding from a spot index, the median across oracle sources [FUND]; no source says
             // the `spot_price` topic is that index (decision 0129).
             index: FeedSource::Stream,
+            // Re-read from REST: neither [WS]'s topics nor [SDKT]'s list a status topic, so the
+            // status poll (`STATUS_STREAM`, a poll endpoint on the REST origin) re-reads
+            // `GET /market/exchange-info` every `hibachi.status_interval` and reports each
+            // subscribed market's status (the `status` module; decision 0130).
+            status: FeedSource::Poll,
             // The coarsest exchange timestamp the streamed frames carry: a trade's `timestamp`
             // is whole seconds [WS]. No public example frame shows a timestamp on the orderbook,
             // `ask_bid_price` or `mark_price` topics [WS], so the value rests on the trade's

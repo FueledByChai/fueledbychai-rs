@@ -294,6 +294,13 @@ pub struct MdCaps {
     pub mark: FeedSource,
     /// Where the index price ([`Feed::Index`](crate::Feed::Index)) comes from.
     pub index: FeedSource,
+    /// Where each subscribed instrument's trading status comes from after discovery, as
+    /// [`MdEvent::Status`](crate::MdEvent) (decision 0130): `None` where the adapter's market
+    /// data reports none, so the [`InstrumentSpec::status`](crate::InstrumentSpec) snapshot
+    /// discovery read is all a consumer has, `Poll` where it re-reads it from REST, `Stream`
+    /// where a streamed channel carries it. No subscription asks for it: an adapter that
+    /// declares a source reports it for every instrument its market data is subscribed to.
+    pub status: FeedSource,
     /// The resolution of the venue's timestamps.
     pub ts_precision: Duration,
     /// How subscriptions spread over connections.
@@ -974,6 +981,8 @@ pub(crate) mod testing {
                 stats: FeedSource::None,
                 mark: FeedSource::None,
                 index: FeedSource::None,
+                // The test venue reports no trading status.
+                status: FeedSource::None,
                 ts_precision: Duration::from_millis(1),
                 topology: ConnTopology::PerInstrument,
                 max_conn_lifetime: None,

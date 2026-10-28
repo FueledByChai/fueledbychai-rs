@@ -46,7 +46,9 @@
 //! - the read lists its contract `LIVE` and the exchange `NORMAL`;
 //! - it advertises no open later than the read's send, less the reopening window below, and no
 //!   close at or before the answer's judged time;
-//! - no scheduled closure below, nor the reopening window after one, meets the span;
+//! - no scheduled closure below, nor the reopening window after one, meets the span, and the
+//!   read was sent no earlier than the reopening window after the latest reopening its reads
+//!   showed ends (below);
 //! - and no halt of that market came after the read's send, whether or not it changed the status
 //!   reported: on a schedule, by another read's answer, or by a read that failed or was refused.
 //!   So a read in flight across a halt never lifts it; only a read sent after it can.
@@ -94,12 +96,23 @@
 //! may cross and nothing trades), and no source says which contract or exchange status it shows.
 //! Until FBC-vg2n records that from evidence, a market is halted for the window
 //! [`KEY_AUCTION_HALT`](crate::KEY_AUCTION_HALT) configures after each reopening the codec knows
-//! of: a maintenance window's end, a reopening of its calendar (the FX weekend's end, and its
-//! first open), and an advertised open. It is applied to every one of them, a superset of the two
-//! the docs name, so a market is never reported trading while an auction may still run. A
-//! maintenance the exchange's status shows with no published window has no end the codec knows,
-//! so no window follows it: the status alone halts every market until a read shows the exchange
-//! `NORMAL`.
+//! of, a superset of the two the docs name:
+//!
+//! - a scheduled one: a published maintenance window's end, a reopening of its calendar (the FX
+//!   weekend's end, and its first open), and an advertised open, each at its instant;
+//! - and one its reads show: once a read has shown the market halted by its contract's status or
+//!   the exchange's (a maintenance with or without a published window, one that overruns it, an
+//!   FX pair still `PAUSED` past its calendar's reopening), the first read that can lift it
+//!   (sent after every halt of it) and shows it trading again shows the venue reopened it at some
+//!   instant no later than that read's judged time, so the window is counted from that time.
+//!   A read sent before that halt and answered after it is not that read: it may show the venue
+//!   before the halt.
+//!
+//! What is guaranteed, then: no read whose span may meet such a reopening or the window after it
+//! reports the market trading, so a market is never reported trading while an auction after one
+//! may still run. What is not: a halt and a reopening that no schedule announces and no read
+//! shows, both falling between two reads, are never reported and start no window, and neither
+//! does a reopening before the poll's first read.
 //!
 //! # Limits
 //!
@@ -198,6 +211,12 @@ struct Market {
     /// The read (its `HttpTag`'s number) whose open and close those are, or the latest-sent of
     /// the reads they were gathered from; 0 for none.
     schedule_of: u64,
+    /// Whether the last read to show its status, by its contract's or the exchange's, showed it
+    /// halted, and no read that can lift it has shown it trading since.
+    status_halted: bool,
+    /// The judged time of the latest read that showed it reopened: the first read that could
+    /// lift it to show it trading after one showed it halted by status (the module docs).
+    reopened: Option<WallNs>,
 }
 
 /// The codec of the status poll endpoint: one epoch, which the endpoint's life is.
@@ -253,12 +272,6 @@ impl HibachiStatus {
     /// What it counted so far.
     pub fn counts(&self) -> HibachiStatusCounts {
         self.counts
-    }
-
-    /// The status last reported for `inst`, `None` before the first or for a market not
-    /// subscribed.
-    pub fn reported(&self, inst: InstrumentId) -> Option<TradingStatus> {
-        self.markets.get(&inst).and_then(|m| m.reported)
     }
 
     /// A fresh timer, `after` from now.
@@ -341,8 +354,25 @@ impl HibachiStatus {
         let halts = &mut self.halts;
         for (&inst, market) in &mut self.markets {
             let listed = answer.contracts.get(&market.symbol);
+            // Sent after every halt of the market: a read that can lift it.
+            let lifts = market.last_halt <= at_send;
+            let trading = listed.map(|l| l.status == TradingStatus::Trading);
+            match trading {
+                // Its contract's or the exchange's status halts it ...
+                Some(false) => market.status_halted = true,
+                // ... and the first read that can lift it to show it trading again shows the
+                // venue reopened it by the time it is judged, no later (RA214-2).
+                Some(true) if lifts && market.status_halted => {
+                    market.status_halted = false;
+                    market.reopened = Some(at);
+                }
+                _ => {}
+            }
             let (open, close) = listed.map_or((None, None), |l| (l.open, l.close));
-            let shown = listed.is_some_and(|l| l.status == TradingStatus::Trading)
+            // The window after the reopening the reads showed, as after a scheduled one.
+            let auction = market.reopened.is_some_and(|r| sent < later(r, after));
+            let shown = trading == Some(true)
+                && !auction
                 && !span.meets(market.sessions.as_ref(), open, close, &known);
             if read > market.schedule_of {
                 (market.open, market.close) = (open, close);
@@ -356,7 +386,7 @@ impl HibachiStatus {
             }
             if !shown {
                 halt(halts, inst, market, sink);
-            } else if market.last_halt <= at_send {
+            } else if lifts {
                 report(market, inst, TradingStatus::Trading, sink);
             }
             // Otherwise the read shows the market trading but was sent before a halt of it: it
@@ -595,6 +625,8 @@ impl MdCodec for HibachiStatus {
                     open: None,
                     close: None,
                     schedule_of: 0,
+                    status_halted: false,
+                    reopened: None,
                 };
                 self.markets.insert(inst, market);
                 added = true;

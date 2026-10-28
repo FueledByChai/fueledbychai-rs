@@ -17,8 +17,8 @@
 //!   ([`KEY_ORDERBOOK_DEPTH`], 1 to 100), the market-data WebSocket origin
 //!   ([`KEY_DATA_WS_URL`]), how long the codec waits before resubscribing a broken orderbook
 //!   ([`KEY_ORDERBOOK_RESUBSCRIBE`]), how often the status poll re-reads each market's trading
-//!   status ([`KEY_STATUS_INTERVAL`]) and how long a market stays halted after a scheduled
-//!   reopening ([`KEY_AUCTION_HALT`]), each required with no default.
+//!   status ([`KEY_STATUS_INTERVAL`]) and how long a market stays halted after a reopening
+//!   ([`KEY_AUCTION_HALT`]), each required with no default.
 //! - [`discover`](VenueFactory::discover): one `GET /market/exchange-info`, read into an
 //!   instrument draft per contract, and
 //!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol), FBC's rule that
@@ -77,9 +77,10 @@
 //! is refused, and halts a market without waiting for a read at the begin of a published
 //! maintenance window, at the end of a session in its calendar and at an advertised close; a
 //! market is reported trading only by a read sent after every such halt, and after the window
-//! [`KEY_AUCTION_HALT`] configures past each reopening for the call auction no source says the
-//! status of (FBC-vg2n). A change no schedule announces (an FX pair paused early, an unscheduled
-//! maintenance) reaches the consumer up to one interval late.
+//! [`KEY_AUCTION_HALT`] configures past each reopening, scheduled or shown by its reads, for the
+//! call auction no source says the status of (FBC-vg2n). A change no schedule announces (an FX
+//! pair paused early, an unscheduled maintenance) reaches the consumer up to one interval late.
+//! The capabilities declare the status's source `FeedSource::Poll` (`MdCaps::status`).
 //!
 //! Of this library only `fbc-oms`'s execution planner reads a market's status, from the
 //! `PlanVenue::status` the consumer passes it (decision 0111): it plans no place or amend on a

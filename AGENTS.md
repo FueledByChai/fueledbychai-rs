@@ -213,14 +213,16 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `WeeklyClosure`s in a zone's wall time under a POSIX-style `UtcOffsetRule`, evaluated by
     integer civil-date arithmetic with no zone data and no clock; `is_open(at)` only ever
     closes, fail-closed across daylight-saving edges, and `next_closed(from)` gives the first
-    instant at or after `from` it closes, so a codec can ask for a timer at a session's end,
-    0130; `None` where it closes nothing), copied from the draft by the resolver, neither in
-    `version` (0125).
+    instant at or after `from` it closes, never an occurrence a skipped hour swallows whole, so
+    a codec can ask for a timer at a session's end, 0130; `None` where it closes nothing),
+    copied from the draft by the resolver, neither in `version` (0125).
     `MdEvent::Status { inst, status }` is an instrument's `TradingStatus` as the venue's market
     data shows it, reported each time it changes, a halt on the venue's schedule included: no
     book event and no feed's health, named in every match on `MdEvent` with a fallback arm, and
     what the consumer passes `PlanVenue::status` once it arrives in place of the spec's
-    discovery snapshot (0130).
+    discovery snapshot; `MdCaps::status: FeedSource` says where it comes from, mandatory like
+    every capability (`None` where the adapter reports none), and the conformance kit's
+    market-data checks breach a status from a venue that declares `None` (0130).
     A `FillEvent` states its `origin: FillOrigin` once: an order's execution (`Order`, its
     client id and grid price) or a change the venue made itself (`Venue`, a `VenueFillKind`:
     liquidation, transfer, settlement or block trade, with no client id and the exact
@@ -696,7 +698,10 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     earlier close, removing none), trading only on a read listing it `LIVE` on a `NORMAL`
     exchange sent after every such halt, after no advertised open and judged before any close
     (a read held back only by such a halt changing nothing), and halted for the required
-    `hibachi.auction_halt` after each reopening until FBC-vg2n; held to the
+    `hibachi.auction_halt` after each reopening until FBC-vg2n, a scheduled one or one its reads
+    show (from the judged time of the first read that can lift a market to show it trading
+    after one showed it halted by status); its caps' `MdCaps::status` is `FeedSource::Poll`;
+    held to the
     hand-built `fixtures/hibachi/rest/status/` driven as the runtime drives it
     (`tests/status.rs`), and in the runtime against the conformance stub on its own thread, on a
     paused clock, with decoder replay of its journal and a consumer's handler passing each

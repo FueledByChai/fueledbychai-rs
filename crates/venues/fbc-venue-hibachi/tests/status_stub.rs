@@ -8,15 +8,16 @@
 //! session's journal (its HTTP answers and timer firings) through decoder replay and gets the
 //! same events, stamps included.
 //!
-//! - a contract going LIVE to PAUSED and back, the exchange entering and leaving
-//!   SCHEDULED_MAINTENANCE, a failed read and a refused answer, each reported once at the poll
-//!   that sees it, and a consumer's handler passing each status it is told into
-//!   `PlanVenue::status`, the execution planner then planning no place or amend on the halted
-//!   market and still its cancel;
-//! - a maintenance window starting between two reads and an FX session ending between two reads,
-//!   each reported halted at its time, a read sent before each and answered after its halt LIVE
-//!   and NORMAL still halted, and none trading again before a read shows it, the window's bounds
-//!   read alike as numbers and as strings;
+//! - the exchange entering SCHEDULED_MAINTENANCE and staying in it past its published window
+//!   and the window after that, a contract going LIVE to PAUSED and back, a failed read and a
+//!   refused answer, each reported once at the poll that sees it, every market a read's status
+//!   halted kept halted for the window after the read that shows it trading again, and a
+//!   consumer's handler passing each status it is told into `PlanVenue::status`, the execution
+//!   planner then planning no place or amend on the halted market and still its cancel;
+//! - a maintenance window starting strictly between two reads and an FX session ending strictly
+//!   between two reads, each reported halted at its own instant, a read sent before each and
+//!   answered after its halt LIVE and NORMAL still halted, and none trading again before a read
+//!   shows it, the window's bounds read alike as numbers and as strings;
 //! - the window after the FX reopening, pending FBC-vg2n, and a read sent before the window
 //!   after a reopening (the FX pair's, and an advertised open) ends, answered after it, halted;
 //! - a close between two reads reported at that instant, a read sent before it and the next
@@ -634,37 +635,52 @@ async fn each_change_is_reported_once_at_the_poll_that_sees_it_and_the_planner_f
     let (consumer, errors) = timeline("hibachi_status_changes", t, true, async |run: &Run| {
         run.asked().await;
         run.answer("live").await;
-        run.read(60, "live").await;
-        // LIVE to PAUSED and back.
-        run.read(120, "eth_paused").await;
-        run.read(180, "eth_paused").await;
-        run.read(240, "live").await;
+        for at in [60, 120, 180, 240] {
+            run.read(at, "live").await;
+        }
         // The exchange enters SCHEDULED_MAINTENANCE (its window, from t+290 to t+330, first
-        // published now) and leaves it once the window and the window after it have passed.
-        run.read(300, "scheduled_maintenance").await;
-        run.read(360, "scheduled_maintenance").await;
-        run.read(420, "scheduled_maintenance").await;
-        run.read(480, "live").await;
+        // published now) and is still in it at the read sent at t+480, after the window and the
+        // window after it (to t+450): the exchange's status alone halts every market then
+        // (RA214-3).
+        for at in [300, 360, 420, 480] {
+            run.read(at, "scheduled_maintenance").await;
+        }
+        // NORMAL at t+540: the venue reopened by then, so every market stays halted until a read
+        // sent the window after it, at t+660 (RA214-2).
+        assert_eq!(540 + AFTER, 660);
+        for at in [540, 600, 660] {
+            run.read(at, "live").await;
+        }
+        // LIVE to PAUSED and back: trading again from the read sent the window after the one
+        // that shows it LIVE.
+        for at in [720, 780] {
+            run.read(at, "eth_paused").await;
+        }
+        for at in [840, 900, 960] {
+            run.read(at, "live").await;
+        }
         // A failed read, twice, then one that succeeds.
-        run.to(540).await;
+        run.to(1_020).await;
         run.asked().await;
         run.refuse(503, Vec::new()).await;
-        run.to(600).await;
+        run.to(1_080).await;
         run.asked().await;
         run.refuse(503, Vec::new()).await;
-        run.read(660, "live").await;
+        run.read(1_140, "live").await;
         // A refused answer (ETH's status null), then one taken.
-        run.to(720).await;
+        run.to(1_200).await;
         run.asked().await;
         run.refuse(200, answer("status_null")).await;
-        run.read(780, "live").await;
+        run.read(1_260, "live").await;
         assert_eq!(run.consumer.count(), 23);
     })
     .await;
     let mut expected = each(0.0, &MARKETS, TRADING);
-    expected.push((120.0, ETH, HALTED));
-    expected.push((240.0, ETH, TRADING));
-    for (halted, lifted) in [(300.0, 480.0), (540.0, 660.0), (720.0, 780.0)] {
+    expected.extend(each(300.0, &MARKETS, HALTED));
+    expected.extend(each(660.0, &MARKETS, TRADING));
+    expected.push((720.0, ETH, HALTED));
+    expected.push((960.0, ETH, TRADING));
+    for (halted, lifted) in [(1_020.0, 1_140.0), (1_200.0, 1_260.0)] {
         expected.extend(each(halted, &MARKETS, HALTED));
         expected.extend(each(lifted, &MARKETS, TRADING));
     }
@@ -694,38 +710,40 @@ async fn each_change_is_reported_once_at_the_poll_that_sees_it_and_the_planner_f
     assert_eq!(*consumer.planned.borrow(), quoted);
 }
 
-/// The Friday timeline under the window fixture `window`: what was reported.
+/// The Friday timeline under the window fixture `window`, from 15 s before [`FRIDAY`], so that
+/// the window's begin (t+105) and the FX weekend's close (t+615) each fall strictly between two
+/// reads (RA214-1): what was reported.
 async fn friday(name: &str, window: &'static str) -> Seen {
-    let t = FRIDAY;
+    let t = FRIDAY - 15;
     let (consumer, errors) = timeline(name, t, false, async move |run: &Run| {
         run.asked().await;
         run.answer(window).await;
-        // A read sent at t+60, before the window's begin (t+90), held; the begin halts every
+        // A read sent at t+60, before the window's begin (t+105), held; the begin halts every
         // market; the read, answered LIVE and NORMAL, lifts nothing.
         run.to(60).await;
         run.asked().await;
         let before = run.consumer.count();
-        run.to(90).await;
+        run.to(105).await;
         until("the window's halt", || run.consumer.count() == before + 3).await;
         run.answer(window).await;
         run.read(120, window).await;
-        // The window ends at t+150; the window after it runs to t+270.
+        // The window ends at t+165; the window after it runs to t+285.
         run.read(180, "live").await;
         run.read(240, "live").await;
         run.read(300, "live").await;
-        for k in 6..=8 {
+        for k in 6..=9 {
             run.read(k * INTERVAL, "live").await;
         }
-        // A read sent at t+540, before the FX weekend closes at t+600, held; the close halts
-        // EUR; the read, and the one sent at the close, answered LIVE: EUR stays halted.
-        assert_eq!(FX_CLOSE, t + 600);
-        run.to(540).await;
+        // A read sent at t+600, before the FX weekend closes at t+615, held across the close;
+        // the close halts EUR at its own instant, no read due then; the read, answered LIVE at
+        // t+630, and the next, sent at t+660, leave EUR halted.
+        assert_eq!(FX_CLOSE, t + 615);
+        run.to(600).await;
         run.asked().await;
         let before = run.consumer.count();
-        run.to(600).await;
+        run.to(615).await;
         until("the session's halt", || run.consumer.count() == before + 1).await;
-        run.answer("live").await;
-        run.asked().await;
+        run.to(630).await;
         run.answer("live").await;
         run.read(660, "live").await;
     })
@@ -739,10 +757,10 @@ async fn a_window_and_an_fx_session_end_between_reads_halt_at_their_time_and_rea
  {
     let numbers = friday("hibachi_status_window_number", "window_number").await;
     let mut expected = each(0.0, &MARKETS, TRADING);
-    expected.extend(each(90.0, &MARKETS, HALTED));
-    assert_eq!(150 + AFTER, 270);
+    expected.extend(each(105.0, &MARKETS, HALTED));
+    assert_eq!(165 + AFTER, 285);
     expected.extend(each(300.0, &MARKETS, TRADING));
-    expected.push((600.0, EUR, HALTED));
+    expected.push((615.0, EUR, HALTED));
     assert_eq!(numbers, expected);
     // The window's bounds as strings: the same.
     let strings = friday("hibachi_status_window_string", "window_string").await;

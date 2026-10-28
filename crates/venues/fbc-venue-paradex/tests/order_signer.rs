@@ -85,6 +85,8 @@ fn decode_caps() -> VenueCaps {
             stats: FeedSource::None,
             mark: FeedSource::None,
             index: FeedSource::None,
+            // As the factory declares it: no trading status is reported (decision 0130).
+            status: FeedSource::None,
             ts_precision: Duration::from_millis(1),
             topology: ConnTopology::PerInstrument,
             max_conn_lifetime: None,

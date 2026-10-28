@@ -982,6 +982,8 @@ fn toy_caps() -> VenueCaps {
             stats: FeedSource::None,
             mark: FeedSource::None,
             index: FeedSource::None,
+            // The toy venue reports no trading status (decision 0130).
+            status: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
             topology: ConnTopology::Shared {
                 max_subscriptions: None,

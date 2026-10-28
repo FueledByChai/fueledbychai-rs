@@ -2,7 +2,7 @@
 //! long a REST request waits, how many levels each orderbook subscription asks for, how long
 //! the market-data codec waits before it asks again for an orderbook it found broken, how often
 //! the status poll re-reads each market's trading status, and how long a market stays halted
-//! after a scheduled reopening. Every key is required and none has a default.
+//! after a reopening. Every key is required and none has a default.
 
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -42,9 +42,11 @@ pub const KEY_ORDERBOOK_DEPTH: &str = "hibachi.orderbook_depth";
 /// decision 0130). No default: the interval bounds how late a change no schedule announces
 /// reaches the consumer, which is the consumer's choice against the IP's REST limit.
 pub const KEY_STATUS_INTERVAL: &str = "hibachi.status_interval";
-/// How long a market stays halted after each scheduled reopening the status poll knows of (a
-/// published maintenance window's end, a contract's session reopening in its calendar, an
-/// advertised open), in whole seconds (`<n>s`, zero refused). Hibachi runs a call auction then
+/// How long a market stays halted after each reopening the status poll knows of (a published
+/// maintenance window's end, a contract's session reopening in its calendar, an advertised open,
+/// and a reopening its reads show, counted from the judged time of the first read that shows the
+/// market trading again after one showed it halted by status), in whole seconds (`<n>s`, zero
+/// refused). Hibachi runs a call auction then
 /// (its call-auction docs), and no source says which status a contract shows during one, so
 /// until FBC-vg2n records it from evidence the poll reports the market halted for this window
 /// and only a read sent after it ends can report it trading (decision 0130). No default.
@@ -103,8 +105,8 @@ pub(crate) const SCHEMA: &[FieldSpec] = &[
         scope: ConfigScope::Process,
         unit: FieldUnit::Duration,
         doc: "how long, in whole seconds (e.g. 900s; zero refused), a market is reported halted \
-              after a maintenance window's end, a session's reopening or an advertised open, for \
-              the call auction Hibachi runs then",
+              after a maintenance window's end, a session's reopening, an advertised open or a \
+              reopening the status poll's reads show, for the call auction Hibachi runs then",
     },
 ];
 
@@ -128,14 +130,14 @@ pub(crate) struct Settings {
     pub rest_timeout: Duration,
     /// How often the status poll re-reads the exchange information.
     pub status_interval: Duration,
-    /// How long a market stays halted after a scheduled reopening.
+    /// How long a market stays halted after a reopening.
     pub auction_halt: Duration,
 }
 
 impl Settings {
     /// Every key, each checked: the REST origin and timeout as discovery reads them, the
     /// orderbook depth, the WebSocket origin, the resubscribe interval, the status interval and
-    /// the window after a scheduled reopening.
+    /// the window after a reopening.
     pub fn read(cfg: &VenueConfig) -> Result<Settings, ConfigError> {
         let rest = rest_origin(cfg)?.to_owned();
         let rest_timeout = rest_timeout(cfg)?;

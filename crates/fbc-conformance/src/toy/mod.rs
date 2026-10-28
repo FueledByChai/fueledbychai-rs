@@ -255,6 +255,8 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
             stats: FeedSource::None,
             mark: FeedSource::None,
             index: FeedSource::None,
+            // The toy reports no trading status: its market data carries none (decision 0130).
+            status: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
             topology: ConnTopology::Shared {
                 max_subscriptions: None,

@@ -485,6 +485,9 @@ fn venue_caps(exec: Option<ExecCaps>) -> VenueCaps {
             // The markets_summary.{market} channel, MarketSummaryEvent.markPrice.
             mark: FeedSource::Stream,
             index: FeedSource::None,
+            // No market-data codec here decodes a market's trading status, so none is reported
+            // and discovery's snapshot stands (decision 0130).
+            status: FeedSource::None,
             // The schema: "Timestamps: all int64, microseconds since Unix epoch (UTC)".
             ts_precision: Duration::from_micros(1),
             // A frame names its message by template id and its instrument by `market`, but a
