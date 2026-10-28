@@ -1,0 +1,1 @@
+{"order_response":{"order_id":"11111111-1111-4111-8111-111111111111","client_order_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","symbol":"AAPL-USD","status":"MODIFIED","order_origin":"SET_REDUCE_ONLY_ALL","reduce_only":true,"side":"SELL","type":"LIMIT","time_in_force":"GTC","quantity":8,"quantity_remaining":8,"price":200,"update_time":1760000000.123,"trade_id":null}}

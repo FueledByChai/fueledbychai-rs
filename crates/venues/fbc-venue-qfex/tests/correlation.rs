@@ -47,6 +47,31 @@ fn documented_style_ack_without_a_client_id_cannot_settle_a_place() {
 }
 
 #[test]
+fn unsolicited_exchange_conversion_is_not_a_place_candidate() {
+    let pending = [Pending {
+        rpc: RpcId(9),
+        symbol: "AAPL-USD",
+        operation: Operation::Place {
+            client_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        },
+    }];
+    let conversion =
+        include_bytes!("../../../../fixtures/qfex/private/exchange_reduce_only_conversion.json");
+    assert_eq!(correlate(conversion, &pending).unwrap(), Correlation::None);
+    let cancelled = br#"{"order_response":{"symbol":"AAPL-USD","client_order_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","status":"CANCELLED"}}"#;
+    assert_eq!(correlate(cancelled, &pending).unwrap(), Correlation::None);
+    let echo = br#"{"ack":{"incoming_message":{"type":"add_order","params":{"symbol":"AAPL-USD","client_order_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}}}}"#;
+    assert_eq!(
+        correlate(echo, &pending).unwrap(),
+        Correlation::Candidate {
+            rpc: RpcId(9),
+            evidence: Evidence::CommandEcho,
+            status: None,
+        }
+    );
+}
+
+#[test]
 fn duplicate_client_id_is_ambiguous_and_cancel_needs_venue_uuid() {
     let duplicate = [
         Pending {

@@ -101,7 +101,11 @@ fn matches_request(
     }
     match request.operation {
         Operation::Place { client_id } => {
-            kind.is_none_or(|kind| kind == "add_order")
+            // A live order update may repeat the place's client id without being
+            // caused by the place. In particular, QFEX can send an unsolicited
+            // MODIFIED update when it converts a resting order to reduce-only.
+            // Only an ACK or an exact add_order command echo is a candidate.
+            (kind == Some("add_order") || (kind.is_none() && status == Some("ACK")))
                 && params.get("client_order_id").and_then(Value::as_str) == Some(client_id)
         }
         Operation::Modify { venue_id } => {

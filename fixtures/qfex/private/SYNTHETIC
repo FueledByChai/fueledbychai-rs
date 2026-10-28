@@ -5,4 +5,6 @@ ids, prices, quantities, and other values are made up; no raw live frame or
 funded-account value is retained here. They prove parser behavior only and do
 not establish venue acceptance.
 The fill, open-orders, user-trades, and position examples are synthetic adaptations of
-QFEX's published examples. Fee sign/currency and snapshot completeness remain unknown.
+QFEX's published examples. The exchange reduce-only conversion is adapted from the
+published order-response lifecycle example. Fee sign/currency and snapshot completeness
+remain unknown.

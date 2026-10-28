@@ -375,6 +375,47 @@ fn malformed_documented_fill_reconnects_with_generic_diagnostic() {
 }
 
 #[test]
+fn exchange_reduce_only_conversion_fails_closed_without_order_truth() {
+    let cfg = config("primary", "4");
+    let caps = Qfex.caps(&cfg).unwrap();
+    let mut codec = Qfex.exec_codec(&cfg, credentials(PUBLIC)).unwrap().unwrap();
+    let mut effects = Effects::new();
+    let mut sink = Sink::default();
+    codec.on_open(StreamId(0), &context(), &mut effects);
+    effects.take();
+    dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            StreamId(0),
+            RawFrame::Text(r#"{"type":"auth","result":"success"}"#),
+            scope,
+            &SpecTable::new(),
+            &mut sink,
+            &mut effects,
+        )
+    })
+    .unwrap();
+    effects.take();
+    let conversion =
+        include_str!("../../../../fixtures/qfex/private/exchange_reduce_only_conversion.json");
+    let result = dispatch_market_data(&caps, |scope| {
+        codec.on_frame(
+            StreamId(0),
+            RawFrame::Text(conversion),
+            scope,
+            &SpecTable::new(),
+            &mut sink,
+            &mut effects,
+        )
+    });
+    assert_eq!(
+        result,
+        Err(DecodeError::Malformed("invalid QFEX private state"))
+    );
+    assert_eq!(sink.0.len(), 1, "only authentication may be emitted");
+    assert!(matches!(effects.as_slice(), [Effect::Reconnect { .. }]));
+}
+
+#[test]
 fn rejected_or_missing_auth_never_emits_authenticated() {
     for reply in [
         r#"{"type":"auth","result":"failure","err":"bad signature"}"#,
