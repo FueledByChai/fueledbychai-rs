@@ -555,7 +555,10 @@ struct Plan {
     silence: Duration,
     labels: Labels,
     /// The limiter a read the venue's wiring made first was charged to (Hibachi's contract
-    /// read), so it and the sessions share one count; `None` for a fresh one.
+    /// read), handed to the venue's sessions in place of a fresh one, so a request of theirs that
+    /// a declared limit counts would be counted beside the read; `None` for a fresh one. Hibachi
+    /// declares one limit, on REST requests, and its market-data sessions make none, so for now
+    /// they add nothing to the read's count.
     limiter: Option<RateLimiter>,
     /// A Hibachi contract's state and its codec's counts.
     hibachi: Option<(Listed, Tally)>,
@@ -689,6 +692,13 @@ impl Shard<'_> {
     /// `ask_bid_price` touch, its trades and its orderbook at its own granularity (or
     /// `--hibachi-granularity`), decoded on its own tick and step.
     async fn hibachi(&self, opts: &HibachiOpts) -> Result<(Wired, MdVenueControl), String> {
+        let plan = self.hibachi_plan(opts).await?;
+        self.wire(plan)
+    }
+
+    /// What [`hibachi`](Shard::hibachi) wires: the contract read through the run's connector and
+    /// charged to Hibachi's declared rate limit, on the limiter the plan then hands the sessions.
+    async fn hibachi_plan(&self, opts: &HibachiOpts) -> Result<Plan, String> {
         let factory = hibachi::Counting::leaked();
         let cfg = hibachi::config(opts);
         let fail = |e: &dyn std::fmt::Display| format!("hibachi: {e}");
@@ -705,7 +715,7 @@ impl Shard<'_> {
             inst: HIBACHI_INST,
             feed,
         };
-        self.wire(Plan {
+        Ok(Plan {
             factory,
             cfg,
             specs,
@@ -864,8 +874,8 @@ mod tests {
 
     const BOOK: BookId = BookId(0);
 
-    fn watcher(out: Out) -> Watcher {
-        let opts = Options {
+    fn options() -> Options {
+        Options {
             paradex: None,
             paradex_touch: ParadexTouch::Bbo,
             binance: None,
@@ -876,7 +886,23 @@ mod tests {
             paradex_url: String::new(),
             binance_ws: String::new(),
             binance_rest: String::new(),
-        };
+        }
+    }
+
+    fn sink(out: Out) -> Sink {
+        Sink {
+            out,
+            closed: Rc::new(Notify::new()),
+            failed: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn watcher(out: Out) -> Watcher {
+        stamping(out, false)
+    }
+
+    /// A watcher on a toy market, its lines led by their times when `stamps`, as md_watch runs.
+    fn stamping(out: Out, stamps: bool) -> Watcher {
         let labels = Labels {
             venue: "toy",
             symbol: "TOY-PERP".to_owned(),
@@ -888,20 +914,22 @@ mod tests {
             tick: Decimal::ONE,
             step: Decimal::ONE,
         };
-        let sink = Sink {
-            out,
-            closed: Rc::new(Notify::new()),
-            failed: Rc::new(RefCell::new(None)),
-        };
-        Watcher::new(labels, &opts, false, Rc::new(Cell::new(false)), sink)
+        let stopping = Rc::new(Cell::new(false));
+        Watcher::new(labels, &options(), stamps, stopping, sink(out))
     }
 
     fn env(seq: u64, body: MdEvent) -> Envelope<MdEvent> {
+        received(seq, WallNs(0), body)
+    }
+
+    /// `body`, as the runtime hands it on: the input `seq` of the shard, stamped `recv_wall`
+    /// on receipt.
+    fn received(seq: u64, recv_wall: WallNs, body: MdEvent) -> Envelope<MdEvent> {
         let stamp = Stamp {
             ingest_seq: seq,
             kernel_rx: None,
             recv_mono: MonoNs(0),
-            recv_wall: WallNs(0),
+            recv_wall,
             conn: ConnKey { conn: 0, epoch: 0 },
         };
         Envelope::new(stamp, VenueMeta::NONE, body)
@@ -1053,5 +1081,124 @@ mod tests {
              MARKET toy TOY-PERP closed by its session calendar\n\
              MARKET toy TOY-PERP open\n"
         );
+    }
+
+    /// Reviewer A RA213-2: a line an input brought is led by the time the runtime stamped that
+    /// input on receipt, `recv_wall`, not by the time md_watch prints it: a `TOUCH`, a `TRADE`
+    /// and a `HEALTH` line at once, and a `BOOK` line when a later flush prints the book the
+    /// snapshot left. Each input here was received on 1970-01-01, which no line printed now
+    /// could be stamped with.
+    #[test]
+    fn a_line_an_input_brought_is_led_by_its_receive_time() {
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut w = stamping(buf.clone(), true);
+        // 01:02:03.456, 01:02:04.001, 01:02:05.999 and 01:02:06.000 UTC on 1970-01-01.
+        let at = |ms: i64| WallNs(ms * 1_000_000);
+        let (touch, trade, health, book) =
+            (at(3_723_456), at(3_724_001), at(3_725_999), at(3_726_000));
+        let inst = PARADEX_INST;
+        let lvl = |px| Lvl {
+            px: Ticks(px),
+            qty: Lots::new(1).unwrap(),
+        };
+        let source = TouchSourceId(0);
+        let quote = MdEvent::Touch {
+            inst,
+            bid: Some(lvl(99)),
+            ask: Some(lvl(101)),
+            source,
+        };
+        w.on_event(received(1, touch, quote));
+        let traded = MdEvent::Trade {
+            inst,
+            id: None,
+            aggressor: Aggressor::Buyer,
+            px: Ticks(100),
+            qty: Lots::new(1).unwrap(),
+        };
+        w.on_event(received(2, trade, traded));
+        let feed = Feed::Touch(source);
+        let gap = MdEvent::Health {
+            inst,
+            feed,
+            h: FeedHealth::Gap,
+        };
+        w.on_event(received(3, health, gap));
+        let snapshot = [
+            MdEvent::BookSnapshotBegin {
+                inst,
+                book: BOOK,
+                epoch: 1,
+            },
+            level(BookSide::Bid, 99),
+            level(BookSide::Ask, 101),
+            MdEvent::BookSnapshotEnd { inst, book: BOOK },
+        ];
+        for ev in snapshot {
+            w.on_event(received(4, book, ev));
+        }
+        w.flush();
+        let text = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert_eq!(
+            text,
+            "01:02:03.456 TOUCH toy TOY-PERP touch bid 99 x 1 ask 101 x 1 mid 100 spread \
+             200.00bps\n\
+             01:02:04.001 TRADE toy TOY-PERP buy 1 @ 100\n\
+             01:02:05.999 HEALTH toy TOY-PERP touch gap\n\
+             01:02:06.000 BOOK toy TOY-PERP book bid 99 x 1 ask 101 x 1 mid 100 spread \
+             200.00bps\n  1 bid 99 x 1 | ask 101 x 1\n"
+        );
+    }
+
+    /// Reviewer A RA213-1: Hibachi's contract read is charged to Hibachi's declared rate limit
+    /// on the limiter the plan then hands the venue's sessions, not on one of its own: the
+    /// plan's limiter has the read's one request counted. (Hibachi's one declared limit counts
+    /// REST requests, which its market-data sessions do not make, so nothing of theirs adds to
+    /// that count yet.)
+    #[tokio::test]
+    async fn a_hibachi_contracts_read_is_charged_to_the_limiter_its_sessions_are_given() {
+        use fbc_conformance::{HttpReply, HttpRoutes, StubServer, WsScript};
+        use fbc_runtime::{BucketKey, ProxyConfig};
+
+        let answer = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/hibachi/rest/exchange_info.json"
+        );
+        let body = std::fs::read(answer).unwrap();
+        let reply = HttpReply { status: 200, body };
+        let routes = HttpRoutes::from([("/market/exchange-info".to_owned(), reply)]);
+        let stub = StubServer::start(WsScript::new(Vec::new()), routes)
+            .await
+            .unwrap();
+        let contract = HibachiOpts {
+            symbol: "ETH/USDT-P".to_owned(),
+            rest: stub.http_url(""),
+            ws: stub.ws_url(""),
+            timeout_ms: 5_000,
+            depth: 3,
+            granularity: None,
+            retry_ms: 2_000,
+        };
+        let opts = Options {
+            hibachi: Some(contract.clone()),
+            ..options()
+        };
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let shard = Shard {
+            opts: &opts,
+            clock: IngestClock::new(),
+            connector: Connector::new(ProxyConfig::Direct),
+            stamps: false,
+            stopping: Rc::new(Cell::new(false)),
+            out: sink(buf.clone()),
+        };
+        let plan = shard.hibachi_plan(&contract).await.unwrap();
+        assert_eq!(stub.http_requests(), ["GET /market/exchange-info"]);
+        let limiter = plan
+            .limiter
+            .as_ref()
+            .expect("the read's limiter, for the sessions");
+        let now = tokio::time::Instant::now();
+        assert_eq!(limiter.used(now, 0, BucketKey::Shared), 1);
     }
 }

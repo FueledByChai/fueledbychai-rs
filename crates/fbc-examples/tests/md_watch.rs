@@ -9,6 +9,10 @@
 //! frames come back at another granularity or depth gaps on every Snapshot with
 //! `param_mismatches` counted, the sign the owner's first live run reads; the usage text and the
 //! crate's README show the command; and nothing in the repository runs md_watch against a venue.
+//! Beside it (PR #213's reviews): the README's other outcomes as the stub plays them, a book
+//! whose Snapshots take the fields but are thin (`thin_sides`) and an orderbook subscription
+//! left unanswered (`resubscribes`, `reconnects`, `RECONNECT`), each against the README's own
+//! signature for it; and `--socks5` carrying the contract read as it carries the WebSocket.
 //!
 //! Two stubs stand in for the venues, serving the committed hand-built fixtures: Paradex's SBE
 //! frames (`fixtures/paradex/md/`: BTC-USD-PERP's `deltas` book, its bbo and a trade) and
@@ -1000,6 +1004,209 @@ async fn a_hibachi_book_whose_snapshots_ignore_the_subscriptions_fields_gaps_wit
     );
 }
 
+/// The crate README's account of how the owner's first live run reads, outcome by outcome: each
+/// `- **<label>**:` bullet of its md_watch section, its wrapped lines joined into one.
+fn readme_outcomes() -> Vec<(String, String)> {
+    let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let readme = fs::read_to_string(readme).unwrap();
+    let section = readme
+        .split("\n## md_watch\n")
+        .nth(1)
+        .expect("an md_watch section");
+    let section = section.split("\n## ").next().unwrap();
+    let mut outcomes: Vec<(String, String)> = Vec::new();
+    let mut inside = false;
+    for line in section.lines() {
+        if let Some(rest) = line.strip_prefix("- **") {
+            let (label, text) = rest.split_once("**:").expect("a labelled outcome");
+            outcomes.push((label.to_owned(), text.trim().to_owned()));
+            inside = true;
+        } else if inside && line.starts_with("  ") {
+            let text = &mut outcomes.last_mut().unwrap().1;
+            text.push(' ');
+            text.push_str(line.trim());
+        } else {
+            inside = false;
+        }
+    }
+    outcomes
+}
+
+/// The README's outcome `label`, its lines joined.
+fn readme_outcome(label: &str) -> String {
+    let found = readme_outcomes().into_iter().find(|(l, _)| l == label);
+    found
+        .map(|(_, text)| text)
+        .unwrap_or_else(|| panic!("the README gives no outcome {label:?}"))
+}
+
+/// Reviewer B RB213-1: a book whose Snapshots come back at the subscription's own granularity
+/// and depth but fail another of the codec's checks gaps on each Snapshot, the check's own
+/// counter named and never `param_mismatches`, and every resubscribe is answered, so no
+/// reconnect is asked for. The stub answers the orderbook subscription, and each of the codec's
+/// two resubscribes, with `eth_snapshot_thin` (granularity 0.01 and depth 3, as asked, but two
+/// asks): each prints `HEALTH ... orderbook gap` and no book, and `COUNTS` names `thin_sides`,
+/// then `resubscribes`. The README reads such a run as an outcome of its own, which names that
+/// counter and says how a thin side is told from a shallow live book; "Not answered", whose
+/// opening sentence these lines once fitted, now asks for what they lack.
+#[tokio::test]
+async fn a_hibachi_book_whose_snapshots_take_the_subscriptions_fields_but_are_thin_gaps_with_thin_sides_counted()
+ {
+    let mut steps = vec![Step::Accept];
+    steps.extend((0..3).map(|_| Step::Read { conn: 0 }));
+    for resubscribed in [false, true, true] {
+        if resubscribed {
+            // The resubscribe, after --hibachi-retry: an unsubscribe and a subscribe.
+            steps.extend((0..2).map(|_| Step::Read { conn: 0 }));
+        }
+        steps.push(Step::Push {
+            conn: 0,
+            frame: hibachi_frame("eth_snapshot_thin"),
+        });
+    }
+    let stub = StubServer::start(WsScript::new(steps), exchange_info())
+        .await
+        .unwrap();
+    // The next resubscribe would come a second after the third gap: md_watch stops before it.
+    let opts = hibachi_args(&stub, "ETH/USDT-P", &["--hibachi-retry", "1000"]);
+    let gap = "HEALTH hibachi ETH/USDT-P orderbook gap";
+    let lines = watch_until(&opts, false, |t| t.matches(gap).count() == 3).await;
+    stub.finished().await.unwrap();
+
+    let hibachi = of(&lines[1..], "hibachi");
+    assert_eq!(hibachi[0], "MARKET hibachi ETH/USDT-P open");
+    assert_eq!(
+        hibachi.iter().filter(|l| *l == gap).count(),
+        3,
+        "{hibachi:#?}"
+    );
+    let shown = |l: &&String| l.starts_with("BOOK ") || l.starts_with("RECONNECT ");
+    assert!(!hibachi.iter().any(|l| shown(&l)), "{hibachi:#?}");
+    let counts: Vec<&str> = hibachi
+        .iter()
+        .filter(|l| l.starts_with("COUNTS "))
+        .map(String::as_str)
+        .collect();
+    // Printed as each kind is first counted (the first resubscribe before or after the second
+    // Snapshot's gap), then in full before the connection's end.
+    let first = "COUNTS hibachi ETH/USDT-P thin_sides 1";
+    let resubscribed = [
+        "COUNTS hibachi ETH/USDT-P thin_sides 1 resubscribes 1",
+        "COUNTS hibachi ETH/USDT-P thin_sides 2 resubscribes 1",
+    ];
+    let last = "COUNTS hibachi ETH/USDT-P thin_sides 3 resubscribes 2";
+    assert_eq!(counts.len(), 3, "{hibachi:#?}");
+    assert_eq!(counts[0], first, "{hibachi:#?}");
+    assert!(resubscribed.contains(&counts[1]), "{hibachi:#?}");
+    let n = hibachi.len();
+    assert_eq!(
+        hibachi[n - 2..],
+        [last, "CLOSED hibachi conn 128 epoch 0 ended"]
+    );
+    // Each Snapshot stated the subscription's own fields, and the codec asked for the same ones
+    // again on each resubscribe.
+    let conns = stub.connections();
+    assert_eq!(conns.len(), 1);
+    let asked = hibachi_requests(&conns[0]);
+    let again = [
+        r#"unsubscribe "orderbook""#,
+        r#"subscribe "orderbook" granularity "0.01" depth 3"#,
+    ];
+    assert_eq!(asked[3..], [again, again].concat());
+
+    // The README's outcome for these lines names their counter, the counters they lack, and the
+    // smaller depth that tells a thin side from a shallow live book.
+    let taken = readme_outcome("Taken, but the book fails another check");
+    for said in [
+        "`thin_sides`",
+        "no `param_mismatches`",
+        "no `reconnects`",
+        "a smaller `--hibachi-depth`",
+    ] {
+        assert!(
+            taken.contains(said),
+            "the outcome does not say {said}: {taken}"
+        );
+    }
+    // "Not answered" asks for a RECONNECT on every connection and no orderbook counter but the
+    // two these lines would have to show, so it cannot be read into them.
+    let not_answered = readme_outcome("Not answered");
+    for said in [
+        "a `RECONNECT` line follows on every connection",
+        "no orderbook counter but `resubscribes` and `reconnects`",
+        "`thin_sides`",
+    ] {
+        assert!(
+            not_answered.contains(said),
+            "\"Not answered\" does not say {said}: {not_answered}"
+        );
+    }
+}
+
+/// Reviewer B RB213-1: "Not answered" as the README now gives it. No orderbook frame comes, so
+/// the book's first gap is printed only when the codec's wait for its Snapshot runs out, on no
+/// frame; the codec then resubscribes and, that unanswered too, asks for a reconnect. `COUNTS`
+/// names `resubscribes` and `reconnects` and no orderbook counter besides, and a `RECONNECT`
+/// line ends the connection. The stub reads the first connection's three subscriptions and the
+/// resubscribe and answers none of them, then the second connection's subscriptions.
+#[tokio::test]
+async fn a_hibachi_orderbook_subscription_left_unanswered_gaps_resubscribes_then_reconnects() {
+    let mut steps = vec![Step::Accept];
+    steps.extend((0..5).map(|_| Step::Read { conn: 0 }));
+    steps.push(Step::Accept);
+    steps.extend((0..3).map(|_| Step::Read { conn: 1 }));
+    let stub = StubServer::start(WsScript::new(steps), exchange_info())
+        .await
+        .unwrap();
+    // The second connection's wait would end a second after it subscribes: md_watch stops before.
+    let opts = hibachi_args(&stub, "ETH/USDT-P", &["--hibachi-retry", "1000"]);
+    let resubscribed = |_: &str| {
+        let conns = stub.connections();
+        conns.get(1).is_some_and(|c| c.received.len() == 3)
+    };
+    let lines = watch_until(&opts, false, resubscribed).await;
+    stub.finished().await.unwrap();
+
+    let hibachi = of(&lines[1..], "hibachi");
+    let at = hibachi
+        .iter()
+        .position(|l| l.starts_with("RECONNECT "))
+        .unwrap_or_else(|| panic!("no reconnect: {hibachi:#?}"));
+    let (first, second) = hibachi.split_at(at);
+    let both = "COUNTS hibachi ETH/USDT-P resubscribes 1 reconnects 1";
+    // Printed as first counted when a flush came between the reconnect asked for and the
+    // connection's end, and in full at its end.
+    assert!((4..=5).contains(&first.len()), "{hibachi:#?}");
+    assert_eq!(
+        first[..3],
+        [
+            "MARKET hibachi ETH/USDT-P open",
+            "HEALTH hibachi ETH/USDT-P orderbook gap",
+            "COUNTS hibachi ETH/USDT-P resubscribes 1",
+        ],
+        "{hibachi:#?}"
+    );
+    assert!(first[3..].iter().all(|l| l == both), "{hibachi:#?}");
+    assert_eq!(
+        second,
+        [
+            "RECONNECT hibachi conn 128 epoch 0 ended",
+            "COUNTS hibachi ETH/USDT-P none",
+            "CLOSED hibachi conn 128 epoch 1 ended",
+        ],
+        "{hibachi:#?}"
+    );
+    let conns = stub.connections();
+    let asked = hibachi_requests(&conns[0]);
+    assert_eq!(
+        asked[3..],
+        [
+            r#"unsubscribe "orderbook""#,
+            r#"subscribe "orderbook" granularity "0.01" depth 3"#,
+        ]
+    );
+}
+
 /// md_watch prints the codec's counts per connection, through a real reconnect: in full before
 /// each `RECONNECT` and `CLOSED` line, and on the second connection as first counted there,
 /// though the first counted the same kind. The stub sends a price-only `ask_bid_price` frame
@@ -1289,9 +1496,11 @@ async fn md_watch_reads_the_hibachi_contract_through_the_venues_discovery() {
 }
 
 /// md_watch's contract read makes only a bare public GET, each charged to Hibachi's declared
-/// rate limit before it is sent, so the read and the sessions share one count: the plan's one
-/// request is charged once and answered by the stub; one the limit has no room for is refused,
-/// and so is one with another method, a header or a body, none of them charged or sent.
+/// rate limit before it is sent: the plan's one request is charged once and answered by the
+/// stub; one the limit has no room for is refused, and so is one with another method, a header
+/// or a body, none of them charged or sent. That the limiter charged is the one the sessions are
+/// then given is `watch.rs`'s
+/// `a_hibachi_contracts_read_is_charged_to_the_limiter_its_sessions_are_given`.
 #[tokio::test]
 async fn md_watch_sends_the_contract_read_as_a_bare_get_charged_to_the_rate_limit() {
     use fbc_core::{Effect, Header, HttpMethod, HttpRequest, VenueFactory, WireSlice};
@@ -1407,6 +1616,27 @@ async fn a_hibachi_contract_is_reported_closed_by_its_status_or_its_calendar() {
     assert_eq!(gbp.state(saturday), "closed: listed Halted");
     assert_eq!(eth.state(saturday), "open");
     assert_eq!(eth.state(wednesday), "open");
+    // Reviewer B RB213-2: the listed status is the read's, made once, so a contract the read
+    // finds PAUSED reads closed at every later instant too (GBP above, on the Wednesday); the
+    // usage text and the README say so, and that a halt listed later is not seen.
+    let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let usage = flat(USAGE);
+    for said in [
+        "its listed status is read once, at the start",
+        "reads closed all run, even once Hibachi reopens it",
+        "a halt listed later is not seen",
+    ] {
+        assert!(usage.contains(said), "--help does not say {said}");
+    }
+    let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let readme = flat(&fs::read_to_string(readme).unwrap());
+    for said in [
+        "holds for the whole run in both directions",
+        "closed: listed Halted` for the whole run, even after Hibachi reopens it",
+        "a halt Hibachi lists later is not seen",
+    ] {
+        assert!(readme.contains(said), "the README does not say {said}");
+    }
 }
 
 /// The done line's command is in the usage text and in the crate's README, beside the README's
@@ -1430,6 +1660,18 @@ fn the_usage_text_and_the_readme_show_the_hibachi_command() {
     ] {
         assert!(readme.contains(said), "the README does not say {said}");
     }
+    // Reviewer B RB213-1: the README tells four outcomes apart, each by a signature of its own.
+    let outcomes = readme_outcomes();
+    let labels: Vec<&str> = outcomes.iter().map(|(label, _)| label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "Not honoured",
+            "Not answered",
+            "Honoured, or the venue's defaults happen to be what was asked",
+            "Taken, but the book fails another check",
+        ]
+    );
 }
 
 /// Nothing in the repository runs md_watch against a venue: no CI workflow or script names it
@@ -1677,4 +1919,108 @@ async fn md_watch_refuses_a_hibachi_contract_read_that_fails() {
         "{err}"
     );
     assert!(stub.connections().is_empty());
+}
+
+/// A SOCKS5 proxy (RFC 1928, no authentication) on a 127.0.0.1 ephemeral port that relays each
+/// CONNECT to the address it names (an IPv4 address, or `localhost`) and records each target as
+/// `<host>:<port>`, in the order the requests arrived. A request it cannot read is recorded as
+/// `refused` and closed.
+async fn socks5_relay() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    use std::net::Ipv4Addr;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn target(client: &mut TcpStream) -> Option<(String, u16)> {
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await.ok()?;
+        let mut methods = vec![0u8; usize::from(greeting[1])];
+        client.read_exact(&mut methods).await.ok()?;
+        (greeting[0] == 5 && methods.contains(&0)).then_some(())?;
+        client.write_all(&[5, 0]).await.ok()?;
+        let mut head = [0u8; 4];
+        client.read_exact(&mut head).await.ok()?;
+        (head[..3] == [5, 1, 0]).then_some(())?;
+        let host = match head[3] {
+            1 => {
+                let mut ip = [0u8; 4];
+                client.read_exact(&mut ip).await.ok()?;
+                Ipv4Addr::from(ip).to_string()
+            }
+            3 => {
+                let mut name = vec![0u8; usize::from(client.read_u8().await.ok()?)];
+                client.read_exact(&mut name).await.ok()?;
+                String::from_utf8(name).ok()?
+            }
+            _ => return None,
+        };
+        Some((host, client.read_u16().await.ok()?))
+    }
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let log = targets.clone();
+    tokio::spawn(async move {
+        while let Ok((mut client, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let Some((host, port)) = target(&mut client).await else {
+                    log.lock().unwrap().push("refused".to_owned());
+                    return;
+                };
+                log.lock().unwrap().push(format!("{host}:{port}"));
+                let ip = if host == "localhost" {
+                    Ipv4Addr::LOCALHOST
+                } else {
+                    host.parse().unwrap_or(Ipv4Addr::UNSPECIFIED)
+                };
+                let Ok(mut upstream) = TcpStream::connect((ip, port)).await else {
+                    let _ = client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+                    return;
+                };
+                let ok = [5, 0, 0, 1, 127, 0, 0, 1, 0, 0];
+                if client.write_all(&ok).await.is_ok() {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                }
+            });
+        }
+    });
+    (port, targets)
+}
+
+/// Reviewer B RB213-4: `--socks5` applies to Hibachi's contract read as to its WebSocket. The
+/// read is md_watch's one HTTP request made outside the runtime's sessions, through the run's
+/// connector; with `--socks5` pointed at a relay, the relay is asked to CONNECT exactly twice,
+/// first to the stub's HTTP port (the read), then to its WebSocket port, and md_watch prints the
+/// book the stub's Snapshot carries, so both went through it and nothing went around it.
+#[tokio::test]
+async fn md_watch_sends_the_hibachi_contract_read_and_its_websocket_through_the_socks5_proxy() {
+    let mut steps = vec![Step::Accept];
+    steps.extend((0..3).map(|_| Step::Read { conn: 0 }));
+    steps.push(Step::Push {
+        conn: 0,
+        frame: hibachi_frame("eth_s0"),
+    });
+    let stub = StubServer::start(WsScript::new(steps), exchange_info())
+        .await
+        .unwrap();
+    let (proxy, targets) = socks5_relay().await;
+    let proxy = format!("127.0.0.1:{proxy}");
+    let opts = hibachi_args(&stub, "ETH/USDT-P", &["--socks5", &proxy]);
+    assert!(matches!(opts.proxy, ProxyConfig::Socks5 { .. }));
+    let book = "BOOK hibachi ETH/USDT-P orderbook bid 2000 x 1.25 ask 2000.1 x 1.5";
+    let lines = watch_until(&opts, false, |t| t.contains(book)).await;
+    stub.finished().await.unwrap();
+
+    assert_eq!(lines.iter().filter(|l| l.starts_with(book)).count(), 1);
+    let http = stub.http_url("");
+    let ws = stub.ws_url("");
+    let relayed = [
+        http.strip_prefix("http://").unwrap(),
+        ws.strip_prefix("ws://").unwrap(),
+    ];
+    assert_eq!(*targets.lock().unwrap(), relayed);
+    assert_eq!(stub.http_requests(), ["GET /market/exchange-info"]);
+    assert_eq!(stub.connections().len(), 1);
 }

@@ -16,8 +16,11 @@ program's flags.
 ## md_watch
 
 Public market data only: md_watch reads no credential and sends no order. Each venue named runs
-on connections of its own, every line after the first is led by its UTC receive time, and
-`--help` lists every flag and every kind of line. Nothing in the repository runs it against a
+on connections of its own, and `--help` lists every flag and every kind of line. Every line
+after the first is led by a UTC time: a `TOUCH`, `TRADE`, `HEALTH` or `BOOK` line by the time
+the runtime stamped the input that brought it (a frame's receive time, or the instant a codec's
+timer fired), and a `MARKET`, `COUNTS`, `RECONNECT` or `CLOSED` line, which no input carries, by
+the time md_watch printed it. Nothing in the repository runs it against a
 venue: its test (`tests/md_watch.rs`) drives each venue's wiring against the conformance stub
 on 127.0.0.1 with hand-built frames.
 
@@ -43,14 +46,24 @@ the anonymous `/ws/market` of `--hibachi-ws`, and prints the two touches apart:
 
 `MARKET` says whether the contract is open. It is closed when the read lists it as anything but
 trading (an FX pair `PAUSED` for its weekend, the exchange in maintenance), or while its session
-calendar closes it (an FX pair from Friday 17:00 to Sunday 17:00 New York time), judged again at
-each flush, so a closed market is reported closed. Whether a closed contract's feed stays live is
-not known yet: a stream silent for 30 s is reported stale and reconnected, so should Hibachi stop
-sending a closed contract's frames, `HEALTH hibachi <symbol> <channel> stale` and `RECONNECT`
-lines would repeat about every 30 s while `MARKET` says closed. The owner's first run over a
-closure (an FX pair at its weekend) tells which; a feed that falls silent is then a ticket for
-md_watch to expect it. The status is the read's, made once at the start: a halt Hibachi lists
-later is not seen, since that re-read is FBC-1632's.
+calendar closes it (an FX pair from Friday 17:00 to Sunday 17:00 New York time). Whether a closed
+contract's feed stays live is not known yet: a stream silent for 30 s is reported stale and
+reconnected, so should Hibachi stop sending a closed contract's frames, `HEALTH hibachi <symbol>
+<channel> stale` and `RECONNECT` lines would repeat about every 30 s while `MARKET` says closed.
+The owner's first run over a closure (an FX pair at its weekend) tells which; a feed that falls
+silent is then a ticket for md_watch to expect it.
+
+Only the session calendar is judged again, at each flush. The listed status is the read's, made
+once at the start, and holds for the whole run in both directions:
+
+- A contract the read finds closed stays closed: one listed `PAUSED`, or the exchange in
+  maintenance, prints `MARKET hibachi <symbol> closed: listed Halted` for the whole run, even
+  after Hibachi reopens it. An FX pair started during its weekend still reads closed after Sunday
+  17:00 New York time, while its `TOUCH` and `BOOK` lines flow.
+- A contract the read finds trading stays open, but for its calendar: a halt Hibachi lists later
+  is not seen, and nor is a maintenance window, which the calendar does not hold yet (FBC-ord5).
+
+Restart md_watch to read the status again. Reading it again while running is FBC-1632's.
 
 `COUNTS` prints what the market-data codec counted on the connection (decision 0129): each kind
 as it is first counted, and all of them before every `RECONNECT` or `CLOSED` line, `none` when
@@ -63,8 +76,9 @@ spelling (`0.10` as `0.1`), the tick itself asking for the book on the tick.
 **Does Hibachi honour the orderbook subscription's `granularity` and `depth`?** That is PR
 #210's open point (FBC-2kmp; decision 0129, "What would show this was wrong"). No source shows
 where the two fields go in a subscription, so the codec writes them beside `symbol` and `topic`
-and holds every orderbook frame's own `granularity` and `depth` to them. The owner's first live
-run settles it:
+and holds every orderbook frame's own `granularity` and `depth` to them, before anything else
+in the frame. The owner's first live run settles it, each outcome below told by its own
+signature in the `hibachi` lines:
 
 ```text
 cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance ETHUSDT --top 3 --seconds 60
@@ -77,15 +91,19 @@ cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance E
   `updates_without_book`, the Updates passed over meanwhile) beside it. The fields then go
   somewhere else, or the topic takes none: a ticket of its own, under a record superseding
   0129's first item.
-- **Not answered**: no `BOOK hibachi` line prints and no `COUNTS` line names
-  `param_mismatches`, while `ask_bid_price` touches can still print. No Snapshot came at
-  all: Hibachi refused the orderbook subscription that carries the two fields (a refusal is a
-  frame md_watch does not print) or ignored it. The codec reports the gap and resubscribes
-  after `--hibachi-retry`, then asks for a reconnect after another, so `HEALTH hibachi
-  ETH/USDT-P orderbook gap`, `COUNTS` lines naming `resubscribes` and `reconnects`, and a
-  `RECONNECT` line repeat on every connection. The topic does not take the fields where the
-  codec writes them: as for "Not honoured", a ticket of its own under a record superseding
-  0129's first item.
+- **Not answered**: no Snapshot came at all, so nothing gaps the book until the codec's wait for
+  one runs out. The first `HEALTH hibachi ETH/USDT-P orderbook gap` prints `--hibachi-retry`
+  after a connection subscribes the orderbook, on no frame; the codec then resubscribes and,
+  when that brings no Snapshot either within another `--hibachi-retry`, asks for a reconnect, so
+  a `RECONNECT` line follows on every connection. The `COUNTS` lines name no orderbook counter but `resubscribes`
+  and `reconnects` (no `param_mismatches`, `thin_sides`, `bounds_failures`, `off_granularity`,
+  `empty_snapshots`, `malformed_books`, `null_sides`, `locked_books` or
+  `updates_without_book`), and no `BOOK hibachi` line prints, while `ask_bid_price` touches can
+  still print. Hibachi refused the orderbook subscription that carries the two fields (a
+  refusal is a frame md_watch does not print) or ignored it: the topic does not take the fields
+  where the codec writes them. As for "Not honoured", a ticket of its own under a record
+  superseding 0129's first item. Any other orderbook counter means an orderbook frame did come:
+  read the run against the other outcomes.
 - **Honoured, or the venue's defaults happen to be what was asked**: `BOOK hibachi` lines print,
   and the closing `COUNTS` line names no `param_mismatches`. To tell the two apart, run once more
   with another depth and another granularity the contract lists, coarser than the one
@@ -96,6 +114,22 @@ cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance E
   reason alone, so take it from the live list: the granularities of the repository's ETH/USDT-P
   fixture (0.01 to 10) are the API docs' and the SDK's public example values
   (`fixtures/hibachi/rest/README.md`), not a reading of the live contract.
+- **Taken, but the book fails another check**: the Snapshots come back at the granularity and
+  depth asked for, yet each gaps the book. `HEALTH hibachi ETH/USDT-P orderbook gap` prints on
+  each Snapshot, about every `--hibachi-retry`, no `BOOK hibachi` line prints, and the `COUNTS`
+  lines name `thin_sides`, `bounds_failures`, `off_granularity` or `empty_snapshots`, with
+  `resubscribes` (and `updates_without_book`) beside it, but no `param_mismatches` and no
+  `reconnects`. A frame is counted under any of those four only once its `granularity` and
+  `depth` were found to be the ones asked for, so Hibachi took the fields, or its defaults happen
+  to be what was asked: for the open point this reads as the outcome above, and the same second
+  run tells the two apart (no `param_mismatches` either time). A run whose `BOOK hibachi` lines
+  print between such gaps reads the same way. The counter named is evidence against one of
+  0129's bounds assumptions ("What would show this was wrong"), for a ticket of its own.
+  `thin_sides` may only mean the live book is shallower than the depth asked for: at the
+  default `--hibachi-depth 15`, a side with fewer than 15 non-empty buckets. A run at a smaller
+  `--hibachi-depth` (`3`, say) shows whether the side is just shallow: its `BOOK hibachi` lines
+  then print. `malformed_books` beside these says less, since a frame whose `messageType` or
+  `timestamp_ms` cannot be read is counted malformed before its fields are.
 
 Record only the conclusion in the queue. The run's lines, prices, sizes, counts and timings stay
 in the owner's private notes, as the 2026-10-22 capture's did (decisions 0001, 0009).

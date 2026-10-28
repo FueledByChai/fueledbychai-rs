@@ -309,8 +309,10 @@ impl Listed {
     /// `open`, or `closed` and why, at `at`: a contract Hibachi listed as anything but trading
     /// (`PAUSED` for an FX weekend, an exchange in maintenance) is closed by its status, and one
     /// it listed trading is closed while its session calendar says so (an FX pair from Friday
-    /// 17:00 to Sunday 17:00 New York time). The status is the read's, made once; a change
-    /// Hibachi makes later is FBC-1632's re-read, which md_watch does not make.
+    /// 17:00 to Sunday 17:00 New York time). The status is the read's, made once, and holds both
+    /// ways: a contract listed closed then reads closed all run, even once Hibachi reopens it,
+    /// and a halt Hibachi lists later is not seen. Reading it again is FBC-1632's re-read, which
+    /// md_watch does not make.
     pub fn state(&self, at: WallNs) -> String {
         match self.status {
             TradingStatus::Trading => match &self.sessions {
