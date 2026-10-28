@@ -13,6 +13,9 @@ Hibachi.
   frame, the bid's bounds running downward, an unchanged side sent as levels [] with both
   bounds, scroll-ins and scroll-outs stated): none is a frame of that capture, and no count,
   rate or timing measured on it is here.
+- The funding_rate_estimation frames' estimates are chosen for the codec's exact division by
+  8 in 1e-12 units (FBC-204c, decision 0131): funding_finest.json's 8e-12 is the finest estimate
+  whose eighth is whole, and funding_indivisible.json's 12e-12 is one whose eighth is not.
 - No file holds an account id, an address, a key or a credential.
 
 This marker covers fixtures/hibachi/md/ only. Recorded Hibachi frames never go here.
