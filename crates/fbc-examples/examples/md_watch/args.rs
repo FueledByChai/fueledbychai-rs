@@ -81,7 +81,12 @@ Lines:
                                                in, then whenever its session calendar opens or
                                                closes it (whether a closed contract's feed
                                                falls silent, and so reads stale, is not known
-                                               yet: see the crate's README)
+                                               yet: see the crate's README); its listed
+                                               status is read once, at the start, so a
+                                               contract listed closed then (PAUSED, or the
+                                               exchange in maintenance) reads closed all run,
+                                               even once Hibachi reopens it, and a halt listed
+                                               later is not seen: restart to read it again
   COUNTS <venue> <market> <counter> <n> ...    what the Hibachi codec counted on the current
                                                connection (frames and sides it passed over or
                                                found wrong, resubscribes, reconnects): a kind
