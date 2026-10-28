@@ -24,17 +24,20 @@
 //!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol), FBC's rule that
 //!   `X/USDT` is `X/USDT-P` ([`discover`](crate::discover) says what is read and how).
 //! - [`plan_md`](VenueFactory::plan_md): one connection to `/ws/market` on the WebSocket origin
-//!   carrying every subscription, and [`md_codec`](VenueFactory::md_codec): its codec,
-//!   [`HibachiMd`], which decodes the `orderbook` ([`BOOK_ORDERBOOK`]), `ask_bid_price`
-//!   ([`TOUCH_ASK_BID_PRICE`]), `trades`, `mark_price`, `spot_price` (as the index) and
-//!   `funding_rate_estimation` topics. The orderbook has no sequence number, so the codec checks
-//!   every frame against the bounds the venue states on its own copy of the book before pushing
-//!   any of its events, and recovers a book it finds broken from a fresh Snapshot, resubscribing
-//!   on the same connection (decision 0129; the `md` module says what each topic becomes).
-//!   Beside it, the status poll ([`STATUS_STREAM`], a poll endpoint on the REST origin carrying
-//!   the same subscriptions; decision 0027) and its codec, [`HibachiStatus`], which re-reads
-//!   `GET /market/exchange-info` every [`KEY_STATUS_INTERVAL`] and reports each subscribed
-//!   market's trading status as `MdEvent::Status` (decision 0130; the `status` module says how).
+//!   carrying every subscription (no connection for an empty set), and
+//!   [`md_codec`](VenueFactory::md_codec): its codec, [`HibachiMd`], which decodes the `orderbook`
+//!   ([`BOOK_ORDERBOOK`]), `ask_bid_price` ([`TOUCH_ASK_BID_PRICE`]), `trades`, `mark_price`,
+//!   `spot_price` (as the index) and `funding_rate_estimation` topics. The orderbook has no
+//!   sequence number, so the codec checks every frame against the bounds the venue states on its
+//!   own copy of the book before pushing any of its events, and recovers a book it finds broken
+//!   from a fresh Snapshot, resubscribing on the same connection (decision 0129; the `md` module
+//!   says what each topic becomes). Beside it, the status poll ([`STATUS_STREAM`], a poll endpoint
+//!   on the REST origin carrying the same subscriptions; decision 0027) and its codec,
+//!   [`HibachiStatus`], which re-reads `GET /market/exchange-info` every [`KEY_STATUS_INTERVAL`]
+//!   and reports each subscribed market's trading status as `MdEvent::Status` (decision 0130; the
+//!   `status` module says how). The status poll is planned for every set, alone and carrying none
+//!   for the empty one, so it stays open, and its codec with what it knows, while the venue's
+//!   market data runs.
 //!
 //! # The quote grid, and what the book's levels are
 //!
@@ -76,10 +79,21 @@
 //! handler and nothing else (decision 0130). It reports every market halted while a read fails or
 //! is refused, and halts a market without waiting for a read at the begin of a published
 //! maintenance window, at the end of a session in its calendar and at an advertised close; a
-//! market is reported trading only by a read sent after every such halt, and after the window
-//! [`KEY_AUCTION_HALT`] configures past each reopening, scheduled or shown by its reads, for the
-//! call auction no source says the status of (FBC-vg2n). A change no schedule announces (an FX
-//! pair paused early, an unscheduled maintenance) reaches the consumer up to one interval late.
+//! market is reported trading only by a read sent after every such halt and after it was
+//! subscribed, and after the window [`KEY_AUCTION_HALT`] configures past each reopening,
+//! scheduled, shown by its reads or possibly hidden by a read that failed, was refused, left the
+//! market out or ended a halt by a close or an open that held the market other than through an
+//! open the venue advertises after it (no longer advertising that close or open, or advertising
+//! instead an open earlier than an instant one showed the market halted), or by the market
+//! subscribed once the reads had begun, that is once the poll had sent a read, for whichever
+//! markets, for the first time or again (the poll staying open with no subscription meanwhile),
+//! for the call auction no source says the status of (FBC-vg2n). So a market is never reported
+//! trading while such an auction may still run, except one after a halt nothing announces and no
+//! read shows, when no read fails, is refused or leaves the market out, and the market is not
+//! subscribed once the reads have begun, from its begin until a read reports the market trading
+//! again; what the poll knows is what its endpoint has read since it opened. A change no schedule
+//! announces (an FX pair paused early, an unscheduled maintenance) reaches the consumer up to one
+//! interval late.
 //! The capabilities declare the status's source `FeedSource::Poll` (`MdCaps::status`).
 //!
 //! Of this library only `fbc-oms`'s execution planner reads a market's status, from the
@@ -272,7 +286,10 @@ impl VenueFactory for Hibachi {
     /// in `caps.rs`), and the status poll ([`STATUS_STREAM`]), a poll endpoint on the REST
     /// origin re-reading every subscribed instrument's trading status (decision 0130). Each
     /// subscription is checked first: a feed the codec does not decode, or an instrument missing
-    /// from `specs`, is refused. An empty set plans nothing.
+    /// from `specs`, is refused. An empty set plans the status poll alone, with no subscription:
+    /// planned for every set on the same stream and transport, it stays open, and its codec with
+    /// what it knows, while the venue's market data runs, so a market subscribed once the reads
+    /// have begun is held as the `status` module says (Verifier VE3-1, VE5-1).
     fn plan_md(
         &self,
         cfg: &VenueConfig,
@@ -283,26 +300,25 @@ impl VenueFactory for Hibachi {
         for sub in subs {
             md::plannable(&settings, specs, *sub)?;
         }
-        if subs.is_empty() {
-            return Ok(Vec::new());
-        }
         let subs: Vec<Subscription> = subs.iter().copied().collect();
-        Ok(vec![
-            EndpointPlan {
-                stream: MD_STREAM,
-                transport: MdTransport::Socket {
-                    url: WireUrl::plain(settings.ws_market),
-                },
-                subs: subs.clone(),
+        let status = EndpointPlan {
+            stream: STATUS_STREAM,
+            transport: MdTransport::Poll {
+                base_url: WireUrl::plain(settings.rest_origin),
             },
-            EndpointPlan {
-                stream: STATUS_STREAM,
-                transport: MdTransport::Poll {
-                    base_url: WireUrl::plain(settings.rest_origin),
-                },
-                subs,
+            subs: subs.clone(),
+        };
+        if subs.is_empty() {
+            return Ok(vec![status]);
+        }
+        let market = EndpointPlan {
+            stream: MD_STREAM,
+            transport: MdTransport::Socket {
+                url: WireUrl::plain(settings.ws_market),
             },
-        ])
+            subs,
+        };
+        Ok(vec![market, status])
     }
 
     /// A [`HibachiStatus`] for a poll endpoint, a [`HibachiMd`] for a socket. A configuration

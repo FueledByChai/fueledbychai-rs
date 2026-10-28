@@ -685,27 +685,39 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     on `fixtures/hibachi/conformance/` (`tests/conformance.rs`), and a stub test on a paused clock
     with decoder replay of its journal (`tests/md_stub.rs`, `fbc-runtime`, `fbc-conformance`,
     `fbc-journal`, `fbc-book` and tokio as dev-dependencies); and, in `src/status.rs` (FBC-1632,
-    0130), the status poll `HibachiStatus`: `plan_md`'s second endpoint, `STATUS_STREAM`, a poll
-    endpoint (0027) on the REST origin carrying the same subscriptions, each instrument they
-    name a market; `GET /market/exchange-info` sent from a timer every required
-    `hibachi.status_interval` (whole seconds, zero refused), each answer judged at the wall time
-    of a timer asked for once it arrives, read by discovery's own status mapping and timestamp
-    parsing plus `maintenanceWindow` (decimal Unix seconds, a number or a string, none after
-    2100); each market's status reported as `MdEvent::Status` once each time it changes, every
-    market halted while a read fails or is refused, a market a read leaves out halted, a market
-    halted between reads on a timer at a published window's begin, its calendar's next close and
-    its advertised close (a read answered after a later-sent one adding its windows and the
-    earlier close, removing none), trading only on a read listing it `LIVE` on a `NORMAL`
-    exchange sent after every such halt, after no advertised open and judged before any close
-    (a read held back only by such a halt changing nothing), and halted for the required
-    `hibachi.auction_halt` after each reopening until FBC-vg2n, a scheduled one or one its reads
-    show (from the judged time of the first read that can lift a market to show it trading
-    after one showed it halted by status); its caps' `MdCaps::status` is `FeedSource::Poll`;
-    held to the
-    hand-built `fixtures/hibachi/rest/status/` driven as the runtime drives it
-    (`tests/status.rs`), and in the runtime against the conformance stub on its own thread, on a
-    paused clock, with decoder replay of its journal and a consumer's handler passing each
-    status into fbc-oms's planner (`tests/status_stub.rs`, `fbc-oms` as a dev-dependency);
+    0130), the status poll `HibachiStatus`: `STATUS_STREAM`, a poll endpoint (0027) on the REST
+    origin carrying the same subscriptions, each instrument they name a market, that `plan_md`
+    plans for every set, beside `/ws/market` or, for the empty set, alone and carrying none, so it
+    and its codec stay open while the venue's market data runs; `GET /market/exchange-info` sent
+    from a timer every required `hibachi.status_interval` (whole seconds, zero refused), each
+    answer judged at the wall time of a timer asked for once it arrives, read by discovery's own
+    status mapping and timestamp parsing plus `maintenanceWindow` (decimal Unix seconds, a number
+    or a string, none after 2100); each market's status reported as `MdEvent::Status` once each time it changes,
+    every market halted while a read fails or is refused, a market a read leaves out halted, a
+    market halted between reads on a timer at a published window's begin, its calendar's next close
+    and its advertised close (the schedule the endpoint's, whichever markets are subscribed: an
+    answer replacing only those judged no later than its read's send, and of answers whose spans
+    overlap, in either order, the earliest close, the latest open and every window kept), trading
+    only on a read listing it `LIVE` on a `NORMAL` exchange sent after every such halt and after it
+    was subscribed, after no advertised open and judged before any close (a read held back only by
+    such a halt or the subscription changing nothing), and halted for the required
+    `hibachi.auction_halt` after each reopening until FBC-vg2n, a scheduled one or one after a halt
+    no schedule announces (from the judged time of the first read that can lift a market to show it
+    trading after one showed it halted by status, left it out, or failed or was refused, or ended a
+    halt by an advertised close or open other than through an open advertised after it and no
+    earlier than every instant a close or an open showed it halted, or after it was subscribed once
+    the reads had begun, that is once the poll had sent a read, for the first time or again), so
+    never reported trading while such an auction may still run, except one after a halt nothing
+    announces and no read shows when no read fails, is refused or leaves the market out, and the
+    market is not subscribed once the reads have begun, from its begin until a read reports it
+    trading; its caps' `MdCaps::status` is `FeedSource::Poll`; held to the hand-built
+    `fixtures/hibachi/rest/status/` driven as the runtime drives it (`tests/status.rs`), to a seeded
+    randomized oracle written from the guarantee, its exception and the window, against venues
+    drawn at random (`tests/status_oracle.rs`), and in the runtime against the conformance
+    stub on its own thread, on a paused clock, with decoder replay of its journal, a consumer's
+    handler passing each status into fbc-oms's planner, and `MdVenue` opening the endpoint on an
+    empty plan and keeping it and its codec open while every subscription is removed and one taken
+    back (`tests/status_stub.rs`, `fbc-oms` as a dev-dependency);
     and its offline signer, FBC-8mzv:
     `src/sign` (a review path) packs a place, a modify (as a place, under its own nonce), a
     cancel by order id or placement nonce and a cancel-all big-endian as Java's
