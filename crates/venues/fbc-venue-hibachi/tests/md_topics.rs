@@ -3,9 +3,13 @@
 //! decodes `ask_bid_price` into a Touch only from a fully sized frame and never leaves a stale one
 //! in force, both `trades` shapes, `mark_price`, `spot_price` and both `funding_rate_estimation`
 //! shapes, synthesizing no exchange timestamp, from the hand-built frames of
-//! `fixtures/hibachi/md/`.
+//! `fixtures/hibachi/md/`. FBC-204c's codec half: each funding estimate, an eight-hour rate,
+//! pushed as its exact eighth per the one-hour interval with that interval, an estimate whose
+//! eighth is finer than 1e-12 refused, and no next funding time read (decision 0131).
 
 mod common;
+
+use std::time::Duration;
 
 use fbc_core::{
     Aggressor, ConfigError, DecodeError, Effect, Effects, ExchNs, ExchTsKind, Feed, FeedHealth,
@@ -436,25 +440,57 @@ fn mark_price_and_spot_price_decode_exactly() {
     }
 }
 
+/// A funding event as the codec pushes it: the rate per the one-hour settlement interval, with
+/// that interval, and no next time.
 fn funding(rate_e12: i64) -> MdEvent {
     MdEvent::Funding {
         inst: ETH,
         rate_e12,
-        interval: None,
+        interval: Some(Duration::from_secs(3_600)),
         next: None,
     }
 }
 
 #[test]
-fn funding_decodes_in_both_shapes_exactly_with_no_interval_and_no_next_time() {
+fn funding_decodes_in_both_shapes_as_the_estimate_s_exact_eighth_per_hour_with_no_next_time() {
     let mut d = Driver::new(&[sub(ETH, Feed::Funding)]);
-    // 0.000012 and -0.000007 in units of 1e-12, never rescaled by an interval.
-    assert_eq!(d.feed("funding_nested"), [funding(12_000_000)]);
-    assert_eq!(d.feed("funding_flat"), [funding(-7_000_000)]);
+    // Eight-hour estimates of 0.000012 and -0.000007, per one-hour interval in units of 1e-12:
+    // 12_000_000 / 8 and -7_000_000 / 8.
+    assert_eq!(d.feed("funding_nested"), [funding(1_500_000)]);
+    assert_eq!(d.feed("funding_flat"), [funding(-875_000)]);
+    // 8e-12, whose eighth is the finest rate the event holds, either way.
     assert_eq!(d.feed("funding_finest"), [funding(1)]);
-    // A finer rate is refused as malformed.
+    let negative = frame("funding_finest").replace(r#":"0.000000000008""#, r#":"-0.000000000008""#);
+    let pushed = d.try_text(&negative).unwrap();
+    assert_eq!(pushed, [(VenueMeta::NONE, funding(-1))]);
+    // Any estimate stated to nine places divides exactly: 1e-9 over eight hours is 125e-12 an
+    // hour. Hibachi's example frame's -0.000040 is -5e-6 an hour.
+    for (rate, hourly) in [
+        ("0.000000001", 125),
+        ("-0.000000001", -125),
+        ("0.123456789", 15_432_098_625),
+        ("-0.000040", -5_000_000),
+        ("0", 0),
+        ("-0.0", 0),
+    ] {
+        let text = frame("funding_flat").replace("-0.000007", rate);
+        let pushed = d.try_text(&text).unwrap();
+        assert_eq!(pushed, [(VenueMeta::NONE, funding(hourly))], "{rate}");
+    }
+    // Nothing is rounded: an estimate whose eighth is finer than 1e-12 is refused, as is one
+    // finer than 1e-12 itself.
     let bad = Err(DecodeError::Malformed("estimatedFundingRate"));
+    assert_eq!(d.try_text(&frame("funding_indivisible")), bad);
     assert_eq!(d.try_text(&frame("funding_too_fine")), bad);
+    for rate in [
+        "0.000000000001",
+        "-0.000000000004",
+        "0.0000000001",
+        "0.000000000020",
+    ] {
+        let text = frame("funding_flat").replace("-0.000007", rate);
+        assert_eq!(d.try_text(&text), bad, "{rate}");
+    }
     for (from, to) in [
         (
             r#""estimatedFundingRate":"-0.000007""#,
@@ -478,6 +514,31 @@ fn funding_decodes_in_both_shapes_exactly_with_no_interval_and_no_next_time() {
     }
     let text = frame("funding_nested").replace(r#""estimatedFundingRate":"0.000012","#, "");
     assert_eq!(d.try_text(&text), bad);
+}
+
+#[test]
+fn the_next_funding_time_is_never_read_until_its_unit_is_evidenced() {
+    let mut d = Driver::new(&[sub(ETH, Feed::Funding)]);
+    // Every fixture carries a nextFundingTimestamp; none is read, whatever its value or form.
+    for name in ["funding_nested", "funding_flat", "funding_finest"] {
+        assert!(
+            frame(name).contains(r#""nextFundingTimestamp":1767229200"#),
+            "{name}"
+        );
+        let pushed = d.feed(name);
+        assert!(
+            matches!(pushed[..], [MdEvent::Funding { next: None, .. }]),
+            "{name}"
+        );
+    }
+    for next in ["1767229200000", r#""soon""#, "null"] {
+        let text = frame("funding_nested").replace("1767229200", next);
+        let pushed = d.try_text(&text).unwrap();
+        assert_eq!(pushed, [(VenueMeta::NONE, funding(1_500_000))], "{next}");
+    }
+    let text = frame("funding_nested").replace(r#","nextFundingTimestamp":1767229200"#, "");
+    let pushed = d.try_text(&text).unwrap();
+    assert_eq!(pushed, [(VenueMeta::NONE, funding(1_500_000))]);
 }
 
 #[test]

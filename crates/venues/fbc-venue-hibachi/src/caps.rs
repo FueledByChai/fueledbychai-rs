@@ -37,6 +37,11 @@
 //! - [FUND] <https://docs.hibachi.xyz/hibachi-docs/trading/funding>: funding computed from "the
 //!   bounded per-second premium of the contract over the spot index", the spot index price at
 //!   settlement being "the median across oracle sources".
+//! - [OWNER] The owner's conclusion of 2026-10-28, recorded in FBC-204c's notes (decision 0131):
+//!   compute funding the way the Java library does at b4188a5. A settled `fundingRate` is a rate
+//!   per one-hour settlement, the streamed `estimatedFundingRate` an eight-hour rate whose
+//!   hourly equivalent is the estimate divided by 8 ([QE] L914-L918), the payment interval one
+//!   hour; `nextFundingTimestamp`'s unit is still unevidenced.
 //!
 //! Every feed declared here is planned and decoded by the `/ws/market` codec (`md`, FBC-2kmp,
 //! decision 0129).
@@ -132,12 +137,22 @@ pub(crate) fn caps(settings: &Settings) -> VenueCaps {
             funding: FundingCaps {
                 // The `funding_rate_estimation` topic [WS].
                 source: FeedSource::Stream,
-                // Its frames carry no interval [WS].
-                interval_reported: false,
+                // Every funding event states its interval, one hour: its frames carry none [WS],
+                // and the codec rescales each eight-hour estimate to the one-hour settlement
+                // interval and states that interval, on the owner's conclusion of 2026-10-28
+                // [OWNER] (FUNDING_SETTLEMENT_INTERVAL, FUNDING_ESTIMATE_PERIOD; decision 0131).
+                // fbc-core's field text ("A funding message states the funding interval") and
+                // `MdEvent::Funding::interval`'s ("when the venue states it") are read here of
+                // the event this codec pushes, the interval stated by the venue's evidenced
+                // schedule where its frames carry none, not of the frame alone (decision 0131,
+                // item 5 and its Alternatives). fbc-core does not yet say which it means;
+                // Paradex's events carry `None` beside its `false`, which agrees with either
+                // reading.
+                interval_reported: true,
                 // They carry `nextFundingTimestamp`, but no public source states its unit (the
-                // Market API spec types it int64 with none), so it is not declared reported,
-                // and the codec pushes `next: None`, until a fixture shaped after evidence pins
-                // it (FBC-204c).
+                // Market API spec types it int64 with none) and [OWNER] leaves it unevidenced, so
+                // it is not declared reported, and the codec pushes `next: None`, until a fixture
+                // shaped after evidence pins it.
                 next_time_reported: false,
             },
             // REST /market/data/stats is not polled.

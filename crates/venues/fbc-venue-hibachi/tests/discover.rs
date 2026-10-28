@@ -3,12 +3,13 @@
 //! sizes, the signing parameters and the session calendar each from the contract's own values;
 //! each contract's status is mapped conservatively; the advertised open and close are read as
 //! decimal Unix seconds; a contract missing a required field, or stating one not as documented,
-//! refuses the answer; and `X/USDT` is `X/USDT-P`.
+//! refuses the answer; and `X/USDT` is `X/USDT-P`. FBC-204c: every perpetual's funding is
+//! `FundingSpec::Known`, hourly, capped at 125 bps per hour (decision 0131).
 
 use std::time::Duration;
 
 use fbc_core::{
-    AliasTable, AssetKey, AssetSym, DecodeError, Effect, FundingSpec, HttpFailure, HttpMethod,
+    AliasTable, AssetKey, AssetSym, Bps, DecodeError, Effect, FundingSpec, HttpFailure, HttpMethod,
     HttpRequest, HttpResponse, InstrumentId, InstrumentKind, InstrumentResolver,
     InstrumentSpecDraft, Listing, Lots, Money, OpKind, PlanError, PriceGrid, RateCharge,
     SigningParams, SizeStep, SymbolError, TradingStatus, TrafficClass, UnderlyingId, VenueConfig,
@@ -16,8 +17,8 @@ use fbc_core::{
 };
 use fbc_venue_hibachi::discover::{EXCHANGE_INFO_TAG, FX_UNDERLYINGS, FX_WEEKEND};
 use fbc_venue_hibachi::{
-    Hibachi, KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE,
-    KEY_REST_TIMEOUT,
+    FUNDING_RATE_CAP, FUNDING_SETTLEMENT_INTERVAL, Hibachi, KEY_DATA_REST_URL, KEY_DATA_WS_URL,
+    KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -205,7 +206,14 @@ fn eth_is_discovered_with_its_contract_id_tick_and_quote_grid() {
     assert_eq!(eth.settle_ccy, sym("USDT"));
     assert_eq!(eth.multiplier, Decimal::ONE);
     assert_eq!(eth.status, TradingStatus::Trading);
-    assert_eq!(eth.funding, FundingSpec::Unknown);
+    // Hourly, capped at 125 bps per hour (the owner's conclusion of 2026-10-28; decision 0131).
+    assert_eq!(
+        eth.funding,
+        FundingSpec::Known {
+            interval: Duration::from_secs(3_600),
+            cap: Some(Bps(125.0)),
+        }
+    );
     assert_eq!(eth.public_fees, None);
     assert_eq!(eth.max_order_size, None);
     assert_eq!(eth.position_limit, None);
@@ -826,10 +834,16 @@ fn an_empty_contract_list_discovers_nothing() {
 }
 
 #[test]
-fn every_perpetual_states_its_funding_unknown() {
+fn every_perpetual_states_its_funding_known_hourly_with_the_cap_per_hour() {
+    let known = FundingSpec::Known {
+        interval: FUNDING_SETTLEMENT_INTERVAL,
+        cap: Some(FUNDING_RATE_CAP),
+    };
+    // Whatever the exchange's or a contract's status: funding is the venue's, not the session's.
     for text in [MAIN, SCHEDULED, UNSCHEDULED] {
         let drafts = decode_body(text.as_bytes()).unwrap();
-        assert!(drafts.iter().all(|d| d.funding == FundingSpec::Unknown));
+        assert!(!drafts.is_empty());
+        assert!(drafts.iter().all(|d| d.funding == known));
         assert!(
             drafts
                 .iter()
