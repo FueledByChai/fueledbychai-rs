@@ -638,6 +638,7 @@ dependencies = [
  "fbc-conformance",
  "fbc-core",
  "fbc-journal",
+ "fbc-oms",
  "fbc-runtime",
  "k256",
  "log",

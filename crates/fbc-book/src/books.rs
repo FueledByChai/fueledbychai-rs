@@ -70,13 +70,16 @@ impl Books {
                 // A book that never got an event is already awaiting its first snapshot.
                 None => Ok(Applied::Unchanged),
             },
+            // A trading status is no book's (decision 0130): a halted market's book stays as it
+            // is, its levels still the venue's.
             MdEvent::Health { .. }
             | MdEvent::Touch { .. }
             | MdEvent::Trade { .. }
             | MdEvent::Mark { .. }
             | MdEvent::Index { .. }
             | MdEvent::Funding { .. }
-            | MdEvent::Stats { .. } => Ok(Applied::Unchanged),
+            | MdEvent::Stats { .. }
+            | MdEvent::Status { .. } => Ok(Applied::Unchanged),
         }
     }
 

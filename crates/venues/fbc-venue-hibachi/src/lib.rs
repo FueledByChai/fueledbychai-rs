@@ -15,8 +15,10 @@
 //! - [`config_schema`](VenueFactory::config_schema): the market-data REST origin and its timeout
 //!   ([`KEY_DATA_REST_URL`], [`KEY_REST_TIMEOUT`]), the orderbook subscriptions' depth
 //!   ([`KEY_ORDERBOOK_DEPTH`], 1 to 100), the market-data WebSocket origin
-//!   ([`KEY_DATA_WS_URL`]) and how long the codec waits before resubscribing a broken orderbook
-//!   ([`KEY_ORDERBOOK_RESUBSCRIBE`]), each required with no default.
+//!   ([`KEY_DATA_WS_URL`]), how long the codec waits before resubscribing a broken orderbook
+//!   ([`KEY_ORDERBOOK_RESUBSCRIBE`]), how often the status poll re-reads each market's trading
+//!   status ([`KEY_STATUS_INTERVAL`]) and how long a market stays halted after a scheduled
+//!   reopening ([`KEY_AUCTION_HALT`]), each required with no default.
 //! - [`discover`](VenueFactory::discover): one `GET /market/exchange-info`, read into an
 //!   instrument draft per contract, and
 //!   [`parse_fbc_common_symbol`](VenueFactory::parse_fbc_common_symbol), FBC's rule that
@@ -29,6 +31,10 @@
 //!   every frame against the bounds the venue states on its own copy of the book before pushing
 //!   any of its events, and recovers a book it finds broken from a fresh Snapshot, resubscribing
 //!   on the same connection (decision 0129; the `md` module says what each topic becomes).
+//!   Beside it, the status poll ([`STATUS_STREAM`], a poll endpoint on the REST origin carrying
+//!   the same subscriptions; decision 0027) and its codec, [`HibachiStatus`], which re-reads
+//!   `GET /market/exchange-info` every [`KEY_STATUS_INTERVAL`] and reports each subscribed
+//!   market's trading status as `MdEvent::Status` (decision 0130; the `status` module says how).
 //!
 //! # The quote grid, and what the book's levels are
 //!
@@ -63,11 +69,22 @@
 //! `CLOSED` are each `Halted`, and every contract is `Halted` while the exchange's status is
 //! anything else (scheduled or unscheduled maintenance). A contract status that is absent, null
 //! or not one of those five refuses the answer. Neither an advertised open nor a session
-//! calendar ever makes a contract trading. Discovery's status is a snapshot of one answer; the
-//! re-read that reports each change (an FX pair `PAUSED` each weekend, an exchange entering
-//! maintenance) is FBC-1632's, before any Hibachi order path quotes. Of this library only
-//! `fbc-oms`'s execution planner reads a market's status, from what the consumer passes it
-//! (decision 0111).
+//! calendar ever makes a contract trading. Discovery's status is a snapshot of one answer: the
+//! status poll ([`HibachiStatus`]) re-reads it every [`KEY_STATUS_INTERVAL`], mapped by the same
+//! function, and reports each subscribed market's status as
+//! [`MdEvent::Status`](fbc_core::MdEvent) each time it changes, through the consumer's market-data
+//! handler and nothing else (decision 0130). It reports every market halted while a read fails or
+//! is refused, and halts a market without waiting for a read at the begin of a published
+//! maintenance window, at the end of a session in its calendar and at an advertised close; a
+//! market is reported trading only by a read sent after every such halt, and after the window
+//! [`KEY_AUCTION_HALT`] configures past each reopening for the call auction no source says the
+//! status of (FBC-vg2n). A change no schedule announces (an FX pair paused early, an unscheduled
+//! maintenance) reaches the consumer up to one interval late.
+//!
+//! Of this library only `fbc-oms`'s execution planner reads a market's status, from the
+//! `PlanVenue::status` the consumer passes it (decision 0111): it plans no place or amend on a
+//! halted market and still plans its cancels. A command the consumer authorizes through
+//! `fbc-oms`'s registry directly is not checked against status, the status poll's or any other.
 //!
 //! # Sessions
 //!
@@ -76,8 +93,8 @@
 //! contract's advertised `marketOpenTimestamp` and `marketCloseTimestamp` are its calendar's first
 //! open and final close. ETH, like every crypto contract with neither, has no calendar. The
 //! published maintenance windows are not in any calendar yet (decision 0125's Consequences
-//! expect them as `ClosedWindow`s; FBC-ord5 maps them), so `is_open` does not see them; FBC-1632's
-//! re-read halts each market at a window's begin.
+//! expect them as `ClosedWindow`s; FBC-ord5 maps them), so `is_open` does not see them; the
+//! status poll halts each market at a window's begin.
 //!
 //! # Funding
 //!
@@ -116,6 +133,7 @@ mod config;
 pub mod discover;
 mod md;
 pub mod sign;
+mod status;
 
 use core::time::Duration;
 use std::collections::BTreeSet;
@@ -128,10 +146,11 @@ use fbc_core::{
 };
 
 pub use config::{
-    KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE,
-    KEY_REST_TIMEOUT,
+    KEY_AUCTION_HALT, KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH,
+    KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, KEY_STATUS_INTERVAL,
 };
 pub use md::{HibachiMd, HibachiMdCounts};
+pub use status::{HibachiStatus, HibachiStatusCounts};
 
 use crate::config::Settings;
 
@@ -143,6 +162,10 @@ pub const TOUCH_ASK_BID_PRICE: TouchSourceId = TouchSourceId(0);
 
 /// The one market-data connection's stream.
 const MD_STREAM: StreamId = StreamId(0);
+
+/// The status poll's stream: a poll endpoint on the market-data REST origin (decisions 0027 and
+/// 0130).
+pub const STATUS_STREAM: StreamId = StreamId(1);
 
 /// The interval between Hibachi's funding settlements: one hour.
 ///
@@ -243,10 +266,12 @@ impl VenueFactory for Hibachi {
         discover::plan(cfg)
     }
 
-    /// One endpoint, `/ws/market` on the WebSocket origin, carrying every subscription: the
-    /// topics share one connection with no stated cap (Hibachi's WebSocket market docs, cited in
-    /// `caps.rs`). Each subscription is checked first: a feed the codec does not decode, or an
-    /// instrument missing from `specs`, is refused. An empty set plans nothing.
+    /// Two endpoints carrying every subscription: `/ws/market` on the WebSocket origin, the
+    /// topics sharing one connection with no stated cap (Hibachi's WebSocket market docs, cited
+    /// in `caps.rs`), and the status poll ([`STATUS_STREAM`]), a poll endpoint on the REST
+    /// origin re-reading every subscribed instrument's trading status (decision 0130). Each
+    /// subscription is checked first: a feed the codec does not decode, or an instrument missing
+    /// from `specs`, is refused. An empty set plans nothing.
     fn plan_md(
         &self,
         cfg: &VenueConfig,
@@ -260,19 +285,33 @@ impl VenueFactory for Hibachi {
         if subs.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(vec![EndpointPlan {
-            stream: MD_STREAM,
-            transport: MdTransport::Socket {
-                url: WireUrl::plain(settings.ws_market),
+        let subs: Vec<Subscription> = subs.iter().copied().collect();
+        Ok(vec![
+            EndpointPlan {
+                stream: MD_STREAM,
+                transport: MdTransport::Socket {
+                    url: WireUrl::plain(settings.ws_market),
+                },
+                subs: subs.clone(),
             },
-            subs: subs.iter().copied().collect(),
-        }])
+            EndpointPlan {
+                stream: STATUS_STREAM,
+                transport: MdTransport::Poll {
+                    base_url: WireUrl::plain(settings.rest_origin),
+                },
+                subs,
+            },
+        ])
     }
 
-    /// A [`HibachiMd`] for `ep`. A configuration [`plan_md`](VenueFactory::plan_md) would refuse
-    /// gives a codec that refuses every subscription with the same error.
+    /// A [`HibachiStatus`] for a poll endpoint, a [`HibachiMd`] for a socket. A configuration
+    /// [`plan_md`](VenueFactory::plan_md) would refuse gives a codec that refuses every
+    /// subscription with the same error.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
-        Box::new(HibachiMd::new(ep.stream, cfg))
+        match ep.transport {
+            MdTransport::Poll { .. } => Box::new(HibachiStatus::new(ep.stream, cfg)),
+            MdTransport::Socket { .. } => Box::new(HibachiMd::new(ep.stream, cfg)),
+        }
     }
 
     /// None: no order entry (decision 0015).

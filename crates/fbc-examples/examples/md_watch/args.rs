@@ -93,6 +93,9 @@ Lines:
                                                as it is first counted, then all of them before
                                                each RECONNECT or CLOSED line (none when
                                                nothing was counted)
+  STATUS <venue> <market> <trading|post-only|reduce-only|cancel-only|halted|delisted>
+                                               the market's trading status, once each time
+                                               it changes
   RECONNECT <venue> conn <n> epoch <e> ended   the connection dropped; its books are invalid
                                                until their next snapshot
   CLOSED <venue> conn <n> epoch <e> ended      md_watch stopped and closed the connection

@@ -198,9 +198,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   (`src/factory.rs`, market data and order entry, 0072),
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
   `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117),
-  `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps and
-  `/ws/market` codec (0129) and its offline signer (`src/sign`, built from `Secrets` by
-  `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
+  `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
+  `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
+  from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -212,8 +212,15 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     (`src/calendar.rs`: an earliest open, a close that never reopens, dated `ClosedWindow`s and
     `WeeklyClosure`s in a zone's wall time under a POSIX-style `UtcOffsetRule`, evaluated by
     integer civil-date arithmetic with no zone data and no clock; `is_open(at)` only ever
-    closes, fail-closed across daylight-saving edges; `None` where it closes nothing), copied
-    from the draft by the resolver, neither in `version` (0125).
+    closes, fail-closed across daylight-saving edges, and `next_closed(from)` gives the first
+    instant at or after `from` it closes, so a codec can ask for a timer at a session's end,
+    0130; `None` where it closes nothing), copied from the draft by the resolver, neither in
+    `version` (0125).
+    `MdEvent::Status { inst, status }` is an instrument's `TradingStatus` as the venue's market
+    data shows it, reported each time it changes, a halt on the venue's schedule included: no
+    book event and no feed's health, named in every match on `MdEvent` with a fallback arm, and
+    what the consumer passes `PlanVenue::status` once it arrives in place of the spec's
+    discovery snapshot (0130).
     A `FillEvent` states its `origin: FillOrigin` once: an order's execution (`Order`, its
     client id and grid price) or a change the venue made itself (`Venue`, a `VenueFillKind`:
     liquidation, transfer, settlement or block trade, with no client id and the exact
@@ -254,7 +261,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     poll endpoint opens no connection (0027); `MdVenue` applies `plan_md`'s endpoints by stream;
     `MdBooks` (fed by the `BookKeeper` handler) keeps one `fbc-book` book per (instrument,
     `BookId`), routing each book event by its channel (a one-side prune or clear too, each
-    feeding its book for its epoch's end, 0124), and exposes each instrument's trading
+    feeding its book for its epoch's end, 0124; a trading status changes and feeds none, 0130),
+    and exposes each instrument's trading
     book as the consumer's `TradingBooks` configures it (FBC-nij); a session tells its handler
     each connection epoch's end (`MdHandler::on_epoch_end`, live and in replay), and every book
     that epoch fed is then gapped until its next snapshot (0039);
@@ -674,7 +682,26 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `fixtures/hibachi/md/` (`tests/md_book.rs`, `tests/md_topics.rs`), the named conformance suite
     on `fixtures/hibachi/conformance/` (`tests/conformance.rs`), and a stub test on a paused clock
     with decoder replay of its journal (`tests/md_stub.rs`, `fbc-runtime`, `fbc-conformance`,
-    `fbc-journal`, `fbc-book` and tokio as dev-dependencies); and its offline signer, FBC-8mzv:
+    `fbc-journal`, `fbc-book` and tokio as dev-dependencies); and, in `src/status.rs` (FBC-1632,
+    0130), the status poll `HibachiStatus`: `plan_md`'s second endpoint, `STATUS_STREAM`, a poll
+    endpoint (0027) on the REST origin carrying the same subscriptions, each instrument they
+    name a market; `GET /market/exchange-info` sent from a timer every required
+    `hibachi.status_interval` (whole seconds, zero refused), each answer judged at the wall time
+    of a timer asked for once it arrives, read by discovery's own status mapping and timestamp
+    parsing plus `maintenanceWindow` (decimal Unix seconds, a number or a string, none after
+    2100); each market's status reported as `MdEvent::Status` once each time it changes, every
+    market halted while a read fails or is refused, a market a read leaves out halted, a market
+    halted between reads on a timer at a published window's begin, its calendar's next close and
+    its advertised close (a read answered after a later-sent one adding its windows and the
+    earlier close, removing none), trading only on a read listing it `LIVE` on a `NORMAL`
+    exchange sent after every such halt, after no advertised open and judged before any close
+    (a read held back only by such a halt changing nothing), and halted for the required
+    `hibachi.auction_halt` after each reopening until FBC-vg2n; held to the
+    hand-built `fixtures/hibachi/rest/status/` driven as the runtime drives it
+    (`tests/status.rs`), and in the runtime against the conformance stub on its own thread, on a
+    paused clock, with decoder replay of its journal and a consumer's handler passing each
+    status into fbc-oms's planner (`tests/status_stub.rs`, `fbc-oms` as a dev-dependency);
+    and its offline signer, FBC-8mzv:
     `src/sign` (a review path) packs a place, a modify (as a place, under its own nonce), a
     cancel by order id or placement nonce and a cancel-all big-endian as Java's
     `HibachiPayloadPacker` and the SDK do, and the cancel-on-disconnect arm's nonce as
@@ -712,7 +739,11 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/hibachi/rest/` (marked `SYNTHETIC`) holds hand-built `/market/exchange-info` answers,
   with a variant for each status and timestamp refusal, and a funding-history answer, its README
-  citing each field's source; `fixtures/hibachi/md/` (marked `SYNTHETIC`) hand-built `/ws/market`
+  citing each field's source; `fixtures/hibachi/rest/status/` (marked `SYNTHETIC`) the status
+  poll's answers, each a change of three of those contracts at instants its tests' timelines
+  name (a pause, either maintenance, a window as numbers, as strings and in milliseconds, an
+  advertised close, a market left out, each refusal), its README saying what each pins;
+  `fixtures/hibachi/md/` (marked `SYNTHETIC`) hand-built `/ws/market`
   frames, one per file, shaped as Hibachi's docs, SDK and the Java library show them and as the
   owner's capture showed in words only, its README citing each shape; and
   `fixtures/hibachi/conformance/` (marked `SYNTHETIC`) the conformance suite's cases built from

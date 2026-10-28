@@ -475,6 +475,18 @@ impl Watcher {
             | MdEvent::Window { .. }
             | MdEvent::SidePrune { .. }
             | MdEvent::SideClear { .. } => self.pending = Some((seq, at)),
+            // A trading status (decision 0130) is a line of its own, never a book's.
+            MdEvent::Status { status, .. } => {
+                let status = match status {
+                    TradingStatus::Trading => "trading",
+                    TradingStatus::PostOnly => "post-only",
+                    TradingStatus::ReduceOnly => "reduce-only",
+                    TradingStatus::CancelOnly => "cancel-only",
+                    TradingStatus::Halted => "halted",
+                    TradingStatus::Delisted => "delisted",
+                };
+                self.line(at, "STATUS", status);
+            }
             MdEvent::Mark { .. }
             | MdEvent::Index { .. }
             | MdEvent::Funding { .. }
@@ -1200,5 +1212,41 @@ mod tests {
             .expect("the read's limiter, for the sessions");
         let now = tokio::time::Instant::now();
         assert_eq!(limiter.used(now, 0, BucketKey::Shared), 1);
+    }
+
+    /// FBC-1632 (decision 0130): a trading status prints a line of its own and leaves the book
+    /// as it was: no book line follows it.
+    #[test]
+    fn a_trading_status_prints_a_status_line_and_no_book() {
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut w = watcher(buf.clone());
+        let inst = PARADEX_INST;
+        let snapshot = [
+            MdEvent::BookSnapshotBegin {
+                inst,
+                book: BOOK,
+                epoch: 1,
+            },
+            level(BookSide::Bid, 99),
+            level(BookSide::Ask, 101),
+            MdEvent::BookSnapshotEnd { inst, book: BOOK },
+        ];
+        for ev in snapshot {
+            w.on_event(env(1, ev));
+        }
+        w.flush();
+        for (seq, status) in [(2, TradingStatus::Halted), (3, TradingStatus::Trading)] {
+            w.on_event(env(seq, MdEvent::Status { inst, status }));
+        }
+        w.flush();
+        let text = String::from_utf8(buf.borrow().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.starts_with("  ")).collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].contains("BOOK toy TOY-PERP book bid 99 x 1"),
+            "{text}"
+        );
+        assert!(lines[1].ends_with("STATUS toy TOY-PERP halted"), "{text}");
+        assert!(lines[2].ends_with("STATUS toy TOY-PERP trading"), "{text}");
     }
 }

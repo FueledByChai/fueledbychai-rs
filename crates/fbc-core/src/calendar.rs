@@ -320,6 +320,21 @@ impl WeeklyClosure {
             opens_closed <= utc_secs && utc_secs < reopens
         })
     }
+
+    /// The first instant after `utc_secs` an occurrence starts closing the instrument, in UTC
+    /// seconds: the earliest start later than it among the occurrences starting in the local
+    /// week it falls in, the week before and the two after (one of the two after always starts
+    /// later, a closure lasting under a week).
+    fn next_start(&self, utc_secs: i64) -> Option<i64> {
+        let local = utc_secs + self.zone.offset_secs(utc_secs);
+        let monday =
+            (local + 3 * SECS_PER_DAY).div_euclid(SECS_PER_WEEK) * SECS_PER_WEEK - 3 * SECS_PER_DAY;
+        let from = self.from.secs();
+        (-1..=2)
+            .map(|week| self.zone.bounds(monday + week * SECS_PER_WEEK + from).0)
+            .filter(|start| *start > utc_secs)
+            .min()
+    }
 }
 
 /// A dated closure, closed from `from` until `to`: a published maintenance window.
@@ -409,6 +424,29 @@ impl SessionCalendar {
         // Every weekly bound and offset is a whole second, so the second `at` falls in decides.
         let secs = at.0.div_euclid(NANOS_PER_SEC);
         !parts.weekly.iter().any(|closure| closure.closes(secs))
+    }
+
+    /// The first instant at or after `from` at which some part of the calendar closes the
+    /// instrument: `from` itself while it is closed then, otherwise the earliest later instant
+    /// a part starts closing it (its final close, a window's start, a weekly occurrence's
+    /// start), and `None` when nothing closes it from `from` on. A codec that halts a market on
+    /// the venue's schedule asks this for the instant to halt it at (decision 0130). Reads no
+    /// clock.
+    pub fn next_closed(&self, from: WallNs) -> Option<WallNs> {
+        if !self.is_open(from) {
+            return Some(from);
+        }
+        let parts = &self.parts;
+        // Open at `from`: before any final close, and past any first open for good.
+        let close = parts.final_close;
+        let windows = parts.windows.iter().map(|w| w.from).filter(|at| *at > from);
+        // An occurrence starting in a later second than `from`'s starts after `from`.
+        let secs = from.0.div_euclid(NANOS_PER_SEC);
+        let weekly = parts.weekly.iter().filter_map(|closure| {
+            let start = closure.next_start(secs)?;
+            start.checked_mul(NANOS_PER_SEC).map(WallNs)
+        });
+        close.into_iter().chain(windows).chain(weekly).min()
     }
 }
 
@@ -994,6 +1032,68 @@ mod tests {
         assert!(!calendar.is_open(from));
         assert!(!calendar.is_open(before(to)));
         assert!(calendar.is_open(to));
+    }
+
+    #[test]
+    fn next_closed_is_the_instant_itself_while_closed_and_the_next_close_while_open() {
+        // Each week's close and reopening of the FX weekend (UTC seconds, zoneinfo), across
+        // both changes of the clocks.
+        let calendar = fx_weekend();
+        let weeks = [
+            (1_799_445_600, 1_799_618_400),
+            (1_804_888_800, 1_805_058_000),
+            (1_825_448_400, 1_825_624_800),
+        ];
+        for (close, reopen) in weeks {
+            let (close, reopen) = (at(close), at(reopen));
+            // Open: the week's close, from a nanosecond, an hour and four days (the Monday)
+            // before it.
+            for ahead in [1, 3_600 * NS, 4 * DAY * NS] {
+                let from = WallNs(close.0 - ahead);
+                assert_eq!(calendar.next_closed(from), Some(close), "{from:?}");
+            }
+            // Closed: the instant itself, through to the last nanosecond before the reopening.
+            for probe in [close, WallNs(close.0 + DAY * NS), before(reopen)] {
+                assert_eq!(calendar.next_closed(probe), Some(probe), "{probe:?}");
+            }
+            // Reopened: next week's close.
+            let next = calendar.next_closed(reopen).unwrap();
+            assert!(next.0 > reopen.0 && next.0 - close.0 <= 7 * DAY * NS + 3_600 * NS);
+            assert!(calendar.is_open(before(next)) && !calendar.is_open(next));
+        }
+    }
+
+    #[test]
+    fn next_closed_takes_the_earliest_part_and_none_when_nothing_closes_again() {
+        let (from, to) = (at(1_811_786_400), at(1_811_793_600));
+        let close = at(1_830_000_000);
+        let open = at(1_800_000_000);
+        let calendar = SessionCalendar::new(CalendarParts {
+            first_open: Some(open),
+            final_close: Some(close),
+            windows: vec![ClosedWindow::new(from, to).unwrap()],
+            weekly: vec![],
+        })
+        .unwrap();
+        // Before the first open it is closed now.
+        assert_eq!(calendar.next_closed(before(open)), Some(before(open)));
+        // Open: the window first, then the final close; inside the window, now.
+        assert_eq!(calendar.next_closed(open), Some(from));
+        assert_eq!(calendar.next_closed(before(from)), Some(from));
+        assert_eq!(calendar.next_closed(from), Some(from));
+        assert_eq!(calendar.next_closed(to), Some(close));
+        assert_eq!(calendar.next_closed(close), Some(close));
+        // A weekly closure ahead of a final close: the weekly one; nothing ever after a first
+        // open alone.
+        let mut weekend = fx_weekend().parts().clone();
+        weekend.final_close = Some(at(1_825_624_800 + 7 * DAY));
+        let both = SessionCalendar::new(weekend).unwrap();
+        assert_eq!(both.next_closed(at(1_825_400_000)), Some(at(1_825_448_400)));
+        assert_eq!(bounds(Some(open), None).next_closed(open), None);
+        // The ends of the clock do not panic.
+        for probe in [i64::MIN, i64::MAX] {
+            let _ = fx_weekend().next_closed(WallNs(probe));
+        }
     }
 
     #[test]

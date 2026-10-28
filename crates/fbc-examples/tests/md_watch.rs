@@ -324,6 +324,7 @@ fn help_documents_every_argument() {
         "HEALTH <venue>",
         "MARKET <venue> <market> <open|closed ...>",
         "COUNTS <venue> <market> <counter> <n> ...",
+        "STATUS <venue> <market> <trading|post-only|reduce-only|cancel-only|halted|delisted>",
         "RECONNECT <venue> conn <n> epoch <e> ended",
         "CLOSED <venue> conn <n> epoch <e> ended",
     ] {

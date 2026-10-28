@@ -1,6 +1,6 @@
 [package]
 name = "fbc-venue-hibachi"
-description = "Hibachi venue adapter: instrument discovery, market data and the offline order signer; order entry is not enabled."
+description = "Hibachi venue adapter: instrument discovery, market data, trading status and the offline order signer; order entry is not enabled."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,15 +16,18 @@ serde_json.workspace = true
 sha2.workspace = true
 zeroize.workspace = true
 
-# Test-only: the conformance suite (tests/conformance.rs), and the stub test (tests/md_stub.rs),
-# which runs the codec in fbc-runtime's market-data session against the conformance kit's stub
-# server on a paused clock, journals it, and replays the journal into fbc-book's books (decision
-# 0006). scripts/check-deps.sh does not count dev-dependencies.
+# Test-only: the conformance suite (tests/conformance.rs), and the stub tests (tests/md_stub.rs
+# and tests/status_stub.rs), which run the codecs in fbc-runtime's market-data session against
+# the conformance kit's stub server on a paused clock, journal it, and replay the journal
+# (decision 0006); the status poll's runs the stub on a runtime of its own on another thread
+# (net, sync), and passes each reported status to fbc-oms's execution planner, as a consumer
+# does (decisions 0111 and 0130). scripts/check-deps.sh does not count dev-dependencies.
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
 fbc-conformance = { path = "../../fbc-conformance" }
 fbc-journal = { path = "../../fbc-journal" }
+fbc-oms = { path = "../../fbc-oms" }
 fbc-runtime = { path = "../../fbc-runtime" }
 # The signer's leak test reads every record the log facade emits, at TRACE (FBC-8mzv).
 log = { workspace = true, features = ["std"] }
-tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+tokio = { workspace = true, features = ["rt", "macros", "net", "sync", "time", "test-util"] }

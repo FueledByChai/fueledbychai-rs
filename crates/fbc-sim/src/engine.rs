@@ -548,6 +548,10 @@ impl SimEngine {
             MdEvent::BookSnapshotEnd { inst, book } if self.trading.get(&inst) == Some(&book) => {
                 self.snapshot_end(&env.body, inst)
             }
+            // A trading status changes no book and moves no queue (decision 0130). SimVenue does
+            // not yet refuse an order on a market the venue's market data shows halted: the
+            // planner withholds places and amends there from the status the consumer passes it.
+            MdEvent::Status { .. } => Ok(()),
             ref body => self.books.apply(body).map(drop).map_err(SimError::Book),
         }
     }
@@ -2217,6 +2221,7 @@ fn book_of(ev: &MdEvent) -> Option<(InstrumentId, BookId)> {
         | MdEvent::Mark { .. }
         | MdEvent::Index { .. }
         | MdEvent::Funding { .. }
-        | MdEvent::Stats { .. } => None,
+        | MdEvent::Stats { .. }
+        | MdEvent::Status { .. } => None,
     }
 }

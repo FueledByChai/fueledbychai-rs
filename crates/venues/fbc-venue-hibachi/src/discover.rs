@@ -23,9 +23,10 @@
 //!   `exchange status`, since a contract has a `status` of its own. Any value but `NORMAL`, the
 //!   SDK's `NORMAL, MAINTENANCE` comment included, makes every contract
 //!   [`TradingStatus::Halted`]. `currentMaintenanceWindow` and `maintenanceWindow` are not read
-//!   here: the re-read of `/market/exchange-info` (FBC-1632) reads them and halts each market at
-//!   a window's begin. So no contract's session calendar holds them as `ClosedWindow`s yet, which
-//!   decision 0125's Consequences expect; FBC-ord5 maps them.
+//!   here: the status poll's re-read of `/market/exchange-info` (`status.rs`, decision 0130)
+//!   reads `maintenanceWindow` and halts each market at a window's begin. So no contract's
+//!   session calendar holds them as `ClosedWindow`s yet, which decision 0125's Consequences
+//!   expect; FBC-ord5 maps them.
 //! - A contract's `status` ([SPEC] `ContractStatus`: `LISTED`, `PRE_OPEN`, `LIVE`, `PAUSED`,
 //!   `CLOSED`, none described), matched exactly: `LIVE` is [`TradingStatus::Trading`] while the
 //!   exchange is `NORMAL`; `LISTED`, `PRE_OPEN`, `PAUSED` and `CLOSED` are each
@@ -72,12 +73,12 @@
 //!   2100-01-01T00:00:00Z (as a count of milliseconds would), refuses the answer as malformed
 //!   naming the field. A close is the calendar's final close, an open its first open, each
 //!   rounded toward closed to whole nanoseconds; the parser reads no clock (0035), so the
-//!   calendar closes the contract from its close on and before its open, and the re-read
-//!   (FBC-1632) halts the market at that close.
+//!   calendar closes the contract from its close on and before its open, and the status poll
+//!   halts the market at that close, or at a later read's own (decision 0130).
 //! - An FX contract, one whose `underlyingSymbol` is in [`FX_UNDERLYINGS`], closes every week
 //!   from Friday 17:00 to Sunday 17:00 New York time ([`FX_WEEKEND`], [FX]). No field of the
 //!   answer marks a contract FX, so the underlyings [FX] names as FX pairs are listed here; a
-//!   pair it does not name has no weekend calendar until it is added, and the re-read still
+//!   pair it does not name has no weekend calendar until it is added, and the status poll still
 //!   halts it when Hibachi shows it `PAUSED`. The weekend holds through the call auction before
 //!   each reopening ([AUCTION]: its "resumption after a trading halt (24/5 FX markets)"; about 15
 //!   minutes in its EUR/USD example, no fixed duration stated), which trades nothing.
@@ -193,7 +194,7 @@ pub(crate) fn plan(cfg: &VenueConfig) -> Result<HttpPlan<Vec<InstrumentSpecDraft
     let url = format!("{}{EXCHANGE_INFO_PATH}", rest_origin(cfg)?);
     let timeout = rest_timeout(cfg)?;
     let mut fx = Effects::new();
-    fx.push(request(WireUrl::plain(url), timeout));
+    fx.push(request(EXCHANGE_INFO_TAG, WireUrl::plain(url), timeout));
     let plan = HttpPlan::new(fx, |responses, scope| {
         // The plan holds one request, so its parser is handed one response.
         let answer = responses.first().ok_or(PlanError::Answers)?;
@@ -202,10 +203,11 @@ pub(crate) fn plan(cfg: &VenueConfig) -> Result<HttpPlan<Vec<InstrumentSpecDraft
     Ok(plan.expect("one HTTP request makes a valid plan"))
 }
 
-/// A public REST request: no header, no credential.
-fn request(url: WireUrl, timeout: Duration) -> Effect {
+/// A public REST request tagged `tag`: no header, no credential, one request against the IP's
+/// REST limit. Discovery's one request, and each of the status poll's reads.
+pub(crate) fn request(tag: HttpTag, url: WireUrl, timeout: Duration) -> Effect {
     Effect::Http {
-        tag: EXCHANGE_INFO_TAG,
+        tag,
         req: HttpRequest {
             method: HttpMethod::Get,
             url,
@@ -227,26 +229,61 @@ pub fn decode_exchange_info(
     body: &[u8],
     scope: &DecodeScope<'_>,
 ) -> Result<Vec<InstrumentSpecDraft>, PlanError> {
-    let doc: Value =
-        serde_json::from_slice(body).map_err(|_| malformed("exchange-info answer is not JSON"))?;
-    let doc = doc
-        .as_object()
-        .ok_or(malformed("exchange-info answer is not an object"))?;
-    let normal = field(doc, EXCHANGE_STATUS, "status")?
-        .as_str()
-        .ok_or(malformed(EXCHANGE_STATUS))?
-        == "NORMAL";
-    let contracts = required(doc, "futureContracts")?
-        .as_array()
-        .ok_or(malformed("futureContracts"))?;
+    let doc = answer_doc(body)?;
+    let normal = exchange_normal(&doc)?;
+    let contracts = future_contracts(&doc)?;
     let mut drafts = Vec::with_capacity(contracts.len());
     for contract in contracts {
-        let contract = contract
-            .as_object()
-            .ok_or(malformed("futureContracts: a contract is not an object"))?;
         drafts.push(draft(contract, normal, scope)?);
     }
     Ok(drafts)
+}
+
+/// An exchange-info answer's top level: refused when the body is not a JSON object. Discovery
+/// and the status poll (decision 0130) read the same answer through it.
+pub(crate) fn answer_doc(body: &[u8]) -> Result<Map<String, Value>, PlanError> {
+    let doc: Value =
+        serde_json::from_slice(body).map_err(|_| malformed("exchange-info answer is not JSON"))?;
+    match doc {
+        Value::Object(doc) => Ok(doc),
+        _ => Err(malformed("exchange-info answer is not an object").into()),
+    }
+}
+
+/// Whether the exchange-level `status` is `NORMAL`: required, refused as missing or malformed
+/// under the name `exchange status`.
+pub(crate) fn exchange_normal(doc: &Map<String, Value>) -> Result<bool, PlanError> {
+    let status = field(doc, EXCHANGE_STATUS, "status")?.as_str();
+    Ok(status.ok_or(malformed(EXCHANGE_STATUS))? == "NORMAL")
+}
+
+/// The answer's contracts, each an object: `futureContracts` is required and a list.
+pub(crate) fn future_contracts(
+    doc: &Map<String, Value>,
+) -> Result<Vec<&Map<String, Value>>, PlanError> {
+    let contracts = required(doc, "futureContracts")?
+        .as_array()
+        .ok_or(malformed("futureContracts"))?;
+    let not_object = || PlanError::from(malformed("futureContracts: a contract is not an object"));
+    contracts
+        .iter()
+        .map(|c| c.as_object().ok_or_else(not_object))
+        .collect()
+}
+
+/// A contract's trading status, mapped conservatively (the module docs): only `LIVE` while the
+/// exchange is `NORMAL` (`normal`) is trading; `LISTED`, `PRE_OPEN`, `PAUSED`, `CLOSED`, and
+/// `LIVE` during maintenance, are halted; absent or `null` is missing, anything else malformed.
+/// Discovery and the status poll map it through this one function.
+pub(crate) fn contract_status(
+    m: &Map<String, Value>,
+    normal: bool,
+) -> Result<TradingStatus, PlanError> {
+    match text(m, "status")? {
+        "LIVE" if normal => Ok(TradingStatus::Trading),
+        "LIVE" | "LISTED" | "PRE_OPEN" | "PAUSED" | "CLOSED" => Ok(TradingStatus::Halted),
+        _ => Err(malformed("status").into()),
+    }
 }
 
 /// One contract as a draft; `normal` is whether the exchange's status is `NORMAL`.
@@ -255,11 +292,7 @@ fn draft(
     normal: bool,
     scope: &DecodeScope<'_>,
 ) -> Result<InstrumentSpecDraft, PlanError> {
-    let status = match text(m, "status")? {
-        "LIVE" if normal => TradingStatus::Trading,
-        "LIVE" | "LISTED" | "PRE_OPEN" | "PAUSED" | "CLOSED" => TradingStatus::Halted,
-        _ => return Err(malformed("status").into()),
-    };
+    let status = contract_status(m, normal)?;
     let id = required(m, "id")?.as_u64();
     let id = id.filter(|n| *n <= u64::from(u32::MAX));
     let native_id = VenueNativeId::Number(id.ok_or(malformed("id"))?);
@@ -354,7 +387,7 @@ fn quote_grid(listed: &Value, tick: Decimal) -> Result<Option<Decimal>, PlanErro
 
 /// Which way an advertised instant rounds to whole nanoseconds: toward closed.
 #[derive(Copy, Clone)]
-enum Round {
+pub(crate) enum Round {
     /// An open: later.
     Up,
     /// A close: earlier.
@@ -362,8 +395,9 @@ enum Round {
 }
 
 /// An optional advertised instant, Unix seconds in a plain decimal string ([`plain_decimal`]),
-/// no later than 2100.
-fn advertised(
+/// no later than 2100. Discovery and the status poll read `marketOpenTimestamp` and
+/// `marketCloseTimestamp` through it.
+pub(crate) fn advertised(
     m: &Map<String, Value>,
     key: &'static str,
     round: Round,
@@ -371,20 +405,24 @@ fn advertised(
     let Some(value) = m.get(key).filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    let secs = value
-        .as_str()
-        .and_then(plain_decimal)
-        .filter(|secs| *secs <= Decimal::from(LATEST_SECS))
-        .ok_or(malformed(key))?;
+    let secs = value.as_str().and_then(|text| unix_seconds(text, round));
+    Ok(Some(secs.ok_or(malformed(key))?))
+}
+
+/// `text`, a count of Unix seconds in a plain decimal string ([`plain_decimal`]), as an instant
+/// rounded `round` to whole nanoseconds; `None` when it is not one, or lies after
+/// 2100-01-01T00:00:00Z (as a count of milliseconds would).
+pub(crate) fn unix_seconds(text: &str, round: Round) -> Option<WallNs> {
+    let secs = plain_decimal(text).filter(|secs| *secs <= Decimal::from(LATEST_SECS))?;
     let nanos = secs * Decimal::from(NANOS);
     let nanos = match round {
         Round::Up => nanos.ceil(),
         Round::Down => nanos.floor(),
     };
-    Ok(Some(WallNs(nanos.to_i64().ok_or(malformed(key))?)))
+    nanos.to_i64().map(WallNs)
 }
 
-fn malformed(part: &'static str) -> DecodeError {
+pub(crate) fn malformed(part: &'static str) -> DecodeError {
     DecodeError::Malformed(part)
 }
 
@@ -406,7 +444,7 @@ fn required<'a>(m: &'a Map<String, Value>, key: &'static str) -> Result<&'a Valu
 }
 
 /// A required string field.
-fn text<'a>(m: &'a Map<String, Value>, key: &'static str) -> Result<&'a str, PlanError> {
+pub(crate) fn text<'a>(m: &'a Map<String, Value>, key: &'static str) -> Result<&'a str, PlanError> {
     Ok(required(m, key)?.as_str().ok_or(malformed(key))?)
 }
 

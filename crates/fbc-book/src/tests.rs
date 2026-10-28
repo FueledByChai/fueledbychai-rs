@@ -275,6 +275,12 @@ fn health_other_than_a_book_gap_changes_nothing() {
             inst: INST,
             px: fbc_core::PxExact::new(1, 0),
         },
+        // A trading status is no book's (FBC-1632, decision 0130): a halted market's book
+        // stays as it is.
+        MdEvent::Status {
+            inst: INST,
+            status: fbc_core::TradingStatus::Halted,
+        },
     ] {
         assert_eq!(books.apply(&ev), Ok(Applied::Unchanged), "{ev:?}");
     }
