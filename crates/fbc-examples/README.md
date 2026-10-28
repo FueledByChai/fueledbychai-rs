@@ -7,11 +7,98 @@ program's flags.
 
 | Program | What it does |
 | --- | --- |
-| `md_watch` | Prints live Paradex and Binance USD-M touches and books through fbc-runtime. No orders, no credentials. |
+| `md_watch` | Prints live Paradex, Binance USD-M and Hibachi touches and books through fbc-runtime. No orders, no credentials. See below. |
 | `testnet_trade` | Paradex TESTNET only: places one post-only order well away from the touch through fbc-oms, cancels it, and Stops (FBC-x69b). |
 | `testnet_quote` | A plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). Paradex TESTNET, or with `--mainnet` a supervised short session on Paradex MAINNET (FBC-tyft). See below. |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 | `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of `--order-usd`, the operator's own size, well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It Starts only after a trustworthy resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094) and the account is flat. See below. |
+
+## md_watch
+
+Public market data only: md_watch reads no credential and sends no order. Each venue named runs
+on connections of its own, every line after the first is led by its UTC receive time, and
+`--help` lists every flag and every kind of line. Nothing in the repository runs it against a
+venue: its test (`tests/md_watch.rs`) drives each venue's wiring against the conformance stub
+on 127.0.0.1 with hand-built frames.
+
+```text
+cargo run -p fbc-examples --example md_watch -- --paradex BTC-USD-PERP --binance BTCUSDT
+cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance ETHUSDT
+```
+
+**Hibachi** (FBC-9o7e). `--hibachi <SYMBOL>` first reads the contract from
+`GET /market/exchange-info` on `--hibachi-rest`, through `fbc-venue-hibachi`'s discovery: its
+tick, step, book granularity, status and session calendar, so nothing is decoded on a grid of
+md_watch's own. Then it subscribes the contract's `ask_bid_price`, `trades` and `orderbook` on
+the anonymous `/ws/market` of `--hibachi-ws`, and prints the two touches apart:
+
+- `TOUCH hibachi <symbol> ask_bid_price`: the venue's own touch, on the contract's tick. It
+  carries no server timestamp and can sit frozen for long stretches, so read each line's receive
+  time. A frame without both sides' sizes gives no line and is counted (`unsized_touches`); one
+  that follows a touch in force also prints `HEALTH hibachi <symbol> ask_bid_price gap`, since
+  that touch is no longer confirmed.
+- `BOOK hibachi <symbol> orderbook`: the book's touch and, with `--top`, its best levels. The
+  levels are buckets of the subscription's granularity (the contract's quote grid, which
+  md_watch's first line names), so the book's touch can sit up to one bucket from the venue's.
+
+`MARKET` says whether the contract is open. It is closed when the read lists it as anything but
+trading (an FX pair `PAUSED` for its weekend, the exchange in maintenance), or while its session
+calendar closes it (an FX pair from Friday 17:00 to Sunday 17:00 New York time), judged again at
+each flush, so a closed market is reported closed. Whether a closed contract's feed stays live is
+not known yet: a stream silent for 30 s is reported stale and reconnected, so should Hibachi stop
+sending a closed contract's frames, `HEALTH hibachi <symbol> <channel> stale` and `RECONNECT`
+lines would repeat about every 30 s while `MARKET` says closed. The owner's first run over a
+closure (an FX pair at its weekend) tells which; a feed that falls silent is then a ticket for
+md_watch to expect it. The status is the read's, made once at the start: a halt Hibachi lists
+later is not seen, since that re-read is FBC-1632's.
+
+`COUNTS` prints what the market-data codec counted on the connection (decision 0129): each kind
+as it is first counted, and all of them before every `RECONNECT` or `CLOSED` line, `none` when
+it counted nothing. The defaults are `--hibachi-rest https://data-api.hibachi.xyz`,
+`--hibachi-ws wss://data-api.hibachi.xyz`, `--hibachi-timeout 5000`, `--hibachi-depth 15` and
+`--hibachi-retry 2000`; the orderbook is subscribed at the contract's quote grid unless
+`--hibachi-granularity` names another, a whole number of its ticks, asked for in its shortest
+spelling (`0.10` as `0.1`), the tick itself asking for the book on the tick.
+
+**Does Hibachi honour the orderbook subscription's `granularity` and `depth`?** That is PR
+#210's open point (FBC-2kmp; decision 0129, "What would show this was wrong"). No source shows
+where the two fields go in a subscription, so the codec writes them beside `symbol` and `topic`
+and holds every orderbook frame's own `granularity` and `depth` to them. The owner's first live
+run settles it:
+
+```text
+cargo run -p fbc-examples --example md_watch -- --hibachi ETH/USDT-P --binance ETHUSDT --top 3 --seconds 60
+```
+
+- **Not honoured**: the book gaps on every frame. Each Snapshot comes back at the venue's own
+  granularity or depth, so `HEALTH hibachi ETH/USDT-P orderbook gap` repeats about every
+  `--hibachi-retry` (each resubscribe brings another such Snapshot), no `BOOK hibachi` line
+  prints, and the `COUNTS` lines name `param_mismatches`, with `resubscribes` (and
+  `updates_without_book`, the Updates passed over meanwhile) beside it. The fields then go
+  somewhere else, or the topic takes none: a ticket of its own, under a record superseding
+  0129's first item.
+- **Not answered**: no `BOOK hibachi` line prints and no `COUNTS` line names
+  `param_mismatches`, while `ask_bid_price` touches can still print. No Snapshot came at
+  all: Hibachi refused the orderbook subscription that carries the two fields (a refusal is a
+  frame md_watch does not print) or ignored it. The codec reports the gap and resubscribes
+  after `--hibachi-retry`, then asks for a reconnect after another, so `HEALTH hibachi
+  ETH/USDT-P orderbook gap`, `COUNTS` lines naming `resubscribes` and `reconnects`, and a
+  `RECONNECT` line repeat on every connection. The topic does not take the fields where the
+  codec writes them: as for "Not honoured", a ticket of its own under a record superseding
+  0129's first item.
+- **Honoured, or the venue's defaults happen to be what was asked**: `BOOK hibachi` lines print,
+  and the closing `COUNTS` line names no `param_mismatches`. To tell the two apart, run once more
+  with another depth and another granularity the contract lists, coarser than the one
+  md_watch's first line names: `--hibachi-depth 5 --hibachi-granularity <G>`, `<G>` taken from
+  the contract's `orderbookGranularities` in `GET /market/exchange-info` on `--hibachi-rest`. A
+  book that prints both times, its levels on `<G>` the second time, cannot have come at the
+  venue's defaults both times. A `<G>` the contract does not list may gap the book for that
+  reason alone, so take it from the live list: the granularities of the repository's ETH/USDT-P
+  fixture (0.01 to 10) are the API docs' and the SDK's public example values
+  (`fixtures/hibachi/rest/README.md`), not a reading of the live contract.
+
+Record only the conclusion in the queue. The run's lines, prices, sizes, counts and timings stay
+in the owner's private notes, as the 2026-10-22 capture's did (decisions 0001, 0009).
 
 ## mainnet_smoke
 

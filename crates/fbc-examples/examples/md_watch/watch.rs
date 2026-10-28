@@ -1,8 +1,9 @@
 //! md_watch's wiring: one fbc-runtime `MdVenue` per venue asked for, each with the venue's
-//! factory, a configuration and spec table built from the command line, and explicit
-//! reconnect pacing, liveness and write-stall settings; a handler per venue that keeps the
-//! books (`MdBooks`, one fbc-book book per channel) and prints a line per update. No order is
-//! built or sent, and no credential is read: both venues' market data is public.
+//! factory, a configuration and spec table built from the command line (Hibachi's spec read from
+//! the venue first, `hibachi.rs`), and explicit reconnect pacing, liveness and write-stall
+//! settings; a handler per venue that keeps the books (`MdBooks`, one fbc-book book per channel)
+//! and prints a line per update. No order is built or sent, and no credential is read: every
+//! venue's market data here is public.
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -26,13 +27,15 @@ use fbc_venue_binance_usdm::{
     KEY_SNAPSHOT_LIMIT, KEY_SNAPSHOT_RETRY, KEY_SNAPSHOT_TIMEOUT, KEY_WS_BASE_URL,
     TOUCH_BOOK_TICKER,
 };
+use fbc_venue_hibachi::{BOOK_ORDERBOOK, HibachiMdCounts, TOUCH_ASK_BID_PRICE};
 use fbc_venue_paradex::ParadexFactory;
 use fbc_venue_paradex::factory::MD_URL;
 use fbc_venue_paradex::md::{BBO, BBO_INTERACTIVE, DELTAS};
 use rust_decimal::Decimal;
 use tokio::sync::Notify;
 
-use crate::args::{Market, Options, ParadexTouch};
+use crate::args::{HibachiOpts, Market, Options, ParadexTouch};
+use crate::hibachi::{self, Listed, Tally};
 
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
@@ -71,14 +74,17 @@ impl Sink {
     }
 }
 
-/// The Paradex market's and the Binance symbol's instrument ids; each venue has its own spec
-/// table, and the ids differ so a line can never be printed under the wrong one.
+/// The Paradex market's, the Binance symbol's and the Hibachi contract's instrument ids; each
+/// venue has its own spec table, and the ids differ so a line can never be printed under the
+/// wrong one.
 pub const PARADEX_INST: InstrumentId = InstrumentId::new(1);
 pub const BINANCE_INST: InstrumentId = InstrumentId::new(2);
+pub const HIBACHI_INST: InstrumentId = InstrumentId::new(3);
 
 /// Each venue's connection numbers, disjoint on the one ingest clock.
 const PARADEX_CONNS: Range<u16> = 0..64;
 const BINANCE_CONNS: Range<u16> = 64..128;
+const HIBACHI_CONNS: Range<u16> = 128..192;
 
 /// Reconnects back off from 250 ms to 30 s, at most 10 attempts a minute, each abandoned if it
 /// has not opened in 10 s.
@@ -215,6 +221,8 @@ pub fn paradex_touches(touch: ParadexTouch) -> Vec<(TouchSourceId, &'static str)
 struct Labels {
     venue: &'static str,
     symbol: String,
+    /// What md_watch's first line says it watches: its channels.
+    about: String,
     inst: InstrumentId,
     /// Each touch source subscribed, and its channel name.
     touches: Vec<(TouchSourceId, &'static str)>,
@@ -224,9 +232,21 @@ struct Labels {
     step: Decimal,
 }
 
+/// What md_watch prints of a Hibachi contract beside its events: its state, from the contract's
+/// read and its session calendar, and what its codec counted.
+struct HibachiShown {
+    listed: Listed,
+    /// The state last printed, `None` before the first `MARKET` line.
+    state: Option<String>,
+    tally: Tally,
+    /// The counts last printed on this connection.
+    counts: HibachiMdCounts,
+}
+
 /// The handler of one venue: keeps its books and prints a line per update.
 pub struct Watcher {
     labels: Labels,
+    hibachi: Option<HibachiShown>,
     top: usize,
     stamps: bool,
     books: MdBooks,
@@ -253,6 +273,7 @@ impl Watcher {
         let trading = TradingBooks::new([(labels.inst, labels.book)]).expect("one book");
         Watcher {
             labels,
+            hibachi: None,
             top: opts.top,
             stamps,
             books: MdBooks::new(trading),
@@ -343,8 +364,48 @@ impl Watcher {
         Some(text)
     }
 
-    /// Prints the book as the last frame left it, when that changed what is shown.
+    /// Prints the book as the last frame left it, when that changed what is shown; then, for a
+    /// Hibachi contract, its state when that changed, and its codec's counts when the codec
+    /// counted a kind of thing it had not counted before on this connection.
     pub fn flush(&mut self) {
+        self.flush_at(now());
+    }
+
+    /// [`flush`](Watcher::flush) at `at`, the instant the contract's state is judged at and its
+    /// lines are stamped with.
+    fn flush_at(&mut self, at: WallNs) {
+        self.flush_book();
+        self.show_market(at);
+        let Some(h) = &self.hibachi else {
+            return;
+        };
+        let counts = h.tally.get();
+        if hibachi::newly_counted(&h.counts, &counts) {
+            self.line(at, "COUNTS", &hibachi::counts_text(&counts));
+            if let Some(h) = &mut self.hibachi {
+                h.counts = counts;
+            }
+        }
+    }
+
+    /// A Hibachi contract's `MARKET` line at `at`, when its state then is not the one last
+    /// printed.
+    pub fn show_market(&mut self, at: WallNs) {
+        let Some(h) = &self.hibachi else {
+            return;
+        };
+        let state = h.listed.state(at);
+        if h.state.as_ref() == Some(&state) {
+            return;
+        }
+        self.line(at, "MARKET", &state);
+        if let Some(h) = &mut self.hibachi {
+            h.state = Some(state);
+        }
+    }
+
+    /// Prints the book as the last frame left it, when that changed what is shown.
+    fn flush_book(&mut self) {
         let Some((_, at)) = self.pending.take() else {
             return;
         };
@@ -422,9 +483,15 @@ impl Watcher {
     }
 
     fn on_end(&mut self, key: ConnKey) {
-        self.flush();
+        self.flush_book();
         self.books.end_epoch(key);
         self.shown = None;
+        // What the connection's codec counted, in full; the next connection's starts from none.
+        if let Some(h) = &mut self.hibachi {
+            let counts = h.tally.take();
+            h.counts = HibachiMdCounts::default();
+            self.line(now(), "COUNTS", &hibachi::counts_text(&counts));
+        }
         let kind = if self.stopping.get() {
             "CLOSED"
         } else {
@@ -440,7 +507,7 @@ impl Watcher {
 }
 
 /// The wall clock now, for a line no frame stamped.
-fn now() -> WallNs {
+pub fn now() -> WallNs {
     let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
     WallNs(since.map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)))
 }
@@ -487,6 +554,11 @@ struct Plan {
     conns: Range<u16>,
     silence: Duration,
     labels: Labels,
+    /// The limiter a read the venue's wiring made first was charged to (Hibachi's contract
+    /// read), so it and the sessions share one count; `None` for a fresh one.
+    limiter: Option<RateLimiter>,
+    /// A Hibachi contract's state and its codec's counts.
+    hibachi: Option<(Listed, Tally)>,
 }
 
 struct Shard<'a> {
@@ -502,8 +574,13 @@ impl Shard<'_> {
     fn wire(&self, plan: Plan) -> Result<(Wired, MdVenueControl), String> {
         let venue = plan.labels.venue;
         let fail = |e: &dyn std::fmt::Display| format!("{venue}: {e}");
-        let caps = plan.factory.caps(&plan.cfg).map_err(|e| fail(&e))?;
-        let limiter = RateLimiter::new(&caps.limits, reserve()).map_err(|e| fail(&e))?;
+        let limiter = match plan.limiter {
+            Some(limiter) => limiter,
+            None => {
+                let caps = plan.factory.caps(&plan.cfg).map_err(|e| fail(&e))?;
+                RateLimiter::new(&caps.limits, reserve()).map_err(|e| fail(&e))?
+            }
+        };
         let config = MdVenueConfig {
             venue: plan.factory,
             cfg: plan.cfg,
@@ -517,13 +594,19 @@ impl Shard<'_> {
             liveness: liveness(plan.silence),
             write_stall: write_stall(),
         };
-        let watcher = Watcher::new(
+        let mut watcher = Watcher::new(
             plan.labels,
             self.opts,
             self.stamps,
             self.stopping.clone(),
             self.out.clone(),
         );
+        watcher.hibachi = plan.hibachi.map(|(listed, tally)| HibachiShown {
+            listed,
+            state: None,
+            tally,
+            counts: HibachiMdCounts::default(),
+        });
         let watcher = Rc::new(RefCell::new(watcher));
         let (venue, control) =
             MdVenue::new(config, Shared(watcher.clone())).map_err(|e| fail(&e))?;
@@ -543,6 +626,7 @@ impl Shard<'_> {
         let touches = paradex_touches(self.opts.paradex_touch);
         let mut subs: Vec<_> = touches.iter().map(|(s, _)| sub(Feed::Touch(*s))).collect();
         subs.extend([sub(Feed::Trades), sub(Feed::Book(DELTAS))]);
+        let names: Vec<_> = touches.iter().map(|(_, name)| *name).collect();
         self.wire(Plan {
             factory,
             cfg,
@@ -550,9 +634,12 @@ impl Shard<'_> {
             subs,
             conns: PARADEX_CONNS,
             silence: PARADEX_SILENCE,
+            limiter: None,
+            hibachi: None,
             labels: Labels {
                 venue: "paradex",
                 symbol: market.symbol.clone(),
+                about: format!("{}, trades, deltas book", names.join(", ")),
                 inst: PARADEX_INST,
                 touches,
                 book: DELTAS,
@@ -582,15 +669,69 @@ impl Shard<'_> {
             ],
             conns: BINANCE_CONNS,
             silence: BINANCE_SILENCE,
+            limiter: None,
+            hibachi: None,
             labels: Labels {
                 venue: "binance",
                 symbol: market.symbol.clone(),
+                about: "bookTicker, diff-depth book".to_owned(),
                 inst: BINANCE_INST,
                 touches: vec![(TOUCH_BOOK_TICKER, "bookTicker")],
                 book: BOOK_DIFF,
                 book_name: "diff-depth",
                 tick: market.tick,
                 step: market.step,
+            },
+        })
+    }
+
+    /// Hibachi's contract, read from the venue first (`hibachi::read_contract`): its
+    /// `ask_bid_price` touch, its trades and its orderbook at its own granularity (or
+    /// `--hibachi-granularity`), decoded on its own tick and step.
+    async fn hibachi(&self, opts: &HibachiOpts) -> Result<(Wired, MdVenueControl), String> {
+        let factory = hibachi::Counting::leaked();
+        let cfg = hibachi::config(opts);
+        let fail = |e: &dyn std::fmt::Display| format!("hibachi: {e}");
+        let caps = factory.caps(&cfg).map_err(|e| fail(&e))?;
+        let limiter = RateLimiter::new(&caps.limits, reserve()).map_err(|e| fail(&e))?;
+        let read =
+            hibachi::read_contract(factory, &cfg, opts, HIBACHI_INST, &self.connector, &limiter);
+        let (spec, listed) = read.await.map_err(|e| fail(&e))?;
+        let (tick, step) = (spec.price_grid.finest(), spec.size_step.get());
+        let granularity = spec.quote_grid.unwrap_or(tick);
+        let mut specs = SpecTable::new();
+        specs.insert(spec);
+        let sub = |feed| Subscription {
+            inst: HIBACHI_INST,
+            feed,
+        };
+        self.wire(Plan {
+            factory,
+            cfg,
+            specs,
+            subs: vec![
+                sub(Feed::Touch(TOUCH_ASK_BID_PRICE)),
+                sub(Feed::Trades),
+                sub(Feed::Book(BOOK_ORDERBOOK)),
+            ],
+            conns: HIBACHI_CONNS,
+            silence: hibachi::SILENCE,
+            limiter: Some(limiter),
+            hibachi: Some((listed, factory.tally.clone())),
+            labels: Labels {
+                venue: "hibachi",
+                symbol: opts.symbol.clone(),
+                about: format!(
+                    "ask_bid_price, trades, orderbook book of {} levels at granularity {}",
+                    opts.depth,
+                    granularity.normalize()
+                ),
+                inst: HIBACHI_INST,
+                touches: vec![(TOUCH_ASK_BID_PRICE, "ask_bid_price")],
+                book: BOOK_ORDERBOOK,
+                book_name: "orderbook",
+                tick,
+                step,
             },
         })
     }
@@ -644,32 +785,31 @@ pub async fn run(
         .as_ref()
         .map(|m| shard.binance(m))
         .transpose()?;
-    let (mut paradex, mut binance) = (wire(paradex), wire(binance));
-    let mut watching = Vec::new();
-    if let Some(m) = &opts.paradex {
-        let touches = paradex_touches(opts.paradex_touch);
-        let names: Vec<_> = touches.iter().map(|(_, name)| *name).collect();
-        watching.push(format!(
-            "paradex {} ({}, trades, deltas book)",
-            m.symbol,
-            names.join(", ")
-        ));
-    }
-    if let Some(m) = &opts.binance {
-        watching.push(format!(
-            "binance {} (bookTicker, diff-depth book)",
-            m.symbol
-        ));
-    }
+    let hibachi = match &opts.hibachi {
+        Some(h) => Some(shard.hibachi(h).await?),
+        None => None,
+    };
+    let (mut paradex, mut binance, mut hibachi) = (wire(paradex), wire(binance), wire(hibachi));
+    let watchers: Vec<_> = paradex
+        .iter()
+        .chain(&binance)
+        .chain(&hibachi)
+        .map(|w| w.watcher.clone())
+        .collect();
+    let watching: Vec<String> = watchers
+        .iter()
+        .map(|w| {
+            let l = &w.borrow().labels;
+            format!("{} {} ({})", l.venue, l.symbol, l.about)
+        })
+        .collect();
     out.write_line(format_args!(
         "md_watch: {}; market data only, no order is ever sent",
         watching.join(", ")
     ));
-    let watchers: Vec<_> = paradex
-        .iter()
-        .chain(&binance)
-        .map(|w| w.watcher.clone())
-        .collect();
+    for watcher in &watchers {
+        watcher.borrow_mut().show_market(now());
+    }
     let stopping = shard.stopping.clone();
     let closed = out.closed.clone();
     let stopper = async move {
@@ -682,7 +822,13 @@ pub async fn run(
         Ok::<(), String>(())
     };
     let running = async {
-        tokio::try_join!(drive(paradex.as_mut()), drive(binance.as_mut()), stopper).map(|_| ())
+        tokio::try_join!(
+            drive(paradex.as_mut()),
+            drive(binance.as_mut()),
+            drive(hibachi.as_mut()),
+            stopper
+        )
+        .map(|_| ())
     };
     // Every session runs on this one thread and hands a frame's events on within one poll, so
     // the timer fires only between frames: a quiet market's last book is printed within
@@ -723,6 +869,7 @@ mod tests {
             paradex: None,
             paradex_touch: ParadexTouch::Bbo,
             binance: None,
+            hibachi: None,
             proxy: fbc_runtime::ProxyConfig::Direct,
             seconds: None,
             top: 2,
@@ -733,6 +880,7 @@ mod tests {
         let labels = Labels {
             venue: "toy",
             symbol: "TOY-PERP".to_owned(),
+            about: String::new(),
             inst: PARADEX_INST,
             touches: Vec::new(),
             book: BOOK,
@@ -816,6 +964,94 @@ mod tests {
                 "toy TOY-PERP book bid - ask 101 x 1 mid - spread -\n  1 bid - | ask 101 x 1\n",
             ],
             "{text}"
+        );
+    }
+
+    /// FBC-9o7e: a Hibachi codec's counts are judged per connection. A kind is printed as it is
+    /// first counted, all of them again at the connection's end before its `RECONNECT` line, and
+    /// the next connection starts from none: the same kind counted there is printed again as
+    /// first counted, though the connection before printed it already.
+    #[test]
+    fn a_hibachi_codecs_counts_are_printed_afresh_after_each_reconnect() {
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut w = watcher(buf.clone());
+        let tally = Tally::default();
+        w.hibachi = Some(HibachiShown {
+            listed: Listed {
+                status: TradingStatus::Trading,
+                sessions: None,
+            },
+            state: None,
+            tally: tally.clone(),
+            counts: HibachiMdCounts::default(),
+        });
+        let one = HibachiMdCounts {
+            unsized_touches: 1,
+            ..HibachiMdCounts::default()
+        };
+        let two = HibachiMdCounts {
+            unsized_touches: 2,
+            ..HibachiMdCounts::default()
+        };
+        // The first connection: counted once, printed; counted again, the same kind, printed
+        // only in full at the connection's end, which leaves its tally at none.
+        tally.set(one);
+        w.flush_at(WallNs(0));
+        tally.set(two);
+        w.flush_at(WallNs(1));
+        w.on_end(ConnKey { conn: 0, epoch: 0 });
+        assert_eq!(tally.get(), HibachiMdCounts::default());
+        // The second connection's codec starts from none, and counts the same kind.
+        tally.set(HibachiMdCounts::default());
+        w.flush_at(WallNs(2));
+        tally.set(one);
+        w.flush_at(WallNs(3));
+        let text = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert_eq!(
+            text,
+            "MARKET toy TOY-PERP open\n\
+             COUNTS toy TOY-PERP unsized_touches 1\n\
+             COUNTS toy TOY-PERP unsized_touches 2\n\
+             RECONNECT toy conn 0 epoch 0 ended\n\
+             COUNTS toy TOY-PERP unsized_touches 1\n"
+        );
+    }
+
+    /// FBC-9o7e: a Hibachi contract's `MARKET` line follows its session calendar through the
+    /// run, not only at its start: each flush judges the state at its own instant and prints it
+    /// when it is not the one last printed. Here a contract listed trading, closed by its
+    /// calendar from 1 000 ns until 2 000 ns, is flushed before, inside and after that window.
+    #[test]
+    fn a_hibachi_contracts_market_line_follows_its_calendar_at_each_flush() {
+        use fbc_core::{CalendarParts, ClosedWindow, SessionCalendar};
+
+        let buf = Rc::new(RefCell::new(Vec::<u8>::new()));
+        let mut w = watcher(buf.clone());
+        let closed = ClosedWindow::new(WallNs(1_000), WallNs(2_000)).unwrap();
+        let sessions = SessionCalendar::new(CalendarParts {
+            first_open: None,
+            final_close: None,
+            windows: vec![closed],
+            weekly: Vec::new(),
+        });
+        w.hibachi = Some(HibachiShown {
+            listed: Listed {
+                status: TradingStatus::Trading,
+                sessions,
+            },
+            state: None,
+            tally: Tally::default(),
+            counts: HibachiMdCounts::default(),
+        });
+        for at in [0, 999, 1_000, 1_999, 2_000, 5_000] {
+            w.flush_at(WallNs(at));
+        }
+        let text = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert_eq!(
+            text,
+            "MARKET toy TOY-PERP open\n\
+             MARKET toy TOY-PERP closed by its session calendar\n\
+             MARKET toy TOY-PERP open\n"
         );
     }
 }
