@@ -19,6 +19,11 @@
 //! FBC-wyv2's done line: the six order-entry checks start their fbc-oms registry, and pass, on toy
 //! variants declaring their open-order snapshot `Untrustworthy` (as Paradex does) or `None`, as
 //! on the toy declaring it `Trustworthy`.
+//!
+//! FBC-qaoy's done line: the six pass, probing what they probe on the toy, on a variant declaring
+//! its order-entry limits apart in `exec_limits`, scoped to the provider user as QFEX's are
+//! (0123, 0128), while its market-data limits stay per account; and a variant whose order-entry
+//! limits mix user and account scopes fails naming `VenueCaps.exec_limits`.
 
 mod toy_setup;
 
@@ -607,6 +612,31 @@ static UNTRUSTWORTHY: Variant = Variant {
 /// The toy declaring it offers no open-order snapshot.
 static NO_SNAPSHOT: Variant = Variant {
     caps: |c| c.exec.as_mut().unwrap().order.snapshot_source = SnapshotSource::None,
+    twist: Twist::None,
+};
+/// The toy declaring its order-entry limits apart from market data's, each scoped to the
+/// provider user as QFEX's are (0123, 0128); market data keeps the toy's per-account limit.
+static USER_SCOPED_ORDER_ENTRY: Variant = Variant {
+    caps: |c| {
+        let user = |l: &fbc_core::RateLimit| fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::User,
+            ..*l
+        };
+        c.exec_limits = Some(c.limits.iter().map(user).collect());
+    },
+    twist: Twist::None,
+};
+/// The toy declaring order-entry limits that mix user and account scopes, which no limiter
+/// serves.
+static MIXED_ORDER_ENTRY_SCOPES: Variant = Variant {
+    caps: |c| {
+        let account = c.limits[0];
+        let user = fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::User,
+            ..account
+        };
+        c.exec_limits = Some(vec![user, account]);
+    },
     twist: Twist::None,
 };
 /// The toy's connection arm has an account-wide effect, authorized for the suite's ACCT.
@@ -2017,6 +2047,40 @@ fn every_order_entry_check_starts_and_passes_whatever_snapshot_source_the_venue_
             assert_eq!(probed, trusted, "{name}");
         }
     }
+}
+
+/// FBC-qaoy's done line: the suite charges order entry to the limits `ExecSession` checks its
+/// limiter against, the venue's separate `exec_limits` where it declares them, so a venue whose
+/// order-entry limits are scoped to the provider user passes each check as the toy does.
+#[test]
+fn every_order_entry_check_runs_under_separate_user_scoped_order_entry_limits() {
+    let checks: [(&str, Check); 6] = [
+        ("amend_ack", suite::amend_ack),
+        ("mixed_batch", suite::mixed_batch),
+        ("unknown_on_timeout", suite::unknown_on_timeout),
+        ("resync_after_reconnect", suite::resync_after_reconnect),
+        ("two_phase_ack", suite::two_phase_ack),
+        ("reject_coverage", suite::reject_coverage),
+    ];
+    let passed = |name: &str, outcome: Result<Verdict, Failure>| match outcome {
+        Ok(Verdict::Passed { probed, .. }) => probed,
+        other => panic!("{name}: {other:?}"),
+    };
+    for (name, check) in checks {
+        let toy = Subject::new(&ToyFactory, FIXTURES, assumed).unwrap();
+        let toy = passed(name, check(&toy));
+        let user = passed(name, check(&USER_SCOPED_ORDER_ENTRY.subject(assumed)));
+        assert_eq!(user, toy, "{name}");
+    }
+}
+
+#[test]
+fn order_entry_limits_no_limiter_serves_fail_naming_exec_limits() {
+    let failure = failed(suite::amend_ack(&MIXED_ORDER_ENTRY_SCOPES.subject(assumed)));
+    assert!(
+        says(&failure, "VenueCaps.exec_limits", "MixedUserScopes"),
+        "{failure}"
+    );
 }
 
 #[test]
