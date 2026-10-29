@@ -302,12 +302,29 @@ impl<'s> Live<'s> {
         })
     }
 
-    /// The venue's declared limits as the session's buckets, none of each kept for safety.
+    /// The venue's declared order-entry limits as the session's buckets, none of each kept for
+    /// safety.
     fn limiter(&self) -> Result<RateLimiter, Failure> {
-        let caps: &VenueCaps = &self.h.caps;
         let reserve = SafetyReserve::percent(0).expect("0% is a reserve");
-        harness_limiter(&caps.limits, reserve)
-            .map_err(|e| self.h.fail("VenueCaps.limits", format!("refused: {e:?}")))
+        harness_limiter(exec_limits(&self.h.caps), reserve).map_err(|e| {
+            self.h
+                .fail(exec_limits_field(&self.h.caps), format!("refused: {e:?}"))
+        })
+    }
+}
+
+/// The limits an order-entry session is charged under, as `ExecSession` checks its limiter
+/// against them (0128): the venue's separate order-entry limits where it declares them, its
+/// one list otherwise.
+fn exec_limits(caps: &VenueCaps) -> &[RateLimit] {
+    caps.exec_limits.as_deref().unwrap_or(&caps.limits)
+}
+
+/// The caps field [`exec_limits`] read, for a breach to name.
+fn exec_limits_field(caps: &VenueCaps) -> &'static str {
+    match caps.exec_limits {
+        Some(_) => "VenueCaps.exec_limits",
+        None => "VenueCaps.limits",
     }
 }
 
@@ -470,7 +487,7 @@ impl Ctx<'_> {
         let full = |(i, l): &(usize, &RateLimit)| {
             l.ops.contains(op) && u64::from(l.units) <= self.used(*i, l.scope)
         };
-        let limits = self.h.caps.limits.iter().enumerate();
+        let limits = exec_limits(&self.h.caps).iter().enumerate();
         let window = limits.filter(full).map(|(_, l)| l.per).max();
         self.advance(window.unwrap_or_default()).await;
         self.sent.set(self.sent.get() + 1);
