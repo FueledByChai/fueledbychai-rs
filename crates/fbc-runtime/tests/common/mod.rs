@@ -38,6 +38,24 @@ async fn listen() -> (TcpListener, SocketAddr) {
     (listener, addr)
 }
 
+/// The receive buffer a [`ScriptedWs`] connection asks for (FBC-l74d).
+const PEER_RECV_BUFFER: u32 = 64 * 1024;
+
+/// A listener whose connections inherit a receive buffer of [`PEER_RECV_BUFFER`], set before it
+/// listens, so they start with a narrow window (FBC-l74d). A client write held behind a peer that
+/// stopped reading then fills under 1 MiB of the kernel's network memory between the two ends
+/// (about 0.7 MiB measured on macOS), not the 1.3 to 3 MiB a peer of default buffers took. That
+/// memory is shared by every process on the machine, and macOS refuses a write it cannot find
+/// room for (ENOBUFS), which the session rightly reads as a failed write that ends the epoch.
+async fn listen_narrow() -> (TcpListener, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(PEER_RECV_BUFFER).unwrap();
+    socket.bind(SocketAddr::new(LOCAL, 0)).unwrap();
+    let listener = socket.listen(128).unwrap();
+    let addr = listener.local_addr().unwrap();
+    (listener, addr)
+}
+
 /// A CONNECT request as the stub received it: the address type byte (3 is DOMAINNAME) and the
 /// host and port it named.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,7 +437,7 @@ impl ScriptedWs {
     }
 
     async fn run(tls: Option<TlsServer>) -> Self {
-        let (listener, addr) = listen().await;
+        let (listener, addr) = listen_narrow().await;
         let (tx, peers) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             loop {
