@@ -1207,15 +1207,46 @@ enum During {
     Http,
 }
 
+/// How many times [`heard_behind_a_stalled_write`] plays its scenario while the kernel refuses
+/// the 64 MiB write (FBC-l74d).
+const PLAYS: usize = 3;
+
 /// A frame decoding to a 64 MiB frame and then `then`, with `during` taken while the peer does
 /// not read the 64 MiB one: what the peer hears on that connection once it reads again, each
 /// frame by its length, until it closes (`None`) or the test has heard `frames`; and the events
-/// the handler, a closure, was handed.
+/// the handler was handed.
+///
+/// The write-stall window never ends that write: the clock is frozen, and only `During::Timer`
+/// moves it, 500 ms of the 3 s window. A play can still end early, because the kernel may refuse
+/// the write when the network memory it shares with every process on the machine runs short
+/// (ENOBUFS on macOS). The session then reads a failed write and ends the epoch, as it should,
+/// so the peer hears the connection end before the frame. That play says nothing of the order
+/// under test. One that heard the end first while the session counted no write stall, which,
+/// with the control held and no other bound in reach, only the connection failing under the
+/// session gives, is played again on a fresh session, up to [`PLAYS`] times; the last play is
+/// returned whatever it heard, so an order the session gets wrong still fails (FBC-l74d).
 async fn heard_behind_a_stalled_write(
     during: During,
     then: &str,
     frames: usize,
 ) -> (Vec<Option<usize>>, usize) {
+    let mut plays = 1;
+    loop {
+        let (heard, events, refused) = play_behind_a_stalled_write(during, then, frames).await;
+        if !refused || plays == PLAYS {
+            return (heard, events);
+        }
+        plays += 1;
+    }
+}
+
+/// One play of [`heard_behind_a_stalled_write`]'s scenario: what the peer heard, the events the
+/// handler was handed, and whether the kernel refused the write.
+async fn play_behind_a_stalled_write(
+    during: During,
+    then: &str,
+    frames: usize,
+) -> (Vec<Option<usize>>, usize, bool) {
     let frozen = freeze();
     let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ExecToy::leak();
@@ -1223,10 +1254,14 @@ async fn heard_behind_a_stalled_write(
     let (mut config, _) = setup(venue, &server.url(), pacing.unwrap());
     config.cfg.insert(HTTP, &http.url(""));
     config.write_stall = WriteStall::new(ms(3_000)).unwrap();
-    let events = Rc::new(RefCell::new(0));
-    let counted = events.clone();
-    let handler = move |_| *counted.borrow_mut() += 1;
-    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    let log = Log::default();
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
+    // An epoch that ended took its timers and requests with it: what `during` waits for never
+    // comes.
+    let ended = {
+        let log = Rc::clone(&log);
+        move || log.borrow().iter().any(|h| matches!(h, Heard::End(_)))
+    };
     let script = async move {
         let mut peer = server.accept().await;
         let _ = (peer.recv().await, peer.recv().await);
@@ -1240,12 +1275,12 @@ async fn heard_behind_a_stalled_write(
         match during {
             During::Timer => {
                 advance(ms(500)).await;
-                settle(|| venue.timers().len() == 1).await;
+                settle(|| venue.timers().len() == 1 || ended()).await;
             }
             During::Http => {
                 let asked = http.request().await;
                 asked.answer("HTTP/1.1 200 OK", "x").await;
-                settle(|| venue.answers().len() == 1).await;
+                settle(|| venue.answers().len() == 1 || ended()).await;
             }
         }
         drop(release);
@@ -1264,8 +1299,8 @@ async fn heard_behind_a_stalled_write(
     let (run, heard) = tokio::join!(session.run(), script);
     run.unwrap();
     drop(frozen);
-    let events = *events.borrow();
-    (heard, events)
+    let refused = heard.first() == Some(&None) && session.counters().write_stalls == 0;
+    (heard, events(&log), refused)
 }
 
 const BIG: usize = 65_536 * 1024;
