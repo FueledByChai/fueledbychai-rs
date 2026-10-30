@@ -13,7 +13,9 @@
 //! `ask_bid_price` frame with no sizes) reaches a consumer only through the concrete
 //! [`HibachiMd`] (decision 0129, item 10), while the runtime holds each codec as a
 //! `Box<dyn MdCodec>`. So md_watch hands the runtime [`Counting`], `Hibachi` itself in every call
-//! but `md_codec`, whose codec copies its counts into a [`Tally`] md_watch reads after each call.
+//! but `md_codec`, whose socket codec copies its counts into a [`Tally`] md_watch reads after each
+//! call. Hibachi's plan also has a status poll (decision 0130), whose codec md_watch takes as
+//! `Hibachi` builds it: its trading statuses reach md_watch as `MdEvent::Status`.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -23,16 +25,16 @@ use fbc_core::{
     AccountSummary, AliasTable, AssetKey, ConfigError, ConnKey, DecodeError, DecodeScope, Effect,
     Effects, EndpointPlan, ExecCodec, ExecEndpoint, FieldSpec, HttpAnswer, HttpFailure, HttpMethod,
     HttpPlan, HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentResolver,
-    InstrumentSpec, InstrumentSpecDraft, Keepalive, Listing, MdCodec, MdSink, MonoNs, RawFrame,
-    Secrets, SessionCalendar, SpecTable, Subscription, SymbolError, TimerTag, TradingStatus,
-    UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId, WallNs,
+    InstrumentSpec, InstrumentSpecDraft, Keepalive, Listing, MdCodec, MdSink, MdTransport, MonoNs,
+    RawFrame, Secrets, SessionCalendar, SpecTable, Subscription, SymbolError, TimerTag,
+    TradingStatus, UnderlyingId, VenueCaps, VenueConfig, VenueError, VenueFactory, VenueId, WallNs,
     dispatch_market_data,
 };
 use fbc_runtime::http::{Bytes, Method, Request};
 use fbc_runtime::{Connector, RateLimiter};
 use fbc_venue_hibachi::{
-    Hibachi, HibachiMd, HibachiMdCounts, KEY_DATA_REST_URL, KEY_DATA_WS_URL, KEY_ORDERBOOK_DEPTH,
-    KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT,
+    Hibachi, HibachiMd, HibachiMdCounts, KEY_AUCTION_HALT, KEY_DATA_REST_URL, KEY_DATA_WS_URL,
+    KEY_ORDERBOOK_DEPTH, KEY_ORDERBOOK_RESUBSCRIBE, KEY_REST_TIMEOUT, KEY_STATUS_INTERVAL,
 };
 use rust_decimal::Decimal;
 
@@ -40,7 +42,8 @@ use crate::args::HibachiOpts;
 use crate::watch::now;
 
 /// The Hibachi configuration from the command line: its two origins, the REST read's timeout,
-/// the orderbook depth and the resubscribe interval, every key `fbc-venue-hibachi` requires.
+/// the orderbook depth, the resubscribe interval, the status poll's interval and the window after
+/// a reopening, every key `fbc-venue-hibachi` requires.
 pub fn config(opts: &HibachiOpts) -> VenueConfig {
     let mut cfg = VenueConfig::new();
     for (key, value) in [
@@ -49,6 +52,8 @@ pub fn config(opts: &HibachiOpts) -> VenueConfig {
         (KEY_ORDERBOOK_DEPTH, opts.depth.to_string()),
         (KEY_DATA_WS_URL, opts.ws.clone()),
         (KEY_ORDERBOOK_RESUBSCRIBE, format!("{}ms", opts.retry_ms)),
+        (KEY_STATUS_INTERVAL, format!("{}s", opts.status_s)),
+        (KEY_AUCTION_HALT, format!("{}s", opts.auction_halt_s)),
     ] {
         cfg.insert(key, &value);
     }
@@ -130,9 +135,13 @@ impl VenueFactory for Counting {
         Hibachi.plan_md(cfg, specs, subs)
     }
 
-    /// `Hibachi`'s codec, as `Hibachi::md_codec` builds it, with its counts copied out after
-    /// every call; a new connection's starts the tally from none.
+    /// `Hibachi`'s codec, as `Hibachi::md_codec` builds it: the status poll's (decision 0130)
+    /// as it is, and the socket's with its counts copied out after every call; a new
+    /// connection's socket codec starts the tally from none.
     fn md_codec(&self, cfg: &VenueConfig, ep: &EndpointPlan) -> Box<dyn MdCodec> {
+        if let MdTransport::Poll { .. } = ep.transport {
+            return Hibachi.md_codec(cfg, ep);
+        }
         self.tally.set(HibachiMdCounts::default());
         Box::new(Counted {
             inner: HibachiMd::new(ep.stream, cfg),
@@ -309,10 +318,10 @@ impl Listed {
     /// `open`, or `closed` and why, at `at`: a contract Hibachi listed as anything but trading
     /// (`PAUSED` for an FX weekend, an exchange in maintenance) is closed by its status, and one
     /// it listed trading is closed while its session calendar says so (an FX pair from Friday
-    /// 17:00 to Sunday 17:00 New York time). The status is the read's, made once, and holds both
-    /// ways: a contract listed closed then reads closed all run, even once Hibachi reopens it,
-    /// and a halt Hibachi lists later is not seen. Reading it again is FBC-1632's re-read, which
-    /// md_watch does not make.
+    /// 17:00 to Sunday 17:00 New York time). The status is the start read's, and holds both ways
+    /// here: a contract listed closed then reads closed all run, even once Hibachi reopens it,
+    /// and a halt Hibachi lists later does not close it. Each change the status poll reads after
+    /// it (FBC-1632, decision 0130) is a `STATUS` line of its own.
     pub fn state(&self, at: WallNs) -> String {
         match self.status {
             TradingStatus::Trading => match &self.sessions {
