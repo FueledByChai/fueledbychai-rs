@@ -17,9 +17,10 @@ program's flags.
 
 Public market data only: md_watch reads no credential and sends no order. Each venue named runs
 on connections of its own, and `--help` lists every flag and every kind of line. Every line
-after the first is led by a UTC time: a `TOUCH`, `TRADE`, `HEALTH` or `BOOK` line by the time
-the runtime stamped the input that brought it (a frame's receive time, the instant a codec's
-timer fired, or, for a `stale` line, the instant the runtime's silence alarm went off), and a
+after the first is led by a UTC time: a `TOUCH`, `TRADE`, `HEALTH`, `BOOK` or `STATUS` line by
+the time the runtime stamped the input that brought it (a frame's or an HTTP answer's receive
+time, the instant a codec's timer fired, or, for a `stale` line, the instant the runtime's
+silence alarm went off), and a
 `MARKET`, `COUNTS`, `RECONNECT` or `CLOSED` line, which no input carries, by the time md_watch
 printed it. Nothing in the repository runs it against a venue: its test (`tests/md_watch.rs`)
 drives each venue's wiring against the conformance stub on 127.0.0.1 with hand-built frames.

@@ -574,8 +574,8 @@ struct Plan {
     /// The limiter a read the venue's wiring made first was charged to (Hibachi's contract
     /// read), handed to the venue's sessions in place of a fresh one, so a request of theirs that
     /// a declared limit counts would be counted beside the read; `None` for a fresh one. Hibachi
-    /// declares one limit, on REST requests, and its market-data sessions make none, so for now
-    /// they add nothing to the read's count.
+    /// declares one limit, on REST requests, so its status poll's reads (decision 0130), one each
+    /// `--hibachi-status`, are counted beside the contract read.
     limiter: Option<RateLimiter>,
     /// A Hibachi contract's state, its codec's counts and its socket's connection number.
     hibachi: Option<(Listed, Tally, u16)>,
@@ -1186,8 +1186,8 @@ mod tests {
     /// Reviewer A RA213-1: Hibachi's contract read is charged to Hibachi's declared rate limit
     /// on the limiter the plan then hands the venue's sessions, not on one of its own: the
     /// plan's limiter has the read's one request counted. (Hibachi's one declared limit counts
-    /// REST requests, which its market-data sessions do not make, so nothing of theirs adds to
-    /// that count yet.)
+    /// REST requests, so once the sessions run, the status poll's reads are counted on it beside
+    /// the read; here no session runs.)
     #[tokio::test]
     async fn a_hibachi_contracts_read_is_charged_to_the_limiter_its_sessions_are_given() {
         use fbc_conformance::{HttpReply, HttpRoutes, StubServer, WsScript};

@@ -104,7 +104,12 @@ Lines:
   STATUS <venue> <market> <trading|post-only|reduce-only|cancel-only|halted|delisted>
                                                the market's trading status, once each time
                                                it changes: for Hibachi, as the status poll
-                                               reads it every --hibachi-status
+                                               reports it from its reads every
+                                               --hibachi-status, halted between reads at a
+                                               published maintenance window's begin, a
+                                               session's end or an advertised close, and
+                                               held halted for --hibachi-auction-halt after
+                                               each reopening it knows of
   RECONNECT <venue> conn <n> epoch <e> ended   the connection dropped; its books are invalid
                                                until their next snapshot
   CLOSED <venue> conn <n> epoch <e> ended      md_watch stopped and closed the connection
