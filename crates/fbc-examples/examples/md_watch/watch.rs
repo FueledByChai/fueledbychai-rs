@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use fbc_core::{
     Aggressor, AssetSym, BookId, ConnKey, Envelope, Feed, FeedHealth, FundingSpec, InstrumentId,
-    InstrumentKind, InstrumentSpec, Lots, Lvl, MdEvent, PriceGrid, SizeStep, SpecTable,
-    Subscription, Ticks, TouchSourceId, TradingStatus, UnderlyingId, VenueConfig, VenueFactory,
-    VenueId, WallNs, dispatch_market_data,
+    InstrumentKind, InstrumentSpec, Lots, Lvl, MdEvent, MdTransport, PriceGrid, SizeStep,
+    SpecTable, Subscription, Ticks, TouchSourceId, TradingStatus, UnderlyingId, VenueConfig,
+    VenueFactory, VenueId, WallNs, dispatch_market_data,
 };
 use fbc_runtime::{
     Connector, IngestClock, Liveness, MdBooks, MdHandler, MdVenue, MdVenueConfig, MdVenueControl,
@@ -241,6 +241,9 @@ struct HibachiShown {
     tally: Tally,
     /// The counts last printed on this connection.
     counts: HibachiMdCounts,
+    /// The connection number of the `/ws/market` socket, whose codec the tally counts: the
+    /// status poll's connection (decision 0130) counts nothing, so its end prints no `COUNTS`.
+    socket: u16,
 }
 
 /// The handler of one venue: keeps its books and prints a line per update.
@@ -498,8 +501,10 @@ impl Watcher {
         self.flush_book();
         self.books.end_epoch(key);
         self.shown = None;
-        // What the connection's codec counted, in full; the next connection's starts from none.
-        if let Some(h) = &mut self.hibachi {
+        // What the socket's codec counted, in full; the next connection's starts from none.
+        if let Some(h) = &mut self.hibachi
+            && key.conn == h.socket
+        {
             let counts = h.tally.take();
             h.counts = HibachiMdCounts::default();
             self.line(now(), "COUNTS", &hibachi::counts_text(&counts));
@@ -572,8 +577,8 @@ struct Plan {
     /// declares one limit, on REST requests, and its market-data sessions make none, so for now
     /// they add nothing to the read's count.
     limiter: Option<RateLimiter>,
-    /// A Hibachi contract's state and its codec's counts.
-    hibachi: Option<(Listed, Tally)>,
+    /// A Hibachi contract's state, its codec's counts and its socket's connection number.
+    hibachi: Option<(Listed, Tally, u16)>,
 }
 
 struct Shard<'a> {
@@ -616,11 +621,12 @@ impl Shard<'_> {
             self.stopping.clone(),
             self.out.clone(),
         );
-        watcher.hibachi = plan.hibachi.map(|(listed, tally)| HibachiShown {
+        watcher.hibachi = plan.hibachi.map(|(listed, tally, socket)| HibachiShown {
             listed,
             state: None,
             tally,
             counts: HibachiMdCounts::default(),
+            socket,
         });
         let watcher = Rc::new(RefCell::new(watcher));
         let (venue, control) =
@@ -727,19 +733,32 @@ impl Shard<'_> {
             inst: HIBACHI_INST,
             feed,
         };
+        let subs = vec![
+            sub(Feed::Touch(TOUCH_ASK_BID_PRICE)),
+            sub(Feed::Trades),
+            sub(Feed::Book(BOOK_ORDERBOOK)),
+        ];
+        // The venue opens its first plan's endpoints under its range's numbers in plan order,
+        // and Hibachi plans its status poll beside the socket (decision 0130): the socket's
+        // number is its place in that plan.
+        let planned = factory
+            .plan_md(&cfg, &specs, &subs.iter().copied().collect())
+            .map_err(|e| fail(&e))?;
+        let socket = planned
+            .iter()
+            .position(|ep| matches!(ep.transport, MdTransport::Socket { .. }))
+            .and_then(|at| u16::try_from(at).ok())
+            .map(|at| HIBACHI_CONNS.start + at)
+            .ok_or_else(|| fail(&"no /ws/market socket planned"))?;
         Ok(Plan {
             factory,
             cfg,
             specs,
-            subs: vec![
-                sub(Feed::Touch(TOUCH_ASK_BID_PRICE)),
-                sub(Feed::Trades),
-                sub(Feed::Book(BOOK_ORDERBOOK)),
-            ],
+            subs,
             conns: HIBACHI_CONNS,
             silence: hibachi::SILENCE,
             limiter: Some(limiter),
-            hibachi: Some((listed, factory.tally.clone())),
+            hibachi: Some((listed, factory.tally.clone(), socket)),
             labels: Labels {
                 venue: "hibachi",
                 symbol: opts.symbol.clone(),
@@ -1024,6 +1043,7 @@ mod tests {
             state: None,
             tally: tally.clone(),
             counts: HibachiMdCounts::default(),
+            socket: 0,
         });
         let one = HibachiMdCounts {
             unsized_touches: 1,
@@ -1082,6 +1102,7 @@ mod tests {
             state: None,
             tally: Tally::default(),
             counts: HibachiMdCounts::default(),
+            socket: 0,
         });
         for at in [0, 999, 1_000, 1_999, 2_000, 5_000] {
             w.flush_at(WallNs(at));
@@ -1190,6 +1211,8 @@ mod tests {
             depth: 3,
             granularity: None,
             retry_ms: 2_000,
+            status_s: 60,
+            auction_halt_s: 900,
         };
         let opts = Options {
             hibachi: Some(contract.clone()),

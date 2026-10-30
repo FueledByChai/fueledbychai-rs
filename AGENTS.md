@@ -547,8 +547,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     conformance stub. So far `examples/md_watch/`: a Paradex market's bbo, trades and `deltas`
     book, a Binance USD-M symbol's `bookTicker` and diff-depth book, and a Hibachi contract's
     `ask_bid_price` touch, trades and `orderbook` book (FBC-9o7e: the contract read first
-    through the venue's discovery, its open or closed state and its codec's counts printed,
-    `examples/md_watch/hibachi.rs`) through `MdVenue`, one `MdBooks` per venue, a line per
+    through the venue's discovery, its open or closed state, each trading status its status poll
+    reports (FBC-1632) and its socket codec's counts printed, `examples/md_watch/hibachi.rs`) through `MdVenue`, one `MdBooks` per venue, a line per
     update; no order, no credential (`tests/md_watch.rs`); and
     `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs, exactly the testnet's
     or a loopback stub's at `/v1`, and the chain id checked before anything connects), an

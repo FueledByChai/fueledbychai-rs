@@ -825,6 +825,37 @@ fn stamped(line: &str) -> Option<&str> {
     shaped.then_some(rest)
 }
 
+/// What the stub's ETH/USDT-P shows on the status poll (decision 0130): `LIVE` on a `NORMAL`
+/// exchange, so trading.
+const ETH_TRADING: &str = "STATUS hibachi ETH/USDT-P trading";
+/// The status poll's connection, the one after the socket's (128) in Hibachi's range: its end
+/// prints no `COUNTS`, which only the socket's codec counts.
+const POLL_CLOSED: &str = "CLOSED hibachi conn 129 epoch 0 ended";
+
+/// `lines` without the status poll's (FBC-1632, decision 0130): its `STATUS` line, which comes
+/// whenever the poll's first read is answered, so at no fixed place among the socket's lines (and
+/// not at all when md_watch stops first), and its connection's `CLOSED` line, which ends every
+/// run. Each is checked: at most one `STATUS` line, ETH/USDT-P trading, and the poll's
+/// connection closed exactly once, at its first epoch.
+fn socket_lines(lines: &[String]) -> Vec<String> {
+    let (mut statuses, mut closed) = (0, 0);
+    let mut kept = Vec::new();
+    for line in lines {
+        let bare = stamped(line).unwrap_or(line);
+        if bare.starts_with("STATUS ") {
+            assert_eq!(bare, ETH_TRADING, "{lines:#?}");
+            statuses += 1;
+        } else if bare == POLL_CLOSED {
+            closed += 1;
+        } else {
+            kept.push(line.clone());
+        }
+    }
+    assert!(statuses <= 1, "{lines:#?}");
+    assert_eq!(closed, 1, "{lines:#?}");
+    kept
+}
+
 /// Runs md_watch on `opts` against `stub` until `done` holds of what it printed (bounded at 60 s,
 /// so a regression fails instead of hanging), each line led by its receive time when `stamps`.
 async fn watch_until(opts: &Options, stamps: bool, done: impl Fn(&str) -> bool) -> Vec<String> {
@@ -872,8 +903,17 @@ async fn md_watch_prints_hibachis_ask_bid_price_touch_and_its_orderbooks_touch_a
         .unwrap();
     let opts = hibachi_args(&stub, "ETH/USDT-P", &["--top", "3"]);
     let trade = "TRADE hibachi ETH/USDT-P buy 0.25 @ 2000.051234";
-    let lines = watch_until(&opts, true, |t| t.contains(trade)).await;
+    // Stopped once the trade and the status poll's first answer are both printed.
+    let lines = watch_until(&opts, true, |t| {
+        t.contains(trade) && t.contains(ETH_TRADING)
+    })
+    .await;
     stub.finished().await.unwrap();
+    // FBC-1632: the status poll Hibachi plans beside the socket printed the contract's status
+    // once, and its connection closed with no COUNTS line of its own.
+    let statuses = lines.iter().filter(|l| l.ends_with(ETH_TRADING)).count();
+    assert_eq!(statuses, 1, "{lines:#?}");
+    let lines = socket_lines(&lines);
 
     assert_eq!(
         lines[0],
@@ -911,9 +951,10 @@ async fn md_watch_prints_hibachis_ask_bid_price_touch_and_its_orderbooks_touch_a
             "CLOSED hibachi conn 128 epoch 0 ended",
         ]
     );
-    // The contract was read from the stub, and the one connection was the stub's: md_watch
-    // subscribed each topic once, the orderbook at the contract's quote grid and the depth given.
-    assert_eq!(stub.http_requests(), ["GET /market/exchange-info"]);
+    // The contract was read from the stub, then once more by the status poll (its interval, 60 s,
+    // had not come round again), and the one connection was the stub's: md_watch subscribed each
+    // topic once, the orderbook at the contract's quote grid and the depth given.
+    assert_eq!(stub.http_requests(), ["GET /market/exchange-info"; 2]);
     let conns = stub.connections();
     assert_eq!(conns.len(), 1);
     let mut asked = hibachi_requests(&conns[0]);
@@ -962,6 +1003,7 @@ async fn a_hibachi_book_whose_snapshots_ignore_the_subscriptions_fields_gaps_wit
         t.matches(gap).count() == 2 && t.contains("resubscribes 1")
     })
     .await;
+    let lines = socket_lines(&lines);
     stub.finished().await.unwrap();
 
     let hibachi = of(&lines[1..], "hibachi");
@@ -1072,6 +1114,7 @@ async fn a_hibachi_book_whose_snapshots_take_the_subscriptions_fields_but_are_th
     let opts = hibachi_args(&stub, "ETH/USDT-P", &["--hibachi-retry", "1000"]);
     let gap = "HEALTH hibachi ETH/USDT-P orderbook gap";
     let lines = watch_until(&opts, false, |t| t.matches(gap).count() == 3).await;
+    let lines = socket_lines(&lines);
     stub.finished().await.unwrap();
 
     let hibachi = of(&lines[1..], "hibachi");
@@ -1166,6 +1209,7 @@ async fn a_hibachi_orderbook_subscription_left_unanswered_gaps_resubscribes_then
         conns.get(1).is_some_and(|c| c.received.len() == 3)
     };
     let lines = watch_until(&opts, false, resubscribed).await;
+    let lines = socket_lines(&lines);
     stub.finished().await.unwrap();
 
     let hibachi = of(&lines[1..], "hibachi");
@@ -1242,6 +1286,7 @@ async fn md_watch_prints_a_hibachi_codecs_counts_afresh_on_each_connection() {
             .is_some_and(|(_, after)| after.contains(counted))
     })
     .await;
+    let lines = socket_lines(&lines);
     stub.finished().await.unwrap();
 
     let hibachi = of(&lines[1..], "hibachi");
@@ -1294,6 +1339,8 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
         depth: 15,
         granularity: None,
         retry_ms: 2_000,
+        status_s: 60,
+        auction_halt_s: 900,
     };
     assert_eq!(opts.hibachi.as_ref(), Some(&defaults));
     assert_eq!(opts.binance.as_ref().unwrap().symbol, "ETHUSDT");
@@ -1303,6 +1350,8 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
         ("--hibachi-timeout <MS>", "(default 5000)"),
         ("--hibachi-depth <N>", "(default 15"),
         ("--hibachi-retry <MS>", "milliseconds (default 2000)"),
+        ("--hibachi-status <S>", "seconds (default 60)"),
+        ("--hibachi-auction-halt <S>", "seconds (default 900"),
     ] {
         let at = USAGE
             .find(said)
@@ -1323,6 +1372,8 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
         ("hibachi.orderbook_depth", "15"),
         ("hibachi.data_ws_url", "wss://data-api.hibachi.xyz"),
         ("hibachi.orderbook_resubscribe", "2000ms"),
+        ("hibachi.status_interval", "60s"),
+        ("hibachi.auction_halt", "900s"),
     ] {
         assert_eq!(cfg.get(key), Some(value), "{key}");
     }
@@ -1342,6 +1393,10 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
         "0.1",
         "--hibachi-retry",
         "250",
+        "--hibachi-status",
+        "5",
+        "--hibachi-auction-halt",
+        "30",
     ]));
     let Ok(Parsed::Watch(opts)) = parsed else {
         panic!("{parsed:?}")
@@ -1356,6 +1411,8 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
             depth: 100,
             granularity: Some(Decimal::new(1, 1)),
             retry_ms: 250,
+            status_s: 5,
+            auction_halt_s: 30,
         })
     );
     // Each value given is the one the venue's configuration carries.
@@ -1367,6 +1424,8 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
         ("hibachi.orderbook_depth", "100"),
         ("hibachi.data_ws_url", "ws://127.0.0.1:8081"),
         ("hibachi.orderbook_resubscribe", "250ms"),
+        ("hibachi.status_interval", "5s"),
+        ("hibachi.auction_halt", "30s"),
     ] {
         assert_eq!(cfg.get(key), Some(value), "{key}");
     }
@@ -1405,6 +1464,14 @@ fn the_hibachi_command_line_takes_documented_defaults_and_refuses_with_a_reason(
         (
             &["--hibachi", "X/USDT-P", "--hibachi-granularity", "-0.1"][..],
             "not a positive decimal",
+        ),
+        (
+            &["--hibachi", "X/USDT-P", "--hibachi-status", "0"][..],
+            "--hibachi-status 0: not a positive whole number of seconds",
+        ),
+        (
+            &["--hibachi", "X/USDT-P", "--hibachi-auction-halt", "15m"][..],
+            "--hibachi-auction-halt 15m: not a positive whole number of seconds",
         ),
         (
             &["--hibachi", "X/USDT-P", "--hibachi-ws", "--top", "2"][..],
@@ -1617,24 +1684,26 @@ async fn a_hibachi_contract_is_reported_closed_by_its_status_or_its_calendar() {
     assert_eq!(gbp.state(saturday), "closed: listed Halted");
     assert_eq!(eth.state(saturday), "open");
     assert_eq!(eth.state(wednesday), "open");
-    // Reviewer B RB213-2: the listed status is the read's, made once, so a contract the read
-    // finds PAUSED reads closed at every later instant too (GBP above, on the Wednesday); the
-    // usage text and the README say so, and that a halt listed later is not seen.
+    // Reviewer B RB213-2: the listed status is the start read's, so a contract the read finds
+    // PAUSED reads closed at every later instant too (GBP above, on the Wednesday); the usage
+    // text and the README say so, and (FBC-1632) that the status poll's STATUS lines show each
+    // later change, which MARKET does not follow.
     let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let usage = flat(USAGE);
     for said in [
-        "its listed status is read once, at the start",
-        "reads closed all run, even once Hibachi reopens it",
-        "a halt listed later is not seen",
+        "its listed status is the start read's",
+        "reads closed here all run, even once Hibachi reopens it",
+        "the STATUS lines show each change the status poll reads after it",
     ] {
         assert!(usage.contains(said), "--help does not say {said}");
     }
     let readme = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("README.md");
     let readme = flat(&fs::read_to_string(readme).unwrap());
     for said in [
-        "holds for the whole run in both directions",
+        "holds there for the whole run in both directions",
         "closed: listed Halted` for the whole run, even after Hibachi reopens it",
-        "a halt Hibachi lists later is not seen",
+        "a halt Hibachi lists later is seen there",
+        "`MARKET` does not follow it",
     ] {
         assert!(readme.contains(said), "the README does not say {said}");
     }
@@ -1735,6 +1804,8 @@ fn md_watchs_counting_factory_is_hibachis_own_with_the_codecs_counts_copied_out(
         depth: 3,
         granularity: None,
         retry_ms: 2_000,
+        status_s: 60,
+        auction_halt_s: 900,
     };
     let cfg = hibachi::config(&opts);
     assert_eq!(factory.id(), Hibachi.id());
@@ -1819,6 +1890,21 @@ fn md_watchs_counting_factory_is_hibachis_own_with_the_codecs_counts_copied_out(
     };
     assert!(codec.subscribe(&[sub], &[], &specs, &mut fx).is_err());
     assert!(fx.take().is_empty());
+    assert_eq!(factory.tally.get().acks, 1);
+    // FBC-1632 (decision 0130): the status poll, which Hibachi plans alone for no subscription,
+    // gets Hibachi's own codec, not a counted socket codec: building it and opening it, which
+    // asks for its first read, leave the socket's tally as it was.
+    let polls = factory.plan_md(&cfg, &specs, &none).unwrap();
+    let [poll] = polls.as_slice() else {
+        panic!("not the status poll alone: {polls:?}")
+    };
+    assert!(
+        matches!(poll.transport, fbc_core::MdTransport::Poll { .. }),
+        "{poll:?}"
+    );
+    let mut status = factory.md_codec(&cfg, poll);
+    status.on_open(&mut fx);
+    assert!(!fx.take().is_empty(), "the status poll asked for no read");
     assert_eq!(factory.tally.get().acks, 1);
     let _next = factory.md_codec(&cfg, &ep);
     assert_eq!(factory.tally.get(), Default::default());
@@ -1992,9 +2078,11 @@ async fn socks5_relay() -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) 
 
 /// Reviewer B RB213-4: `--socks5` applies to Hibachi's contract read as to its WebSocket. The
 /// read is md_watch's one HTTP request made outside the runtime's sessions, through the run's
-/// connector; with `--socks5` pointed at a relay, the relay is asked to CONNECT exactly twice,
-/// first to the stub's HTTP port (the read), then to its WebSocket port, and md_watch prints the
-/// book the stub's Snapshot carries, so both went through it and nothing went around it.
+/// connector; with `--socks5` pointed at a relay, the relay is asked to CONNECT first to the
+/// stub's HTTP port (the read), then to its WebSocket port and, for the status poll's first read
+/// (FBC-1632), to its HTTP port again, those two in either order; md_watch prints the book the
+/// stub's Snapshot carries and the status the poll read, so all three went through it and nothing
+/// went around it.
 #[tokio::test]
 async fn md_watch_sends_the_hibachi_contract_read_and_its_websocket_through_the_socks5_proxy() {
     let mut steps = vec![Step::Accept];
@@ -2011,17 +2099,31 @@ async fn md_watch_sends_the_hibachi_contract_read_and_its_websocket_through_the_
     let opts = hibachi_args(&stub, "ETH/USDT-P", &["--socks5", &proxy]);
     assert!(matches!(opts.proxy, ProxyConfig::Socks5 { .. }));
     let book = "BOOK hibachi ETH/USDT-P orderbook bid 2000 x 1.25 ask 2000.1 x 1.5";
-    let lines = watch_until(&opts, false, |t| t.contains(book)).await;
+    let lines = watch_until(&opts, false, |t| {
+        t.contains(book) && t.contains(ETH_TRADING)
+    })
+    .await;
     stub.finished().await.unwrap();
 
     assert_eq!(lines.iter().filter(|l| l.starts_with(book)).count(), 1);
+    assert_eq!(socket_lines(&lines).len() + 2, lines.len(), "{lines:#?}");
     let http = stub.http_url("");
     let ws = stub.ws_url("");
-    let relayed = [
+    let (http, ws) = (
         http.strip_prefix("http://").unwrap(),
         ws.strip_prefix("ws://").unwrap(),
-    ];
-    assert_eq!(*targets.lock().unwrap(), relayed);
-    assert_eq!(stub.http_requests(), ["GET /market/exchange-info"]);
+    );
+    let relayed = targets.lock().unwrap().clone();
+    assert_eq!(
+        relayed.first().map(String::as_str),
+        Some(http),
+        "{relayed:?}"
+    );
+    let mut after = relayed[1..].to_vec();
+    after.sort_unstable();
+    let mut both = vec![http.to_owned(), ws.to_owned()];
+    both.sort_unstable();
+    assert_eq!(after, both, "{relayed:?}");
+    assert_eq!(stub.http_requests(), ["GET /market/exchange-info"; 2]);
     assert_eq!(stub.connections().len(), 1);
 }

@@ -43,7 +43,8 @@ Options:
   --paradex-step <DEC>    size step the Paradex market is decoded on (default 0.00000001)
   --binance-tick <DEC>    price grid the Binance symbol is decoded on (default 0.00000001)
   --binance-step <DEC>    size step the Binance symbol is decoded on (default 0.00000001)
-  --hibachi-rest <URL>    Hibachi market-data REST origin, read once for the contract
+  --hibachi-rest <URL>    Hibachi market-data REST origin, read first for the contract and
+                          then by the status poll every --hibachi-status
                           (default https://data-api.hibachi.xyz)
   --hibachi-ws <URL>      Hibachi market-data WebSocket origin; md_watch connects to /ws/market
                           on it (default wss://data-api.hibachi.xyz)
@@ -59,6 +60,13 @@ Options:
   --hibachi-retry <MS>    how long after finding the orderbook broken the codec subscribes it
                           again, and then waits for its Snapshot before reconnecting, in
                           milliseconds (default 2000)
+  --hibachi-status <S>    how often the status poll re-reads GET /market/exchange-info for the
+                          contract's trading status, in seconds (default 60)
+  --hibachi-auction-halt <S>
+                          how long the status poll reports the contract halted after each
+                          reopening it knows of, for the call auction Hibachi may run then, in
+                          seconds (default 900, the 15 minutes the call-auction docs' example
+                          runs)
   -h, --help              print this help
 
 A market is spelled as the venue spells it: a Paradex market in ASCII letters, digits and
@@ -82,20 +90,21 @@ Lines:
                                                closes it (whether a closed contract's feed
                                                falls silent, and so reads stale, is not known
                                                yet: see the crate's README); its listed
-                                               status is read once, at the start, so a
-                                               contract listed closed then (PAUSED, or the
-                                               exchange in maintenance) reads closed all run,
-                                               even once Hibachi reopens it, and a halt listed
-                                               later is not seen: restart to read it again
+                                               status is the start read's, so a contract
+                                               listed closed then (PAUSED, or the exchange in
+                                               maintenance) reads closed here all run, even
+                                               once Hibachi reopens it: the STATUS lines show
+                                               each change the status poll reads after it
   COUNTS <venue> <market> <counter> <n> ...    what the Hibachi codec counted on the current
                                                connection (frames and sides it passed over or
                                                found wrong, resubscribes, reconnects): a kind
                                                as it is first counted, then all of them before
-                                               each RECONNECT or CLOSED line (none when
-                                               nothing was counted)
+                                               each RECONNECT or CLOSED line of the /ws/market
+                                               connection (none when nothing was counted)
   STATUS <venue> <market> <trading|post-only|reduce-only|cancel-only|halted|delisted>
                                                the market's trading status, once each time
-                                               it changes
+                                               it changes: for Hibachi, as the status poll
+                                               reads it every --hibachi-status
   RECONNECT <venue> conn <n> epoch <e> ended   the connection dropped; its books are invalid
                                                until their next snapshot
   CLOSED <venue> conn <n> epoch <e> ended      md_watch stopped and closed the connection
@@ -125,6 +134,15 @@ pub const HIBACHI_DEPTH: u16 = 15;
 pub const HIBACHI_MAX_DEPTH: u16 = 100;
 /// How long a broken orderbook waits for its resubscribe, as md_watch's Binance snapshot retry.
 pub const HIBACHI_RETRY_MS: u64 = 2_000;
+/// How often the status poll re-reads the contract's trading status (`fbc-venue-hibachi`'s
+/// `hibachi.status_interval`, decision 0130): one request a minute against Hibachi's per-IP REST
+/// limit.
+pub const HIBACHI_STATUS_S: u64 = 60;
+/// How long the status poll holds the contract halted after each reopening it knows of
+/// (`hibachi.auction_halt`, decision 0130): the 15 minutes of the call auction in Hibachi's
+/// call-auction docs' example (auction mode from 21:45 UTC, the uncross at 22:00), since no source
+/// says which status a contract shows during one (FBC-vg2n).
+pub const HIBACHI_AUCTION_HALT_S: u64 = 900;
 
 /// The deepest `--top`: Paradex's book channel carries 15 levels per side.
 pub const MAX_TOP: usize = 15;
@@ -160,6 +178,8 @@ pub struct HibachiOpts {
     pub depth: u16,
     pub granularity: Option<Decimal>,
     pub retry_ms: u64,
+    pub status_s: u64,
+    pub auction_halt_s: u64,
 }
 
 /// What to watch and how.
@@ -202,6 +222,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut hibachi_depth = HIBACHI_DEPTH;
     let mut hibachi_granularity = None;
     let mut hibachi_retry_ms = HIBACHI_RETRY_MS;
+    let mut hibachi_status_s = HIBACHI_STATUS_S;
+    let mut hibachi_auction_halt_s = HIBACHI_AUCTION_HALT_S;
     let finest: Decimal = FINEST.parse().expect("a decimal");
     let mut grids = [finest; 4];
     let mut args = args.into_iter();
@@ -269,6 +291,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             }
             "--hibachi-granularity" => hibachi_granularity = Some(positive(&flag, &value()?)?),
             "--hibachi-retry" => hibachi_retry_ms = millis(&flag, &value()?)?,
+            "--hibachi-status" => hibachi_status_s = secs(&flag, &value()?)?,
+            "--hibachi-auction-halt" => hibachi_auction_halt_s = secs(&flag, &value()?)?,
             _ => return Err(format!("unknown argument {flag}; --help lists them")),
         }
     }
@@ -289,6 +313,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         depth: hibachi_depth,
         granularity: hibachi_granularity,
         retry_ms: hibachi_retry_ms,
+        status_s: hibachi_status_s,
+        auction_halt_s: hibachi_auction_halt_s,
     });
     Ok(Parsed::Watch(Box::new(Options {
         paradex: market(paradex, grids[0], grids[1]),
@@ -380,6 +406,16 @@ fn millis(flag: &str, value: &str) -> Result<u64, String> {
         Ok(ms) if ms > 0 => Ok(ms),
         _ => Err(format!(
             "{flag} {value}: not a positive whole number of milliseconds"
+        )),
+    }
+}
+
+/// A positive whole number of seconds.
+fn secs(flag: &str, value: &str) -> Result<u64, String> {
+    match value.parse::<u64>() {
+        Ok(s) if s > 0 => Ok(s),
+        _ => Err(format!(
+            "{flag} {value}: not a positive whole number of seconds"
         )),
     }
 }

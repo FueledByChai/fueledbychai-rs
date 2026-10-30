@@ -53,23 +53,32 @@ reconnected, so should Hibachi stop sending a closed contract's frames, `HEALTH 
 The owner's first run over a closure (an FX pair at its weekend) tells which; a feed that falls
 silent is then a ticket for md_watch to expect it.
 
-Only the session calendar is judged again, at each flush. The listed status is the read's, made
-once at the start, and holds for the whole run in both directions:
+Only the session calendar is judged again for `MARKET`, at each flush. Its listed status is the
+start read's, and holds there for the whole run in both directions:
 
 - A contract the read finds closed stays closed: one listed `PAUSED`, or the exchange in
   maintenance, prints `MARKET hibachi <symbol> closed: listed Halted` for the whole run, even
   after Hibachi reopens it. An FX pair started during its weekend still reads closed after Sunday
   17:00 New York time, while its `TOUCH` and `BOOK` lines flow.
 - A contract the read finds trading stays open, but for its calendar: a halt Hibachi lists later
-  is not seen, and nor is a maintenance window, which the calendar does not hold yet (FBC-ord5).
+  does not close it, and nor does a maintenance window, which the calendar does not hold yet
+  (FBC-ord5).
 
-Restart md_watch to read the status again. Reading it again while running is FBC-1632's.
+The status poll re-reads the status while md_watch runs (FBC-1632, decision 0130): Hibachi's plan
+holds it beside `/ws/market`, a `GET /market/exchange-info` every `--hibachi-status` seconds, and
+md_watch prints each status it reports as `STATUS hibachi <symbol> <status>`, once each time it
+changes. So a halt Hibachi lists later is seen there, a published maintenance window halts the
+contract from its begin, and after each reopening the poll knows of it reports the contract
+`halted` for `--hibachi-auction-halt` seconds, for the call auction Hibachi may run then, whose
+status no source gives yet (FBC-vg2n). `MARKET` does not follow it. The poll's endpoint takes the
+connection number after the socket's, and its end prints a `CLOSED` line of its own.
 
-`COUNTS` prints what the market-data codec counted on the connection (decision 0129): each kind
-as it is first counted, and all of them before every `RECONNECT` or `CLOSED` line, `none` when
-it counted nothing. The defaults are `--hibachi-rest https://data-api.hibachi.xyz`,
-`--hibachi-ws wss://data-api.hibachi.xyz`, `--hibachi-timeout 5000`, `--hibachi-depth 15` and
-`--hibachi-retry 2000`; the orderbook is subscribed at the contract's quote grid unless
+`COUNTS` prints what the market-data codec counted on the `/ws/market` connection (decision
+0129): each kind as it is first counted, and all of them before each of that connection's
+`RECONNECT` or `CLOSED` lines, `none` when it counted nothing. The defaults are
+`--hibachi-rest https://data-api.hibachi.xyz`, `--hibachi-ws wss://data-api.hibachi.xyz`,
+`--hibachi-timeout 5000`, `--hibachi-depth 15`, `--hibachi-retry 2000`, `--hibachi-status 60`
+and `--hibachi-auction-halt 900`; the orderbook is subscribed at the contract's quote grid unless
 `--hibachi-granularity` names another, a whole number of its ticks, asked for in its shortest
 spelling (`0.10` as `0.1`), the tick itself asking for the book on the tick.
 
