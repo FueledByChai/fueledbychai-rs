@@ -28,7 +28,7 @@ use crate::codec::{
 };
 use crate::command::NotSentReason;
 use crate::event::{RpcId, StreamId};
-use crate::ids::{IdError, InstrumentId};
+use crate::ids::{AccountKey, IdError, InstrumentId};
 use crate::resolve::{AssetKey, InstrumentSpecDraft, SymbolError};
 use crate::scope::DecodeScope;
 use crate::units::Money;
@@ -542,6 +542,13 @@ pub trait VenueFactory: Sync + 'static {
     fn config_schema(&self) -> &'static [FieldSpec];
     /// What the venue can do under `cfg`.
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError>;
+    /// The consumer's account key explicitly bound to this venue configuration, when the
+    /// adapter requires one. `None` preserves existing venues' contract. A returned key is
+    /// compared with the execution session's account before any endpoint is planned or opened;
+    /// it is a caller-attested mapping, not proof of provider account ownership.
+    fn exec_account_key(&self, _cfg: &VenueConfig) -> Result<Option<AccountKey>, ConfigError> {
+        Ok(None)
+    }
     /// The asset key of the instrument a Java-era ticker names on this venue, by FBC's rule for
     /// it (Paradex `X/USDT` is `X-USD-PERP`, Hibachi `X/USDT` is `X/USDT-P`, Binance `X/USDT` is
     /// `XUSDT`): the key the venue's discovery states for that instrument, which the consumer's

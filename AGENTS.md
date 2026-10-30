@@ -319,6 +319,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     before a session plans or opens its endpoints; once armed, a disconnect cancels that
     account's orders across connections, including orders placed after the arm, and each new
     epoch must arm again (0121);
+    a venue whose configuration names the consumer account it is bound to
+    (`VenueFactory::exec_account_key`, `Ok(None)` by default) refuses a session for any other
+    account, `ExecSessionError::AccountBinding`, before caps or planning (0122);
     `WallClockNonces` is the production nonce source for a venue whose nonce is a wall-clock
     timestamp (Hibachi): `max(clock, last + 1)` microseconds over an injected `WallClock`,
     resumed after a journal's `last_nonce` (refused, `JournalGap`, for records holding a gap), refusing a block further ahead of its clock than
