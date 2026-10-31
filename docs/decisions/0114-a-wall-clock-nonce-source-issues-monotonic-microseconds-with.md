@@ -1,6 +1,6 @@
 # 0114 — A wall-clock nonce source issues monotonic microseconds within the caller's window, resumes after the journal's last nonce, and a source's refusal ends the order-entry session
 
-Status: accepted
+Status: superseded by 0133
 Date: 2026-10-19
 
 ## Context
