@@ -331,8 +331,14 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     epoch must arm again (0121);
     `WallClockNonces` is the production nonce source for a venue whose nonce is a wall-clock
     timestamp (Hibachi): `max(clock, last + 1)` microseconds over an injected `WallClock`,
-    resumed after a journal's `last_nonce` (refused, `JournalGap`, for records holding a gap), refusing a block further ahead of its clock than
-    the caller's window, which has no default (FBC-3bq4, 0114, `tests/wall_nonces.rs`);
+    refusing a block further ahead of its clock than the caller's window, which has no default
+    (FBC-3bq4, 0114), and issuing only at or below a ceiling its `NonceLease`'s `LeaseStore`
+    (`LeaseFile` in production) has already persisted: the first when it is built, the next by
+    a writer thread of its own once half the consumer's span is left, a block past it refused
+    (`PastLease`) and never waited for; resumed after the larger of the lease's ceiling and a
+    journal's `last_nonce` (refused, `JournalGap`, for records holding a gap), so a restart
+    never reissues a nonce sent while its journal record was unwritten, whatever its clock reads
+    (FBC-ak22, 0133, `tests/wall_nonces.rs`, `tests/exec_journal.rs`);
     `ShardHost` is the shard host (0100): one loop driving a shard's session runs as its
     `Member`s on one task, sharing one `IngestClock`, that drains every input they have ready
     (yield to the runtime, poll every member, again while a round spent the task's coop

@@ -1946,6 +1946,11 @@ async fn deadline_fired(name: &str, connected: bool) -> Run {
 const WALL_US: u64 = 1_792_000_000_000_000;
 /// Hibachi's documented nonce window, as a consumer would pass it.
 const NONCE_WINDOW: Duration = Duration::from_secs(15);
+/// How far ahead of the next nonce each nonce lease ceiling reaches, as a consumer would pass it
+/// (decision 0133).
+const LEASE_SPAN: Duration = Duration::from_secs(2);
+/// [`LEASE_SPAN`] in microseconds.
+const LEASE_SPAN_US: u64 = 2_000_000;
 
 /// The wall clock a `WallClockNonces` reads, set by the test: a read of a cleared clock panics,
 /// so a replay run with it cleared proves it read no clock.
@@ -1979,14 +1984,39 @@ impl fbc_runtime::WallClock for StubWall {
     }
 }
 
+/// A nonce lease store in memory, persisting each ceiling at once: the lease of the sessions
+/// here whose test is not about it (the lease's own are FBC-ak22's, below and in
+/// `wall_nonces.rs`).
+#[derive(Default)]
+struct MemLease(Option<u64>);
+
+impl fbc_runtime::LeaseStore for MemLease {
+    fn ceiling(&self) -> Option<u64> {
+        self.0
+    }
+
+    fn persist(&mut self, ceiling: u64) -> std::io::Result<()> {
+        self.0 = Some(ceiling);
+        Ok(())
+    }
+}
+
+fn mem_lease() -> fbc_runtime::NonceLease<MemLease> {
+    fbc_runtime::NonceLease {
+        store: MemLease::default(),
+        span: LEASE_SPAN,
+    }
+}
+
 /// The toy's session over `server`, its nonces from a `WallClockNonces` reading `wall`
 /// (resumed after `last` when given), journaled as [`SOURCE`].
 fn wall_config(server: &ScriptedWs, wall: &StubWall, last: Option<u64>) -> ExecSessionConfig {
     let reserved = armed_oms::Reserved::default();
     let mut config = armed_oms::session_config(&server.url(), &reserved);
+    let (clock, lease) = (wall.clone(), mem_lease());
     let nonces = match last {
-        None => fbc_runtime::WallClockNonces::new(wall.clone(), NONCE_WINDOW),
-        Some(last) => fbc_runtime::WallClockNonces::resuming(wall.clone(), NONCE_WINDOW, last),
+        None => fbc_runtime::WallClockNonces::new(clock, NONCE_WINDOW, lease),
+        Some(last) => fbc_runtime::WallClockNonces::resuming(clock, NONCE_WINDOW, last, lease),
     };
     config.nonces = Box::new(nonces.unwrap());
     config.nonce_source = SOURCE;
@@ -2110,7 +2140,8 @@ async fn a_wall_clock_sources_nonces_are_journaled_and_each_encode_replays_byte_
     let last = fbc_runtime::last_nonce(&records, SOURCE).unwrap().unwrap();
     assert_eq!(last, WALL_US + 4);
     let behind = StubWall::at_us(WALL_US - 1_000_000);
-    let mut resumed = fbc_runtime::WallClockNonces::resuming(behind, NONCE_WINDOW, last).unwrap();
+    let mut resumed =
+        fbc_runtime::WallClockNonces::resuming(behind, NONCE_WINDOW, last, mem_lease()).unwrap();
     let next = resumed.try_reserve(2).unwrap();
     assert_eq!(next.as_slice(), [WALL_US + 5, WALL_US + 6]);
     assert!(
@@ -2217,9 +2248,10 @@ async fn a_source_resumed_past_its_clock_by_more_than_the_window_refuses_the_arm
     let records: Vec<Record> = run.entries.iter().map(|e| e.record.clone()).collect();
     assert_eq!(fbc_runtime::last_nonce(&records, SOURCE), Ok(Some(last)));
     let near = StubWall::at_us(last - 1_000_000);
-    let mut next = fbc_runtime::WallClockNonces::resuming(near, NONCE_WINDOW, last).unwrap();
+    let mut next =
+        fbc_runtime::WallClockNonces::resuming(near, NONCE_WINDOW, last, mem_lease()).unwrap();
     assert_eq!(next.try_reserve(1).unwrap().as_slice(), [last + 1]);
-    let behind = fbc_runtime::WallClockNonces::resuming(wall, NONCE_WINDOW, last);
+    let behind = fbc_runtime::WallClockNonces::resuming(wall, NONCE_WINDOW, last, mem_lease());
     assert!(behind.unwrap().try_reserve(1).is_err());
 }
 
@@ -2258,4 +2290,250 @@ async fn a_journal_set_after_the_source_issued_names_its_last_nonce_first() {
     // The high-water first, then the arm's, above it.
     assert_eq!(journaled, [WALL_US + 2, WALL_US + 3]);
     assert!(matches!(run.entries[0].record, Record::Nonce { .. }));
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-ak22: the nonce lease in a session (decision 0133).
+// ---------------------------------------------------------------------------------------------
+
+/// What the test holds a lease file's writes with, and sees whether one is under way through.
+#[derive(Default)]
+struct Gate {
+    held: std::sync::Mutex<bool>,
+    released: std::sync::Condvar,
+    writing: std::sync::atomic::AtomicBool,
+}
+
+impl Gate {
+    fn hold(&self) {
+        *self.held.lock().unwrap() = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap() = false;
+        self.released.notify_all();
+    }
+
+    fn writing(&self) -> bool {
+        self.writing.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A lease file whose every write waits while its gate is held, then goes to the file.
+struct HeldFile {
+    file: fbc_runtime::LeaseFile,
+    gate: Arc<Gate>,
+}
+
+impl fbc_runtime::LeaseStore for HeldFile {
+    fn ceiling(&self) -> Option<u64> {
+        self.file.ceiling()
+    }
+
+    fn persist(&mut self, ceiling: u64) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.gate.writing.store(true, SeqCst);
+        let mut held = self.gate.held.lock().unwrap();
+        while *held {
+            held = self.gate.released.wait(held).unwrap();
+        }
+        drop(held);
+        let done = fbc_runtime::LeaseStore::persist(&mut self.file, ceiling);
+        self.gate.writing.store(false, SeqCst);
+        done
+    }
+}
+
+/// A journal sink whose records reach the journal's writer until its process dies; from then on
+/// each is taken and kept in memory, never written, as the records still queued in a sink are
+/// when its process dies. It never blocks either way.
+struct Dying {
+    queue: QueueSink,
+    dead: bool,
+    unwritten: Vec<Record>,
+}
+
+impl JournalSink for Dying {
+    fn record(&mut self, class: TrafficClass, now: WallNs, record: &Record) -> Recorded {
+        if self.dead {
+            self.unwritten.push(record.clone());
+            return Recorded::Ok;
+        }
+        self.queue.record(class, now, record)
+    }
+
+    fn record_ref(&mut self, class: TrafficClass, now: WallNs, record: RecordRef<'_>) -> Recorded {
+        if self.dead {
+            self.unwritten.push(record.to_record());
+            return Recorded::Ok;
+        }
+        self.queue.record_ref(class, now, record)
+    }
+
+    fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded {
+        if self.dead {
+            return Recorded::Ok;
+        }
+        self.queue.omit(class, now)
+    }
+}
+
+/// FBC-ak22's done line, the session's half (decision 0133): a session whose nonces come from a
+/// `WallClockNonces` over a lease file writes a cancel with its nonce while the lease's renewal is
+/// held mid-write and the cancel's journal records are taken but never written: no cancel waits
+/// on a journal or lease write (0006), its nonce issued under the ceiling the file already held.
+/// The process then dies. Its journal on disk ends before the cancel's nonce, so the journal
+/// alone would have a restart reissue it; a source resumed from that journal and the lease file
+/// the process left issues no nonce at or below it, whatever the restart's clock reads.
+#[tokio::test]
+async fn a_cancel_goes_out_with_its_lease_and_journal_writes_pending_and_a_restart_never_reissues_its_nonce()
+ {
+    let window_us = u64::try_from(NONCE_WINDOW.as_micros()).unwrap();
+    let mut server = ScriptedWs::start().await;
+    let root = fresh_dir("exec_journal_nonce_lease");
+    let leases = fresh_dir("exec_journal_nonce_lease_files");
+    fs::create_dir_all(&leases).unwrap();
+    let path = leases.join("account.lease");
+    let gate = Arc::new(Gate::default());
+    let store = HeldFile {
+        file: fbc_runtime::LeaseFile::create(&path).unwrap(),
+        gate: Arc::clone(&gate),
+    };
+    let wall = StubWall::at_us(WALL_US);
+    let reserved = armed_oms::Reserved::default();
+    let mut config = armed_oms::session_config(&server.url(), &reserved);
+    let lease = fbc_runtime::NonceLease {
+        store,
+        span: LEASE_SPAN,
+    };
+    let nonces = fbc_runtime::WallClockNonces::new(wall.clone(), NONCE_WINDOW, lease).unwrap();
+    config.nonces = Box::new(nonces);
+    config.nonce_source = SOURCE;
+    // The lease's first ceiling is on disk before the source has issued anything.
+    let ceiling = WALL_US + LEASE_SPAN_US;
+    let file = fbc_runtime::LeaseFile::open(&path).unwrap();
+    assert_eq!(file.ceiling(), Some(ceiling));
+    let cancel = armed_oms::Oms::armed().cancel();
+
+    let sink = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (queue, drain) = journal_queue(sink, redaction_key()).unwrap();
+    let writer = drain
+        .spawn(JournalWriter::create(&root, SHARD, redaction_key()).unwrap())
+        .unwrap();
+    let sink = Rc::new(RefCell::new(Dying {
+        queue,
+        dead: false,
+        unwritten: Vec::new(),
+    }));
+    let heard = Heard::default();
+    let keep = Rc::clone(&heard);
+    let handler = move |env: Envelope<ExecEvent>| keep.borrow_mut().push(env.body);
+    let (mut session, control) = ExecSession::new(config, handler).unwrap();
+    session.set_journal(Journal::new(Rc::clone(&sink)));
+    let orders = session.orders();
+    let crashed = leases.join("crashed.lease");
+    let (dying, held, stepped) = (Rc::clone(&sink), Arc::clone(&gate), wall.clone());
+    let (lease_file, left) = (path.clone(), crashed.clone());
+    let play = async move {
+        let mut peer = server.accept().await;
+        armed_and_resynced(&mut peer, &orders, &heard).await;
+        // Three quarters of the lease's span on, a quarter is left: its writer renews, and the
+        // test holds the write.
+        held.hold();
+        stepped.set_us(WALL_US + 3 * LEASE_SPAN_US / 4);
+        until(|| held.writing()).await;
+        // From here the journal's writer is given nothing: every record is queued, unwritten.
+        dying.borrow_mut().dead = true;
+        orders.submit(cancel).unwrap();
+        let written = recv_text(&mut peer).await;
+        assert!(written.starts_with("cancel|"), "{written}");
+        // Written with both writes pending: the lease's renewal held, the journal's records
+        // never written.
+        assert!(held.writing());
+        // The process dies here: what its lease file holds now is what a restart reads.
+        fs::copy(&lease_file, &left).unwrap();
+        drop(control);
+        while peer.next().await.is_some() {}
+        frame_nonces(&written)
+    };
+    let (ended, carried) = tokio::join!(session.run(), play);
+    ended.unwrap();
+    drop(session);
+    gate.release();
+    writer.close().unwrap();
+
+    // The cancel's nonce, issued under the ceiling the lease file already held.
+    let late = WALL_US + 3 * LEASE_SPAN_US / 4;
+    assert_eq!(carried, [late]);
+    let sent = late;
+    assert!(sent <= ceiling);
+    // The session offered it to the journal, which never wrote it: the journal on disk holds only
+    // the arm's nonce, below it.
+    let offered = Record::Nonce {
+        source: SOURCE,
+        value: sent,
+    };
+    assert!(sink.borrow().unwritten.contains(&offered));
+    let records: Vec<Record> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .entries()
+        .map(|e| e.unwrap().record)
+        .collect();
+    let journaled: Vec<u64> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Nonce { source, value } if *source == SOURCE => Some(*value),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(journaled, [WALL_US]);
+    let last = fbc_runtime::last_nonce(&records, SOURCE).unwrap().unwrap();
+    assert!(last < sent);
+
+    // The journal alone would reissue it: a source resumed after the journal's last nonce, over
+    // a store that never held the lease, issues the cancel's nonce again at the cancel's clock.
+    let at_cancel = StubWall::at_us(sent);
+    let mut journal_only =
+        fbc_runtime::WallClockNonces::resuming(at_cancel, NONCE_WINDOW, last, mem_lease()).unwrap();
+    assert_eq!(journal_only.try_reserve(1).unwrap().as_slice(), [sent]);
+
+    // The lease file the process left holds the ceiling the cancel's nonce was issued under; a
+    // source resumed from it never issues at or below the cancel's nonce, whatever its clock.
+    let left = fbc_runtime::LeaseFile::open(&crashed).unwrap().ceiling();
+    assert_eq!(left, Some(ceiling));
+    let clocks = [
+        WALL_US - 3_600_000_000,
+        WALL_US - 20_000_000,
+        WALL_US,
+        sent,
+        sent + 1,
+        WALL_US + 30_000_000,
+    ];
+    let mut refused = 0;
+    for (i, at) in clocks.into_iter().enumerate() {
+        let copy = leases.join(format!("restart-{i}.lease"));
+        fs::copy(&crashed, &copy).unwrap();
+        let lease = fbc_runtime::NonceLease {
+            store: fbc_runtime::LeaseFile::open(&copy).unwrap(),
+            span: LEASE_SPAN,
+        };
+        let clock = StubWall::at_us(at);
+        let mut resumed =
+            fbc_runtime::WallClockNonces::resuming(clock, NONCE_WINDOW, last, lease).unwrap();
+        let next = at.max(ceiling + 1);
+        match resumed.try_reserve(2) {
+            Ok(block) => assert_eq!(block.as_slice(), [next, next + 1], "clock {at}"),
+            Err(why) => {
+                let outside = matches!(why, fbc_core::NonceRefused::OutsideWindow { .. });
+                assert!(outside && next + 1 - at > window_us, "clock {at}: {why}");
+                refused += 1;
+            }
+        }
+        assert!(next > sent);
+    }
+    // The clocks stepped back past the window were refused; the rest issued above the cancel's.
+    assert_eq!(refused, 2);
 }

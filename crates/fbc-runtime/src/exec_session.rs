@@ -439,7 +439,8 @@ pub enum ExecSessionError {
     Nonces { asked: u16, reserved: usize },
     /// The consumer's nonce source refused a reservation for `on_open`, `on_timer`, the
     /// resync or an encode, reserving none (FBC-3bq4): a wall-clock source whose clock fell
-    /// too far behind its last nonce (decision 0114). Nothing of the call was made or written.
+    /// too far behind its last nonce (decision 0114), or whose next nonce would pass the lease it
+    /// has persisted (FBC-ak22, decision 0133). Nothing of the call was made or written.
     NonceRefused(NonceRefused),
     /// The frames the codec's `on_open` asks for weigh more together than the venue's buckets
     /// ever admit, so no epoch could open.
