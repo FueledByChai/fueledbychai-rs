@@ -765,7 +765,8 @@ pub trait NonceSource: Send {
 
     /// Reserves `len` nonces as [`reserve`](NonceSource::reserve) does, or refuses, reserving
     /// none, when it cannot give nonces the venue would take (FBC-3bq4, decision 0114): a source
-    /// over a wall clock fallen too far behind its last nonce. The runtime reserves through this
+    /// over a wall clock fallen too far behind its last nonce, or one whose next nonce would pass
+    /// the lease it has persisted (FBC-ak22, decision 0133). The runtime reserves through this
     /// call and surfaces a refusal as its error, so no nonce outside what the source allows is
     /// ever sent. By default it never refuses.
     fn try_reserve(&mut self, len: u16) -> Result<NonceBlock, NonceRefused> {
@@ -793,6 +794,10 @@ pub enum NonceRefused {
     ClockBeforeEpoch,
     /// The block would pass `u64::MAX`.
     Exhausted,
+    /// The block's last nonce would lie `past` the ceiling the source's lease has persisted so
+    /// far (FBC-ak22, decision 0133): a restart resumes after that ceiling, so a nonce above it
+    /// could be issued again. The source refuses rather than wait for the lease's next write.
+    PastLease { past: Duration },
 }
 
 impl fmt::Display for NonceRefused {
@@ -804,6 +809,10 @@ impl fmt::Display for NonceRefused {
             ),
             NonceRefused::ClockBeforeEpoch => f.write_str("the clock reads before the Unix epoch"),
             NonceRefused::Exhausted => f.write_str("no nonce is left below u64::MAX"),
+            NonceRefused::PastLease { past } => write!(
+                f,
+                "the next nonce would lie {past:?} past the nonce lease persisted so far"
+            ),
         }
     }
 }

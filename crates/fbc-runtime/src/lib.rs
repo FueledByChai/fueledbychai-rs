@@ -181,7 +181,10 @@ pub use inputs::{
 pub use journal::Journal;
 pub use liveness::{Liveness, LivenessError};
 pub use md_venue::{MdVenue, MdVenueConfig, MdVenueControl, PlanError};
-pub use nonce::{JournalGap, SystemWallClock, WallClock, WallClockNonces, ZeroWindow, last_nonce};
+pub use nonce::{
+    JournalGap, LeaseFile, LeaseStore, NonceLease, NonceStartError, SystemWallClock, WallClock,
+    WallClockNonces, last_nonce,
+};
 pub use pacing::{PacingError, ReconnectPacing};
 pub use ratelimit::{
     BucketKey, Charged, RateCounts, RateError, RateLimiter, RateUserKey, Refused, Request,
