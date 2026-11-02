@@ -50,8 +50,14 @@ this.
    directory, so a crash leaves either the old ceiling or the new one. `LeaseFile::create` is
    for a sequence that has never issued a nonce and refuses a path that exists.
    `LeaseFile::open` refuses a missing file or one that holds no ceiling, so a lost lease is
-   never read as a fresh one. One process holds a lease file, as one process holds an account
-   (0007's reasoning, as 0114 kept it).
+   never read as a fresh one. A `LeaseFile` holds an exclusive advisory lock on `<path>.lock`
+   for as long as it lives, and a source's writer keeps it until its last write has returned.
+   Until then a second `create` or `open` of the same path, in this process or another, is
+   refused (`WouldBlock`), so a dropped source's late write never lands over the ceiling of a
+   source built after it (Codex P2 r4429948074 on PR #220). Dropping a source with no write under
+   way waits for its writer to end, so the file opens again at once; dropping one with a write
+   under way does not wait. One process holds a lease file, as one process holds an account
+   (0007's reasoning, as 0114 kept it), and the lock now enforces it.
 4. **What stays in force from 0114.** Item 1 (the source issues `max(clock, last + 1)` over an
    injected `WallClock`), item 3 (the window is the caller's, a block outside it is refused, and
    a window under a microsecond is refused when the source is built) and item 4 (`try_reserve`;
@@ -79,7 +85,9 @@ Building a `WallClockNonces` now takes a `NonceLease`, persists once, starts a t
 a `Clone` clock. Its constructors return `NonceStartError`, which replaces `ZeroWindow`, and
 `NonceRefused` gains `PastLease`, which an exhaustive match must handle. Each source writes its
 lease about twice a span. A consumer keeps one lease file per nonce sequence beside its journal,
-creates it once for a new account and opens it on every later start. A lost lease file puts the
+creates it once for a new account and opens it on every later start; an open refused because
+the file is held means an earlier source's write has not yet returned, and the consumer tries
+again later. A lost lease file puts the
 consumer back where 0114 left it: resuming after a bound of its own, which this record does not
 cover. A restart's first nonce can lie up to a span ahead of its clock, so a span well inside
 the window leaves a quick restart room to issue at once. A disk that stalls for longer than a

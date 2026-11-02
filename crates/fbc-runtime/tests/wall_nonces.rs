@@ -134,6 +134,19 @@ impl LeaseStore for Store {
     }
 
     fn persist(&mut self, ceiling: u64) -> io::Result<()> {
+        self.write(|| {
+            if self.0.failing.load(Ordering::SeqCst) {
+                return Err(io::Error::other("the test's disk refused the write"));
+            }
+            self.0.persisted.lock().unwrap().push(ceiling);
+            Ok(())
+        })
+    }
+}
+
+impl Store {
+    /// Runs `write` once the store is not held, as a write under way the whole time.
+    fn write(&self, write: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
         let state = &self.0;
         state.writing.store(true, Ordering::SeqCst);
         let mut held = state.held.lock().unwrap();
@@ -141,15 +154,33 @@ impl LeaseStore for Store {
             held = state.released.wait(held).unwrap();
         }
         drop(held);
-        let done = if state.failing.load(Ordering::SeqCst) {
-            Err(io::Error::other("the test's disk refused the write"))
-        } else {
-            state.persisted.lock().unwrap().push(ceiling);
-            Ok(())
-        };
+        let done = write();
         state.writing.store(false, Ordering::SeqCst);
         done
     }
+}
+
+/// A lease file whose writes the test holds through `gate`, a [`Store`] used only for that.
+struct HeldFile {
+    file: LeaseFile,
+    gate: Store,
+}
+
+impl LeaseStore for HeldFile {
+    fn ceiling(&self) -> Option<u64> {
+        self.file.ceiling()
+    }
+
+    fn persist(&mut self, ceiling: u64) -> io::Result<()> {
+        let HeldFile { file, gate } = self;
+        gate.write(|| file.persist(ceiling))
+    }
+}
+
+/// The ceiling the lease file at `path` holds on disk, read without taking it.
+fn on_disk(path: &Path) -> u64 {
+    let text = fs::read_to_string(path).unwrap();
+    text.trim_end().parse().unwrap()
 }
 
 /// A lease over `store` reaching [`SPAN`] ahead.
@@ -613,12 +644,17 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
         span: SPAN,
     };
     let mut first = WallClockNonces::new(clock.clone(), WINDOW, leased).unwrap();
-    let on_disk = LeaseFile::open(&path).unwrap().ceiling().unwrap();
-    assert_eq!(on_disk, T_US + SPAN_US);
+    // Held by the source: read off the disk, not opened.
+    assert_eq!(
+        LeaseFile::open(&path).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let leased = on_disk(&path);
+    assert_eq!(leased, T_US + SPAN_US);
     let sent = ok(first.try_reserve(3));
     assert_eq!(sent, [T_US, T_US + 1, T_US + 2]);
     let last_sent = T_US + 2;
-    assert!(sent.iter().all(|n| *n <= on_disk));
+    assert!(sent.iter().all(|n| *n <= leased));
     // Its journal wrote the first two records; the third was still queued when it died.
     let written = [
         Record::Nonce {
@@ -644,14 +680,14 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
     // With the lease file, whatever the restart's clock reads.
     let clocks = [
         T_US - 3_600_000_000,
-        on_disk + 1 - window_us - 1,
-        on_disk + 1 - window_us,
+        leased + 1 - window_us - 1,
+        leased + 1 - window_us,
         T_US - 1_000_000,
         T_US,
         last,
         last_sent,
         last_sent + 1,
-        on_disk,
+        leased,
         T_US + 20_000_000,
     ];
     for (i, at) in clocks.into_iter().enumerate() {
@@ -665,10 +701,9 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
         let mut resumed = WallClockNonces::resuming(restart.clone(), WINDOW, last, lease).unwrap();
         // Resumed after the lease's ceiling, above the journal's last nonce, with its own first
         // ceiling persisted a span ahead.
-        assert_eq!(resumed.last(), Some(on_disk), "clock {at}");
-        let leased = LeaseFile::open(&copy).unwrap().ceiling().unwrap();
-        assert_eq!(leased, at.max(on_disk) + SPAN_US, "clock {at}");
-        let next = at.max(on_disk + 1);
+        assert_eq!(resumed.last(), Some(leased), "clock {at}");
+        assert_eq!(on_disk(&copy), at.max(leased) + SPAN_US, "clock {at}");
+        let next = at.max(leased + 1);
         assert!(next > last_sent);
         let first = resumed.try_reserve(1);
         if next - at > window_us {
@@ -676,7 +711,7 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
                 matches!(first, Err(NonceRefused::OutsideWindow { .. })),
                 "clock {at}: {first:?}"
             );
-            assert_eq!(resumed.last(), Some(on_disk));
+            assert_eq!(resumed.last(), Some(leased));
         } else {
             assert_eq!(ok(first), [next], "clock {at}");
             // The clock moved on to it: the next block follows it, still above the sent nonce.
@@ -685,7 +720,7 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
         }
     }
     // The clocks stepped back past the window were refused; every other one issued.
-    let refused = |at: u64| (on_disk + 1).saturating_sub(at) > window_us;
+    let refused = |at: u64| (leased + 1).saturating_sub(at) > window_us;
     assert_eq!(clocks.iter().filter(|at| refused(**at)).count(), 2);
 }
 
@@ -803,7 +838,7 @@ fn a_lease_write_that_fails_is_reported_and_retried() {
 }
 
 /// A lease whose first ceiling cannot be persisted builds no source: a store that refuses the
-/// write, or a lease file in a directory that does not exist.
+/// write; a lease file in a directory that does not exist is refused before that.
 #[test]
 fn a_lease_whose_first_ceiling_is_not_persisted_builds_no_source() {
     let clock = Stub::at_us(T_US);
@@ -814,35 +849,34 @@ fn a_lease_whose_first_ceiling_is_not_persisted_builds_no_source() {
         other => panic!("{other:?}"),
     }
     assert_eq!(store.persisted(), []);
+    // A lease file in a directory that does not exist is refused before any source is built.
     let nowhere = fresh_dir("lease_in_a_missing_directory")
         .join("missing")
         .join("a.lease");
-    let lease = NonceLease {
-        store: LeaseFile::create(&nowhere).unwrap(),
-        span: SPAN,
-    };
-    match WallClockNonces::new(clock, WINDOW, lease) {
-        Err(NonceStartError::Lease(e)) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
-        other => panic!("{other:?}"),
-    }
+    let refused = LeaseFile::create(&nowhere).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::NotFound);
 }
 
 /// A lease file holds one ceiling, as a decimal line, each persist replacing it whole with no
-/// file of its own left beside it; `create` is for a sequence that never issued a nonce and
-/// refuses a path that exists, and `open` refuses a file that is missing or holds no ceiling,
-/// so a lost lease is never read as a fresh one.
+/// file of its own left beside it but the lock it is held by; `create` is for a sequence that
+/// never issued a nonce and refuses a path that exists, and `open` refuses a file that is missing
+/// or holds no ceiling, so a lost lease is never read as a fresh one. Either refuses a lease file
+/// another holder has (`WouldBlock`).
 #[test]
 fn a_lease_file_holds_one_ceiling_replaced_whole() {
     let dir = fresh_dir("lease_file");
     let path = dir.join("account.lease");
-    let mut file = LeaseFile::create(&path).unwrap();
-    assert_eq!(file.ceiling(), None);
-    assert_eq!(file.path(), path);
-    assert!(!path.exists());
     assert_eq!(
         LeaseFile::open(&path).unwrap_err().kind(),
         io::ErrorKind::NotFound
     );
+    let mut file = LeaseFile::create(&path).unwrap();
+    assert_eq!(file.ceiling(), None);
+    assert_eq!(file.path(), path);
+    assert!(!path.exists());
+    for held in [LeaseFile::create(&path), LeaseFile::open(&path)] {
+        assert_eq!(held.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
     file.persist(T_US).unwrap();
     file.persist(T_US + 9).unwrap();
     assert_eq!(file.ceiling(), Some(T_US + 9));
@@ -850,12 +884,18 @@ fn a_lease_file_holds_one_ceiling_replaced_whole() {
         fs::read_to_string(&path).unwrap(),
         format!("{}\n", T_US + 9)
     );
-    let names: Vec<_> = fs::read_dir(&dir)
+    let mut names: Vec<_> = fs::read_dir(&dir)
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert_eq!(names, ["account.lease"]);
-    assert_eq!(LeaseFile::open(&path).unwrap().ceiling(), Some(T_US + 9));
+    names.sort();
+    assert_eq!(names, ["account.lease", "account.lease.lock"]);
+    drop(file);
+    let mut reopened = LeaseFile::open(&path).unwrap();
+    assert_eq!(reopened.ceiling(), Some(T_US + 9));
+    reopened.persist(T_US + 10).unwrap();
+    assert_eq!(on_disk(&path), T_US + 10);
+    drop(reopened);
     assert_eq!(
         LeaseFile::create(&path).unwrap_err().kind(),
         io::ErrorKind::AlreadyExists
@@ -865,4 +905,65 @@ fn a_lease_file_holds_one_ceiling_replaced_whole() {
         let refused = LeaseFile::open(&path).unwrap_err();
         assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{garbage:?}");
     }
+}
+
+/// Codex P2 r4429948074 on PR #220: a source dropped while its lease's renewal is still being
+/// written must not have that write land over the ceiling of a source built after it over the
+/// same lease file, which could have issued nonces under its higher ceiling by then. A lease
+/// file is held while a source's writer may still write it: opening it again is refused
+/// (`WouldBlock`) until the dropped source's last write has landed, and a source then built over
+/// it resumes after that write's ceiling. A source dropped with no write under way lets go of
+/// its lease file at once.
+#[test]
+fn a_lease_file_opens_again_only_once_a_dropped_sources_last_write_has_landed() {
+    let dir = fresh_dir("reopened_after_a_held_write");
+    let path = dir.join("account.lease");
+    let clock = Stub::at_us(T_US);
+    let gate = Store::default();
+    let held = |file: LeaseFile| NonceLease {
+        store: HeldFile {
+            file,
+            gate: gate.clone(),
+        },
+        span: SPAN,
+    };
+
+    // Held while its source lives; let go at once when the source is dropped with no write under
+    // way.
+    let created = held(LeaseFile::create(&path).unwrap());
+    let first = WallClockNonces::new(clock.clone(), WINDOW, created).unwrap();
+    for refused in [LeaseFile::open(&path), LeaseFile::create(&path)] {
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+    drop(first);
+    let file = LeaseFile::open(&path).unwrap();
+    assert_eq!(file.ceiling(), Some(T_US + SPAN_US));
+
+    // The next source's renewal is held mid-write when it is dropped.
+    let mut second = WallClockNonces::new(clock.clone(), WINDOW, held(file)).unwrap();
+    let ceiling = second.ceiling();
+    assert_eq!(ceiling, T_US + 2 * SPAN_US);
+    gate.hold();
+    let late = ceiling - SPAN_US / 4;
+    clock.set_us(late);
+    assert_eq!(ok(second.try_reserve(1)), [late]);
+    wait_for(|| gate.writing());
+    drop(second);
+    // Its file cannot be taken while that write may still land.
+    for refused in [LeaseFile::open(&path), LeaseFile::create(&path)] {
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+    assert_eq!(on_disk(&path), ceiling);
+
+    // Released: the write lands, the dropped source's writer lets go, and the file opens with the
+    // ceiling that write persisted, which a new source resumes after and leases a span past.
+    gate.release();
+    wait_for(|| LeaseFile::open(&path).is_ok());
+    let landed = late + SPAN_US;
+    let file = LeaseFile::open(&path).unwrap();
+    assert_eq!(file.ceiling(), Some(landed));
+    let third = WallClockNonces::new(clock, WINDOW, held(file)).unwrap();
+    assert_eq!(third.last(), Some(landed));
+    assert_eq!(third.ceiling(), landed + SPAN_US);
+    assert_eq!(on_disk(&path), landed + SPAN_US);
 }
