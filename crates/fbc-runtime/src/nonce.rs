@@ -33,12 +33,12 @@
 //! A clock running ahead of server time cannot be seen from here; a consumer that measures its
 //! skew against the venue's time is beyond this source.
 
-use std::fs::{self, File};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{NonceBlock, NonceRefused, NonceSource, WallNs};
@@ -67,7 +67,10 @@ impl WallClock for SystemWallClock {
 
 /// Where a [`WallClockNonces`]'s lease ceilings are persisted (FBC-ak22, decision 0133): one
 /// store per nonce sequence, which is per account on Hibachi. [`LeaseFile`] is the production
-/// one; a test brings its own.
+/// one; a test brings its own. A store is the source's alone while the source's writer may still
+/// write it: nothing else writes its ceilings, and a source built over the same sequence takes it
+/// only once that writer has let it go, so no late write lowers a later source's ceiling.
+/// [`LeaseFile`] holds a lock for that.
 pub trait LeaseStore: Send + 'static {
     /// The ceiling last persisted, by this process or an earlier one: no nonce above it was
     /// issued. `None` for a store that has held none, as for a sequence that never issued one.
@@ -141,6 +144,8 @@ pub struct WallClockNonces<C> {
     span_us: u64,
     last: Option<u64>,
     lease: Arc<Lease>,
+    /// The lease's writer, which owns the store until it ends.
+    writer: Option<JoinHandle<()>>,
 }
 
 /// What a source and its lease's writer share.
@@ -162,6 +167,8 @@ struct Writer {
     due: bool,
     /// The source was dropped: write nothing more, read no clock.
     stopped: bool,
+    /// A write is under way: the store has been called and has not returned.
+    writing: bool,
     /// The last write's failure, cleared by one that succeeds.
     failure: Option<io::ErrorKind>,
 }
@@ -232,7 +239,7 @@ impl<C: WallClock + Clone + 'static> WallClockNonces<C> {
         });
         let shared = Arc::clone(&lease);
         let read = clock.clone();
-        thread::Builder::new()
+        let writer = thread::Builder::new()
             .name("fbc-nonce-lease".to_owned())
             .spawn(move || renew(&shared, &read, store, span_us))
             .map_err(NonceStartError::Lease)?;
@@ -244,6 +251,7 @@ impl<C: WallClock + Clone + 'static> WallClockNonces<C> {
             span_us,
             last,
             lease,
+            writer: Some(writer),
         })
     }
 }
@@ -277,11 +285,24 @@ impl<C> WallClockNonces<C> {
 }
 
 impl<C> Drop for WallClockNonces<C> {
-    /// Stops the lease's writer without waiting for a write under way: it reads no clock and
-    /// starts no write after this returns.
+    /// Stops the lease's writer: it reads no clock and starts no write after this returns. A
+    /// writer with no write under way ends at once and is waited for, so its store is let go
+    /// (a [`LeaseFile`]'s lock released) before this returns. One with a write under way is not
+    /// waited for: it lets its store go once that write has returned, so a source built over
+    /// the same lease file meanwhile is refused rather than overwritten (Codex P2 r4429948074 on
+    /// PR #220).
     fn drop(&mut self) {
-        self.lease.writer().stopped = true;
+        let busy = {
+            let mut writer = self.lease.writer();
+            writer.stopped = true;
+            writer.writing
+        };
         self.lease.wake.notify_one();
+        if !busy && let Some(writer) = self.writer.take() {
+            // It ends without a write: it checks `stopped` before it starts one. A panic in it
+            // (its clock's, say) has nothing left to report here.
+            let _ = writer.join();
+        }
     }
 }
 
@@ -350,7 +371,7 @@ fn renewal(durable: u64, base: u64, span_us: u64) -> Option<u64> {
 /// once half a span or less is left, persists the next ceiling, which the source issues under
 /// only once the store has returned. A renewal asked for with half a span left so has a quarter
 /// span, at least, to land before the clock reaches the ceiling. It ends when the source is
-/// dropped.
+/// dropped, once any write under way has returned, and lets the store go as it ends.
 fn renew<C: WallClock, S: LeaseStore>(lease: &Lease, clock: &C, mut store: S, span_us: u64) {
     let period = Duration::from_micros((span_us / 4).max(1));
     loop {
@@ -368,12 +389,16 @@ fn renew<C: WallClock, S: LeaseStore>(lease: &Lease, clock: &C, mut store: S, sp
             let base = clock_us(clock).max(lease.issued.load(Ordering::SeqCst));
             let durable = lease.durable.load(Ordering::SeqCst);
             match renewal(durable, base, span_us) {
-                Some(next) => next,
+                Some(next) => {
+                    writer.writing = true;
+                    next
+                }
                 None => continue,
             }
         };
         let written = store.persist(next);
         let mut writer = lease.writer();
+        writer.writing = false;
         match written {
             Ok(()) => {
                 lease.durable.fetch_max(next, Ordering::SeqCst);
@@ -397,20 +422,29 @@ fn micros(d: Duration) -> u64 {
 /// A lease file (decision 0133): the ceiling as one decimal line. Each persist writes a file
 /// beside it, syncs it, renames it over the lease file and, on Unix, syncs the directory, so a
 /// crash leaves the old ceiling or the new, never a torn one. One file per nonce sequence, in a
-/// directory the consumer gives; the library names no path. One process holds it, as one
-/// process holds the account (0007).
+/// directory the consumer gives; the library names no path.
+///
+/// It is held while it lives: an exclusive advisory lock (`flock` on Unix) on `<path>.lock`,
+/// which the operating system releases when the process exits however it exits, so one holder,
+/// in this process or another, writes the ceiling at a time. A source's writer holds it until
+/// its last write has returned, so a later source over the same file cannot take it while an
+/// earlier one's write may still land (Codex P2 r4429948074 on PR #220). The lock file is left
+/// in place: deleting one while another holder opens it would let two holders lock two files.
 #[derive(Debug)]
 pub struct LeaseFile {
     path: PathBuf,
     ceiling: Option<u64>,
+    /// The lock on `<path>.lock`, held as long as this lives.
+    _held: File,
 }
 
 impl LeaseFile {
     /// The lease file at `path` for a sequence that has never issued a nonce: refused when
-    /// `path` exists. Nothing is written until the first persist, which a source makes before
-    /// it issues anything.
+    /// `path` exists, or is held (`WouldBlock`). Nothing is written to `path` until the first
+    /// persist, which a source makes before it issues anything.
     pub fn create(path: impl Into<PathBuf>) -> io::Result<LeaseFile> {
         let path = path.into();
+        let held = hold(&path)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -423,15 +457,19 @@ impl LeaseFile {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(LeaseFile {
                 path,
                 ceiling: None,
+                _held: held,
             }),
             Err(e) => Err(e),
         }
     }
 
-    /// The lease file an earlier process persisted at `path`, with its ceiling: refused when it
-    /// is missing or holds no ceiling, so a lost lease is never read as a fresh one.
+    /// The lease file an earlier process, or an earlier source, persisted at `path`, with its
+    /// ceiling: refused when it is missing or holds no ceiling, so a lost lease is never read as
+    /// a fresh one, and while it is held (`WouldBlock`), so its ceiling is read only once no
+    /// other holder can still write it.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<LeaseFile> {
         let path = path.into();
+        let held = hold(&path)?;
         let text = fs::read_to_string(&path)?;
         let digits = text
             .strip_suffix('\n')
@@ -443,6 +481,7 @@ impl LeaseFile {
         Ok(LeaseFile {
             path,
             ceiling: Some(ceiling),
+            _held: held,
         })
     }
 
@@ -474,6 +513,31 @@ impl LeaseStore for LeaseFile {
         sync_dir(&self.path)?;
         self.ceiling = Some(ceiling);
         Ok(())
+    }
+}
+
+/// Takes the lock on `<path>.lock`, creating it if need be, without waiting: `WouldBlock` while
+/// another holder, in this process or another, has it.
+fn hold(path: &Path) -> io::Result<File> {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(PathBuf::from(name))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!(
+                "the nonce lease file {} is held by another holder, or by a source whose last \
+                 write has not yet returned",
+                path.display()
+            ),
+        )),
+        Err(TryLockError::Error(e)) => Err(e),
     }
 }
 

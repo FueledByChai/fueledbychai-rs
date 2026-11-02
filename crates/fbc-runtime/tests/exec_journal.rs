@@ -2411,8 +2411,8 @@ async fn a_cancel_goes_out_with_its_lease_and_journal_writes_pending_and_a_resta
     config.nonce_source = SOURCE;
     // The lease's first ceiling is on disk before the source has issued anything.
     let ceiling = WALL_US + LEASE_SPAN_US;
-    let file = fbc_runtime::LeaseFile::open(&path).unwrap();
-    assert_eq!(file.ceiling(), Some(ceiling));
+    let text = fs::read_to_string(&path).unwrap();
+    assert_eq!(text, format!("{ceiling}\n"));
     let cancel = armed_oms::Oms::armed().cancel();
 
     let sink = SinkConfig {
