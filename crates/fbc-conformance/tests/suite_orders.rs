@@ -22,8 +22,9 @@
 //!
 //! FBC-qaoy's done line: the six pass, probing what they probe on the toy, on a variant declaring
 //! its order-entry limits apart in `exec_limits`, scoped to the provider user as QFEX's are
-//! (0123, 0128), while its market-data limits stay per account; and a variant whose order-entry
-//! limits mix user and account scopes fails naming `VenueCaps.exec_limits`.
+//! (0123, 0128), while its market-data limits stay per account; a limit declared only there is
+//! waited out before the next placement or amend; and a variant whose order-entry limits mix
+//! user and account scopes fails naming `VenueCaps.exec_limits`.
 
 mod toy_setup;
 
@@ -623,6 +624,26 @@ static USER_SCOPED_ORDER_ENTRY: Variant = Variant {
             ..*l
         };
         c.exec_limits = Some(c.limits.iter().map(user).collect());
+    },
+    twist: Twist::None,
+};
+/// The toy declaring its order-entry limits apart, scoped to the provider user, with a second
+/// limit there alone: one placement or amend a second, which `limits` does not hold, so only a
+/// check that waits out what `exec_limits` declares sends its second order (DeepSeek DS-1).
+static ONE_ORDER_A_SECOND_FOR_ORDER_ENTRY: Variant = Variant {
+    caps: |c| {
+        let user = |l: &fbc_core::RateLimit| fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::User,
+            ..*l
+        };
+        let mut limits: Vec<_> = c.limits.iter().map(user).collect();
+        limits.push(fbc_core::RateLimit {
+            scope: fbc_core::LimitScope::User,
+            ops: TagSet::of(&[OpKind::Place, OpKind::Amend]),
+            per: Duration::from_secs(1),
+            units: 1,
+        });
+        c.exec_limits = Some(limits);
     },
     twist: Twist::None,
 };
@@ -2071,6 +2092,24 @@ fn every_order_entry_check_runs_under_separate_user_scoped_order_entry_limits() 
         let toy = passed(name, check(&toy));
         let user = passed(name, check(&USER_SCOPED_ORDER_ENTRY.subject(assumed)));
         assert_eq!(user, toy, "{name}");
+    }
+}
+
+/// FBC-qaoy's done line, the window a request waits for (DeepSeek DS-1): a limit declared only
+/// in `exec_limits` is waited out before the check's next placement or amend. `amend_ack` and
+/// `reject_coverage` each send a second one within the limit's second.
+#[test]
+fn a_limit_declared_only_in_exec_limits_is_waited_out_before_the_next_order() {
+    let variant = &ONE_ORDER_A_SECOND_FOR_ORDER_ENTRY;
+    for (name, check) in [
+        ("amend_ack", suite::amend_ack as Check),
+        ("reject_coverage", suite::reject_coverage),
+    ] {
+        let passed = check(&variant.subject(assumed));
+        assert!(
+            matches!(passed, Ok(Verdict::Passed { .. })),
+            "{name}: {passed:?}"
+        );
     }
 }
 
