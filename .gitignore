@@ -1,10 +1,14 @@
 target/
 **/*.rs.bk
 .env
+.env.*
+.env_*
+.env-*
 *.key
 *.pem
 # An editor's local history (.history/) keeps copies of ignored files such as .env, credentials
-# included; scripts/privacy-check.sh also refuses any such copy that gets published anyway.
+# included; scripts/privacy-check.sh also refuses any such copy, or any environment file named
+# above, that gets published anyway.
 .history/
 
 # Beads / Dolt files (added by bd init)

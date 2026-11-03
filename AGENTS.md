@@ -817,7 +817,7 @@ proof gate: a change under `crates/` brings a change under `crates/*/tests/` or 
 `#[test]` or `#[cfg(test)]` line, or `No new test: <reason>` in the commit body), then the
 privacy check (`scripts/privacy-check.sh --self-test`, then the scan for JWTs, bearer tokens,
 key- and address-shaped hex, PEM headers and master-key bytes, and, by path alone, editor-history
-copies and environment files, `.history/` being ignored in `.gitignore`; 0009), then the external
+copies and environment files, which `.gitignore` ignores; 0009), then the external
 reviewer's offline proof (`scripts/deepseek-review-tests.py`, below), then, once `Cargo.toml`
 exists, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo test --workspace`, `cargo build --workspace --release` and the credential placement
