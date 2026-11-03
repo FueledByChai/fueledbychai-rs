@@ -26,8 +26,9 @@
 #   - an editor-history copy or an environment file, anywhere, by its path alone: any file
 #     inside a .history/ directory, and any file named .env, .env.<x>, .env_<x> or .env-<x>
 #     (an editor's local history once copied the ignored root .env, live venue credentials
-#     included). The tracked .gitignore ignores .history/, so only a copy published anyway
-#     (force-added, or with the ignore removed) is scanned; its contents are never printed.
+#     included). The tracked .gitignore ignores .history/ and each of those names, so only a
+#     file published anyway (force-added, or with the ignore removed) is scanned; its contents
+#     are never printed.
 #
 # A directory is marked synthetic by a file named SYNTHETIC in it, saying where the values come
 # from and that no funded account uses them. Only a marker whose path contains a fixtures/
@@ -255,33 +256,29 @@ self_test() {
   echo "target/" > "$dir/repo/.gitignore"; mkdir -p "$dir/repo/target"
   printf '%s\n' "$hex" > "$dir/repo/target/build.txt"
   out="$(LOOP_ROOT="$dir/repo" FBC_PRIVACY_KEY_FILES="" "$0")" || { echo "self-test: ignored files should not be scanned: $out"; exit 1; }
-  # 12. An editor-history copy of a credential file: this repository's own .gitignore ignores
-  #     it in a fresh checkout (no local exclude, no global one), so the scan never reads it; a
-  #     copy force-added anyway fails by its path, as does an unignored environment file, and
-  #     neither value is printed. A name that only starts with .env (.envrc) is not one.
-  local real secret hist envf
+  # 12. An editor-history copy of a credential file, or an environment file: this repository's
+  #     own .gitignore ignores each in a fresh checkout (no local exclude, no global one), so the
+  #     scan never reads it; a copy force-added anyway fails by its path, and no value is
+  #     printed. The bare .env is the name whose editor-history copy leaked. A name that only
+  #     starts with .env (.envrc) is neither.
+  local real secret envf
   real="$(cd "$(dirname "$0")/.." && pwd)"
   secret="QFEX_SECRET_KEY=$(printf 'f0%.0s' $(seq 1 16))"
-  hist=".history/.env_20261023065831"
   cp "$real/.gitignore" "$dir/repo/.gitignore"
-  mkdir -p "$dir/repo/.history"
-  printf '%s\n' "$secret" > "$dir/repo/$hist"
-  out="$(git -C "$dir/repo" -c core.excludesFile=/dev/null check-ignore -v "$hist")" || { echo "self-test: the tracked .gitignore must ignore $hist in a fresh checkout"; exit 1; }
-  case "$out" in .gitignore:*) ;; *) echo "self-test: $hist must be ignored by the tracked .gitignore, not a local exclude: $out"; exit 1 ;; esac
-  out="$(LOOP_ROOT="$dir/repo" FBC_PRIVACY_KEY_FILES="" "$0")" || { echo "self-test: an ignored editor-history copy should not be scanned: $out"; exit 1; }
-  git -C "$dir/repo" add -f "$hist"
-  rc=0; out="$(LOOP_ROOT="$dir/repo" FBC_PRIVACY_KEY_FILES="" "$0")" || rc=$?
-  [ "$rc" = 1 ] && echo "$out" | grep -qF "$hist is an editor-history copy" || { echo "self-test: a force-added editor-history copy should fail (rc $rc): $out"; exit 1; }
-  echo "$out" | grep -qF "$secret" && { echo "self-test: an editor-history copy's value must never be printed"; exit 1; }
-  git -C "$dir/repo" rm -q --cached "$hist"
-  rm -r "$dir/repo/.history"
-  for envf in .env.local src/.env_backup src/.env-prod; do
+  for envf in .history/.env_20261023065831 .history/.env .env .env.local src/.env_backup src/.env-prod; do
+    mkdir -p "$dir/repo/$(dirname "$envf")"
     printf '%s\n' "$secret" > "$dir/repo/$envf"
+    out="$(git -C "$dir/repo" -c core.excludesFile=/dev/null check-ignore -v "$envf")" || { echo "self-test: the tracked .gitignore must ignore $envf in a fresh checkout"; exit 1; }
+    case "$out" in .gitignore:*) ;; *) echo "self-test: $envf must be ignored by the tracked .gitignore, not a local exclude: $out"; exit 1 ;; esac
+    out="$(LOOP_ROOT="$dir/repo" FBC_PRIVACY_KEY_FILES="" "$0")" || { echo "self-test: an ignored $envf should not be scanned: $out"; exit 1; }
+    git -C "$dir/repo" add -f "$envf"
     rc=0; out="$(LOOP_ROOT="$dir/repo" FBC_PRIVACY_KEY_FILES="" "$0")" || rc=$?
-    [ "$rc" = 1 ] && echo "$out" | grep -qF "$envf is an editor-history copy or an environment file" || { echo "self-test: $envf should fail by its path (rc $rc): $out"; exit 1; }
-    echo "$out" | grep -qF "$secret" && { echo "self-test: an environment file's value must never be printed"; exit 1; }
+    [ "$rc" = 1 ] && echo "$out" | grep -qF "$envf is an editor-history copy or an environment file" || { echo "self-test: a force-added $envf should fail by its path (rc $rc): $out"; exit 1; }
+    echo "$out" | grep -qF "$secret" && { echo "self-test: the value of $envf must never be printed"; exit 1; }
+    git -C "$dir/repo" rm -q --cached "$envf"
     rm "$dir/repo/$envf"
   done
+  rm -r "$dir/repo/.history"
   echo 'use flake' > "$dir/repo/.envrc"
   out="$(LOOP_ROOT="$dir/repo" FBC_PRIVACY_KEY_FILES="" "$0")" || { echo "self-test: .envrc is not an environment-file copy: $out"; exit 1; }
   rm "$dir/repo/.envrc"
