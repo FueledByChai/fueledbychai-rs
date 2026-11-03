@@ -259,13 +259,15 @@ self_test() {
   # 12. An editor-history copy of a credential file, or an environment file: this repository's
   #     own .gitignore ignores each in a fresh checkout (no local exclude, no global one), so the
   #     scan never reads it; a copy force-added anyway fails by its path, and no value is
-  #     printed. The bare .env is the name whose editor-history copy leaked. A name that only
-  #     starts with .env (.envrc) is neither.
+  #     printed. The bare .env is the name whose editor-history copy leaked. A copy in
+  #     .history/ named like no environment file (notes_20261023.txt) is ignored only by
+  #     .history/ and refused only by the .history/ path rule, so it proves both. A name that
+  #     only starts with .env (.envrc) is neither.
   local real secret envf
   real="$(cd "$(dirname "$0")/.." && pwd)"
   secret="QFEX_SECRET_KEY=$(printf 'f0%.0s' $(seq 1 16))"
   cp "$real/.gitignore" "$dir/repo/.gitignore"
-  for envf in .history/.env_20261023065831 .history/.env .env .env.local src/.env_backup src/.env-prod; do
+  for envf in .history/notes_20261023.txt .history/.env_20261023065831 .history/.env .env .env.local src/.env_backup src/.env-prod; do
     mkdir -p "$dir/repo/$(dirname "$envf")"
     printf '%s\n' "$secret" > "$dir/repo/$envf"
     out="$(git -C "$dir/repo" -c core.excludesFile=/dev/null check-ignore -v "$envf")" || { echo "self-test: the tracked .gitignore must ignore $envf in a fresh checkout"; exit 1; }
