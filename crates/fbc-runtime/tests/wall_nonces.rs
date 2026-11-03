@@ -848,6 +848,45 @@ fn sources_rebuilt_over_one_lease_without_issuing_keep_the_next_ones_first_nonce
     assert_eq!(ok(next.try_reserve(3)), [edge + 1, edge + 2, edge + 3]);
 }
 
+/// No ceiling is lowered, however the clock steps back (DeepSeek's review of a9b8aba6, DS-1 and
+/// DS-4 on PR #220): a source whose nonce reached the window's edge sees its clock step back a
+/// second, and its writer, checking many times over, persists nothing below the ceiling, which
+/// stays at the nonce it issued. A source restarted over the same store with that clock resumes
+/// after it, persists it again, a first ceiling more than the window past its clock, and refuses
+/// until its clock has moved on.
+#[test]
+fn no_ceiling_is_lowered_when_the_clock_steps_back() {
+    let window_us = u64::try_from(WINDOW.as_micros()).unwrap();
+    // A short span, so the writer checks every 10 ms of real time.
+    let leased = |store: &Store| NonceLease {
+        store: store.clone(),
+        span: Duration::from_micros(40_000),
+    };
+    let clock = Stub::at_us(T_US);
+    let store = Store::default();
+    let edge = T_US + window_us;
+    let mut nonces =
+        WallClockNonces::resuming(clock.clone(), WINDOW, edge - 1, leased(&store)).unwrap();
+    assert_eq!(nonces.ceiling(), edge);
+    assert_eq!(ok(nonces.try_reserve(1)), [edge]);
+
+    // The clock steps back a second: ten of the writer's checks later, nothing was lowered.
+    clock.set_us(T_US - 1_000_000);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(store.persisted(), [edge]);
+    assert_eq!(nonces.ceiling(), edge);
+    drop(nonces);
+
+    let mut restart = WallClockNonces::new(clock, WINDOW, leased(&store)).unwrap();
+    assert_eq!(restart.last(), Some(edge));
+    assert_eq!(store.persisted(), [edge, edge]);
+    let refused = restart.try_reserve(1);
+    assert!(
+        matches!(refused, Err(NonceRefused::OutsideWindow { .. })),
+        "{refused:?}"
+    );
+}
+
 /// A restart resumes after the larger of its journal's last nonce and its lease's ceiling, the
 /// journal's when it lies above the ceiling the store holds (DeepSeek DS-3 on PR #220): the
 /// source names the journal's nonce, leases a span past it, and issues above it.
