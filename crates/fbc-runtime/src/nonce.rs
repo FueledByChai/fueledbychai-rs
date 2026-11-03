@@ -111,8 +111,11 @@ pub enum NonceStartError {
     ZeroWindow,
     /// The lease's span is under a microsecond or longer than the window.
     Span { span: Duration, window: Duration },
-    /// The lease's first ceiling was not persisted, or its writer thread did not start.
+    /// The lease's first ceiling was not persisted.
     Lease(io::Error),
+    /// The lease's writer thread did not start. Its first ceiling was persisted: the lease file
+    /// is sound, and a later start resumes after that ceiling.
+    Writer(io::Error),
 }
 
 impl std::fmt::Display for NonceStartError {
@@ -129,6 +132,10 @@ impl std::fmt::Display for NonceStartError {
             NonceStartError::Lease(e) => {
                 write!(f, "the nonce lease's first ceiling was not persisted: {e}")
             }
+            NonceStartError::Writer(e) => write!(
+                f,
+                "the nonce lease's writer thread did not start, its first ceiling persisted: {e}"
+            ),
         }
     }
 }
@@ -136,7 +143,7 @@ impl std::fmt::Display for NonceStartError {
 impl std::error::Error for NonceStartError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            NonceStartError::Lease(e) => Some(e),
+            NonceStartError::Lease(e) | NonceStartError::Writer(e) => Some(e),
             _ => None,
         }
     }
@@ -256,7 +263,7 @@ impl<C: WallClock + Clone + 'static> WallClockNonces<C> {
         let writer = thread::Builder::new()
             .name("fbc-nonce-lease".to_owned())
             .spawn(move || renew(&shared, &read, store, span_us, window_us))
-            .map_err(NonceStartError::Lease)?;
+            .map_err(NonceStartError::Writer)?;
         Ok(WallClockNonces {
             clock,
             window,
@@ -455,8 +462,13 @@ fn micros(d: Duration) -> u64 {
 
 /// A lease file (decision 0133): the ceiling as one decimal line. Each persist writes a file
 /// beside it, syncs it, renames it over the lease file and, on Unix, syncs the directory, so a
-/// crash leaves the old ceiling or the new, never a torn one. One file per nonce sequence, in a
-/// directory the consumer gives; the library names no path.
+/// crash leaves the old ceiling or the new, never a torn one. That guarantee is Unix's: elsewhere
+/// a directory cannot be synced, so a crash there may undo a rename `persist` has returned from.
+/// One file per nonce sequence, in a directory the consumer gives; the library names no path,
+/// and its errors name none either, since a consumer's path may carry an account ([`path`]
+/// gives it back).
+///
+/// [`path`]: LeaseFile::path
 ///
 /// It is held while it lives: an exclusive advisory lock (`flock` on Unix) on `<path>.lock`,
 /// which the operating system releases when the process exits however it exits, so one holder,
@@ -482,11 +494,8 @@ impl LeaseFile {
         match fs::symlink_metadata(&path) {
             Ok(_) => Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
-                format!(
-                    "{} exists: a nonce lease file is created only for a sequence that never \
-                     issued a nonce",
-                    path.display()
-                ),
+                "the nonce lease file exists: one is created only for a sequence that never \
+                 issued a nonce",
             )),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(LeaseFile {
                 path,
@@ -509,8 +518,10 @@ impl LeaseFile {
             .strip_suffix('\n')
             .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
         let ceiling = digits.and_then(|d| d.parse().ok()).ok_or_else(|| {
-            let what = format!("{} holds no nonce lease ceiling", path.display());
-            io::Error::new(io::ErrorKind::InvalidData, what)
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the nonce lease file holds no ceiling",
+            )
         })?;
         Ok(LeaseFile {
             path,
@@ -565,11 +576,8 @@ fn hold(path: &Path) -> io::Result<File> {
         Ok(()) => Ok(file),
         Err(TryLockError::WouldBlock) => Err(io::Error::new(
             io::ErrorKind::WouldBlock,
-            format!(
-                "the nonce lease file {} is held by another holder, or by a source whose last \
-                 write has not yet returned",
-                path.display()
-            ),
+            "the nonce lease file is held by another holder, or by a source whose last write \
+             has not yet returned",
         )),
         Err(TryLockError::Error(e)) => Err(e),
     }
