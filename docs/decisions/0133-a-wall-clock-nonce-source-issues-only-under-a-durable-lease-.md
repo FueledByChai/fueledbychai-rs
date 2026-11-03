@@ -34,12 +34,15 @@ this.
    persists it, since a nonce past that is refused anyway (`OutsideWindow`). Without that,
    sources rebuilt over one lease that issue nothing, in a crash loop say, would each lease a
    span past the last ceiling and push the next one's first nonce out of its window, further
-   with each rebuild (DeepSeek DS-1 on PR #220). Nor is a first ceiling below the nonce the
-   source resumes after. No reservation calls the store or waits for the writer. A reservation
-   whose block would pass the ceiling persisted so far is refused, `NonceRefused::PastLease`,
-   reserving nothing, and the session ends with that refusal as 0114's item 4 says. Once the
-   source is dropped, the writer reads no clock and starts no write; the drop does not wait for
-   a write under way.
+   with each rebuild (DeepSeek DS-1 on PR #220). The cap never lowers the lease. A renewal is
+   persisted only when it lies above the ceiling already persisted, and a first ceiling is never
+   below the nonce the source resumes after, which wins over the cap. So a restart whose clock
+   lies further behind that nonce than the window persists the nonce itself and refuses until
+   its clock has moved on (DeepSeek's review of a9b8aba6, DS-1 and DS-4). No reservation calls
+   the store or waits for the writer. A reservation whose block would pass the ceiling persisted
+   so far is refused, `NonceRefused::PastLease`, reserving nothing, and the session ends with
+   that refusal as 0114's item 4 says. Once the source is dropped, the writer reads no clock and
+   starts no write; the drop does not wait for a write under way.
 2. **Restart.** A source resumes after the larger of the ceiling its store holds and, when the
    consumer passes one (`resuming`), the last nonce its journal holds (`last_nonce`, unchanged).
    Every nonce an earlier process sent lies at or below the ceiling it had persisted, including a
@@ -102,7 +105,11 @@ cover. A restart's first nonce lies above the last ceiling: a span ahead of the 
 persisted it, or up to the window ahead after restarts that issued nothing. A span well inside
 the window leaves a quick restart room to issue at once. A source whose ceiling reached the
 window's edge, as with a span equal to the window, issues again only once its clock has moved
-past the clock that persisted that ceiling, its writer renewing as it goes. A disk that stalls
+past the clock that persisted that ceiling, its writer renewing as it goes. A quarter span,
+the room a renewal asked for at half a span left still has, should hold the largest block a
+command reserves and a durable write's latency: a span shorter than that has reservations
+refused (`PastLease`) whatever the clock reads (DeepSeek's review of a9b8aba6, DS-2 and DS-3).
+A disk that stalls
 for longer than a quarter span lets the clock reach the ceiling. Reservations are then refused
 and the session ends, leaving the venue's cancel-on-disconnect to act, rather than issuing a
 nonce a restart could reuse; `WallClockNonces::lease_failure` reports a write that failed.

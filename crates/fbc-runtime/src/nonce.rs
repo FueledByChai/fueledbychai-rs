@@ -21,8 +21,11 @@
 //! nonce, whichever is later, once half a span or less is left, so no reservation (a cancel's
 //! included) ever waits on a write (0006). No ceiling reaches more than the window past the
 //! clock, which no nonce may pass anyway, so sources rebuilt over one lease without issuing
-//! never drive the next one's first nonce out of its window (DeepSeek DS-1 on PR #220). A
-//! reservation that would pass the ceiling persisted so far is refused,
+//! never drive the next one's first nonce out of its window (DeepSeek DS-1 on PR #220). Nor is a
+//! ceiling ever lowered: a renewal is persisted only above the ceiling already persisted, and a
+//! source never leases below the nonce it resumes after, so a restart whose clock lies further
+//! behind that nonce than the window persists the nonce itself and refuses until its clock has
+//! moved on. A reservation that would pass the ceiling persisted so far is refused,
 //! [`NonceRefused::PastLease`], rather than waited for; the session ends with it as with any
 //! refusal. [`LeaseFile`] is the store for production: one file per account.
 //! The journal's [`last_nonce`] is still read: a source resumes after the larger of it and the
@@ -91,7 +94,10 @@ pub trait LeaseStore: Send + 'static {
 /// resumes after the last ceiling, so a span well inside the window leaves it room to issue at
 /// once; a restart of a source whose ceiling had reached the window's edge issues only once its
 /// clock has moved past the clock that persisted that ceiling. Each renewal is one durable
-/// write, about two a span.
+/// write, about two a span. A quarter span, the room a renewal asked for at half a span left
+/// still has, should hold the largest block the consumer reserves at once (a command's items)
+/// and a durable write's latency: a span shorter than that leaves reservations refused
+/// ([`NonceRefused::PastLease`]) whatever the clock reads.
 #[derive(Debug)]
 pub struct NonceLease<S> {
     pub store: S,
@@ -380,7 +386,9 @@ fn renewal(durable: u64, now: u64, issued: u64, span_us: u64, window_us: u64) ->
 /// last nonce, but never more than the window past the clock. A nonce past that is refused
 /// anyway (`OutsideWindow`), and a ceiling past it would only have a restart resume beyond the
 /// window: sources rebuilt over one lease, each issuing nothing, would push the next one's first
-/// nonce a span further out each time (DeepSeek DS-1 on PR #220).
+/// nonce a span further out each time (DeepSeek DS-1 on PR #220). It never lowers the lease: a
+/// source's first ceiling is at least the nonce it resumes after, and [`renewal`] persists only
+/// above the ceiling already persisted.
 fn reach(now: u64, issued: u64, span_us: u64, window_us: u64) -> u64 {
     let ahead = now.max(issued).saturating_add(span_us);
     ahead.min(now.saturating_add(window_us))
