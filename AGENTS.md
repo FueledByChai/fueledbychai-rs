@@ -337,8 +337,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     refusing a block further ahead of its clock than the caller's window, which has no default
     (FBC-3bq4, 0114), and issuing only at or below a ceiling its `NonceLease`'s `LeaseStore`
     (`LeaseFile` in production, locked against a second holder until a dropped source's last
-    write has returned) has already persisted: the first when it is built, the next by
-    a writer thread of its own once half the consumer's span is left, a block past it refused
+    write has returned) has already persisted, none more than the window past its clock: the
+    first when it is built, the next by a writer thread of its own once half the consumer's span
+    is left, a block past it refused
     (`PastLease`) and never waited for; resumed after the larger of the lease's ceiling and a
     journal's `last_nonce` (refused, `JournalGap`, for records holding a gap), so a restart
     never reissues a nonce sent while its journal record was unwritten, whatever its clock reads

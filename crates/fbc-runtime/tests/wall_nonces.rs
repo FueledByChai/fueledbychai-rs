@@ -409,7 +409,8 @@ fn the_window_is_the_callers_and_a_zero_one_is_refused() {
 /// The lease's span is the caller's, required, and lies within the window: a ceiling a span
 /// ahead must leave a restart a nonce the venue takes. A span under a microsecond, or past the
 /// window, is refused when the source is built, nothing persisted; one of the window's length is
-/// kept as given.
+/// kept as given, and its source restarts: refused within the microsecond its lease reached the
+/// window's edge, issuing at once a millisecond later (DeepSeek DS-4 on PR #220).
 #[test]
 fn the_span_is_the_callers_and_lies_within_the_window() {
     let clock = Stub::at_us(T_US);
@@ -432,13 +433,30 @@ fn the_span_is_the_callers_and_lies_within_the_window() {
         }
     }
     assert_eq!(store.persisted(), []);
-    let whole = NonceLease {
+    let whole = |store: &Store| NonceLease {
         store: store.clone(),
         span: WINDOW,
     };
-    let nonces = WallClockNonces::new(clock, WINDOW, whole).unwrap();
+    let mut nonces = WallClockNonces::new(clock.clone(), WINDOW, whole(&store)).unwrap();
     assert_eq!(nonces.span(), WINDOW);
-    assert_eq!(store.persisted(), [T_US + 15_000_000]);
+    let edge = T_US + 15_000_000;
+    assert_eq!(store.persisted(), [edge]);
+    assert_eq!(ok(nonces.try_reserve(1)), [T_US]);
+    drop(nonces);
+
+    // Restarted within the same microsecond: resumed at the window's edge, refused.
+    let mut same = WallClockNonces::new(clock.clone(), WINDOW, whole(&store)).unwrap();
+    assert_eq!(same.last(), Some(edge));
+    let refused = same.try_reserve(1);
+    assert!(
+        matches!(refused, Err(NonceRefused::OutsideWindow { .. })),
+        "{refused:?}"
+    );
+    drop(same);
+    // A millisecond on, the next restart issues at once.
+    clock.set_us(T_US + 1_000);
+    let mut later = WallClockNonces::new(clock, WINDOW, whole(&store)).unwrap();
+    assert_eq!(ok(later.try_reserve(1)), [edge + 1]);
 }
 
 /// A clock before the Unix epoch gives no nonce; nor does a block that would pass `u64::MAX`.
@@ -579,7 +597,8 @@ fn a_journal_that_dropped_records_names_no_last_nonce() {
     // A gap refuses whatever source is asked for.
     assert!(last_nonce(&records, NonceSourceId(9)).is_err());
 
-    // Resuming after the clock plus the window: refused until the clock has moved past it.
+    // Resuming after the clock plus the window: refused until the clock has moved past it, and
+    // the lease, which never reaches more than the window past the clock, with it.
     let window_us = u64::try_from(WINDOW.as_micros()).unwrap();
     let clock = Stub::at_us(T_US);
     let bound = T_US + window_us;
@@ -587,6 +606,7 @@ fn a_journal_that_dropped_records_names_no_last_nonce() {
         WallClockNonces::resuming(clock.clone(), WINDOW, bound, lease(&Store::default())).unwrap();
     assert!(resumed.try_reserve(1).is_err());
     clock.set_us(T_US + 1);
+    wait_for(|| resumed.ceiling() > bound);
     assert_eq!(ok(resumed.try_reserve(1)), [bound + 1]);
 }
 
@@ -700,9 +720,11 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
         let restart = Stub::at_us(at);
         let mut resumed = WallClockNonces::resuming(restart.clone(), WINDOW, last, lease).unwrap();
         // Resumed after the lease's ceiling, above the journal's last nonce, with its own first
-        // ceiling persisted a span ahead.
+        // ceiling persisted a span ahead, though never more than the window past its clock nor
+        // below the ceiling it resumed after.
         assert_eq!(resumed.last(), Some(leased), "clock {at}");
-        assert_eq!(on_disk(&copy), at.max(leased) + SPAN_US, "clock {at}");
+        let reach = (at.max(leased) + SPAN_US).min(at + window_us).max(leased);
+        assert_eq!(on_disk(&copy), reach, "clock {at}");
         let next = at.max(leased + 1);
         assert!(next > last_sent);
         let first = resumed.try_reserve(1);
@@ -714,8 +736,10 @@ fn a_source_resumed_after_a_nonce_its_journal_never_wrote_never_reissues_it_what
             assert_eq!(resumed.last(), Some(leased));
         } else {
             assert_eq!(ok(first), [next], "clock {at}");
-            // The clock moved on to it: the next block follows it, still above the sent nonce.
+            // The clock moved on to it, and the lease with it: the next block follows it, still
+            // above the sent nonce.
             restart.set_us(next);
+            wait_for(|| resumed.ceiling() >= next + 3);
             assert_eq!(ok(resumed.try_reserve(3)), [next + 1, next + 2, next + 3]);
         }
     }
@@ -764,6 +788,78 @@ fn every_nonce_lies_under_a_ceiling_persisted_before_it_and_the_lease_is_renewed
     wait_for(|| nonces.ceiling() >= top + SPAN_US);
     assert_eq!(top, now + u64::from(u16::MAX) - 1);
     assert_eq!(nonces.lease_failure(), None);
+}
+
+/// An idle source's lease is renewed by its writer on its own schedule, four times a span, with
+/// no reservation asking (DeepSeek DS-2 on PR #220): the clock walks on until half a span or
+/// less is left with nothing issued, the writer persists the next ceiling, and a nonce past the
+/// first ceiling is then issued at once rather than refused.
+#[test]
+fn an_idle_sources_writer_renews_its_lease_on_its_own_schedule() {
+    // A short span, so the writer's period, a quarter span of real time, is short too.
+    let span_us = 40_000;
+    let clock = Stub::at_us(T_US);
+    let store = Store::default();
+    let leased = NonceLease {
+        store: store.clone(),
+        span: Duration::from_micros(span_us),
+    };
+    let mut nonces = WallClockNonces::new(clock.clone(), WINDOW, leased).unwrap();
+    let first = T_US + span_us;
+    assert_eq!(store.persisted(), [first]);
+    // Three quarters of a span on, nothing reserved: the writer renews by itself.
+    let idle = T_US + 3 * span_us / 4;
+    clock.set_us(idle);
+    wait_for(|| nonces.ceiling() > first);
+    assert_eq!(store.persisted(), [first, idle + span_us]);
+    assert_eq!(nonces.last(), None);
+    // The clock past the first ceiling: its nonce is issued under the renewed one.
+    clock.set_us(first + 1);
+    assert_eq!(ok(nonces.try_reserve(1)), [first + 1]);
+}
+
+/// Sources built and dropped over one lease, each issuing nothing, as a crash loop or a consumer
+/// rebuilding its source after every session error does, never push its ceiling more than the
+/// window past the clock: the next source's first nonce lies within its window once its clock
+/// has moved past the clock that persisted that ceiling, however many came before (DeepSeek
+/// DS-1 on PR #220). A ceiling a span past the last at every rebuild would leave the next source
+/// refusing every nonce, and every rebuild pushing that further out.
+#[test]
+fn sources_rebuilt_over_one_lease_without_issuing_keep_the_next_ones_first_nonce_in_its_window() {
+    let window_us = u64::try_from(WINDOW.as_micros()).unwrap();
+    let edge = T_US + window_us;
+    let clock = Stub::at_us(T_US);
+    let store = Store::default();
+    for _ in 0..10 {
+        drop(WallClockNonces::new(clock.clone(), WINDOW, lease(&store)).unwrap());
+    }
+    // Each a span past the last until the window's edge, then held there.
+    let persisted = store.persisted();
+    let spans = [T_US + SPAN_US, T_US + 2 * SPAN_US, T_US + 3 * SPAN_US];
+    assert_eq!(persisted[..3], spans, "{persisted:?}");
+    assert_eq!(persisted[3..], [edge; 7], "{persisted:?}");
+
+    // A millisecond on, the next source issues at once, within its window, above every ceiling.
+    let later = T_US + 1_000;
+    clock.set_us(later);
+    let mut next = WallClockNonces::new(clock, WINDOW, lease(&store)).unwrap();
+    assert_eq!(next.last(), Some(edge));
+    assert_eq!(next.ceiling(), later + window_us);
+    assert_eq!(ok(next.try_reserve(3)), [edge + 1, edge + 2, edge + 3]);
+}
+
+/// A restart resumes after the larger of its journal's last nonce and its lease's ceiling, the
+/// journal's when it lies above the ceiling the store holds (DeepSeek DS-3 on PR #220): the
+/// source names the journal's nonce, leases a span past it, and issues above it.
+#[test]
+fn a_restart_resumes_after_its_journals_last_nonce_when_that_lies_above_the_leases_ceiling() {
+    let clock = Stub::at_us(T_US);
+    let store = Store::holding(T_US + 50);
+    let mut resumed = WallClockNonces::resuming(clock, WINDOW, T_US + 100, lease(&store)).unwrap();
+    assert_eq!(resumed.last(), Some(T_US + 100));
+    assert_eq!(resumed.high_water(), Some(T_US + 100));
+    assert_eq!(store.persisted(), [T_US + 50, T_US + 100 + SPAN_US]);
+    assert_eq!(ok(resumed.try_reserve(2)), [T_US + 101, T_US + 102]);
 }
 
 /// FBC-ak22's done line, no reservation waiting on a durable write (0006): with the lease's

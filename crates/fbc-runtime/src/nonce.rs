@@ -19,9 +19,12 @@
 //! first ceiling is persisted when the source is built, a span ahead of its clock; after that a
 //! writer thread of the source's own persists the next, a span ahead of the clock or of the last
 //! nonce, whichever is later, once half a span or less is left, so no reservation (a cancel's
-//! included) ever waits on a write (0006). A reservation that would pass the ceiling persisted so
-//! far is refused, [`NonceRefused::PastLease`], rather than waited for; the session ends with it
-//! as with any refusal. [`LeaseFile`] is the store for production: one file per account.
+//! included) ever waits on a write (0006). No ceiling reaches more than the window past the
+//! clock, which no nonce may pass anyway, so sources rebuilt over one lease without issuing
+//! never drive the next one's first nonce out of its window (DeepSeek DS-1 on PR #220). A
+//! reservation that would pass the ceiling persisted so far is refused,
+//! [`NonceRefused::PastLease`], rather than waited for; the session ends with it as with any
+//! refusal. [`LeaseFile`] is the store for production: one file per account.
 //! The journal's [`last_nonce`] is still read: a source resumes after the larger of it and the
 //! lease's ceiling.
 //!
@@ -83,10 +86,12 @@ pub trait LeaseStore: Send + 'static {
 }
 
 /// A source's lease: the store its ceilings are persisted to, and how far ahead of the clock,
-/// or of the last nonce if that is later, each reaches. The span is the consumer's, required:
-/// from a microsecond to the window, since a restart resumes after the last ceiling and its
-/// first nonce must still lie within the window. Each renewal is one durable write, about two
-/// a span.
+/// or of the last nonce if that is later, each reaches, never more than the window past the
+/// clock. The span is the consumer's, required, from a microsecond to the window. A restart
+/// resumes after the last ceiling, so a span well inside the window leaves it room to issue at
+/// once; a restart of a source whose ceiling had reached the window's edge issues only once its
+/// clock has moved past the clock that persisted that ceiling. Each renewal is one durable
+/// write, about two a span.
 #[derive(Debug)]
 pub struct NonceLease<S> {
     pub store: S,
@@ -154,7 +159,7 @@ struct Lease {
     /// The ceiling persisted: no nonce above it is issued.
     durable: AtomicU64,
     /// The last nonce issued or resumed after (0 for none): a renewal reaches a span past it
-    /// when it is later than the clock.
+    /// when it is later than the clock, though never more than the window past the clock.
     issued: AtomicU64,
     writer: Mutex<Writer>,
     wake: Condvar,
@@ -211,7 +216,8 @@ impl<C: WallClock + Clone + 'static> WallClockNonces<C> {
     }
 
     /// Persists the lease's first ceiling, a span past the clock or the nonce resumed after,
-    /// whichever is later, on this thread, before any nonce is issued, then starts its writer.
+    /// whichever is later, but no more than the window past the clock nor below the nonce
+    /// resumed after, on this thread, before any nonce is issued, then starts its writer.
     fn start<S: LeaseStore>(
         clock: C,
         window: Duration,
@@ -229,7 +235,9 @@ impl<C: WallClock + Clone + 'static> WallClockNonces<C> {
         }
         let last = journal_last.max(store.ceiling());
         let issued = last.unwrap_or(0);
-        let first = clock_us(&clock).max(issued).saturating_add(span_us);
+        // Not below the nonce resumed after, which a store never loses: a clock stepped back past
+        // the window leases nothing new, and the source refuses until its clock has moved on.
+        let first = reach(clock_us(&clock), issued, span_us, window_us).max(issued);
         store.persist(first).map_err(NonceStartError::Lease)?;
         let lease = Arc::new(Lease {
             durable: AtomicU64::new(first),
@@ -241,7 +249,7 @@ impl<C: WallClock + Clone + 'static> WallClockNonces<C> {
         let read = clock.clone();
         let writer = thread::Builder::new()
             .name("fbc-nonce-lease".to_owned())
-            .spawn(move || renew(&shared, &read, store, span_us))
+            .spawn(move || renew(&shared, &read, store, span_us, window_us))
             .map_err(NonceStartError::Lease)?;
         Ok(WallClockNonces {
             clock,
@@ -345,7 +353,7 @@ impl<C: WallClock> NonceSource for WallClockNonces<C> {
         let block = NonceBlock::consecutive(first, len).ok_or(NonceRefused::Exhausted)?;
         self.last = Some(block_last);
         self.lease.issued.fetch_max(block_last, Ordering::SeqCst);
-        if renewal(ceiling, now_us.max(block_last), self.span_us).is_some() {
+        if renewal(ceiling, now_us, block_last, self.span_us, self.window_us).is_some() {
             self.lease.renew_now();
         }
         Ok(block)
@@ -359,12 +367,23 @@ impl<C: WallClock> NonceSource for WallClockNonces<C> {
     }
 }
 
-/// The ceiling to persist when `durable` is the one persisted and `base` the later of the clock
-/// and the last nonce: a span past `base` once half a span or less is left, else none.
-fn renewal(durable: u64, base: u64, span_us: u64) -> Option<u64> {
-    let room = durable.saturating_sub(base);
-    let next = base.saturating_add(span_us);
+/// The ceiling to persist when `durable` is the one persisted, `now` the clock and `issued` the
+/// last nonce: [`reach`]'s, once half a span or less is left past the later of the two, else
+/// none.
+fn renewal(durable: u64, now: u64, issued: u64, span_us: u64, window_us: u64) -> Option<u64> {
+    let room = durable.saturating_sub(now.max(issued));
+    let next = reach(now, issued, span_us, window_us);
     (room <= span_us / 2 && next > durable).then_some(next)
+}
+
+/// How far a ceiling persisted at `now` reaches: a span past the later of the clock and the
+/// last nonce, but never more than the window past the clock. A nonce past that is refused
+/// anyway (`OutsideWindow`), and a ceiling past it would only have a restart resume beyond the
+/// window: sources rebuilt over one lease, each issuing nothing, would push the next one's first
+/// nonce a span further out each time (DeepSeek DS-1 on PR #220).
+fn reach(now: u64, issued: u64, span_us: u64, window_us: u64) -> u64 {
+    let ahead = now.max(issued).saturating_add(span_us);
+    ahead.min(now.saturating_add(window_us))
 }
 
 /// The lease's writer: four times a span, and whenever the source asks, it reads the clock and,
@@ -372,7 +391,13 @@ fn renewal(durable: u64, base: u64, span_us: u64) -> Option<u64> {
 /// only once the store has returned. A renewal asked for with half a span left so has a quarter
 /// span, at least, to land before the clock reaches the ceiling. It ends when the source is
 /// dropped, once any write under way has returned, and lets the store go as it ends.
-fn renew<C: WallClock, S: LeaseStore>(lease: &Lease, clock: &C, mut store: S, span_us: u64) {
+fn renew<C: WallClock, S: LeaseStore>(
+    lease: &Lease,
+    clock: &C,
+    mut store: S,
+    span_us: u64,
+    window_us: u64,
+) {
     let period = Duration::from_micros((span_us / 4).max(1));
     loop {
         let next = {
@@ -386,9 +411,10 @@ fn renew<C: WallClock, S: LeaseStore>(lease: &Lease, clock: &C, mut store: S, sp
             }
             writer.due = false;
             // Read under the lock the source's drop takes, so no clock is read once it returns.
-            let base = clock_us(clock).max(lease.issued.load(Ordering::SeqCst));
+            let now = clock_us(clock);
+            let issued = lease.issued.load(Ordering::SeqCst);
             let durable = lease.durable.load(Ordering::SeqCst);
-            match renewal(durable, base, span_us) {
+            match renewal(durable, now, issued, span_us, window_us) {
                 Some(next) => {
                     writer.writing = true;
                     next
