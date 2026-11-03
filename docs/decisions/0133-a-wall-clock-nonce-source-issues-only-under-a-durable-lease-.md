@@ -30,10 +30,16 @@ this.
    (`NonceStartError::Lease`). After that a writer thread of the source's own persists the next
    ceiling, a span past the later of the clock and the last nonce, once half a span or less is
    left. It checks four times a span, and at once when a reservation finds half a span or less
-   left. No reservation calls the store or waits for the writer. A reservation whose block would
-   pass the ceiling persisted so far is refused, `NonceRefused::PastLease`, reserving nothing,
-   and the session ends with that refusal as 0114's item 4 says. Once the source is dropped, the
-   writer reads no clock and starts no write; the drop does not wait for a write under way.
+   left. No ceiling, the first included, reaches more than the window past the clock that
+   persists it, since a nonce past that is refused anyway (`OutsideWindow`). Without that,
+   sources rebuilt over one lease that issue nothing, in a crash loop say, would each lease a
+   span past the last ceiling and push the next one's first nonce out of its window, further
+   with each rebuild (DeepSeek DS-1 on PR #220). Nor is a first ceiling below the nonce the
+   source resumes after. No reservation calls the store or waits for the writer. A reservation
+   whose block would pass the ceiling persisted so far is refused, `NonceRefused::PastLease`,
+   reserving nothing, and the session ends with that refusal as 0114's item 4 says. Once the
+   source is dropped, the writer reads no clock and starts no write; the drop does not wait for
+   a write under way.
 2. **Restart.** A source resumes after the larger of the ceiling its store holds and, when the
    consumer passes one (`resuming`), the last nonce its journal holds (`last_nonce`, unchanged).
    Every nonce an earlier process sent lies at or below the ceiling it had persisted, including a
@@ -42,8 +48,11 @@ this.
    (`OutsideWindow`) until it has moved on. Records holding a gap (`JournalGap`) no longer need
    a bound of the consumer's own: the consumer resumes over the lease alone (`new`). When a
    journal is set the session still writes the source's high-water first
-   (`NonceSource::high_water`, from 0114's item 2), which is now the nonce the source resumed
-   after, at or above the lease's ceiling.
+   (`NonceSource::high_water`, from 0114's item 2). That is now the nonce the source resumed
+   after: the ceiling its store held when it was built, or the journal's last nonce if that is
+   larger. The ceiling the source then persists lies above it and bounds what the source may
+   issue; the journal alone does not cover nonces up to that ceiling, and only the lease does
+   (DeepSeek DS-7 on PR #220).
 3. **The lease file.** `LeaseFile` is the production store: one decimal ceiling in a file at a
    path the consumer gives, one file per nonce sequence (per account on Hibachi). Each persist
    writes a file beside it, syncs it, renames it over the lease file and, on Unix, syncs the
@@ -89,11 +98,14 @@ creates it once for a new account and opens it on every later start; an open ref
 the file is held means an earlier source's write has not yet returned, and the consumer tries
 again later. A lost lease file puts the
 consumer back where 0114 left it: resuming after a bound of its own, which this record does not
-cover. A restart's first nonce can lie up to a span ahead of its clock, so a span well inside
-the window leaves a quick restart room to issue at once. A disk that stalls for longer than a
-quarter span lets the clock reach the ceiling. Reservations are then refused and the session
-ends, leaving the venue's cancel-on-disconnect to act, rather than issuing a nonce a restart
-could reuse; `WallClockNonces::lease_failure` reports a write that failed.
+cover. A restart's first nonce lies above the last ceiling: a span ahead of the clock that
+persisted it, or up to the window ahead after restarts that issued nothing. A span well inside
+the window leaves a quick restart room to issue at once. A source whose ceiling reached the
+window's edge, as with a span equal to the window, issues again only once its clock has moved
+past the clock that persisted that ceiling, its writer renewing as it goes. A disk that stalls
+for longer than a quarter span lets the clock reach the ceiling. Reservations are then refused
+and the session ends, leaving the venue's cancel-on-disconnect to act, rather than issuing a
+nonce a restart could reuse; `WallClockNonces::lease_failure` reports a write that failed.
 
 ## What would show this was wrong
 
