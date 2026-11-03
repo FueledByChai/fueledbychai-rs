@@ -1,6 +1,6 @@
 # 0133 — A wall-clock nonce source issues only under a durable lease renewed ahead of use, and a restart resumes after its ceiling
 
-Status: accepted, supersedes 0114
+Status: accepted, supersedes 0114's item 2 (its items 1, 3 and 4 stand)
 Date: 2026-10-30
 
 ## Context

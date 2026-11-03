@@ -24,7 +24,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -520,6 +520,13 @@ fn a_refusal_says_what_was_wrong() {
             NonceStartError::Lease(io::Error::other("the disk refused the write")),
             "the nonce lease's first ceiling was not persisted: the disk refused the write",
         ),
+        // A writer that did not start is told apart, its ceiling persisted (DeepSeek DS-4 on
+        // 33ed0061, PR #220).
+        (
+            NonceStartError::Writer(io::Error::other("no thread")),
+            "the nonce lease's writer thread did not start, its first ceiling persisted: no \
+             thread",
+        ),
     ];
     for (refused, text) in starts {
         assert_eq!(refused.to_string(), text);
@@ -541,6 +548,34 @@ fn an_empty_reservation_reads_no_clock() {
     clock.clear();
     assert!(ok(nonces.try_reserve(0)).is_empty());
     assert_eq!(nonces.last(), None);
+}
+
+/// A dropped source's writer reads no clock (DeepSeek DS-6 on 33ed0061, PR #220): its writer,
+/// checking every 10 ms of real time, reads the clock while the source lives, and not once after
+/// the drop has returned, however long the test then waits.
+#[test]
+fn a_dropped_sources_writer_reads_no_clock() {
+    #[derive(Clone)]
+    struct Counted(Stub, Arc<AtomicUsize>);
+    impl WallClock for Counted {
+        fn now(&self) -> WallNs {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.now()
+        }
+    }
+    let reads = Arc::new(AtomicUsize::new(0));
+    let clock = Counted(Stub::at_us(T_US), Arc::clone(&reads));
+    let lease = NonceLease {
+        store: Store::default(),
+        span: Duration::from_micros(40_000),
+    };
+    let nonces = WallClockNonces::new(clock, WINDOW, lease).unwrap();
+    let built = reads.load(Ordering::SeqCst);
+    wait_for(|| reads.load(Ordering::SeqCst) > built);
+    drop(nonces);
+    let dropped = reads.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(reads.load(Ordering::SeqCst), dropped);
 }
 
 /// The system clock reads after 2026-09-14, a month before this file was written, and a source
@@ -996,11 +1031,16 @@ fn a_lease_whose_first_ceiling_is_not_persisted_builds_no_source() {
 /// file of its own left beside it but the lock it is held by; `create` is for a sequence that
 /// never issued a nonce and refuses a path that exists, and `open` refuses a file that is missing
 /// or holds no ceiling, so a lost lease is never read as a fresh one. Either refuses a lease file
-/// another holder has (`WouldBlock`).
+/// another holder has (`WouldBlock`). No refusal names the path, which may carry an account
+/// (DeepSeek DS-5 on 33ed0061, PR #220).
 #[test]
 fn a_lease_file_holds_one_ceiling_replaced_whole() {
     let dir = fresh_dir("lease_file");
     let path = dir.join("account.lease");
+    let unnamed = |e: io::Error| {
+        assert!(!e.to_string().contains("account"), "{e}");
+        e.kind()
+    };
     assert_eq!(
         LeaseFile::open(&path).unwrap_err().kind(),
         io::ErrorKind::NotFound
@@ -1010,7 +1050,7 @@ fn a_lease_file_holds_one_ceiling_replaced_whole() {
     assert_eq!(file.path(), path);
     assert!(!path.exists());
     for held in [LeaseFile::create(&path), LeaseFile::open(&path)] {
-        assert_eq!(held.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(unnamed(held.unwrap_err()), io::ErrorKind::WouldBlock);
     }
     file.persist(T_US).unwrap();
     file.persist(T_US + 9).unwrap();
@@ -1032,13 +1072,13 @@ fn a_lease_file_holds_one_ceiling_replaced_whole() {
     assert_eq!(on_disk(&path), T_US + 10);
     drop(reopened);
     assert_eq!(
-        LeaseFile::create(&path).unwrap_err().kind(),
+        unnamed(LeaseFile::create(&path).unwrap_err()),
         io::ErrorKind::AlreadyExists
     );
     for garbage in ["", "\n", "12x\n", "-3\n", "18446744073709551616\n"] {
         fs::write(&path, garbage).unwrap();
         let refused = LeaseFile::open(&path).unwrap_err();
-        assert_eq!(refused.kind(), io::ErrorKind::InvalidData, "{garbage:?}");
+        assert_eq!(unnamed(refused), io::ErrorKind::InvalidData, "{garbage:?}");
     }
 }
 
