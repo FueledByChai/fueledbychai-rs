@@ -1,7 +1,11 @@
 //! Public MDS capabilities from QFEX's [WebSocket overview](https://docs.qfex.com/websocket/main),
 //! [pulsed BBO](https://docs.qfex.com/websocket/channels/mds/bbo),
-//! [pulsed book](https://docs.qfex.com/websocket/channels/mds/orderbook), and
-//! [trade](https://docs.qfex.com/websocket/channels/mds/trades) pages.
+//! [pulsed book](https://docs.qfex.com/websocket/channels/mds/orderbook),
+//! [trade](https://docs.qfex.com/websocket/channels/mds/trades),
+//! [mark price](https://docs.qfex.com/websocket/channels/mds/mark_price),
+//! [underlier](https://docs.qfex.com/websocket/channels/mds/underlier) and
+//! [funding rate](https://docs.qfex.com/websocket/channels/mds/funding_rate) pages, and the
+//! 2026-11-04 public capture in `fixtures/qfex/live/` (its README).
 
 use std::time::Duration;
 
@@ -49,13 +53,21 @@ pub(crate) fn caps() -> VenueCaps {
                 trade_id: true,
             },
             funding: FundingCaps {
-                source: FeedSource::None,
+                // The `funding` channel.
+                source: FeedSource::Stream,
+                // No frame states the interval; the funding page's hourly settlement is not a
+                // field of the frame.
                 interval_reported: false,
+                // `time_remaining` counts from when a frame was sent, so the capture's
+                // `time` + `time_remaining` falls seconds short of the settlement: no frame
+                // states the next funding time.
                 next_time_reported: false,
             },
             stats: FeedSource::None,
-            mark: FeedSource::None,
-            index: FeedSource::None,
+            // The `mark_price` channel.
+            mark: FeedSource::Stream,
+            // The `underlier` channel, its `external` prices only (the codec's docs).
+            index: FeedSource::Stream,
             // The public MDS codec decodes no market's trading status, so none is reported and
             // discovery's snapshot stands (decision 0130).
             status: FeedSource::None,

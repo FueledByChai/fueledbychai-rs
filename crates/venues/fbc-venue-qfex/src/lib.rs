@@ -1,8 +1,9 @@
 //! QFEX public market data and instrument discovery. Order entry is deliberately unavailable
 //! (decision 0117).
 //!
-//! The public WebSocket and its `bbo`, `level2`, and `trade` messages are documented at
-//! <https://docs.qfex.com/websocket/main> and the corresponding MDS channel pages.
+//! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
+//! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
+//! corresponding MDS channel pages; [`QfexMd`] says what each becomes.
 
 mod caps;
 pub mod discover;
@@ -21,7 +22,8 @@ use fbc_core::{
     VenueError, VenueFactory, WireUrl,
 };
 
-use md::{QfexMd, channel};
+use md::channel;
+pub use md::{QfexMd, QfexMdCounts};
 
 /// The public MDS WebSocket URL, e.g. `wss://mds.qfex.com`.
 pub const KEY_MDS_URL: &str = "qfex.mds_url";

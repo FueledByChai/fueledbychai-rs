@@ -578,12 +578,12 @@ fn bad_subscription_is_rejected_before_any_frame_is_sent() {
     let mut codec = subscribed();
     let mut fx = Effects::new();
     let err = codec.subscribe(
-        &[sub(Feed::Trades), sub(Feed::Funding)],
+        &[sub(Feed::Trades), sub(Feed::Stats)],
         &[],
         &specs(),
         &mut fx,
     );
-    assert_eq!(err, Err(VenueError::UnsupportedFeed(sub(Feed::Funding))));
+    assert_eq!(err, Err(VenueError::UnsupportedFeed(sub(Feed::Stats))));
     assert!(fx.is_empty());
     let mut config = cfg();
     config.insert(KEY_MDS_URL, "wss://mds.qfex.com/path");
@@ -763,8 +763,8 @@ fn factory_refuses_bad_endpoints_and_unavailable_feeds_before_planning() {
         Err(VenueError::UnknownInstrument(unknown.inst))
     );
     assert_eq!(
-        Qfex.plan_md(&cfg(), &specs(), &BTreeSet::from([sub(Feed::Funding)])),
-        Err(VenueError::UnsupportedFeed(sub(Feed::Funding)))
+        Qfex.plan_md(&cfg(), &specs(), &BTreeSet::from([sub(Feed::Stats)])),
+        Err(VenueError::UnsupportedFeed(sub(Feed::Stats)))
     );
 }
 

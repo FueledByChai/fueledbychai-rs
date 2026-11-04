@@ -1,4 +1,26 @@
 //! Sans-IO decoder for QFEX's public MDS WebSocket.
+//!
+//! Besides `bbo`, `level2` and `trade`, it decodes three reference channels, each value exact and
+//! never rounded to a grid:
+//!
+//! - [`mark_price`](https://docs.qfex.com/websocket/channels/mds/mark_price): `price` as
+//!   [`MdEvent::Mark`]. The page's example has no `sequence`; live frames carry one.
+//! - [`underlier`](https://docs.qfex.com/websocket/channels/mds/underlier): `price` as
+//!   [`MdEvent::Index`], the price QFEX funds against, only where `source` is `external`.
+//!   [`MdEvent::Index`] cannot say where a price came from, so an `internal` one (which the page
+//!   gives outside extended hours, and the 2026-11-04 capture shows within them too) pushes no
+//!   event and is counted ([`QfexMdCounts::internal_underliers`]): the index pauses rather than
+//!   carry a price the consumer cannot classify.
+//! - [`funding`](https://docs.qfex.com/websocket/channels/mds/funding_rate) (the subscription
+//!   channel; not `funding_rate`): `funding_rate`, a decimal fraction for the hourly settlement
+//!   ([funding](https://docs.qfex.com/qfex/funding);
+//!   [market_stats](https://docs.qfex.com/websocket/channels/mds/market_stats): "decimal
+//!   strings, not percentage strings"; the capture, `fixtures/qfex/README.md`), as
+//!   [`MdEvent::Funding`] in units of 1e-12 exactly: a rate finer than 1e-12 or outside `i64`
+//!   refuses the frame. No frame states the interval, so `interval` is `None`. `next` is `None`:
+//!   the capture shows `time` + `time_remaining` falls seconds short of the settlement, since
+//!   `time_remaining` counts from when the frame was sent. Neither `time_remaining` nor the live
+//!   frames' undocumented `annualised_funding_rate` is read.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,28 +38,56 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{BOOK_LEVEL2, TOUCH_BBO};
 
+/// Each feed the codec decodes and its wire channel, which a subscription names and each of
+/// its frames carries as its `type`.
+const CHANNELS: [(Feed, &str); 6] = [
+    (Feed::Touch(TOUCH_BBO), "bbo"),
+    (Feed::Book(BOOK_LEVEL2), "level2"),
+    (Feed::Trades, "trade"),
+    (Feed::Mark, "mark_price"),
+    (Feed::Index, "underlier"),
+    (Feed::Funding, "funding"),
+];
+
+/// The feed of a wire channel.
+fn feed_of(channel: &str) -> Option<Feed> {
+    CHANNELS
+        .iter()
+        .find(|(_, name)| *name == channel)
+        .map(|(feed, _)| *feed)
+}
+
 /// Check a subscription and return its wire channel and exact venue symbol.
 pub(crate) fn channel(
     specs: &SpecTable,
     sub: Subscription,
 ) -> Result<(&'static str, String), VenueError> {
-    let name = match sub.feed {
-        Feed::Touch(TOUCH_BBO) => "bbo",
-        Feed::Book(BOOK_LEVEL2) => "level2",
-        Feed::Trades => "trade",
-        _ => return Err(VenueError::UnsupportedFeed(sub)),
-    };
+    let name = CHANNELS
+        .iter()
+        .find(|(feed, _)| *feed == sub.feed)
+        .map(|(_, name)| *name)
+        .ok_or(VenueError::UnsupportedFeed(sub))?;
     let spec = specs
         .get(sub.inst)
         .ok_or(VenueError::UnknownInstrument(sub.inst))?;
     Ok((name, spec.venue_symbol.as_wire().to_owned()))
 }
 
+/// What the codec counted: frames it took that push no event.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub struct QfexMdCounts {
+    /// `underlier` frames whose `source` is `internal`, each taken and pushing no
+    /// [`MdEvent::Index`].
+    pub internal_underliers: u64,
+}
+
+/// The codec for one connection epoch of QFEX's public MDS WebSocket.
 #[derive(Clone)]
-pub(crate) struct QfexMd {
+pub struct QfexMd {
     stream: StreamId,
     active: BTreeSet<Subscription>,
     epochs: BTreeMap<InstrumentId, u32>,
+    counts: QfexMdCounts,
 }
 
 #[derive(Default)]
@@ -50,12 +100,19 @@ impl MdSink for BufferedEvents {
 }
 
 impl QfexMd {
-    pub(crate) fn new(stream: StreamId) -> Self {
-        Self {
+    /// A codec writing its subscriptions to `stream`.
+    pub fn new(stream: StreamId) -> QfexMd {
+        QfexMd {
             stream,
             active: BTreeSet::new(),
             epochs: BTreeMap::new(),
+            counts: QfexMdCounts::default(),
         }
+    }
+
+    /// What it counted so far, frames refused excepted: a frame refused counts nothing.
+    pub fn counts(&self) -> QfexMdCounts {
+        self.counts
     }
 
     fn decode_item(
@@ -130,12 +187,7 @@ impl QfexMd {
         let spec = specs
             .by_symbol(symbol)
             .ok_or(DecodeError::UnknownInstrument)?;
-        let feed = match kind {
-            "bbo" => Feed::Touch(TOUCH_BBO),
-            "level2" => Feed::Book(BOOK_LEVEL2),
-            "trade" => Feed::Trades,
-            _ => return Err(DecodeError::Malformed("type")),
-        };
+        let feed = feed_of(kind).ok_or(DecodeError::Malformed("type"))?;
         if !self.active.contains(&Subscription {
             inst: spec.id,
             feed,
@@ -221,6 +273,30 @@ impl QfexMd {
                     },
                 );
             }
+            "mark_price" => {
+                let px = reference_price(data)?;
+                sink.push(meta, MdEvent::Mark { inst: spec.id, px });
+            }
+            "underlier" => {
+                let px = reference_price(data)?;
+                match string(data, "source")? {
+                    "external" => sink.push(meta, MdEvent::Index { inst: spec.id, px }),
+                    "internal" => self.counts.internal_underliers += 1,
+                    _ => return Err(DecodeError::Malformed("source")),
+                }
+            }
+            "funding" => {
+                let rate_e12 = rate_e12(data)?;
+                sink.push(
+                    meta,
+                    MdEvent::Funding {
+                        inst: spec.id,
+                        rate_e12,
+                        interval: None,
+                        next: None,
+                    },
+                );
+            }
             _ => unreachable!(),
         }
         Ok(())
@@ -285,12 +361,10 @@ impl QfexMd {
             .ok_or(DecodeError::Malformed("symbols"))?;
         let mut refused = BTreeSet::new();
         for channel in channels {
-            let feed = match channel.as_str() {
-                Some("bbo") => Feed::Touch(TOUCH_BBO),
-                Some("level2") => Feed::Book(BOOK_LEVEL2),
-                Some("trade") => Feed::Trades,
-                _ => return Err(DecodeError::Malformed("channels")),
-            };
+            let feed = channel
+                .as_str()
+                .and_then(feed_of)
+                .ok_or(DecodeError::Malformed("channels"))?;
             for symbol in symbols {
                 let wire = symbol.as_str().ok_or(DecodeError::Malformed("symbols"))?;
                 let spec = specs
@@ -459,6 +533,36 @@ fn price(
         .parse()
         .map_err(|_| bad)?;
     spec.price_grid.ticks_exact(px).ok_or(bad)
+}
+
+/// A mark or underlier `price`: a positive decimal string, exact.
+fn reference_price(data: &Map<String, Value>) -> Result<PxExact, DecodeError> {
+    let bad = DecodeError::Malformed("price");
+    let px: PxExact = string(data, "price")?.parse().map_err(|_| bad)?;
+    if px.mantissa <= 0 {
+        return Err(bad);
+    }
+    Ok(px)
+}
+
+/// A `funding` frame's `funding_rate`, a decimal fraction as a decimal string, in units of
+/// 1e-12 exactly: refused where it is finer than that or outside `i64`, never rounded.
+fn rate_e12(data: &Map<String, Value>) -> Result<i64, DecodeError> {
+    let bad = DecodeError::Malformed("funding_rate");
+    let rate: PxExact = string(data, "funding_rate")?.parse().map_err(|_| bad)?;
+    // rate = mantissa x 10^exp, so rate x 10^12 = mantissa x 10^(exp + 12).
+    let shift = i32::from(rate.exp) + 12;
+    let scale = 10_i64.checked_pow(shift.unsigned_abs()).ok_or(bad);
+    if shift >= 0 {
+        rate.mantissa.checked_mul(scale?).ok_or(bad)
+    } else {
+        match scale {
+            Ok(scale) if rate.mantissa % scale == 0 => Ok(rate.mantissa / scale),
+            // A divisor beyond i64 leaves a whole number of 1e-12 only for zero.
+            Err(_) if rate.mantissa == 0 => Ok(0),
+            _ => Err(bad),
+        }
+    }
 }
 
 fn quantity(
