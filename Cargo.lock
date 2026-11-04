@@ -679,9 +679,13 @@ version = "0.0.1"
 dependencies = [
  "fbc-book",
  "fbc-core",
+ "fbc-journal",
  "fbc-runtime",
+ "getrandom 0.3.4",
+ "hmac",
  "rust_decimal",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
 ]

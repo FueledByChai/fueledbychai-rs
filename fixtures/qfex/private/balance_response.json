@@ -1,0 +1,16 @@
+{
+  "balance_response": {
+    "id": "77777777-7777-4777-8777-777777777777",
+    "user_id": "5a5a5a5a-0000-4000-8000-0000000000a1",
+    "deposit": 1000.0,
+    "realised_pnl": 0.0,
+    "order_margin": 27.08,
+    "position_margin": 10.0,
+    "unrealised_pnl": 0.5,
+    "net_funding": 0.0,
+    "available_balance": 963.42,
+    "referral_rewards": 0.0,
+    "builder_rewards": 0.0,
+    "fees": 0.002
+  }
+}

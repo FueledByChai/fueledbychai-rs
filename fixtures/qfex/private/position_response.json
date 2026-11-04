@@ -1,0 +1,17 @@
+{
+  "position_response": {
+    "id": "66666666-6666-4666-8666-666666666666",
+    "symbol": "AAPL-USD",
+    "position": 1.0,
+    "margin_alloc": 10.0,
+    "realised_pnl": 0.0,
+    "unrealised_pnl": 0.5,
+    "net_funding": 0.0,
+    "open_orders": 1.0,
+    "open_quantity": 2.708,
+    "leverage": 20.0,
+    "initial_margin": 0.05,
+    "maintenance_margin": 0.03333333333333333,
+    "average_price": 200.0
+  }
+}

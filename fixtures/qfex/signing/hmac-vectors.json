@@ -1,0 +1,161 @@
+{
+  "source": "fixtures/qfex/signing/hmac_oracle.py (Python hmac and hashlib)",
+  "vectors": [
+    {
+      "name": "docs_shaped",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        49406,
+        47806
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "000000000000c0fe000000000000babe",
+      "unix_ts": 1760545414,
+      "message": "000000000000c0fe000000000000babe:1760545414",
+      "signature": "61a1979f91a91ca89c95d0a1cd218a2d596c97c0ca4c43127552d633fa07a838"
+    },
+    {
+      "name": "nonce_zero",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        0,
+        0
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "00000000000000000000000000000000",
+      "unix_ts": 1760545414,
+      "message": "00000000000000000000000000000000:1760545414",
+      "signature": "a28385a4577d757083eb49ccb75a10793d5fc15ff3831297e34fc0c661bd8269"
+    },
+    {
+      "name": "nonce_max",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        18446744073709551615,
+        18446744073709551615
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "ffffffffffffffffffffffffffffffff",
+      "unix_ts": 1760545414,
+      "message": "ffffffffffffffffffffffffffffffff:1760545414",
+      "signature": "fc8be4548676dc63f33d0bb36ac59abe8710b58ff242bc2775b18b8cef474999"
+    },
+    {
+      "name": "padding_low_half",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        0,
+        18446744073709551615
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "0000000000000000ffffffffffffffff",
+      "unix_ts": 1760545414,
+      "message": "0000000000000000ffffffffffffffff:1760545414",
+      "signature": "96c967b4083be4b774ffecc5899a6ca1d3aa85ce54ef38a030c68730a28aa662"
+    },
+    {
+      "name": "padding_high_half",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        18446744073709551615,
+        0
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "ffffffffffffffff0000000000000000",
+      "unix_ts": 1760545414,
+      "message": "ffffffffffffffff0000000000000000:1760545414",
+      "signature": "12e7cc488af62ffe0a72816ceeb150177490b01e899ab54825fc89bbc8fa7a03"
+    },
+    {
+      "name": "padding_ones",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        1,
+        1
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "00000000000000010000000000000001",
+      "unix_ts": 1760545414,
+      "message": "00000000000000010000000000000001:1760545414",
+      "signature": "329c6c55e01bb6703f39350803e0478621f0f02644b8f3433e546a9a9a78c558"
+    },
+    {
+      "name": "floor_last_nanosecond",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        7,
+        8
+      ],
+      "wall_ns": 1760545414999999999,
+      "nonce_hex": "00000000000000070000000000000008",
+      "unix_ts": 1760545414,
+      "message": "00000000000000070000000000000008:1760545414",
+      "signature": "77571fd1483bf4dd6ce75bfe100acae9b26ee2bcdc95b3ccad4eb08ffab0a799"
+    },
+    {
+      "name": "floor_next_second",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        7,
+        8
+      ],
+      "wall_ns": 1760545415000000000,
+      "nonce_hex": "00000000000000070000000000000008",
+      "unix_ts": 1760545415,
+      "message": "00000000000000070000000000000008:1760545415",
+      "signature": "5392f3973a72b5d8c27b3bf63a3d2f20cd55fc65857e2269be8162258dcf65db"
+    },
+    {
+      "name": "floor_epoch",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        7,
+        8
+      ],
+      "wall_ns": 0,
+      "nonce_hex": "00000000000000070000000000000008",
+      "unix_ts": 0,
+      "message": "00000000000000070000000000000008:0",
+      "signature": "25fcae68e3e4ff1a5e46c61581316b4847e99b352f26af8ebea88c05d29f154f"
+    },
+    {
+      "name": "floor_epoch_last_nanosecond",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        7,
+        8
+      ],
+      "wall_ns": 999999999,
+      "nonce_hex": "00000000000000070000000000000008",
+      "unix_ts": 0,
+      "message": "00000000000000070000000000000008:0",
+      "signature": "25fcae68e3e4ff1a5e46c61581316b4847e99b352f26af8ebea88c05d29f154f"
+    },
+    {
+      "name": "floor_latest_wall",
+      "secret": "SYNTHETIC-qfex-secret-belonging-to-no-account",
+      "nonce": [
+        7,
+        8
+      ],
+      "wall_ns": 9223372036854775807,
+      "nonce_hex": "00000000000000070000000000000008",
+      "unix_ts": 9223372036,
+      "message": "00000000000000070000000000000008:9223372036",
+      "signature": "91bfd4deb4d27555ba7a1a48ed74358d4290fd35ff08f7c2577d5c357522aa65"
+    },
+    {
+      "name": "utf8_secret",
+      "secret": "SYNTHETIC-sécret-ключ",
+      "nonce": [
+        49406,
+        47806
+      ],
+      "wall_ns": 1760545414000000000,
+      "nonce_hex": "000000000000c0fe000000000000babe",
+      "unix_ts": 1760545414,
+      "message": "000000000000c0fe000000000000babe:1760545414",
+      "signature": "d6210e96aed2b73ac00b9045be853e91ab44ea0aad6df8d1e88a5c516b42802e"
+    }
+  ]
+}

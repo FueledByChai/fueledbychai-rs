@@ -1,0 +1,23 @@
+{
+  "fill_response": {
+    "trade_id": "55555555-5555-4555-8555-555555555555",
+    "user_id": "5a5a5a5a-0000-4000-8000-0000000000a1",
+    "symbol": "AAPL-USD",
+    "price": 200.0,
+    "quantity": 1.0,
+    "side": "SELL",
+    "aggressor_side": "BUY",
+    "order_id": "11111111-1111-4111-8111-111111111111",
+    "fee": 0.002,
+    "order_type": "LIMIT",
+    "tif": "GTC",
+    "order_price": 200.0,
+    "client_order_id": "synthetic-cid-1",
+    "remaining_quantity": 0.0,
+    "take_profit": 0.0,
+    "stop_loss": 0.0,
+    "execution_type": "MAKER",
+    "timestamp": 1760000003.25,
+    "realised_pnl": 0.0
+  }
+}

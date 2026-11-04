@@ -1,0 +1,19 @@
+{
+  "order_response": {
+    "order_id": "11111111-1111-4111-8111-111111111111",
+    "symbol": "AAPL-USD",
+    "status": "ACK",
+    "quantity": 1.0,
+    "price": 200.0,
+    "take_profit": 0.0,
+    "stop_loss": 0.0,
+    "side": "BUY",
+    "type": "LIMIT",
+    "time_in_force": "GTC",
+    "user_id": "5a5a5a5a-0000-4000-8000-0000000000a1",
+    "client_order_id": "synthetic-cid-1",
+    "quantity_remaining": 1.0,
+    "update_time": 1760000000.123,
+    "trade_id": null
+  }
+}
