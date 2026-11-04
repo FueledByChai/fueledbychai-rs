@@ -48,6 +48,7 @@ pub fn commands_selfcontained(subject: &Subject<'_>) -> Result<Verdict, Failure>
             why: "the caps declare no reference an amend, cancel or query can name an order by",
         });
     }
+    h.sized()?;
     let mut breaches = Vec::new();
     let mut probed = Vec::new();
     // The placement a warm codec sees first; none where the caps allow no order.

@@ -1,7 +1,7 @@
 //! What the checks share: the venue's caps and first instrument under the assumed setup,
 //! codecs built fresh from the factory and taken through the setup's bootstrap, client ids
 //! minted under a lease of the suite's own, venue ids made in the venue's decode scope, and
-//! the commands built from them.
+//! the commands built from them, each order at a price and size inside the instrument's limits.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -12,8 +12,8 @@ use fbc_core::{
     AccountKey, AmendOrder, BookId, CancelOrder, CapTag, Channel, CidMint, ClientOrderId,
     ConnState, ConnTopology, CtxCall, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
     EndpointPlan, ExecCodec, ExecEvent, ExecSink, Feature, Feed, HttpResponse, HttpTag,
-    InstrumentId, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease, NewOrder,
-    NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
+    InstrumentId, InstrumentSpec, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease,
+    NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
     QueryOrder, RawFrame, RefKind, RpcId, Side, SpecTable, StreamId, Subscription, TagSet, Ticks,
     TifTag, VenueCaps, VenueCommand, VenueMeta, VenueOrderId, WallNs, WireUrl, dispatch,
     dispatch_market_data,
@@ -35,7 +35,8 @@ pub(crate) const MD_STREAM: StreamId = StreamId(0);
 const MD_URL: &str = "wss://conformance.invalid/md";
 /// The first placement nonce an order carries; item `i`'s is this plus `i`.
 const PLACEMENT_NONCE: u64 = 1_000;
-/// The limit price aimed at: the valid price at or above it on the instrument's grid is used.
+/// The limit price aimed at: the valid price at or above it on the instrument's grid is used,
+/// or a higher one where the instrument's minimum notional needs it ([`probe`]).
 const PX: Ticks = Ticks(100);
 
 /// What an encode gave.
@@ -56,9 +57,13 @@ pub(crate) struct Harness<'s> {
     pub other_inst: Option<InstrumentId>,
     /// The stream fixture frames are handed to the codec on.
     pub exec_stream: StreamId,
+    /// The size of the orders the checks build, within the instrument's limits ([`probe`]).
     pub(crate) qty: Lots,
-    /// A valid limit price on the instrument's grid (Codex r4189256906).
+    /// Their limit price, valid on the instrument's grid (Codex r4189256906, r4189398089).
     pub(crate) px: Ticks,
+    /// Why no order fits the instrument's limits, by the spec field, where none does: `px` and
+    /// `qty` are then the price and size [`probe`] starts from.
+    unfit: Option<(&'static str, String)>,
 }
 
 impl<'s> Harness<'s> {
@@ -73,14 +78,11 @@ impl<'s> Harness<'s> {
                 "the spec table lists no instrument",
             ));
         };
-        // At least one lot, so an amend always leaves something to rest.
-        let qty = Lots::new(spec.min_size.get().max(1)).expect("a positive count");
         let inst = spec.id;
-        let grid = &spec.price_grid;
-        let px = grid
-            .ceil_valid(PX)
-            .or_else(|| grid.lowest_valid())
-            .unwrap_or(PX);
+        let ((px, qty), unfit) = match probe(spec) {
+            Ok(order) => (order, None),
+            Err(unfit) => (start(spec), Some(unfit)),
+        };
         let other_inst = setup.specs.iter().nth(1).map(|spec| spec.id);
         Ok(Harness {
             check,
@@ -92,7 +94,17 @@ impl<'s> Harness<'s> {
             exec_stream: setup.exec_stream,
             qty,
             px,
+            unfit,
         })
+    }
+
+    /// A failure naming the instrument's spec field where no order fits its limits, so a check
+    /// that builds orders refuses the setup rather than send orders a codec may refuse for it.
+    pub fn sized(&self) -> Result<(), Failure> {
+        match &self.unfit {
+            Some((field, what)) => Err(self.fail(field, what.clone())),
+            None => Ok(()),
+        }
     }
 
     /// The venue's caps under the assumed setup, read before anything needs an instrument.
@@ -566,6 +578,89 @@ pub(crate) fn placement_nonce(i: usize) -> u64 {
     PLACEMENT_NONCE + i as u64
 }
 
+/// The price and size an order the checks build starts from: the valid price at or above
+/// [`PX`] on the instrument's grid (the lowest valid where none is), and its `min_size`, one lot
+/// at least, so an amend always leaves something to rest.
+fn start(spec: &InstrumentSpec) -> (Ticks, Lots) {
+    let grid = &spec.price_grid;
+    let px = grid
+        .ceil_valid(PX)
+        .or_else(|| grid.lowest_valid())
+        .unwrap_or(PX);
+    let qty = Lots::new(spec.min_size.get().max(1)).expect("a positive count");
+    (px, qty)
+}
+
+/// The price and size of the orders the checks build on `spec`, inside its limits (Codex
+/// r4189398089): from [`start`], the size raised until the order's notional reaches the spec's
+/// `min_notional`, never past its `max_order_size`; where no size within that reaches it at that
+/// price, the lowest valid price above at which the largest does, with the least size that
+/// reaches it there. The notional is the spec's own ([`InstrumentSpec::notional`]), in its quote
+/// currency, as `min_notional` is stated. Why no order fits, by the spec field, where none does.
+fn probe(spec: &InstrumentSpec) -> Result<(Ticks, Lots), (&'static str, String)> {
+    let (px, least) = start(spec);
+    let symbol = spec.venue_symbol.as_wire();
+    if let Some(most) = spec.max_order_size.filter(|&most| most < least) {
+        let what = format!(
+            "{symbol} takes orders of at most {} lots, fewer than its least, {} lots (its \
+             min_size, and one lot at least): no order fits to probe with",
+            most.get(),
+            least.get()
+        );
+        return Err(("InstrumentSpec.max_order_size", what));
+    }
+    let Some(min) = spec.min_notional else {
+        return Ok((px, least));
+    };
+    let most = spec.max_order_size.map_or(i64::MAX, Lots::get);
+    let notional = |px: Ticks, q: i64| spec.notional(px, Lots::new(q).expect("a count"));
+    // Rising with the price and the size: a notional too large to hold reaches any minimum.
+    let reaches = |px: Ticks, q: i64| notional(px, q).is_none_or(|n| n.nanos >= min.nanos);
+    // The least size reaching it at `px`, where one that it can hold does.
+    let sized = |px: Ticks| {
+        let q = least_true(least.get(), most, |q| reaches(px, q))?;
+        let held = notional(px, q).is_some_and(|n| n.nanos >= min.nanos);
+        held.then(|| (px, Lots::new(q).expect("a count")))
+    };
+    let raised = || {
+        let t = least_true(px.0, i64::MAX, |t| reaches(Ticks(t), most))?;
+        spec.price_grid.ceil_valid(Ticks(t))
+    };
+    let unfit = || {
+        let within = match spec.max_order_size {
+            Some(max) => format!(" within its max_order_size of {} lots", max.get()),
+            None => String::new(),
+        };
+        let what = format!(
+            "no order of {symbol}{within} reaches its min_notional at a valid price: no order \
+             fits to probe with"
+        );
+        ("InstrumentSpec.min_notional", what)
+    };
+    sized(px)
+        .or_else(|| raised().and_then(&sized))
+        .ok_or_else(unfit)
+}
+
+/// The least `x` in `lo..=hi` at which `holds`, false and then true across the range, holds;
+/// `None` where it does not hold at `hi`.
+fn least_true(lo: i64, hi: i64, holds: impl Fn(i64) -> bool) -> Option<i64> {
+    if lo > hi || !holds(hi) {
+        return None;
+    }
+    let (mut lo, mut hi) = (lo, hi);
+    while lo < hi {
+        let half = (i128::from(hi) - i128::from(lo)) / 2;
+        let mid = lo + i64::try_from(half).expect("half a range of i64s");
+        if holds(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(lo)
+}
+
 /// The reference kinds of `all` not in `declared`.
 pub(crate) fn undeclared(declared: TagSet<RefKind>, all: &[RefKind]) -> Vec<RefKind> {
     all.iter()
@@ -607,6 +702,7 @@ fn mint_in(dir: &Path, seed: (u64, u64, WallNs), n: usize) -> Result<Vec<ClientO
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
 
     #[test]
     fn the_plainest_order_skips_a_combination_a_declared_conflict_refuses() {
@@ -623,6 +719,60 @@ mod tests {
         );
         o.tifs = TagSet::of(&[TifTag::Ioc]);
         assert_eq!(Shape::plain(&o), None);
+    }
+
+    /// The toy's first instrument (a 0.5 tick, a 0.001 step, one lot least), its orders at
+    /// least `min` nanos of notional and at most `max` lots.
+    fn limited(min: Option<i128>, max: Option<i64>) -> InstrumentSpec {
+        let mut spec = crate::toy::specs().get(crate::toy::INST_A).unwrap().clone();
+        spec.min_notional = min.map(|nanos| fbc_core::Money::new(nanos, spec.quote_ccy));
+        spec.max_order_size = max.map(|max| Lots::new(max).unwrap());
+        spec
+    }
+
+    /// `probe`'s order as a tick and a count of lots.
+    fn probed(spec: &InstrumentSpec) -> (i64, i64) {
+        let (px, qty) = probe(spec).unwrap();
+        (px.0, qty.get())
+    }
+
+    #[test]
+    fn the_probe_order_is_the_least_size_then_the_lowest_price_inside_the_limits() {
+        const USDC: i128 = 1_000_000_000;
+        // No limit: one lot at tick 100 (50.0).
+        assert_eq!(probed(&limited(None, None)), (100, 1));
+        assert_eq!(probed(&limited(None, Some(1))), (100, 1));
+        // 10 USDC: 200 lots at 50.0, within 500 lots or none.
+        assert_eq!(probed(&limited(Some(10 * USDC), Some(500))), (100, 200));
+        assert_eq!(probed(&limited(Some(10 * USDC), None)), (100, 200));
+        // Within 100 lots: 100.0 (tick 200), and a tick above it for a cent more.
+        assert_eq!(probed(&limited(Some(10 * USDC), Some(100))), (200, 100));
+        let cent = USDC / 100;
+        assert_eq!(
+            probed(&limited(Some(10 * USDC + cent), Some(100))),
+            (201, 100)
+        );
+
+        // A banded grid, 100.0 in steps of 0.5 and 200.0 (tick 400) in steps of 1.5: the price
+        // rises to the first band, then onto the second band's step, and the size to reach the
+        // minimum there.
+        let mut banded = limited(Some(30 * USDC + 5 * cent), Some(100));
+        let bands = [
+            (Decimal::new(1000, 1), Decimal::new(5, 1)),
+            (Decimal::new(2000, 1), Decimal::new(15, 1)),
+        ];
+        banded.price_grid = fbc_core::PriceGrid::banded(&bands).unwrap();
+        assert_eq!(probed(&banded), (603, 100));
+        banded.min_notional = None;
+        assert_eq!(probed(&banded), (200, 1));
+    }
+
+    #[test]
+    fn a_search_over_no_range_or_one_never_true_finds_nothing() {
+        assert_eq!(least_true(2, 1, |_| true), None);
+        assert_eq!(least_true(1, 9, |_| false), None);
+        assert_eq!(least_true(i64::MIN, i64::MAX, |x| x >= -3), Some(-3));
+        assert_eq!(least_true(5, 5, |_| true), Some(5));
     }
 
     #[test]

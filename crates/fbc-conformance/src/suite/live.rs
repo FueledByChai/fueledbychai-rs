@@ -120,6 +120,7 @@ impl<'s> Live<'s> {
         };
         let order = exec.order;
         let h = Harness::new(check, subject)?;
+        h.sized()?;
         if subject.setup().order_entry.is_none() {
             let what = "the venue declares order entry, yet the setup states no OrderEntryStub \
                         for the stub server to answer it with";

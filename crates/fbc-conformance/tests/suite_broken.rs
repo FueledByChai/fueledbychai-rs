@@ -5,18 +5,25 @@
 //! a control refused or sent without its request, an instrument cancel-all charged wider than
 //! its instrument, a codec that encodes differently once it has seen the order, and a setup
 //! the factory refuses; and where a check passes or is skipped with nothing to check.
+//!
+//! FBC-fuis's done line too: both checks pass a toy whose codec refuses an order below its
+//! instrument's `min_notional` or above its `max_order_size`, on a setup where the instrument's
+//! `min_size` at the probe's price is below `min_notional`; `caps_truthful` passes a toy whose
+//! identical cancel-all frames go to each instrument's own stream, and accepts `Unsupported`
+//! for a flag-conflict amend where `AmendCaps.refs` names no reference an amend can carry.
 
 use std::collections::BTreeSet;
 
 use fbc_conformance::suite::{self, Failure, Setup, Subject, Verdict};
 use fbc_conformance::toy::{self, ToyExec, ToyFactory, ToySigner};
 use fbc_core::{
-    AccountSummary, AssetKey, Batch, CancelBatch, CancelOnDisconnect, CancelScope, ConfigError,
-    CtxCall, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec,
-    ExecEndpoint, ExecEvent, ExecSink, Feature, FieldSpec, HttpFailure, HttpPlan, HttpTag, Inbound,
-    InboundSpans, InstrumentSpecDraft, MdCodec, MonoNs, NonceBlock, NotSentReason, OrderCaps,
-    OrderKindTag, PathStamps, RawFrame, RefKind, RpcId, Secrets, SpecTable, StreamId, Subscription,
-    Support, SymbolError, TagSet, TifTag, TimerTag, VenueCaps, VenueCommand, VenueConfig,
+    AccountSummary, AmendOrder, AssetKey, Batch, CancelBatch, CancelOnDisconnect, CancelScope,
+    Channel, ConfigError, CtxCall, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt,
+    EndpointPlan, ExecCodec, ExecEndpoint, ExecEvent, ExecSink, Feature, FieldSpec, HttpFailure,
+    HttpPlan, HttpTag, Inbound, InboundSpans, InstrumentId, InstrumentSpec, InstrumentSpecDraft,
+    Lots, MdCodec, Money, MonoNs, NonceBlock, NotSentReason, OrderCaps, OrderKindTag, OrderRef,
+    PathStamps, RawFrame, RefKind, RpcId, Secrets, Side, SpecTable, StreamId, Subscription,
+    Support, SymbolError, TagSet, Ticks, TifTag, TimerTag, VenueCaps, VenueCommand, VenueConfig,
     VenueError, VenueFactory, VenueMeta, WallNs,
 };
 
@@ -106,6 +113,15 @@ enum Twist {
     Widened,
     /// Once it has sent a placement, every later request also asks for a timer.
     Stateful,
+    /// An order or amend whose notional at its price is below its instrument's `min_notional`,
+    /// or whose size is above its `max_order_size`, is refused `Unencodable`.
+    ChecksSize,
+    /// An instrument cancel-all goes on a stream of that instrument's own, written as a
+    /// cancel-all of everything on its connection: the same bytes for every instrument.
+    PerInstrumentStreams,
+    /// Every amend is refused `Unsupported` before anything else is read: its amends name an
+    /// order by its placement nonce alone, which an amend never carries.
+    AmendsUnnamed,
 }
 
 /// What a broken toy's factory builds for order entry.
@@ -247,6 +263,17 @@ fn timer() -> Effect {
         tag: TimerTag(9),
         after: core::time::Duration::from_secs(1),
     }
+}
+
+/// Whether an order of `qty` at `px` (none for a market order) is outside what `spec` takes:
+/// above its largest order, or, priced, below its minimum notional.
+fn unfit(spec: &InstrumentSpec, px: Option<Ticks>, qty: Lots) -> bool {
+    let over = spec.max_order_size.is_some_and(|max| qty > max);
+    let under = match (spec.min_notional, px) {
+        (Some(min), Some(px)) => spec.notional(px, qty).is_none_or(|n| n.nanos < min.nanos),
+        _ => false,
+    };
+    over || under
 }
 
 impl ExecCodec for Twisted {
@@ -418,6 +445,52 @@ impl ExecCodec for Twisted {
                     fx.push(timer());
                 }
                 Ok(receipt)
+            }
+            (Twist::ChecksSize, result) => {
+                let sized = match cmd {
+                    VenueCommand::Place(o) => vec![(o.inst, o.kind.limit_px(), o.qty)],
+                    VenueCommand::PlaceBatch(os) => os
+                        .iter()
+                        .map(|o| (o.inst, o.kind.limit_px(), o.qty))
+                        .collect(),
+                    VenueCommand::Amend(a) => vec![(a.inst, Some(a.px), a.qty)],
+                    _ => Vec::new(),
+                };
+                let unfit = |&(inst, px, qty): &(InstrumentId, Option<Ticks>, Lots)| {
+                    unfit(specs.get(inst).unwrap(), px, qty)
+                };
+                if sized.iter().any(unfit) {
+                    fx.take();
+                    return Err(NotSentReason::Unencodable);
+                }
+                result
+            }
+            (Twist::PerInstrumentStreams, Ok(receipt)) => {
+                let VenueCommand::CancelAll(CancelScope::Instrument(inst)) = cmd else {
+                    return Ok(receipt);
+                };
+                let stream = StreamId(100 + u16::try_from(inst.get()).unwrap());
+                for effect in fx.take() {
+                    fx.push(match effect {
+                        Effect::Send {
+                            rpc, class, charge, ..
+                        } => Effect::Send {
+                            stream,
+                            frame: fbc_core::WireSlice::plain(
+                                format!("cancelall|rpc={}", rpc.unwrap().id.0).into_bytes(),
+                            ),
+                            rpc,
+                            class,
+                            charge,
+                        },
+                        other => other,
+                    });
+                }
+                Ok(receipt)
+            }
+            (Twist::AmendsUnnamed, _) if matches!(cmd, VenueCommand::Amend(_)) => {
+                fx.take();
+                Err(NotSentReason::Unsupported)
             }
             (_, result) => result,
         }
@@ -1149,6 +1222,234 @@ fn a_subject_shows_its_factory_and_fixtures() {
         shown.starts_with("Subject { factory: \"TOY-CONFORMANCE\", fixtures:"),
         "{shown}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-fuis: probe orders inside the instrument's size limits, cancel-alls compared with the
+// stream they go to, and amends no declared reference can name.
+// ---------------------------------------------------------------------------------------------
+
+/// The toy's setup with its first instrument's orders at least 10 USDC of notional and at most
+/// `max` lots: its least order, one lot (0.001) at the probe's tick 100 (50.0 USDC), is 0.05
+/// USDC.
+fn floored(max: i64) -> Setup {
+    let mut specs = toy::specs();
+    let mut a = specs.get(toy::INST_A).unwrap().clone();
+    a.min_notional = Some(Money::new(10_000_000_000, a.quote_ccy));
+    a.max_order_size = Some(Lots::new(max).unwrap());
+    specs.insert(a);
+    Setup { specs, ..assumed() }
+}
+
+/// An amend of the toy's first instrument to `qty` lots at tick `px`, naming it by the venue's
+/// id.
+fn amend_to(qty: i64, px: i64) -> VenueCommand {
+    let vid = toy::with_scope(|scope| scope.venue_order_id("conformance-0")).unwrap();
+    VenueCommand::Amend(AmendOrder {
+        target: OrderRef::Venue(vid),
+        inst: toy::INST_A,
+        side: Side::Buy,
+        tif: TifTag::Gtc,
+        channel: Channel::Public,
+        post_only: false,
+        reduce_only: false,
+        reducing: false,
+        px: Ticks(px),
+        qty: Lots::new(qty).unwrap(),
+        cum_filled: Lots::ZERO,
+    })
+}
+
+#[test]
+fn both_checks_pass_a_codec_refusing_orders_outside_the_instruments_size_limits() {
+    // Codex r4189398089: the instrument's least order at the probe's price is below its minimum
+    // notional, and the codec refuses it, as it refuses one above the largest order.
+    let size_checked = Broken::twisted(Twist::ChecksSize);
+    let setups: [fn() -> Setup; 2] = [
+        // 200 lots at tick 100 reach 10 USDC, within 500.
+        || floored(500),
+        // No order of at most 100 lots reaches it at tick 100; at tick 200 (100.0 USDC) 100 do.
+        || floored(100),
+    ];
+    for setup in setups {
+        let subject = Subject::new(&size_checked, FIXTURES, setup).unwrap();
+        for check in [suite::caps_truthful, suite::commands_selfcontained] {
+            let outcome = check(&subject);
+            assert!(matches!(outcome, Ok(Verdict::Passed { .. })), "{outcome:?}");
+        }
+    }
+    // The codec does refuse what the limits refuse, and sends what they take.
+    let specs = floored(100).specs;
+    let encode = |cmd: &VenueCommand| {
+        let ctx = EncodeCtx {
+            wall: WallNs(1),
+            mono: MonoNs(1),
+            nonces: NonceBlock::new(vec![1]),
+        };
+        let mut codec = Twisted::new(Twist::ChecksSize);
+        let (stamps, mut fx) = (&mut PathStamps::off(), Effects::new());
+        let result = codec.encode(cmd, RpcId(1), &specs, &ctx, stamps, &mut fx);
+        (result.err(), fx.len())
+    };
+    let refused = (Some(NotSentReason::Unencodable), 0);
+    // One lot at tick 100, 0.05 USDC; 99 lots at tick 200, 9.90 USDC; 101 lots, past 100.
+    for (qty, px) in [(1, 100), (99, 200), (101, 200)] {
+        assert_eq!(
+            encode(&amend_to(qty, px)),
+            refused,
+            "{qty} lots at tick {px}"
+        );
+    }
+    assert_eq!(encode(&amend_to(100, 200)), (None, 1));
+}
+
+#[test]
+fn a_setup_whose_instrument_takes_no_order_is_refused_naming_its_spec_field() {
+    /// Its least order, ten lots, is more than its largest, five.
+    fn inverted() -> Setup {
+        let mut specs = toy::specs();
+        let mut a = specs.get(toy::INST_A).unwrap().clone();
+        a.min_size = Lots::new(10).unwrap();
+        a.max_order_size = Some(Lots::new(5).unwrap());
+        specs.insert(a);
+        Setup { specs, ..assumed() }
+    }
+    /// No order reaches its minimum notional at any price.
+    fn unreachable() -> Setup {
+        let mut specs = toy::specs();
+        let mut a = specs.get(toy::INST_A).unwrap().clone();
+        a.min_notional = Some(Money::new(i128::MAX, a.quote_ccy));
+        specs.insert(a);
+        Setup { specs, ..assumed() }
+    }
+    /// No order of at most 500 lots reaches it.
+    fn bounded() -> Setup {
+        let mut setup = unreachable();
+        let mut a = setup.specs.get(toy::INST_A).unwrap().clone();
+        a.max_order_size = Some(Lots::new(500).unwrap());
+        setup.specs.insert(a);
+        setup
+    }
+    /// A setup, the spec field its refusal names and what it says.
+    type Case = (fn() -> Setup, &'static str, &'static str);
+    let cases: [Case; 3] = [
+        (
+            inverted,
+            "InstrumentSpec.max_order_size",
+            "TOYA-PERP takes orders of at most 5 lots, fewer than its least, 10 lots (its \
+             min_size, and one lot at least): no order fits to probe with",
+        ),
+        (
+            unreachable,
+            "InstrumentSpec.min_notional",
+            "no order of TOYA-PERP reaches its min_notional at a valid price: no order fits to \
+             probe with",
+        ),
+        (
+            bounded,
+            "InstrumentSpec.min_notional",
+            "no order of TOYA-PERP within its max_order_size of 500 lots reaches its \
+             min_notional at a valid price: no order fits to probe with",
+        ),
+    ];
+    for (setup, field, what) in cases {
+        let subject = Subject::new(&ToyFactory, FIXTURES, setup).unwrap();
+        for outcome in [
+            suite::caps_truthful(&subject),
+            suite::commands_selfcontained(&subject),
+            suite::encode_deterministic(&subject),
+            suite::amend_ack(&subject),
+        ] {
+            let failure = failed(outcome);
+            assert_eq!(said(&failure, field), what);
+            assert_eq!(failure.breaches.len(), 1, "{failure}");
+        }
+    }
+    // A venue taking no orders sizes none, whatever its instrument's limits.
+    let md_only = Broken {
+        caps: Some(|caps| caps.exec = None),
+        builds: Builds::Nothing,
+    };
+    let subject = Subject::new(&md_only, FIXTURES, inverted).unwrap();
+    let outcome = suite::caps_truthful(&subject);
+    assert!(matches!(outcome, Ok(Verdict::Passed { .. })), "{outcome:?}");
+}
+
+#[test]
+fn identical_cancel_alls_each_on_its_instruments_own_stream_are_not_widened() {
+    // Codex r4189398084: where each instrument's orders go on a connection of its own, a
+    // cancel-all of what its connection carries is that instrument's alone, though every
+    // instrument's is written alike.
+    let outcome = Broken::twisted(Twist::PerInstrumentStreams).caps_truthful();
+    assert!(matches!(outcome, Ok(Verdict::Passed { .. })), "{outcome:?}");
+    // The same bytes on the same stream still cancel beyond the instrument.
+    let failure = failed(Broken::twisted(Twist::AccountWide).caps_truthful());
+    let what = said(
+        &failure,
+        "OrderCaps.cancel_all_instrument is Native: never widened",
+    );
+    assert!(what.starts_with("written exactly as the cancel-all of another"));
+}
+
+/// The toy declaring that its amends name an order by its placement nonce alone, which no amend
+/// carries, and its codec refusing every amend for that first.
+const AMENDS_BY_NONCE: Broken = Broken {
+    caps: Some(|caps| {
+        let amend = order(caps).amend.as_mut().unwrap();
+        amend.refs = TagSet::of(&[RefKind::PlacementNonce]);
+    }),
+    builds: Builds::Codec(Twist::AmendsUnnamed),
+};
+
+/// The same, its amends declared to name an order by nothing.
+const AMENDS_BY_NOTHING: Broken = Broken {
+    caps: Some(|caps| order(caps).amend.as_mut().unwrap().refs = TagSet::none()),
+    builds: Builds::Codec(Twist::AmendsUnnamed),
+};
+
+#[test]
+fn an_amend_no_declared_reference_can_name_may_be_refused_unsupported_before_its_flags() {
+    // Codex r4189398073: a codec may read the amend's reference before its flags, and refuse
+    // the flag-conflict amend as Unsupported where no reference it carries is declared.
+    let conflict = "OrderCaps.flag_conflicts has (PostOnly, Ioc) (an amend)";
+    for broken in [AMENDS_BY_NONCE, AMENDS_BY_NOTHING] {
+        let probed = match broken.caps_truthful() {
+            Ok(Verdict::Passed { probed, .. }) => probed,
+            other => panic!("{other:?}"),
+        };
+        for name in [conflict, "AmendCaps.refs lacks [Venue, Client]"] {
+            assert!(probed.iter().any(|p| p == name), "{name}: {probed:#?}");
+        }
+    }
+    // Where the caps declare a reference an amend carries, its flag conflict is still refused
+    // for the conflict.
+    let failure = failed(Broken::twisted(Twist::AmendsUnnamed).caps_truthful());
+    assert_eq!(
+        said(&failure, conflict),
+        "refused as NotSent(Unsupported), not NotSent(FlagConflict)"
+    );
+    let control = said(&failure, "control: an amend");
+    assert!(control.starts_with("refused as NotSent(Unsupported) though the caps declare it"));
+    // No limit order allowed, every one a conflict: the base amend may be refused for its
+    // reference too.
+    let conflicted = Broken {
+        caps: Some(|caps| {
+            let o = order(caps);
+            o.amend.as_mut().unwrap().refs = TagSet::of(&[RefKind::PlacementNonce]);
+            o.tifs = TagSet::of(&[TifTag::Ioc]);
+            o.flag_conflicts = vec![(Feature::Ioc, Feature::Ioc)];
+        }),
+        builds: Builds::Codec(Twist::AmendsUnnamed),
+    };
+    let failure = failed(conflicted.caps_truthful());
+    for amend in [
+        "OrderCaps allows no limit order to amend",
+        "OrderCaps.flag_conflicts has (Ioc, Ioc) (an amend)",
+    ] {
+        assert!(!failure.names(amend), "{failure}");
+    }
+    // The toy's codec sends the IOC placements its caps now refuse.
+    assert!(failure.names("OrderCaps allows no order: the first it names"));
 }
 
 // ---------------------------------------------------------------------------------------------
