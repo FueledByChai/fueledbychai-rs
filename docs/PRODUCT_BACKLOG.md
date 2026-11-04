@@ -384,5 +384,52 @@ private trading path is enabled.
   declares `exec: None` and `Readiness::Record` (0117).
 - Hand-built fixtures from QFEX's published schemas prove timestamps, exact price and size
   conversion, malformed-frame atomicity, and subscription validation.
-- Instrument discovery and private order entry are separate tickets; only private-path evidence
-  can lift the recording ceiling.
+- Instrument discovery is a separate ticket, and private order entry is BT-702; only BT-702's
+  private-path evidence can lift the recording ceiling.
+
+### BT-702 — QFEX order entry, proven on pre-production before production admits it
+
+**Status:** Proposed  
+**User story:** As the owner, I want to place and cancel QFEX orders from an explicitly chosen
+primary account or subaccount through fbc-oms and the one runtime, but only once owner-assisted
+runs on QFEX's pre-production environment have shown what its replies, its cancel-on-disconnect
+and its resync actually do, so that no QFEX order reaches production on behaviour its pages
+leave open.
+
+Depends on BT-701 and BT-502: QFEX discovery (FBC-e3g7, under BT-701) gives order entry its
+instruments, and BT-502's conformance suite runs on its factory.
+
+**Acceptance criteria:**
+
+- QFEX's HMAC signer and private authentication live in the venue crate's `src/sign` and
+  `src/auth` (review paths), proven on SYNTHETIC vectors under `fixtures/qfex`, with credentials
+  reaching them only as `Secrets`. No credential or account identifier appears in clear in a
+  journal record, a log line or an error (0009, 0043). The provider account is named
+  explicitly and bound to the consumer's `AccountKey`, with no fallback to the primary account
+  (0122 items 1 to 3).
+- Order entry covers the owner's v1 scope in 0132's Context: limit GTC, post-only (ALO) and IOC
+  places, with native modify refused until a capture settles it, and cancels and queries by the
+  venue's order id only (0132 item 6). Every place and cancel goes through an fbc-oms
+  authorization (0013). A reply settles only the request it names, and a place unanswered at
+  its deadline ends `Unknown` and is never resent (0005, 0132 item 8). A rate refusal holds the
+  shared provider-user budget and settles nothing (0123, 0126, 0128). Decoder replay of a
+  redacted journal gives the same events and effects as live (0006), except where the
+  echo-redaction record (FBC-qyqw) narrows that for frames that echo a request.
+- Each epoch's account-wide cancel-on-disconnect arm, sent under the consumer's explicit
+  authority, is answered only as the pre-production capture shows, and the drop test shows
+  what a graceful close, the arm and an abrupt drop each cancel (0058, 0121; 0132 items 1, 2
+  and 4).
+- The resync is one bracket of order pages, positions and missed fills. It is declared
+  untrustworthy and seeds no position until a later record makes it trustworthy (0055; 0132
+  item 5).
+- Order entry opens only under the host-guarded pre-production probe mode (0132 item 6) and
+  runs only as owner-assisted runs (0067; 0132 item 7) on QFEX's pre-production environment,
+  with the primary and subaccount credentials QFEX supplies. The runs' report answers each
+  question 0132's Consequences list for the primary account and for a subaccount, and their
+  scrubbed evidence lands under `fixtures/qfex/exec-recorded/` (0009).
+- Every `ExecCaps` value cites a QFEX page or a captured fixture (0054), and the named
+  conformance suite passes on the QFEX factory (0025).
+- Production stays `exec: None` and `Readiness::Record` until a merged record admits QFEX order
+  entry under 0117 on this evidence, for the accounts the evidence covered (0132 item 4). That
+  record also makes the resync trustworthy with a measured `snapshot_lag_bound` (0109; 0132
+  items 4 and 5 and its Consequences).
