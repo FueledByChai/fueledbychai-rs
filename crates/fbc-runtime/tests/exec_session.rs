@@ -1103,8 +1103,51 @@ async fn a_nonce_source_that_reserves_another_count_for_a_timer_ends_the_session
     assert_eq!(session.current(), key(1));
 }
 
+/// How many times [`replayed`] plays a stalled-write scenario while the kernel refuses its
+/// 64 MiB write (FBC-l74d).
+const PLAYS: usize = 3;
+
+/// What the last play of `play` saw. Each play holds a 64 MiB write behind a peer that stopped
+/// reading, on a fresh session, and says beside what it saw whether the kernel refused that
+/// write (FBC-l74d).
+///
+/// The write-stall window ends such a write only once the play's `advance` reaches it: the clock
+/// is frozen otherwise. A play can still end early, because the kernel may refuse the write when
+/// the network memory it shares with every process on the machine runs short (ENOBUFS on
+/// macOS). The session then reads a failed write and ends the epoch, as it should, taking the
+/// epoch's timers and requests with it, so what the scenario waits for never comes. That play
+/// says nothing of what is under test. One whose epoch ended before the window while the session
+/// counted no write stall, which, with the control held and no other bound in reach, only the
+/// connection failing under the session gives, is played again, up to [`PLAYS`] times; the last
+/// play is returned whatever it saw, so a session that gets the scenario wrong still fails.
+async fn replayed<T>(mut play: impl AsyncFnMut() -> (T, bool)) -> T {
+    let mut plays = 1;
+    loop {
+        let (seen, refused) = play().await;
+        if !refused || plays == PLAYS {
+            return seen;
+        }
+        plays += 1;
+    }
+}
+
+/// Whether the handler `log` keeps has heard an epoch end: one that ended took its timers and
+/// requests with it, so what a scenario waits for meanwhile never comes ([`replayed`]).
+fn ended(log: Log) -> impl Fn() -> bool {
+    move || log.borrow().iter().any(|h| matches!(h, Heard::End(_)))
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_ends_the_epoch() {
+    let (write_stalls, timer, current) = replayed(play_a_timer_during_a_stalled_write).await;
+    assert_eq!(write_stalls, 1);
+    assert_eq!(timer, Some(TimerTag(5)));
+    assert_eq!(current, key(1));
+}
+
+/// One play of the test above: the write stalls counted, the first timer fired and the current
+/// epoch, and whether the kernel refused the write ([`replayed`]).
+async fn play_a_timer_during_a_stalled_write() -> ((u64, Option<TimerTag>, ConnKey), bool) {
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = ExecToy::leak();
@@ -1112,7 +1155,9 @@ async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_e
     let pacing = ReconnectPacing::new(ms(1_000), ms(8_000), 100, ms(60_000), Duration::MAX);
     let (mut config, _) = setup(venue, &server.url(), pacing.unwrap());
     config.write_stall = WriteStall::new(ms(3_000)).unwrap();
-    let (mut session, control) = ExecSession::new(config, |_| {}).unwrap();
+    let log = Log::default();
+    let ended = ended(Rc::clone(&log));
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
     let script = async move {
         let mut peer = server.accept().await;
         let _ = (peer.recv().await, peer.recv().await);
@@ -1127,7 +1172,12 @@ async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_e
         churn().await;
         assert!(venue.timers().is_empty());
         advance(ms(1)).await;
-        settle(|| venue.timers().len() == 1).await;
+        settle(|| venue.timers().len() == 1 || ended()).await;
+        if venue.timers().is_empty() {
+            // The epoch ended before the timer was due, and so before the window.
+            drop((control, release));
+            return true;
+        }
         // The write is abandoned at the window, 3 s after it began, and the epoch ends as a
         // drop: the next attempt waits the pacing's 1 s floor, so it starts 4 s in.
         for step in [2_499, 1, 999] {
@@ -1146,17 +1196,33 @@ async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_e
         }
         assert!(next.is_some());
         drop((control, release));
+        false
     };
-    let (run, ()) = tokio::join!(session.run(), script);
+    let (run, early) = tokio::join!(session.run(), script);
     run.unwrap();
     drop(frozen);
-    assert_eq!(session.counters().write_stalls, 1);
-    assert_eq!(venue.timers()[0].0, TimerTag(5));
-    assert_eq!(session.current(), key(1));
+    let write_stalls = session.counters().write_stalls;
+    let timer = venue.timers().first().map(|(tag, _)| *tag);
+    let refused = early && write_stalls == 0;
+    ((write_stalls, timer, session.current()), refused)
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the_write_ends() {
+    let (run, timers, write_stalls) = replayed(play_nonces_mis_reserved_during_a_write).await;
+    let short = ExecSessionError::Nonces {
+        asked: 1,
+        reserved: 0,
+    };
+    assert_eq!(run, Some(short));
+    assert_eq!(timers, 0);
+    assert_eq!(write_stalls, 1);
+}
+
+/// One play of the test above: the session's error, the timers that reached the codec and the
+/// write stalls counted, and whether the kernel refused the write ([`replayed`]).
+async fn play_nonces_mis_reserved_during_a_write() -> ((Option<ExecSessionError>, usize, u64), bool)
+{
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = ExecToy::leak();
@@ -1168,7 +1234,9 @@ async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the
         short_from: 1,
         log: Arc::default(),
     });
-    let (mut session, _control) = ExecSession::new(config, |_| {}).unwrap();
+    let log = Log::default();
+    let ended = ended(Rc::clone(&log));
+    let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
     let script = async move {
         let mut peer = server.accept().await;
         let _ = (peer.recv().await, peer.recv().await);
@@ -1180,21 +1248,26 @@ async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the
         churn().await;
         // The first firing's nonces are mis-reserved, so neither reaches the codec; the session
         // ends once the write it waits on is abandoned at the window.
-        for step in [500, 100, 2_400] {
+        for step in [500, 100] {
             advance(ms(step)).await;
             churn().await;
         }
-        release
+        if ended() {
+            // The epoch ended before the window, short of the pacing's 1 s floor: dropping the
+            // control ends the session before it reconnects.
+            drop((control, release));
+            return None;
+        }
+        advance(ms(2_400)).await;
+        churn().await;
+        Some((control, release))
     };
-    let (run, release) = tokio::join!(session.run(), script);
-    drop((frozen, release));
-    let short = ExecSessionError::Nonces {
-        asked: 1,
-        reserved: 0,
-    };
-    assert_eq!(run.err(), Some(short));
-    assert!(venue.timers().is_empty());
-    assert_eq!(session.counters().write_stalls, 1);
+    let (run, kept) = tokio::join!(session.run(), script);
+    let early = kept.is_none();
+    drop((frozen, kept));
+    let write_stalls = session.counters().write_stalls;
+    let refused = early && write_stalls == 0;
+    ((run.err(), venue.timers().len(), write_stalls), refused)
 }
 
 /// What woke the session while a write waited.
@@ -1207,46 +1280,27 @@ enum During {
     Http,
 }
 
-/// How many times [`heard_behind_a_stalled_write`] plays its scenario while the kernel refuses
-/// the 64 MiB write (FBC-l74d).
-const PLAYS: usize = 3;
-
 /// A frame decoding to a 64 MiB frame and then `then`, with `during` taken while the peer does
 /// not read the 64 MiB one: what the peer hears on that connection once it reads again, each
 /// frame by its length, until it closes (`None`) or the test has heard `frames`; and the events
-/// the handler was handed.
-///
-/// The write-stall window never ends that write: the clock is frozen, and only `During::Timer`
-/// moves it, 500 ms of the 3 s window. A play can still end early, because the kernel may refuse
-/// the write when the network memory it shares with every process on the machine runs short
-/// (ENOBUFS on macOS). The session then reads a failed write and ends the epoch, as it should,
-/// so the peer hears the connection end before the frame. That play says nothing of the order
-/// under test. One that heard the end first while the session counted no write stall, which,
-/// with the control held and no other bound in reach, only the connection failing under the
-/// session gives, is played again on a fresh session, up to [`PLAYS`] times; the last play is
-/// returned whatever it heard, so an order the session gets wrong still fails (FBC-l74d).
+/// the handler was handed. Only `During::Timer` moves the clock, 500 ms of the 3 s window; a play
+/// that heard the end before the 64 MiB frame while the session counted no write stall is played
+/// again ([`replayed`]).
 async fn heard_behind_a_stalled_write(
     during: During,
     then: &str,
     frames: usize,
 ) -> (Vec<Option<usize>>, usize) {
-    let mut plays = 1;
-    loop {
-        let (heard, events, refused) = play_behind_a_stalled_write(during, then, frames).await;
-        if !refused || plays == PLAYS {
-            return (heard, events);
-        }
-        plays += 1;
-    }
+    replayed(async || play_behind_a_stalled_write(during, then, frames).await).await
 }
 
-/// One play of [`heard_behind_a_stalled_write`]'s scenario: what the peer heard, the events the
-/// handler was handed, and whether the kernel refused the write.
+/// One play of [`heard_behind_a_stalled_write`]'s scenario: what the peer heard and the events
+/// the handler was handed, and whether the kernel refused the write.
 async fn play_behind_a_stalled_write(
     during: During,
     then: &str,
     frames: usize,
-) -> (Vec<Option<usize>>, usize, bool) {
+) -> ((Vec<Option<usize>>, usize), bool) {
     let frozen = freeze();
     let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ExecToy::leak();
@@ -1256,12 +1310,7 @@ async fn play_behind_a_stalled_write(
     config.write_stall = WriteStall::new(ms(3_000)).unwrap();
     let log = Log::default();
     let (mut session, control) = ExecSession::new(config, Keep::new(&log)).unwrap();
-    // An epoch that ended took its timers and requests with it: what `during` waits for never
-    // comes.
-    let ended = {
-        let log = Rc::clone(&log);
-        move || log.borrow().iter().any(|h| matches!(h, Heard::End(_)))
-    };
+    let ended = ended(Rc::clone(&log));
     let script = async move {
         let mut peer = server.accept().await;
         let _ = (peer.recv().await, peer.recv().await);
@@ -1300,7 +1349,7 @@ async fn play_behind_a_stalled_write(
     run.unwrap();
     drop(frozen);
     let refused = heard.first() == Some(&None) && session.counters().write_stalls == 0;
-    (heard, events(&log), refused)
+    ((heard, events(&log)), refused)
 }
 
 const BIG: usize = 65_536 * 1024;
@@ -1337,6 +1386,15 @@ async fn a_reconnect_behind_a_waiting_write_ends_the_epoch_before_a_timers_frame
 /// stop (Reviewer B, B6).
 #[tokio::test(start_paused = true)]
 async fn a_request_asked_for_while_a_write_waits_after_the_stop_is_never_started_or_charged() {
+    let (answers, charged) = replayed(play_a_request_asked_for_after_the_stop).await;
+    assert_eq!(answers, ["7:200:stop|ask|tag=8|path=/y"]);
+    // Since the result came back, only the stop's close frame was charged: not request 8.
+    assert_eq!(charged, 1);
+}
+
+/// One play of the test above: the results the codec took and the units charged since the first
+/// came back, and whether the kernel refused the write ([`replayed`]).
+async fn play_a_request_asked_for_after_the_stop() -> ((Vec<String>, u64), bool) {
     let frozen = freeze();
     let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ExecToy::leak();
@@ -1348,6 +1406,7 @@ async fn a_request_asked_for_while_a_write_waits_after_the_stop_is_never_started
     // The units charged to the toy's one limit, the account's; the clock never moves.
     let account = || limiter.used(Instant::now(), 0, BucketKey::Shared);
     let log = Log::default();
+    let ended = ended(Rc::clone(&log));
     let handler = Keep::new(&log);
     let slot = Rc::clone(&handler.control);
     let (mut session, control) = ExecSession::new(config, handler).unwrap();
@@ -1365,16 +1424,21 @@ async fn a_request_asked_for_while_a_write_waits_after_the_stop_is_never_started
         asked
             .answer("HTTP/1.1 200 OK", "stop|ask|tag=8|path=/y")
             .await;
-        settle(|| venue.answers().len() == 1).await;
+        settle(|| venue.answers().len() == 1 || ended()).await;
+        let early = venue.answers().is_empty();
+        if early {
+            // The epoch ended before the result came back, so it reached no codec and no event
+            // stops the session: dropping the control does, before it reconnects.
+            drop(slot.borrow_mut().take());
+        }
         drop(release);
-        before
+        (before, early)
     };
-    let (run, before) = tokio::join!(session.run(), script);
+    let (run, (before, early)) = tokio::join!(session.run(), script);
     run.unwrap();
     drop(frozen);
-    assert_eq!(venue.answers(), ["7:200:stop|ask|tag=8|path=/y"]);
-    // Since the result came back, only the stop's close frame was charged: not request 8.
-    assert_eq!(account(), before + 1);
+    let refused = early && session.counters().write_stalls == 0;
+    ((venue.answers(), account() - before), refused)
 }
 
 // ---------------------------------------------------------------------------------------------
