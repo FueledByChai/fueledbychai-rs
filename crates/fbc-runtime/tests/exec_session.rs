@@ -1159,15 +1159,18 @@ async fn a_refused_play_is_played_again_up_to_plays_times_and_the_last_is_return
 
 #[tokio::test(start_paused = true)]
 async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_ends_the_epoch() {
-    let (write_stalls, timer, current) = replayed(play_a_timer_during_a_stalled_write).await;
+    let (early, write_stalls, timer, current) = replayed(play_a_timer_during_a_stalled_write).await;
+    // Not before the window either, stall counted or not (DeepSeek DS-1 on 07e55ea8).
+    assert!(!early, "the epoch ended before the write-stall window");
     assert_eq!(write_stalls, 1);
     assert_eq!(timer, Some(TimerTag(5)));
     assert_eq!(current, key(1));
 }
 
-/// One play of the test above: the write stalls counted, the first timer fired and the current
-/// epoch, and whether the kernel refused the write ([`replayed`]).
-async fn play_a_timer_during_a_stalled_write() -> ((u64, Option<TimerTag>, ConnKey), bool) {
+/// One play of the test above: whether the epoch ended before the window, the write stalls
+/// counted, the first timer fired and the current epoch; and whether the kernel refused the
+/// write ([`replayed`]).
+async fn play_a_timer_during_a_stalled_write() -> ((bool, u64, Option<TimerTag>, ConnKey), bool) {
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = ExecToy::leak();
@@ -1228,12 +1231,15 @@ async fn play_a_timer_during_a_stalled_write() -> ((u64, Option<TimerTag>, ConnK
     let write_stalls = session.counters().write_stalls;
     let timer = venue.timers().first().map(|(tag, _)| *tag);
     let refused = early && write_stalls == 0;
-    ((write_stalls, timer, session.current()), refused)
+    ((early, write_stalls, timer, session.current()), refused)
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the_write_ends() {
-    let (run, timers, write_stalls) = replayed(play_nonces_mis_reserved_during_a_write).await;
+    let (early, run, timers, write_stalls) =
+        replayed(play_nonces_mis_reserved_during_a_write).await;
+    // Not before the window either, stall counted or not (DeepSeek DS-1 on 07e55ea8).
+    assert!(!early, "the epoch ended before the write-stall window");
     let short = ExecSessionError::Nonces {
         asked: 1,
         reserved: 0,
@@ -1243,10 +1249,11 @@ async fn a_timers_nonces_mis_reserved_while_a_write_waits_end_the_session_as_the
     assert_eq!(write_stalls, 1);
 }
 
-/// One play of the test above: the session's error, the timers that reached the codec and the
-/// write stalls counted, and whether the kernel refused the write ([`replayed`]).
-async fn play_nonces_mis_reserved_during_a_write() -> ((Option<ExecSessionError>, usize, u64), bool)
-{
+/// One play of the test above: whether the epoch ended before the window, the session's error,
+/// the timers that reached the codec and the write stalls counted; and whether the kernel
+/// refused the write ([`replayed`]).
+async fn play_nonces_mis_reserved_during_a_write()
+-> ((bool, Option<ExecSessionError>, usize, u64), bool) {
     let frozen = freeze();
     let mut server = ScriptedWs::start().await;
     let venue = ExecToy::leak();
@@ -1291,7 +1298,10 @@ async fn play_nonces_mis_reserved_during_a_write() -> ((Option<ExecSessionError>
     drop((frozen, kept));
     let write_stalls = session.counters().write_stalls;
     let refused = early && write_stalls == 0;
-    ((run.err(), venue.timers().len(), write_stalls), refused)
+    (
+        (early, run.err(), venue.timers().len(), write_stalls),
+        refused,
+    )
 }
 
 /// What woke the session while a write waited.
