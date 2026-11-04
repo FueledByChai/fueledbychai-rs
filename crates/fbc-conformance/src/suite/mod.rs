@@ -83,6 +83,19 @@
 //! An authenticated session holds no order state, so a bootstrapped codec has still seen
 //! nothing of any order. Without a bootstrap the codec is used as built, never opened.
 //!
+//! # The orders the checks build
+//!
+//! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`] and the order-entry
+//! checks build their orders on the first instrument of the [`Setup`]'s spec table, at one price
+//! and size inside its limits (Codex r4189398089): the valid price at or above tick 100 on its
+//! grid and its `min_size` (one lot at least), the size raised until the order's notional
+//! ([`InstrumentSpec::notional`](fbc_core::InstrumentSpec::notional)) reaches its
+//! `min_notional`, never past its `max_order_size`, and the price raised, to the lowest valid
+//! one at which the largest order reaches it, where no size within that does at that price. A
+//! setup whose first instrument takes no such order fails those checks, naming
+//! `InstrumentSpec.max_order_size` (below `min_size`) or `InstrumentSpec.min_notional` (reached
+//! at no valid price), rather than send orders a codec may rightly refuse.
+//!
 //! # The order-entry checks
 //!
 //! The suite knows no venue's protocol, so a venue that declares order entry states, in

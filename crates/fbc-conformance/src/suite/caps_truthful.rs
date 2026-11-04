@@ -17,7 +17,16 @@
 //! - a refusal asks for no effect: no frame, no HTTP request, no timer;
 //! - an instrument cancel-all the caps declare is sent charged as a cancel-all of that
 //!   instrument and nothing wider (an account-wide request's charge names no instrument), and
-//!   one they leave out is refused rather than widened to the account.
+//!   written differently from another instrument's, or on a stream of its own; one they leave
+//!   out is refused rather than widened to the account.
+//!
+//! An amend no reference the caps declare for amends can name (they declare none, or only a
+//! placement nonce, which no amend carries) may be refused `NotSent(Unsupported)` for that
+//! before its shape is read, so each amend probe on such caps accepts that refusal too.
+//!
+//! Every order a probe builds is priced and sized inside the instrument's limits: its
+//! `min_notional` reached, its `max_order_size` kept. A setup whose first instrument takes no
+//! such order fails, naming the spec field.
 //!
 //! Beside the probes, one control per operation the caps declare (the plainest allowed
 //! placement, batch, amend, cancel, batch cancel and query, an account cancel-all, arming and
@@ -56,7 +65,7 @@ enum Expect {
     /// Sent, carrying its request: a control.
     Sent,
     /// Sent, carrying its request, every charge a cancel-all of the probe's instrument, and
-    /// written differently from the same cancel-all of another instrument.
+    /// written differently from the same cancel-all of another instrument, or on another stream.
     SentOnInstrument,
 }
 
@@ -88,6 +97,7 @@ pub fn caps_truthful(subject: &Subject<'_>) -> Result<Verdict, Failure> {
             )),
         };
     };
+    h.sized()?;
     let probes = probes(&h, &exec.order)?;
     let mut breaches = Vec::new();
     let mut probed = Vec::new();
@@ -158,9 +168,11 @@ fn judge(h: &Harness<'_>, p: &Probe, e: &Encoded, other: Option<&Encoded>) -> Op
 
 /// Why an instrument cancel-all sent as `e` reaches beyond its instrument, if it does: a
 /// charge that is not a cancel-all of the instrument (an account-wide request's charge names
-/// none), or a request written exactly as the same cancel-all of another instrument is, which
-/// cannot name its own (Codex r4188991848). The kit reads no venue's wire, so a request that
-/// names its instrument somewhere and still cancels the account is beyond it.
+/// none), or a request written exactly as the same cancel-all of another instrument is, on the
+/// same stream, which cannot name its own (Codex r4188991848). The same bytes on a stream of
+/// each instrument's own are a cancel-all of what that connection carries, which is that
+/// instrument's (Codex r4189398084). The kit reads no venue's wire, so a request that names
+/// its instrument somewhere and still cancels the account is beyond it.
 fn widened(h: &Harness<'_>, e: &Encoded, other: Option<&Encoded>) -> Option<String> {
     let inst = h.inst.get();
     let charges = e.fx.as_slice().iter().filter_map(Effect::charge);
@@ -203,13 +215,15 @@ fn widened(h: &Harness<'_>, e: &Encoded, other: Option<&Encoded>) -> Option<Stri
     })
 }
 
-/// The bytes each frame or HTTP request in `fx` puts on the wire: a frame's, a request's
-/// method, URL, headers and body.
+/// What each frame or HTTP request in `fx` puts on the wire, and where: a frame's stream and
+/// bytes, a request's method, URL, headers and body.
 fn requests(fx: &Effects) -> Vec<String> {
     fx.as_slice()
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Send { frame, .. } => Some(format!("{:?}", frame.bytes())),
+            Effect::Send { stream, frame, .. } => {
+                Some(format!("stream {} {:?}", stream.0, frame.bytes()))
+            }
             Effect::Http { req, .. } => Some(format!(
                 "{:?} {} {:?} {:?}",
                 req.method,
@@ -429,6 +443,16 @@ fn amend_shapes(h: &Harness<'_>, o: &OrderCaps, ids: &Ids, push: Push<'_>) {
         return push(label, amend(base.shape, both), expect);
     };
     let named = AMEND_REFS.iter().any(|&k| caps.refs.contains(k));
+    // An amend no declared reference names may be refused as `Unsupported` for that before
+    // its shape is read (Codex r4189398073); the shape's refusals are only `Unsupported` and
+    // `FlagConflict`, so a `FlagConflict` probe takes `Unsupported` as its other reason.
+    let unnamed = |expect: Expect| match expect {
+        Expect::Refused { want, .. } if !named && want != Unsupported => Expect::Refused {
+            want,
+            or: Some(Unsupported),
+        },
+        expect => expect,
+    };
     match base.refused {
         None if named => {
             let cmd = amend(base.shape, both.clone());
@@ -438,23 +462,17 @@ fn amend_shapes(h: &Harness<'_>, o: &OrderCaps, ids: &Ids, push: Push<'_>) {
         Some(why) => {
             let label = "OrderCaps allows no limit order to amend".to_owned();
             let cmd = amend(base.shape, both.clone());
-            push(
-                label,
-                cmd,
-                Expect::Refused {
-                    want: why,
-                    or: None,
-                },
-            );
+            let expect = Expect::Refused {
+                want: why,
+                or: None,
+            };
+            push(label, cmd, unnamed(expect));
         }
     }
     for (label, shape, why) in variants(o, base.shape, false) {
         let label = format!("{label} (an amend)");
-        push(
-            label,
-            amend(shape, both.clone()),
-            base.expect(o, shape, why),
-        );
+        let expect = unnamed(base.expect(o, shape, why));
+        push(label, amend(shape, both.clone()), expect);
     }
     let left_out = undeclared(caps.refs, &AMEND_REFS);
     if let Some((target, _)) = ids.carrying(0, &left_out) {

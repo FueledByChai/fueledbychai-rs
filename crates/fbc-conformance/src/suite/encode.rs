@@ -42,6 +42,7 @@ pub fn encode_deterministic(subject: &Subject<'_>) -> Result<Verdict, Failure> {
             why: "the caps declare no order entry (VenueCaps.exec is None): it encodes nothing",
         });
     };
+    h.sized()?;
     let mut probes: Vec<Probe> = subject
         .setup()
         .goldens
