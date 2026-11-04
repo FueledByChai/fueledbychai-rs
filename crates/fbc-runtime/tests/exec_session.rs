@@ -1137,6 +1137,26 @@ fn ended(log: Log) -> impl Fn() -> bool {
     move || log.borrow().iter().any(|h| matches!(h, Heard::End(_)))
 }
 
+/// [`replayed`] plays again only while a play says the kernel refused its write, at most
+/// [`PLAYS`] times, and returns the last play's outcome whatever it says (DeepSeek DS-1 on
+/// f3ad0533): scripted plays, since only a kernel's refusal takes a real one there.
+#[tokio::test]
+async fn a_refused_play_is_played_again_up_to_plays_times_and_the_last_is_returned() {
+    // The outcome returned and the plays made, when the first `refusals` plays are refused.
+    async fn played(refusals: usize) -> (usize, usize) {
+        let mut plays = 0;
+        let seen = replayed(async || {
+            plays += 1;
+            (plays, plays <= refusals)
+        })
+        .await;
+        (seen, plays)
+    }
+    assert_eq!(played(0).await, (1, 1));
+    assert_eq!(played(1).await, (2, 2));
+    assert_eq!(played(usize::MAX).await, (PLAYS, PLAYS));
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_timer_due_during_a_stalled_write_fires_into_on_timer_and_the_window_ends_the_epoch() {
     let (write_stalls, timer, current) = replayed(play_a_timer_during_a_stalled_write).await;
