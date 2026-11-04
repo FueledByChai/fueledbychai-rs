@@ -1,104 +1,97 @@
-//! Classification of QFEX trade WebSocket rate errors. The echo is untrusted and may contain
-//! credentials; only its message type is used, and no echoed bytes enter diagnostics.
+//! What QFEX's trade WebSocket says about its rate budgets, read from the bytes its frames keep
+//! in clear (decisions 0126 and 0134).
+//!
+//! - [`operation`]: the bucket a request type is charged to, from QFEX's
+//!   [rate page](https://docs.qfex.com/websocket/rate), whose two buckets per provider user,
+//!   general and cancel, [`crate::trade_rate`] declares. An echo's `type` is the only place a
+//!   refusal names its bucket.
+//! - [`hint`]: the retry hint, only in one of the two documented forms of a `message`, `Rate
+//!   limit exceeded, retry after N seconds` (the rate page) and `Too many requests. Please retry
+//!   after Nms.` (the [errors page](https://docs.qfex.com/websocket/errors)).
+//! - [`can_echo`]: whether a frame can echo a request (0126): it names `incoming_message`, after
+//!   JSON escapes are decoded.
+//!
+//! This is budget feedback only: no refusal is evidence that a sent order did or did not take
+//! effect, and nothing here settles or resends a request.
 
 use std::time::Duration;
 
-use fbc_core::{Effect, InboundSpans, OpKind, RateCharge, StreamId};
-use serde_json::Value;
+use fbc_core::OpKind;
 
-/// A provider refusal and its unambiguous operation, if known. This is budget feedback only:
-/// it is never evidence that a sent order did or did not take effect.
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub struct RateRefusal {
-    /// The operation, only when its echoed type has one documented bucket.
-    pub charge: Option<RateCharge>,
-    /// The provider's parsed retry-after duration, when valid.
-    pub retry_after: Option<Duration>,
+/// Each request type the codec maps to an operation, and so to a bucket: the types a journal
+/// keeps in clear when an err or an ack echoes one (0134 item 3). `auth` is never one, nor is
+/// `cancel_on_disconnect`, whose bucket the rate page does not name, so its refusal holds both.
+pub(crate) const MAPPED: [(&str, OpKind); 14] = [
+    ("add_order", OpKind::Place),
+    ("modify_order", OpKind::Amend),
+    ("modify_stop_order", OpKind::Amend),
+    ("get_order", OpKind::Query),
+    ("get_user_orders", OpKind::Query),
+    ("get_user_trades", OpKind::Query),
+    ("get_user_leverage", OpKind::Query),
+    ("get_available_leverage_levels", OpKind::Query),
+    ("subscribe", OpKind::Subscribe),
+    ("unsubscribe", OpKind::Subscribe),
+    ("set_user_leverage", OpKind::Control),
+    ("cancel_order", OpKind::Cancel),
+    ("cancel_stop_order", OpKind::Cancel),
+    ("cancel_all_orders", OpKind::CancelAll),
+];
+
+/// The operation an echoed request type is charged as, exactly as written.
+pub(crate) fn operation(kind: &str) -> Option<OpKind> {
+    MAPPED
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, op)| *op)
 }
 
-/// Parse a QFEX rate refusal without retaining its echoed message.
-pub fn refusal(value: &Value) -> Option<RateRefusal> {
-    let fields = value.as_object()?;
-    if fields.get("type")?.as_str()? != "Err"
-        || fields.get("error_code")?.as_str()? != "RateLimited"
-    {
-        return None;
-    }
-    let operation = fields
-        .get("incoming_message")
-        .and_then(Value::as_object)
-        .and_then(|echo| echo.get("type"))
-        .and_then(Value::as_str)
-        .and_then(|kind| match kind {
-            "add_order" => Some(OpKind::Place),
-            "modify_order" | "modify_stop_order" => Some(OpKind::Amend),
-            "get_order"
-            | "get_user_orders"
-            | "get_user_trades"
-            | "get_user_leverage"
-            | "get_available_leverage_levels" => Some(OpKind::Query),
-            "subscribe" | "unsubscribe" => Some(OpKind::Subscribe),
-            "set_user_leverage" => Some(OpKind::Control),
-            "cancel_order" | "cancel_stop_order" => Some(OpKind::Cancel),
-            "cancel_all_orders" => Some(OpKind::CancelAll),
-            // Published rate documentation does not name COD's bucket. Hold both.
-            _ => None,
-        });
-    Some(RateRefusal {
-        charge: operation.map(|op| RateCharge::one(op, None)),
-        retry_after: fields
-            .get("message")
-            .and_then(Value::as_str)
-            .and_then(parse_retry),
+/// The two documented forms: the text before N, the text after it, and N's unit.
+const FORMS: [(&str, &str, u64); 2] = [
+    ("Rate limit exceeded, retry after ", " seconds", 1_000),
+    ("Too many requests. Please retry after ", "ms.", 1),
+];
+
+/// N and its unit in milliseconds, when `message` is exactly one of the two documented forms
+/// with N one or more ASCII digits.
+fn form(message: &str) -> Option<(&str, u64)> {
+    FORMS.iter().find_map(|(before, after, unit)| {
+        let n = message.strip_prefix(before)?.strip_suffix(after)?;
+        (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())).then_some((n, *unit))
     })
 }
 
-/// Translate a rate refusal into budget feedback for its WebSocket stream. The effect carries
-/// neither an RPC id nor the echoed request, so it cannot settle or resend a sent command.
-pub fn effect(stream: StreamId, value: &Value) -> Option<Effect> {
-    let parsed = refusal(value)?;
-    Some(Effect::RateLimited {
-        stream,
-        charge: parsed.charge,
-        retry_after: parsed.retry_after,
-    })
+/// Whether `message` is exactly one of the two documented hint forms, whatever its N: what the
+/// journal keeps in clear of a RateLimited err's `message` (0134 item 3).
+pub(crate) fn is_hint_form(message: &str) -> bool {
+    form(message).is_some()
 }
 
-fn parse_retry(message: &str) -> Option<Duration> {
-    let tail = message.strip_prefix("Rate limit exceeded, retry after ")?;
-    let number = tail.strip_suffix(" seconds")?;
-    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    number
-        .parse::<u64>()
+/// The hold `message` asks for: N seconds or N milliseconds in one of the two forms. An N of
+/// zero, or one too large for a `Duration` of milliseconds, is an invalid hint and gives none,
+/// so the hold lasts at least the declared window (0126, 0134 item 5).
+pub(crate) fn hint(message: &str) -> Option<Duration> {
+    let (n, unit) = form(message)?;
+    n.parse::<u64>()
         .ok()
         .filter(|n| *n > 0)
-        .map(Duration::from_secs)
+        .and_then(|n| n.checked_mul(unit))
+        .map(Duration::from_millis)
 }
 
-/// Redact the entire inbound frame whenever it may echo the original request, even when the
-/// envelope is malformed. A malformed frame can still spell the field with JSON Unicode
-/// escapes, so looking only for its literal bytes would leave echoed credentials in the journal.
-pub fn echoed_frame_spans(bytes: &[u8]) -> Option<InboundSpans> {
-    if contains_ascii_after_json_escapes(bytes, b"incoming_message") {
-        let end = u32::try_from(bytes.len()).ok()?;
-        return Some(InboundSpans::frame(std::iter::once(0..end).collect()));
-    }
-    None
-}
-
-fn contains_ascii_after_json_escapes(bytes: &[u8], needle: &[u8]) -> bool {
-    let contains = |haystack: &[u8]| haystack.windows(needle.len()).any(|part| part == needle);
+/// Whether `bytes` can echo a request: they name `incoming_message`, literally or once JSON
+/// `\u` escapes of ASCII are decoded, valid JSON or not. A false positive only keeps more of a
+/// frame from the journal.
+pub(crate) fn can_echo(bytes: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"incoming_message";
+    let contains = |haystack: &[u8]| haystack.windows(NEEDLE.len()).any(|part| part == NEEDLE);
     if contains(bytes) {
         return true;
     }
     if !bytes.contains(&b'\\') {
         return false;
     }
-    // This is a conservative redaction scan, not a second JSON parser. Decode ASCII Unicode
-    // escapes anywhere in the frame so it still finds the marker in malformed JSON. A false
-    // positive only redacts more; a malformed escape is copied unchanged.
+    // A conservative scan, not a second JSON parser: a malformed escape is copied unchanged.
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
@@ -123,217 +116,75 @@ fn contains_ascii_after_json_escapes(bytes: &[u8], needle: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fbc_core::{ConnKey, LimitScope, RateLimit, TagSet, TrafficClass, Via};
-    use fbc_runtime::{RateLimiter, RateUserKey, Request, SafetyReserve};
-    use serde_json::json;
-    use tokio::time::Instant;
 
     #[test]
-    fn classifies_only_exact_echoed_operations_and_preserves_hint() {
-        let frame = json!({"type":"Err", "error_code":"RateLimited",
-            "message":"Rate limit exceeded, retry after 7 seconds",
-            "incoming_message":{"type":"cancel_order", "signature":"secret"}});
-        let got = refusal(&frame).unwrap();
-        assert_eq!(got.charge.unwrap().op, OpKind::Cancel);
-        assert_eq!(got.retry_after, Some(Duration::from_secs(7)));
-        assert!(matches!(
-            effect(StreamId(0), &frame),
-            Some(Effect::RateLimited {
-                charge: Some(_),
-                retry_after: Some(_),
-                ..
-            })
-        ));
-        for echo in [
-            json!({}),
-            json!({"type":"cancel_on_disconnect"}),
-            json!({"type":"cancel_order,add_order"}),
-        ] {
-            let mut unknown = frame.clone();
-            unknown["incoming_message"] = echo;
-            assert!(refusal(&unknown).unwrap().charge.is_none());
+    fn each_mapped_type_has_its_bucket_and_nothing_else_does() {
+        for (kind, op) in MAPPED {
+            assert_eq!(operation(kind), Some(op));
         }
-        assert!(refusal(&json!({"type":"Err", "error_code":"Other"})).is_none());
+        for kind in [
+            "auth",
+            "cancel_on_disconnect",
+            "transfer_balance",
+            "Add_order",
+            " add_order",
+            "",
+        ] {
+            assert_eq!(operation(kind), None, "{kind}");
+        }
     }
 
     #[test]
-    fn malformed_envelopes_and_hints_fail_closed() {
-        for value in [
-            json!(null),
-            json!({"error_code":"RateLimited"}),
-            json!({"type":"Err"}),
-            json!({"type":"err", "error_code":"RateLimited"}),
-        ] {
-            assert!(effect(StreamId(0), &value).is_none());
-        }
-        for hint in [
+    fn only_the_two_documented_forms_give_a_hint() {
+        let secs = Duration::from_secs;
+        assert_eq!(
+            hint("Rate limit exceeded, retry after 7 seconds"),
+            Some(secs(7))
+        );
+        assert_eq!(
+            hint("Rate limit exceeded, retry after 007 seconds"),
+            Some(secs(7))
+        );
+        assert_eq!(
+            hint("Too many requests. Please retry after 200ms."),
+            Some(Duration::from_millis(200))
+        );
+        for message in [
             "Rate limit exceeded, retry after x seconds",
-            "Rate limit exceeded, retry after 0 seconds",
-            "Rate limit exceeded, retry after 2 second",
             "Rate limit exceeded, retry after  seconds",
+            "Rate limit exceeded, retry after 2 second",
+            "Rate limit exceeded, retry after -2 seconds",
+            "Rate limit exceeded, retry after 2 seconds.",
+            "Too many requests. Please retry after 200ms",
+            "Too many requests. Please retry after 0.2s.",
+            "Too many requests.",
+            "",
         ] {
-            let value = json!({"type":"Err", "error_code":"RateLimited",
-                "message":hint, "incoming_message":{"type":"add_order"}});
-            assert_eq!(refusal(&value).unwrap().retry_after, None);
+            assert!(!is_hint_form(message), "{message}");
+            assert_eq!(hint(message), None, "{message}");
         }
-        assert!(echoed_frame_spans(br#"{"type":"Ok"}"#).is_none());
-        let malformed = br#"{"error_code":"RateLimited","incoming_message":{"signature":"secret"}"#;
-        assert_eq!(
-            echoed_frame_spans(malformed).unwrap().body()[0],
-            0..malformed.len() as u32
-        );
-    }
-
-    #[test]
-    fn known_echoed_types_select_only_their_declared_bucket() {
-        for (kind, operation) in [
-            ("add_order", OpKind::Place),
-            ("modify_order", OpKind::Amend),
-            ("modify_stop_order", OpKind::Amend),
-            ("get_order", OpKind::Query),
-            ("get_user_orders", OpKind::Query),
-            ("get_user_trades", OpKind::Query),
-            ("get_user_leverage", OpKind::Query),
-            ("get_available_leverage_levels", OpKind::Query),
-            ("subscribe", OpKind::Subscribe),
-            ("unsubscribe", OpKind::Subscribe),
-            ("set_user_leverage", OpKind::Control),
-            ("cancel_order", OpKind::Cancel),
-            ("cancel_stop_order", OpKind::Cancel),
-            ("cancel_all_orders", OpKind::CancelAll),
+        // Kept in clear, but no hold of its own: zero, and too large for a Duration.
+        for message in [
+            "Rate limit exceeded, retry after 0 seconds",
+            "Too many requests. Please retry after 0ms.",
+            "Rate limit exceeded, retry after 18446744073709552 seconds",
+            "Too many requests. Please retry after 18446744073709551616ms.",
         ] {
-            let value = json!({"type":"Err", "error_code":"RateLimited",
-                "incoming_message":{"type":kind}});
-            assert_eq!(refusal(&value).unwrap().charge.unwrap().op, operation);
+            assert!(is_hint_form(message), "{message}");
+            assert_eq!(hint(message), None, "{message}");
         }
     }
 
     #[test]
-    fn echoed_credentials_are_whole_frame_redacted_without_diagnostics() {
-        let raw = br#"{"type":"Err","error_code":"RateLimited","incoming_message":{"type":"auth","signature":"secret"}}"#;
-        assert_eq!(
-            echoed_frame_spans(raw).unwrap().body()[0],
-            0..raw.len() as u32
-        );
-        let refusal = refusal(&serde_json::from_slice(raw).unwrap()).unwrap();
-        assert!(refusal.charge.is_none());
-        assert!(!format!("{refusal:?}").contains("secret"));
-        let escaped = br#"{"type":"Err","error_code":"RateLimit\u0065d","incoming_message":{"signature":"secret"}}"#;
-        assert_eq!(
-            echoed_frame_spans(escaped).unwrap().body()[0],
-            0..escaped.len() as u32
-        );
-        let malformed_escaped = br#"{"type":"Err","error_code":"RateLimit\u0065d","incoming_mess\u0061ge":{"signature":"secret"}"#;
-        assert_eq!(
-            echoed_frame_spans(malformed_escaped).unwrap().body()[0],
-            0..malformed_escaped.len() as u32
-        );
-        let entirely_escaped = br#"{"type":"Err","error_code":"RateLimited","\u0069\u006e\u0063\u006f\u006d\u0069\u006e\u0067\u005f\u006d\u0065\u0073\u0073\u0061\u0067\u0065":{"signature":"secret"}"#;
-        assert_eq!(
-            echoed_frame_spans(entirely_escaped).unwrap().body()[0],
-            0..entirely_escaped.len() as u32
-        );
-    }
-
-    #[test]
-    fn synthetic_primary_and_subaccount_faults_share_general_and_cancel_holds() {
-        let limits = [
-            RateLimit {
-                scope: LimitScope::User,
-                ops: TagSet::of(&[OpKind::Place, OpKind::Query, OpKind::Subscribe]),
-                per: Duration::from_secs(60),
-                units: 10,
-            },
-            RateLimit {
-                scope: LimitScope::User,
-                ops: TagSet::of(&[OpKind::Cancel, OpKind::CancelAll]),
-                per: Duration::from_secs(60),
-                units: 10,
-            },
-        ];
-        let reserve = SafetyReserve::percent(50).unwrap();
-        let primary =
-            RateLimiter::for_user(RateUserKey::new(0x7a00_1001), &limits, reserve).unwrap();
-        let sub = RateLimiter::for_user(RateUserKey::new(0x7a00_1001), &limits, reserve).unwrap();
-        let conn = ConnKey { conn: 1, epoch: 1 };
-        let now = Instant::now();
-        let request = |op, class| Request {
-            charge: RateCharge::one(op, None),
-            via: Via::Frame,
-            class,
-        };
-        let place = request(OpKind::Place, TrafficClass::Normal);
-        let cancel = request(OpKind::Cancel, TrafficClass::Safety);
-        let fault = |kind: &str, hint: &str| {
-            json!({"type":"Err", "error_code":"RateLimited",
-            "message":hint, "incoming_message":{"type":kind}})
-        };
-
-        // A general fault seen by the subaccount gates the primary too. It does not spend
-        // the independent cancel bucket or create a new send effect.
-        let general = effect(
-            StreamId(0),
-            &fault("add_order", "Rate limit exceeded, retry after 4 seconds"),
-        )
-        .unwrap();
-        let Effect::RateLimited {
-            charge,
-            retry_after,
-            ..
-        } = general
-        else {
-            panic!("feedback only")
-        };
-        sub.provider_rejected(now, conn, charge, retry_after);
-        assert!(primary.charge(now, conn, &[place]).is_err());
-        assert!(primary.charge(now, conn, &[cancel]).is_ok());
-        assert!(
-            primary
-                .charge(now + Duration::from_secs(5), conn, &[place])
-                .is_ok()
-        );
-
-        let cancel_fault = effect(
-            StreamId(0),
-            &fault("cancel_order", "Rate limit exceeded, retry after 6 seconds"),
-        )
-        .unwrap();
-        let Effect::RateLimited {
-            charge,
-            retry_after,
-            ..
-        } = cancel_fault
-        else {
-            panic!("feedback only")
-        };
-        primary.provider_rejected(now + Duration::from_secs(5), conn, charge, retry_after);
-        assert!(
-            sub.charge(now + Duration::from_secs(5), conn, &[cancel])
-                .is_err()
-        );
-        assert!(
-            sub.charge(now + Duration::from_secs(5), conn, &[place])
-                .is_ok()
-        );
-
-        // An echo without a trustworthy type gates both budgets, even Safety cancel traffic.
-        let unknown = effect(StreamId(0), &fault("auth", "unparseable retry hint")).unwrap();
-        let Effect::RateLimited {
-            charge,
-            retry_after,
-            ..
-        } = unknown
-        else {
-            panic!("feedback only")
-        };
-        assert!(charge.is_none() && retry_after.is_none());
-        sub.provider_rejected(now + Duration::from_secs(12), conn, charge, retry_after);
-        for req in [place, cancel] {
-            assert!(
-                primary
-                    .charge(now + Duration::from_secs(13), conn, &[req])
-                    .is_err()
-            );
-        }
+    fn an_echo_is_found_literally_or_behind_ascii_escapes() {
+        assert!(can_echo(br#"{"incoming_message":{}}"#));
+        assert!(can_echo(br#"{"incoming_mess\u0061ge":{}"#));
+        assert!(can_echo(
+            br#"{"\u0069\u006e\u0063\u006f\u006d\u0069\u006e\u0067\u005f\u006d\u0065\u0073\u0073\u0061\u0067\u0065":1}"#
+        ));
+        assert!(!can_echo(br#"{"type":"Ok"}"#));
+        assert!(!can_echo(br#"{"incoming\u005"#));
+        assert!(!can_echo(br#"{"incoming\u00ff_message":1}"#));
+        assert!(!can_echo(br#"{"incoming\u0100_message\uzzzz\u":1}"#));
     }
 }

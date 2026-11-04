@@ -935,21 +935,30 @@ fn no_credential_is_read_or_held_outside_src_auth_and_src_sign() {
         "qfex.public_key",
     ];
     let mut outside = 0;
+    let mut held = 0;
     for (name, text) in &all {
         if review(name) {
             continue;
         }
         outside += 1;
+        // The order-entry codec holds the opaque handle (FBC-zeb0), which gives no credential
+        // back; naming its type is all it may do there.
+        let holds = name == "exec/mod.rs";
         for (at, line) in text.lines().enumerate() {
             // The factory receives the consumer's credentials and drops them unread.
             let line = line.replace("_creds: Secrets", "");
             for word in forbidden {
+                if holds && word == "TradeAuth" {
+                    held += usize::from(line.contains(word));
+                    continue;
+                }
                 assert!(!line.contains(word), "src/{name}:{} names {word}", at + 1);
             }
             assert!(!line.contains("creds"), "src/{name}:{}: {line}", at + 1);
         }
     }
     assert!(outside >= 5, "{outside} files outside the review paths");
+    assert!(held > 0, "the codec holds the handle where the scan looks");
     // And the review paths are where they are read: the scan looks for the right thing.
     let read_in = |name: &str| {
         all.iter()
