@@ -1193,14 +1193,18 @@ async fn play_a_timer_during_a_stalled_write() -> ((u64, Option<TimerTag>, ConnK
         assert!(venue.timers().is_empty());
         advance(ms(1)).await;
         settle(|| venue.timers().len() == 1 || ended()).await;
-        if venue.timers().is_empty() {
-            // The epoch ended before the timer was due, and so before the window.
+        // The write is abandoned at the window, 3 s after it began, and the epoch ends as a
+        // drop: the next attempt waits the pacing's 1 s floor, so it starts 4 s in.
+        advance(ms(2_499)).await;
+        churn().await;
+        if ended() {
+            // The epoch ended before the window, before or after the timer fired (DeepSeek DS-1
+            // on 94acdbd4).
             drop((control, release));
             return true;
         }
-        // The write is abandoned at the window, 3 s after it began, and the epoch ends as a
-        // drop: the next attempt waits the pacing's 1 s floor, so it starts 4 s in.
-        for step in [2_499, 1, 999] {
+        assert!(server.try_accept().is_none());
+        for step in [1, 999] {
             advance(ms(step)).await;
             churn().await;
             assert!(server.try_accept().is_none());
@@ -1268,17 +1272,17 @@ async fn play_nonces_mis_reserved_during_a_write() -> ((Option<ExecSessionError>
         churn().await;
         // The first firing's nonces are mis-reserved, so neither reaches the codec; the session
         // ends once the write it waits on is abandoned at the window.
-        for step in [500, 100] {
+        for step in [500, 100, 2_399] {
             advance(ms(step)).await;
             churn().await;
         }
         if ended() {
-            // The epoch ended before the window, short of the pacing's 1 s floor: dropping the
-            // control ends the session before it reconnects.
+            // The epoch ended before the window (DeepSeek DS-2 on 94acdbd4): the session then
+            // ended on the mis-reserved nonces, or reconnected, and dropping the control ends it.
             drop((control, release));
             return None;
         }
-        advance(ms(2_400)).await;
+        advance(ms(1)).await;
         churn().await;
         Some((control, release))
     };
