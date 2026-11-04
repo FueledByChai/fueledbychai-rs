@@ -1,0 +1,1 @@
+{"stop_order_response":{"stop_order_id":"88888888-8888-4888-8888-888888888888","user_id":"5a5a5a5a-0000-4000-8000-0000000000a1","symbol":"AAPL-USD","price":190,"quantity":1,"direction":"BELOW","stop_order_type":"STOP_LOSS","client_order_id":"","update_time":1760000004}}

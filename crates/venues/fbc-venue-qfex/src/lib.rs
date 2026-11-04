@@ -1,25 +1,29 @@
-//! QFEX public market data and instrument discovery. Order entry is deliberately unavailable
-//! (decision 0117).
+//! QFEX public market data and instrument discovery, with the trade socket's offline HMAC
+//! signer and authentication (`sign` and `auth`, review paths, decision 0009). Order entry is
+//! deliberately unavailable (decisions 0117 and 0122): `caps.exec` is `None`, readiness stays
+//! `Record`, `plan_exec` plans nothing and `exec_codec` builds nothing.
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
 //! corresponding MDS channel pages; [`QfexMd`] says what each becomes.
 
+pub mod auth;
 mod caps;
 pub mod discover;
 mod md;
 #[doc(hidden)]
 pub mod rate;
+pub mod sign;
 mod trade_rate;
 
 use std::collections::BTreeSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fbc_core::{
-    AccountSummary, AssetKey, BookId, ConfigError, ConfigScope, EndpointPlan, ExecCodec,
-    ExecEndpoint, FieldSpec, FieldUnit, HttpPlan, InstrumentSpecDraft, MdCodec, MdTransport,
-    Secrets, SpecTable, StreamId, Subscription, SymbolError, TouchSourceId, VenueCaps, VenueConfig,
-    VenueError, VenueFactory, WireUrl,
+    AccountKey, AccountSummary, AssetKey, BookId, ConfigError, ConfigScope, EndpointPlan,
+    ExecCodec, ExecEndpoint, FieldSpec, FieldUnit, HttpPlan, InstrumentSpecDraft, MdCodec,
+    MdTransport, Secrets, SpecTable, StreamId, Subscription, SymbolError, TouchSourceId, VenueCaps,
+    VenueConfig, VenueError, VenueFactory, WireUrl,
 };
 
 use md::channel;
@@ -55,6 +59,10 @@ const SCHEMA: &[FieldSpec] = &[
         unit: FieldUnit::Duration,
         doc: "positive public REST request timeout as <n>ms or <n>s",
     },
+    // Read by `exec_account_key` (decision 0122); the trade socket's keys are listed once order
+    // entry lands.
+    auth::ACCOUNT_ID_FIELD,
+    auth::ACCOUNT_KEY_FIELD,
 ];
 
 fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
@@ -140,6 +148,13 @@ impl VenueFactory for Qfex {
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         mds_url(cfg)?;
         Ok(caps::caps())
+    }
+
+    /// The consumer's account key `cfg` binds its explicitly selected provider account to
+    /// (decision 0122): refused when either is missing or invalid, never defaulted to the
+    /// primary account.
+    fn exec_account_key(&self, cfg: &VenueConfig) -> Result<Option<AccountKey>, ConfigError> {
+        auth::account_key(cfg).map(Some)
     }
 
     fn parse_fbc_common_symbol(&self, s: &str) -> Result<AssetKey, SymbolError> {

@@ -1,0 +1,56 @@
+{
+  "all_orders_response": {
+    "orders": [
+      {
+        "order_id": "22222222-2222-4222-8222-222222222222",
+        "symbol": "AAPL-USD",
+        "status": "ACK",
+        "quantity": 2.708,
+        "price": 199.5,
+        "side": "SELL",
+        "type": "LIMIT",
+        "time_in_force": "GTC",
+        "user_id": "5a5a5a5a-0000-4000-8000-0000000000a1",
+        "client_order_id": "",
+        "quantity_remaining": 2.708,
+        "update_time": 1760000001.5,
+        "trade_id": null
+      },
+      {
+        "order_id": "33333333-3333-4333-8333-333333333333",
+        "symbol": "NVDA-USD",
+        "status": "ACK",
+        "quantity": 3,
+        "price": 120,
+        "side": "BUY",
+        "type": "LIMIT",
+        "time_in_force": "GTC",
+        "user_id": "5a5a5a5a-0000-4000-8000-0000000000a1",
+        "client_order_id": "synthetic-cid-2",
+        "quantity_remaining": 3,
+        "update_time": 1760000002,
+        "trade_id": null
+      }
+    ],
+    "twaps": [
+      {
+        "twap_id": "44444444-4444-4444-8444-444444444444",
+        "client_twap_id": "",
+        "user_id": "5a5a5a5a-0000-4000-8000-0000000000a1",
+        "status": "ACTIVE",
+        "symbol": "AAPL-USD",
+        "total_quantity": 10,
+        "filled_quantity": 2,
+        "average_fill_price": 200.25,
+        "worst_price": 210,
+        "total_num_orders": 5,
+        "order_interval_secs": 60,
+        "reduce_only": false,
+        "side": "BUY",
+        "start_time": 1760000000,
+        "updated_at": 1760000120,
+        "created_at": 1760000000
+      }
+    ]
+  }
+}

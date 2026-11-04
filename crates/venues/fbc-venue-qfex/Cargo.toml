@@ -1,6 +1,6 @@
 [package]
 name = "fbc-venue-qfex"
-description = "QFEX public market-data adapter; order entry is not enabled."
+description = "QFEX public market-data adapter and the trade socket's offline HMAC signer and authentication; order entry is not enabled."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,11 +10,19 @@ publish = false
 
 [dependencies]
 fbc-core = { path = "../../fbc-core" }
+# The trade socket's authentication (src/sign, src/auth; FBC-77aa): HMAC-SHA256 and the
+# random nonces it signs.
+getrandom.workspace = true
+hmac.workspace = true
 rust_decimal.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 time.workspace = true
 
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
+# tests/signing.rs journals the authentication and private frames and reads them back
+# (decisions 0006 and 0028). scripts/check-deps.sh does not count dev-dependencies.
+fbc-journal = { path = "../../fbc-journal" }
 fbc-runtime = { path = "../../fbc-runtime" }
 tokio.workspace = true

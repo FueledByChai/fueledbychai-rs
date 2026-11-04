@@ -1,0 +1,12 @@
+Synthetic signing fixtures (decision 0009). Nothing in this directory belongs to an account.
+
+- The secrets in hmac-vectors.json are made-up text, chosen for these vectors alone; they are no
+  QFEX API secret of the owner's or of anyone's. The nonces and wall times are made-up inputs:
+  0 and u64::MAX in each half of the nonce for its zero padding, and the nanoseconds either side
+  of a second, the epoch and the latest wall time for the whole-second floor.
+- Every signature (a 64-hex value) is computed from those inputs by hmac_oracle.py with Python's
+  standard hmac and hashlib, apart from the Rust signer, by the rule QFEX's authentication page
+  states (https://docs.qfex.com/websocket/channels/trade/authenticate). To write the file again:
+  python3 -I fixtures/qfex/signing/hmac_oracle.py > fixtures/qfex/signing/hmac-vectors.json
+
+This marker covers fixtures/qfex/signing/ only. Recorded QFEX frames or answers never go here.

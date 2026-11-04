@@ -1,0 +1,14 @@
+Synthetic private trade-socket frames (decision 0009). Nothing in this directory was received
+from QFEX or belongs to an account.
+
+- Each file is one frame, hand-built with the member names QFEX's trade AsyncAPI
+  (https://docs.qfex.com/websocket/trade.yaml) gives OrderResponse, AllOrdersResponse (its
+  orders and twaps rows), FillResponse, PositionPayload, BalancePayload and StopOrder, in the
+  envelopes its channel pages show (order_response is the order responses page's example,
+  https://docs.qfex.com/websocket/channels/trade/order, with its values replaced).
+- Every value is made up: the UUIDs are repeated digits, the user_id and id values name no user
+  or account, and the symbols, prices, quantities, times and enum values (execution_type,
+  direction, stop_order_type, a TWAP's status) are invented, not taken from a capture or
+  checked against QFEX. They prove which bytes the redaction names, not how a codec decodes.
+
+This marker covers fixtures/qfex/private/ only. A recorded frame never goes here.
