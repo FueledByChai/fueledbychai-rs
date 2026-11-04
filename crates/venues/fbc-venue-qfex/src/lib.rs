@@ -1,7 +1,9 @@
 //! QFEX public market data and instrument discovery, with the trade socket's offline HMAC
-//! signer and authentication (`sign` and `auth`, review paths, decision 0009). Order entry is
-//! deliberately unavailable (decisions 0117 and 0122): `caps.exec` is `None`, readiness stays
-//! `Record`, `plan_exec` plans nothing and `exec_codec` builds nothing.
+//! signer and authentication (`sign` and `auth`, review paths, decision 0009) and its
+//! recording-only codec ([`exec::QfexExec`]: authentication, private subscriptions, rate
+//! feedback and inspected private state). Order entry is deliberately unavailable (decisions
+//! 0117 and 0122): `caps.exec` is `None`, readiness stays `Record`, `plan_exec` plans nothing
+//! and `exec_codec` builds nothing, so only a test or the probe builds that codec.
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
@@ -10,9 +12,9 @@
 pub mod auth;
 mod caps;
 pub mod discover;
+pub mod exec;
 mod md;
-#[doc(hidden)]
-pub mod rate;
+mod rate;
 pub mod sign;
 mod trade_rate;
 
