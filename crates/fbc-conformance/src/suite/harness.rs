@@ -1,9 +1,10 @@
 //! What the checks share: the venue's caps and first instrument under the assumed setup,
 //! codecs built fresh from the factory and taken through the setup's bootstrap, client ids
-//! minted under a lease of the suite's own, venue ids made in the venue's decode scope, and
-//! the commands built from them, each order at a price and size inside the instrument's limits.
+//! minted under a lease of the suite's own, venue ids in the shape the setup gives made in the
+//! venue's decode scope, and the commands built from them, each order at a price and size
+//! inside the instrument's limits.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +39,8 @@ const PLACEMENT_NONCE: u64 = 1_000;
 /// The limit price aimed at: the valid price at or above it on the instrument's grid is used,
 /// or a higher one where the instrument's minimum notional needs it ([`probe`]).
 const PX: Ticks = Ticks(100);
+/// The setup field a venue id the checks cannot use is a breach of.
+const VENUE_IDS: &str = "Setup.venue_order_ids";
 
 /// What an encode gave.
 #[derive(Debug)]
@@ -64,6 +67,10 @@ pub(crate) struct Harness<'s> {
     /// Why no order fits the instrument's limits, by the spec field, where none does: `px` and
     /// `qty` are then the price and size [`probe`] starts from.
     unfit: Option<(&'static str, String)>,
+    /// Order `i`'s venue id as the venue writes one ([`Setup::venue_order_ids`]).
+    ///
+    /// [`Setup::venue_order_ids`]: super::Setup::venue_order_ids
+    venue_order_ids: fn(usize) -> String,
 }
 
 impl<'s> Harness<'s> {
@@ -95,6 +102,7 @@ impl<'s> Harness<'s> {
             qty,
             px,
             unfit,
+            venue_order_ids: setup.venue_order_ids,
         })
     }
 
@@ -328,14 +336,29 @@ impl<'s> Harness<'s> {
         mint(hwm, snapshot_max, start, n).map_err(|why| self.fail("setup", why))
     }
 
-    /// The venue's order ids `conformance-0` to `conformance-<n-1>`.
-    pub fn vids(&self, n: usize) -> Vec<VenueOrderId> {
+    /// The venue's order ids for orders `0` to `n - 1`, as the setup's `venue_order_ids` writes
+    /// them (FBC-6rfe), each made in the venue's decode scope (decision 0004). An id the core
+    /// refuses (empty, or longer than its longest venue id), or one id given two orders, fails
+    /// the check naming `Setup.venue_order_ids`.
+    pub fn vids(&self, n: usize) -> Result<Vec<VenueOrderId>, Failure> {
+        let mut seen: HashMap<VenueOrderId, usize> = HashMap::with_capacity(n);
         dispatch(&self.caps, NAMESPACE, |scope| {
-            (0..n)
-                .map(|i| scope.venue_order_id(&format!("conformance-{i}")))
-                .collect::<Result<_, _>>()
+            let made = (0..n).map(|i| {
+                let wire = (self.venue_order_ids)(i);
+                let vid = scope.venue_order_id(&wire).map_err(|e| {
+                    let what = format!("order {i}'s id is not a venue order id: {e}");
+                    self.fail(VENUE_IDS, what)
+                })?;
+                match seen.insert(vid.clone(), i) {
+                    Some(j) => {
+                        let what = format!("gives orders {j} and {i} the one id {wire:?}");
+                        Err(self.fail(VENUE_IDS, what))
+                    }
+                    None => Ok(vid),
+                }
+            });
+            made.collect()
         })
-        .expect("a short non-empty venue id")
     }
 }
 
@@ -488,7 +511,7 @@ impl Ids {
     pub fn new(h: &Harness<'_>, n: usize) -> Result<Ids, Failure> {
         Ok(Ids {
             cids: h.cids(n)?,
-            vids: h.vids(n),
+            vids: h.vids(n)?,
         })
     }
 

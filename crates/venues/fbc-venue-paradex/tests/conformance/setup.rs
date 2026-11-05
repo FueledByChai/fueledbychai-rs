@@ -3,10 +3,11 @@
 //! configuration and the synthetic account and key of `fixtures/paradex/signing`; the golden
 //! commands, each signed at its Java vector's timestamp ([`golden_table`]); the bootstrap that
 //! takes a fresh order-entry codec to its authenticated state (the login's answer, then the
-//! auth frame's reply); and how Paradex's order entry answers over the stub server
-//! ([`order_entry`]): the login and a flat REST resync over HTTP, the opening's frames by
-//! method, and each order request as Paradex's WebSocket API answers it, an accepted
-//! placement or amend followed by its `OrderEvent` (SBE 1:2).
+//! auth frame's reply); venue order ids in Paradex's decimal form ([`venue_order_ids`]); and
+//! how Paradex's order entry answers over the stub server ([`order_entry`]): the login and a
+//! flat REST resync over HTTP, the opening's frames by method, and each order request as
+//! Paradex's WebSocket API answers it, an accepted placement or amend followed by its
+//! `OrderEvent` (SBE 1:2).
 
 #![allow(dead_code)]
 
@@ -97,7 +98,14 @@ pub fn assumed() -> Setup {
         exec_stream: EXEC_STREAM,
         order_entry: Some(order_entry()),
         bootstrap: Some(bootstrap()),
+        venue_order_ids,
     }
+}
+
+/// Order `i`'s venue id as Paradex writes one: decimal digits, as the ids in
+/// `fixtures/paradex/exec` are, which a modify signs as a number (`src/sign/felt.rs`).
+pub fn venue_order_ids(i: usize) -> String {
+    format!("17595000000{i:08}")
 }
 
 /// The login's answer, then the auth frame's reply (the codec's first control id).

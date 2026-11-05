@@ -2,7 +2,8 @@
 //! tests on the toy: its two instruments, no configuration, no credentials, the golden
 //! commands whose encodings `signing_golden/` holds, its order-entry stream, which the case
 //! files' frames are handed on, how its order entry answers over the stub server
-//! ([`order_entry`]), and no bootstrap: the toy's codec encodes as built.
+//! ([`order_entry`]), no bootstrap: the toy's codec encodes as built, and venue order ids as
+//! its stub spells them ([`venue_order_ids`]).
 
 #![allow(dead_code)]
 
@@ -39,7 +40,13 @@ pub fn assumed() -> Setup {
         exec_stream: toy::EXEC_STREAM,
         order_entry: Some(order_entry()),
         bootstrap: None,
+        venue_order_ids,
     }
+}
+
+/// Order `i`'s venue id as the stub's answers spell them; the toy takes any.
+pub fn venue_order_ids(i: usize) -> String {
+    format!("toy-{i}")
 }
 
 /// How the toy's order entry answers over the stub server: its order-entry URL pointed at the
