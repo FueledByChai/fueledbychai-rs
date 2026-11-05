@@ -96,6 +96,13 @@
 //! `InstrumentSpec.max_order_size` (below `min_size`) or `InstrumentSpec.min_notional` (reached
 //! at no valid price), rather than send orders a codec may rightly refuse.
 //!
+//! [`price_grid`] sizes its own orders, at the many prices it quantizes on every instrument, the
+//! same way price by price (FBC-7y5e): the prices around one of the grid's boundaries go at one
+//! size, the least inside the instrument's limits at the lowest of them, so two of them encoded
+//! alike are still one price sent twice. Where some price it quantizes takes no size inside the
+//! limits, it fails naming `InstrumentSpec.max_order_size` or `InstrumentSpec.min_notional` of
+//! that instrument, with the prices, and sends nothing on it.
+//!
 //! # The order-entry checks
 //!
 //! The suite knows no venue's protocol, so a venue that declares order entry states, in
