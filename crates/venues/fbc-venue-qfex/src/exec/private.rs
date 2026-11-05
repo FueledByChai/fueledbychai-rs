@@ -252,15 +252,16 @@ pub(crate) fn exact(raw: &str) -> Option<Decimal> {
     let Some((mantissa, exponent)) = raw.split_once(['e', 'E']) else {
         return Decimal::from_str_exact(raw).ok();
     };
-    // A Decimal holds at most 28 places, so a larger shift could only overflow or round.
-    let exponent: i32 = exponent.parse().ok().filter(|e: &i32| e.abs() <= 64)?;
+    // A Decimal holds at most 28 places, so a larger shift could only overflow or round. The
+    // range is checked as a range: `i32::MIN` has no absolute value (Codex P2, PR #226).
+    let exponent: i32 = exponent.parse().ok().filter(|e| (-64..=64).contains(e))?;
     let (sign, unsigned) = match mantissa.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", mantissa),
     };
     let (int, frac) = unsigned.split_once('.').unwrap_or((unsigned, ""));
     let digits = format!("{int}{frac}");
-    let point = int.len() as i32 + exponent;
+    let point = i32::try_from(int.len()).ok()?.checked_add(exponent)?;
     let text = if point <= 0 {
         format!(
             "{sign}0.{}{digits}",
