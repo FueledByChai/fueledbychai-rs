@@ -10,7 +10,8 @@
 //!   rest is dropped, and so zeroed. Its fields are private and it gives none of them back: a
 //!   codec asks it for the authentication frame ([`TradeAuth::frame`]) and for the spans of an
 //!   inbound frame to redact ([`TradeAuth::inbound_spans`]), and gets bytes whose credentials
-//!   are already marked for the journal.
+//!   are already marked for the journal; for a private REST read, it gives the signed headers
+//!   ([`TradeAuth::rest_headers`], decision 0132 item 5).
 //! - [`opening_url`] builds the trade socket's URL, whose query carries the public key
 //!   (`?api_key=`), with that key marked as a redaction span.
 //! - [`account_selection`] and [`account_key`] read the explicit provider account and the
@@ -34,8 +35,8 @@ use core::ops::Range;
 use std::net::Ipv4Addr;
 
 use fbc_core::{
-    AccountKey, ConfigError, ConfigScope, EncodeCtx, FieldSpec, FieldUnit, Inbound, InboundSpans,
-    Secret, Secrets, SignError, VenueConfig, VenueError, WireSlice, WireUrl,
+    AccountKey, ConfigError, ConfigScope, EncodeCtx, FieldSpec, FieldUnit, Header, Inbound,
+    InboundSpans, Secret, Secrets, SignError, VenueConfig, VenueError, WireSlice, WireUrl,
 };
 
 use crate::sign::{HmacKey, KeyError};
@@ -76,7 +77,8 @@ pub const ACCOUNT_KEY_FIELD: FieldSpec = FieldSpec {
           order-entry session's account before planning",
 };
 
-/// The public key's schema entry. The factory lists it once order entry lands (FBC-zeb0).
+/// The public key's schema entry, which the factory lists for the probe mode (decision 0132
+/// item 6).
 pub const PUBLIC_KEY_FIELD: FieldSpec = FieldSpec {
     key: PUBLIC_KEY,
     scope: ConfigScope::Account,
@@ -86,7 +88,7 @@ pub const PUBLIC_KEY_FIELD: FieldSpec = FieldSpec {
 };
 
 /// The secret's schema entry; the consumer hands its value over as a credential. The factory
-/// lists it once order entry lands (FBC-zeb0).
+/// lists it for the probe mode (decision 0132 item 6).
 pub const SECRET_KEY_FIELD: FieldSpec = FieldSpec {
     key: SECRET_KEY,
     scope: ConfigScope::Account,
@@ -95,7 +97,8 @@ pub const SECRET_KEY_FIELD: FieldSpec = FieldSpec {
           trade socket's authentication",
 };
 
-/// The trade socket's schema entry. The factory lists it once order entry lands (FBC-zeb0).
+/// The trade socket's schema entry, which the factory lists for the probe mode (decision 0132
+/// item 6), whose guard admits only its pre-production origin or a loopback address.
 pub const TRADE_URL_FIELD: FieldSpec = FieldSpec {
     key: TRADE_URL,
     scope: ConfigScope::Account,
@@ -103,6 +106,20 @@ pub const TRADE_URL_FIELD: FieldSpec = FieldSpec {
     doc: "the trade WebSocket origin: wss:// with a host and optional port, or ws:// on \
           loopback for a test stub",
 };
+
+/// The private REST reads' headers, from QFEX's REST reference (for instance
+/// [user positions](https://docs.qfex.com/api-reference/rest/user/user-positions)): the public
+/// key, the HMAC signature, the nonce and the Unix time in seconds it signs, all four required,
+/// and the optional account selection.
+pub const REST_PUBLIC_KEY: &str = "x-qfex-public-key";
+/// The hex HMAC-SHA256 signature of `${nonce}:${unix_ts}`.
+pub const REST_SIGNATURE: &str = "x-qfex-hmac-signature";
+/// The hex nonce, unique within 15 minutes.
+pub const REST_NONCE: &str = "x-qfex-nonce";
+/// The Unix time, in whole seconds.
+pub const REST_TIMESTAMP: &str = "x-qfex-timestamp";
+/// The subaccount a read acts on; omitted, it acts on the primary account.
+pub const REST_ACCOUNT: &str = "x-qfex-requested-account-id";
 
 /// The longest public key accepted. QFEX documents no length; this only keeps a frame and a
 /// URL that carry one far below what a span can address.
@@ -357,6 +374,51 @@ impl TradeAuth {
             WireSlice::redacted(text.into_bytes(), spans)
                 .expect("spans in order, inside the frame"),
         )
+    }
+
+    /// How many nonces one signed REST read takes from its `EncodeCtx`: the two halves of its
+    /// 128-bit nonce, as [`frame`](TradeAuth::frame)'s.
+    pub const REST_NONCES: u16 = 2;
+
+    /// The headers of one private REST read (decision 0132 item 5) made with `ctx`, whose
+    /// nonces must be exactly the [`REST_NONCES`](TradeAuth::REST_NONCES) reserved for it.
+    /// QFEX's REST reference signs a read as it signs the trade socket's authentication: an
+    /// HMAC-SHA256 of `${nonce}:${unix_ts}`, hex encoded, keyed with the secret (`sign`). So:
+    ///
+    /// - [`REST_PUBLIC_KEY`], the public key, and [`REST_SIGNATURE`], the signature, each
+    ///   `redact: true`, so the journal keeps them only as keyed hashes (decisions 0024 and
+    ///   0122 item 3);
+    /// - [`REST_NONCE`] and [`REST_TIMESTAMP`] as they are, as the authentication frame writes
+    ///   them, the journal already holding the nonces;
+    /// - [`REST_ACCOUNT`], the subaccount's UUID, `redact: true`, only when the handle selects
+    ///   a subaccount: omitted, QFEX reads the primary account, which the configuration
+    ///   selected explicitly (decision 0122).
+    ///
+    /// Refused, building nothing, for any other number of nonces or a wall time before the
+    /// Unix epoch.
+    pub fn rest_headers(&self, ctx: &EncodeCtx) -> Result<Vec<Header>, SignError> {
+        let nonce = match ctx.nonces.as_slice() {
+            &[high, low] => [high, low],
+            _ => {
+                return Err(SignError::Unsignable("a QFEX REST read takes two nonces"));
+            }
+        };
+        let signed = self.key.sign(nonce, ctx.wall)?;
+        let header = |name, value: &str, redact| Header {
+            name,
+            value: value.to_owned(),
+            redact,
+        };
+        let mut headers = vec![
+            header(REST_PUBLIC_KEY, self.public_key.expose(), true),
+            header(REST_SIGNATURE, signed.signature(), true),
+            header(REST_NONCE, signed.nonce(), false),
+            header(REST_TIMESTAMP, &signed.unix_ts().to_string(), false),
+        ];
+        if let Some(id) = &self.subaccount {
+            headers.push(header(REST_ACCOUNT, id.expose(), true));
+        }
+        Ok(headers)
     }
 
     /// The spans of `input`, a frame off the trade socket or a response to one of its codec's

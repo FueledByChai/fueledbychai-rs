@@ -151,9 +151,45 @@ pub(crate) fn err<'n>(body: &'n [Member<'_>]) -> Err<'n> {
 /// left in clear, and when the blanked frame would not be kept the same way: replay then meets
 /// the frame the codec read live, and redacts it to the same bytes again.
 pub(crate) fn spans(text: &str, account: &[Range<u32>]) -> Vec<Range<u32>> {
+    spans_by(text, account, kept)
+}
+
+/// The journal's spans of `text`, a frame that can echo a request, on an epoch whose arm the
+/// codec encoded (decision 0132 items 1 and 3, as 0134 item 7 narrows them), with the same
+/// account and replay checks as [`spans`]:
+///
+/// - a frame whose only content is an err or ack envelope echoing the arm ([`arm_kept`]) is
+///   kept in clear but for its `message`, which is kept too only for a RateLimited err in one
+///   of the two hint forms; a member added to the body or beside the envelope makes it any
+///   other frame;
+/// - while the arm is the connection's only request in flight (`only`), any other frame keeps
+///   its shape whatever its envelope, with what 0134 item 3 keeps in clear in an err or an ack,
+///   every other value a span of its own ([`window_kept`]); an echo of authentication, and a
+///   frame that is not JSON, stay whole;
+/// - a value either rule keeps in clear for what it says, a code, an echo type or a hint, is
+///   judged on the bytes between its quotes, so an escaped one is a span ([`plain_code`]);
+/// - otherwise it is redacted as [`spans`] redacts it (0126, 0134).
+pub(crate) fn armed_spans(text: &str, account: &[Range<u32>], only: bool) -> Vec<Range<u32>> {
+    spans_by(text, account, |text| {
+        arm_kept(text)
+            .or_else(|| only.then(|| window_kept(text)).flatten())
+            .or_else(|| (!only).then(|| kept(text)).flatten())
+    })
+}
+
+/// The spans `rule` gives `text`, or one span over the whole frame when it gives none, when an
+/// account span falls outside them, or when the frame blanked by them is not given the same.
+fn spans_by(
+    text: &str,
+    account: &[Range<u32>],
+    rule: impl Fn(&str) -> Option<Vec<Range<usize>>>,
+) -> Vec<Range<u32>> {
     let end = u32::try_from(text.len()).unwrap_or(u32::MAX);
     let whole = (end > 0).then_some(0..end).into_iter().collect();
-    let Some(live) = kept(text) else {
+    if text.len() > u32::MAX as usize {
+        return whole;
+    }
+    let Some(live) = rule(text) else {
         return whole;
     };
     let live: Vec<Range<u32>> = live
@@ -165,7 +201,7 @@ pub(crate) fn spans(text: &str, account: &[Range<u32>]) -> Vec<Range<u32>> {
             .any(|kept| kept.start <= span.start && span.end <= kept.end)
     };
     let blanked = String::from_utf8(json::blank(text.as_bytes(), &live)).ok();
-    let again = blanked.as_deref().and_then(kept);
+    let again = blanked.as_deref().and_then(rule);
     let same = again.is_some_and(|again| {
         again.len() == live.len()
             && again
@@ -190,11 +226,9 @@ fn kept(text: &str) -> Option<Vec<Range<usize>>> {
     if root.repeats() {
         return None;
     }
-    // Where the body sits: the top-level object itself, or the member named here.
-    let (body, at, is_err) = match envelope(top) {
-        Envelope::FlatErr(body) => (body, None, true),
-        Envelope::NestedErr(body) => (body, Some("err"), true),
-        Envelope::Ack(body) => (body, Some("ack"), false),
+    let envelope = envelope(top);
+    let body = match envelope {
+        Envelope::FlatErr(body) | Envelope::NestedErr(body) | Envelope::Ack(body) => body,
         Envelope::Other | Envelope::Ambiguous => return None,
     };
     let echo_type = json::get(body, "incoming_message")
@@ -204,25 +238,154 @@ fn kept(text: &str) -> Option<Vec<Range<usize>>> {
     if echo_type == Some("auth") {
         return None;
     }
+    let mut spans = Vec::new();
+    envelope_spans(top, &envelope, &mut spans);
+    Some(spans)
+}
+
+/// What 0134 item 3 keeps of a frame in one of the three envelopes, every other value a span
+/// of its own (item 4): the flat err's `"Err"`, an err's documented code, the echo's mapped
+/// `type` and a RateLimited err's hint, inside the envelope's body; nothing outside it.
+fn envelope_spans(top: &[Member<'_>], envelope: &Envelope<'_, '_>, spans: &mut Vec<Range<usize>>) {
+    // Where the body sits: the top-level object itself, or the member named here.
+    let (body, at, is_err) = match *envelope {
+        Envelope::FlatErr(body) => (body, None, true),
+        Envelope::NestedErr(body) => (body, Some("err"), true),
+        Envelope::Ack(body) => (body, Some("ack"), false),
+        Envelope::Other | Envelope::Ambiguous => return,
+    };
     let body_rule = Body {
         is_err,
-        rate_limited: is_err && err(body).code == Some(ErrCode::RateLimited),
+        rate_limited: is_err && plain_code(body) == Some(ErrCode::RateLimited),
     };
-    let mut spans = Vec::new();
     for (name, value) in top {
-        if at.is_none() && name == "type" {
+        if at.is_none() && name == "type" && value.str() == Some("Err") {
             // The flat err's `type` is "Err", which made it the flat err.
         } else if at.is_none() {
-            body_rule.member(name, value, &mut spans);
-        } else if at == Some(name.as_ref()) {
+            body_rule.member(name, value, spans);
+        } else if at == Some(name.as_ref()) && value.members().is_some() {
             for (name, value) in value.members().unwrap_or_default() {
-                body_rule.member(name, value, &mut spans);
+                body_rule.member(name, value, spans);
             }
         } else {
+            scalars(value, spans);
+        }
+    }
+}
+
+/// The arm the codec encodes (decision 0132 item 1): the cancel-on-disconnect page's request
+/// and the AsyncAPI's `CancelOnDisconnectCommand`, turning the protection on.
+pub const ARM: &str = r#"{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true}}"#;
+
+/// The members each envelope's body documents (0134 item 1), the flat err's `type` included.
+const ERR_MEMBERS: [&str; 4] = ["type", "error_code", "message", "incoming_message"];
+
+/// The spans of a frame whose only content is an err or ack envelope whose echo equals the arm
+/// ([`same`]), or `None` for any other frame: nothing in clear but its `message`, unless the
+/// frame is a RateLimited err whose message is exactly one of the two hint forms (0132 item 3,
+/// 0134 item 7). The arm carries no credential, account identifier or order.
+fn arm_kept(text: &str) -> Option<Vec<Range<usize>>> {
+    let root = json::parse(text)?;
+    let top = root.members()?;
+    if root.repeats() {
+        return None;
+    }
+    // The body's documented members: the flat err's four, the nested err's three, the ack's one.
+    let (body, documented, is_err): (_, &[&str], _) = match envelope(top) {
+        Envelope::FlatErr(body) => (body, &ERR_MEMBERS, true),
+        Envelope::NestedErr(body) if top.len() == 1 => (body, &ERR_MEMBERS[1..], true),
+        Envelope::Ack(body) if top.len() == 1 => (body, &ERR_MEMBERS[3..], false),
+        _ => return None,
+    };
+    let documented = |name: &str| documented.contains(&name);
+    if !body.iter().all(|(name, _)| documented(name)) {
+        return None;
+    }
+    let arm = json::parse(ARM).expect("the arm is JSON");
+    if !json::get(body, "incoming_message").is_some_and(|echo| same(echo, &arm)) {
+        return None;
+    }
+    let rate_limited = is_err && plain_code(body) == Some(ErrCode::RateLimited);
+    let mut spans = Vec::new();
+    for (name, value) in body {
+        let hint = rate_limited && value.plain_str().is_some_and(rate::is_hint_form);
+        if name == "message" && !hint {
             scalars(value, &mut spans);
         }
     }
     Some(spans)
+}
+
+/// Whether two values are the same JSON: objects with the same members and values, in any
+/// order and none repeated, arrays item by item, strings by their text, and numbers and
+/// literals as written. A member added is not the same.
+fn same(a: &Node<'_>, b: &Node<'_>) -> bool {
+    use json::Kind;
+    match (&a.kind, &b.kind) {
+        (Kind::Object(x), Kind::Object(y)) => {
+            x.len() == y.len()
+                && !a.repeats()
+                && !b.repeats()
+                && x.iter()
+                    .all(|(name, v)| json::get(y, name).is_some_and(|w| same(v, w)))
+        }
+        (Kind::Array(x), Kind::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| same(v, w))
+        }
+        (Kind::Str(x), Kind::Str(y)) => x == y,
+        (Kind::Num(x), Kind::Num(y)) | (Kind::Literal(x), Kind::Literal(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// The spans of a frame that arrives while the arm is the connection's only request in flight
+/// and is not the arm's own echo (decision 0132 item 3, 0134 item 7), or `None` when it stays
+/// whole: an echo of authentication anywhere in it, or bytes that are not JSON. Its envelope,
+/// member names and nesting are kept whatever its envelope, nested, flat or none, an escape or
+/// a repeated member included; in an err or an ack what 0134 item 3 keeps stays in clear, and
+/// every other scalar is a span of its own.
+fn window_kept(text: &str) -> Option<Vec<Range<usize>>> {
+    let root = json::parse(text)?;
+    if echoes_auth(&root) {
+        return None;
+    }
+    let mut spans = Vec::new();
+    match root.members().map(envelope) {
+        Some(envelope @ (Envelope::FlatErr(_) | Envelope::NestedErr(_) | Envelope::Ack(_))) => {
+            envelope_spans(root.members().unwrap_or_default(), &envelope, &mut spans);
+        }
+        _ => scalars(&root, &mut spans),
+    }
+    Some(spans)
+}
+
+/// Whether any `incoming_message` in `node`, at any depth, is an object naming `auth` as one of
+/// its `type` members.
+fn echoes_auth(node: &Node<'_>) -> bool {
+    match &node.kind {
+        json::Kind::Object(members) => members.iter().any(|(name, value)| {
+            let auth = name == "incoming_message"
+                && value.members().is_some_and(|echo| {
+                    echo.iter()
+                        .any(|(name, v)| name == "type" && v.str() == Some("auth"))
+                });
+            auth || echoes_auth(value)
+        }),
+        json::Kind::Array(items) => items.iter().any(echoes_auth),
+        _ => false,
+    }
+}
+
+/// An err's code when item 3 keeps it in clear: documented, and written with no escape.
+///
+/// Every value kept in clear is judged on exactly the bytes between its quotes (0134 item 3),
+/// [`Node::plain_str`]. Within the arm's window a frame with an escape keeps its shape (0132
+/// item 3, 0134 item 7), but an escaped code, echo type or hint is never one item 3 keeps: it
+/// is a span, and an escaped `RateLimited` makes no RateLimited err.
+fn plain_code(body: &[Member<'_>]) -> Option<ErrCode> {
+    json::get(body, "error_code")
+        .and_then(Node::plain_str)
+        .and_then(ErrCode::from_wire)
 }
 
 /// What an envelope's body keeps of each of its members.
@@ -233,13 +396,16 @@ struct Body {
 
 impl Body {
     fn member(&self, name: &str, value: &Node<'_>, spans: &mut Vec<Range<usize>>) {
+        // Judged on the bytes between the quotes ([`plain_code`]).
+        let documented = || value.plain_str().and_then(ErrCode::from_wire).is_some();
+        let hint = || value.plain_str().is_some_and(rate::is_hint_form);
         match name {
-            "error_code" if self.is_err && value.str().and_then(ErrCode::from_wire).is_some() => {}
-            "message" if self.rate_limited && value.str().is_some_and(rate::is_hint_form) => {}
+            "error_code" if self.is_err && documented() => {}
+            "message" if self.rate_limited && hint() => {}
             "incoming_message" => match value.members() {
                 Some(members) => {
                     for (name, value) in members {
-                        let mapped = value.str().and_then(rate::operation).is_some();
+                        let mapped = value.plain_str().and_then(rate::operation).is_some();
                         if name != "type" || !mapped {
                             scalars(value, spans);
                         }

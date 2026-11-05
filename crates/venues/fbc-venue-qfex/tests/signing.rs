@@ -936,6 +936,7 @@ fn no_credential_is_read_or_held_outside_src_auth_and_src_sign() {
     ];
     let mut outside = 0;
     let mut held = 0;
+    let mut handed = 0;
     for (name, text) in &all {
         if review(name) {
             continue;
@@ -945,8 +946,23 @@ fn no_credential_is_read_or_held_outside_src_auth_and_src_sign() {
         // back; naming its type is all it may do there.
         let holds = name == "exec/mod.rs";
         for (at, line) in text.lines().enumerate() {
-            // The factory receives the consumer's credentials and drops them unread.
-            let line = line.replace("_creds: Secrets", "");
+            // The factory receives the consumer's credentials and drops them unread, or, under
+            // the probe mode (FBC-mfey, decision 0132 item 6), hands them unread to src/auth's
+            // handle; its schema lists the credential keys' entries, which src/auth declares.
+            let mut line = line.replace("_creds: Secrets", "");
+            if name == "lib.rs" {
+                for allowed in [
+                    "creds: Secrets,",
+                    "auth::TradeAuth::new(cfg, creds)",
+                    "auth::PUBLIC_KEY_FIELD,",
+                    "auth::SECRET_KEY_FIELD,",
+                ] {
+                    if line.trim() == allowed {
+                        handed += usize::from(allowed.contains("TradeAuth"));
+                        line.clear();
+                    }
+                }
+            }
             for word in forbidden {
                 if holds && word == "TradeAuth" {
                     held += usize::from(line.contains(word));
@@ -959,6 +975,10 @@ fn no_credential_is_read_or_held_outside_src_auth_and_src_sign() {
     }
     assert!(outside >= 5, "{outside} files outside the review paths");
     assert!(held > 0, "the codec holds the handle where the scan looks");
+    assert_eq!(
+        handed, 1,
+        "the factory hands the credentials to src/auth in one place"
+    );
     // And the review paths are where they are read: the scan looks for the right thing.
     let read_in = |name: &str| {
         all.iter()

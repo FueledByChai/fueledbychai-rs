@@ -1,10 +1,14 @@
 //! QFEX public market data and instrument discovery, with the trade socket's offline HMAC
 //! signer and authentication (`sign` and `auth`, review paths, decision 0009) and its
-//! recording-only codec ([`exec::QfexExec`]: authentication, private subscriptions, rate
-//! feedback, inspected private state and the offline v1 order encoder, whose commands no reply
-//! settles). Order entry is deliberately unavailable (decisions 0117 and 0122): `caps.exec` is
-//! `None`, readiness stays `Record`, `plan_exec` plans nothing and `exec_codec` builds nothing,
-//! so only a test or the probe builds that codec.
+//! order-entry codec ([`exec::QfexExec`]: authentication, private subscriptions, rate feedback,
+//! inspected private state and the offline v1 order encoder, whose commands no reply settles).
+//!
+//! Order entry is off unless the configuration sets decision 0132 item 6's pre-production probe
+//! mode ([`probe`]): with `qfex.exec.mode` absent, `caps.exec` is `None`, `plan_exec` plans
+//! nothing and `exec_codec` builds nothing (decisions 0117 and 0122). Under `preprod_probe`,
+//! whose guard admits only QFEX's pre-production origins or loopback stubs, the factory declares
+//! the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade socket and builds the
+//! codec in its probe mode. Readiness stays `Record` in both, and production stays `exec: None`.
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
@@ -15,6 +19,7 @@ mod caps;
 pub mod discover;
 pub mod exec;
 mod md;
+pub mod probe;
 mod rate;
 pub mod sign;
 mod trade_rate;
@@ -62,10 +67,17 @@ const SCHEMA: &[FieldSpec] = &[
         unit: FieldUnit::Duration,
         doc: "positive public REST request timeout as <n>ms or <n>s",
     },
-    // Read by `exec_account_key` (decision 0122); the trade socket's keys are listed once order
-    // entry lands.
+    // Read by `exec_account_key` (decision 0122).
     auth::ACCOUNT_ID_FIELD,
     auth::ACCOUNT_KEY_FIELD,
+    // The pre-production probe mode and what it reads (decision 0132 item 6).
+    probe::EXEC_MODE_FIELD,
+    auth::TRADE_URL_FIELD,
+    auth::PUBLIC_KEY_FIELD,
+    auth::SECRET_KEY_FIELD,
+    probe::PAGE_SIZE_FIELD,
+    probe::RESYNC_TIMEOUT_FIELD,
+    probe::RPC_TIMEOUT_FIELD,
 ];
 
 fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {
@@ -135,7 +147,9 @@ pub(crate) fn valid_host_port(authority: &str) -> bool {
         })
 }
 
-/// A read-only QFEX venue factory.
+/// The QFEX venue factory: market data, and order entry only under decision 0132's
+/// pre-production probe mode ([`probe::mode`]), which every method that plans or builds
+/// anything asks first, so a configuration the mode or its guard refuses plans nothing.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct Qfex;
 
@@ -148,15 +162,21 @@ impl VenueFactory for Qfex {
         SCHEMA
     }
 
+    /// Market data only, or with the probe's order entry under `preprod_probe`.
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
+        let probe = probe::mode(cfg)?;
         mds_url(cfg)?;
-        Ok(caps::caps())
+        Ok(match probe {
+            None => caps::caps(),
+            Some(_) => caps::probe_caps(),
+        })
     }
 
     /// The consumer's account key `cfg` binds its explicitly selected provider account to
     /// (decision 0122): refused when either is missing or invalid, never defaulted to the
-    /// primary account.
+    /// primary account, and refused too when the probe mode or its guard refuses `cfg`.
     fn exec_account_key(&self, cfg: &VenueConfig) -> Result<Option<AccountKey>, ConfigError> {
+        probe::mode(cfg)?;
         auth::account_key(cfg).map(Some)
     }
 
@@ -168,6 +188,7 @@ impl VenueFactory for Qfex {
         &self,
         cfg: &VenueConfig,
     ) -> Result<HttpPlan<Vec<InstrumentSpecDraft>>, VenueError> {
+        probe::mode(cfg)?;
         discover::plan(cfg)
     }
 
@@ -177,6 +198,7 @@ impl VenueFactory for Qfex {
         specs: &SpecTable,
         subs: &BTreeSet<Subscription>,
     ) -> Result<Vec<EndpointPlan>, VenueError> {
+        probe::mode(cfg)?;
         let url = mds_url(cfg)?;
         for sub in subs {
             channel(specs, *sub)?;
@@ -197,16 +219,36 @@ impl VenueFactory for Qfex {
         Box::new(QfexMd::new(ep.stream))
     }
 
-    fn plan_exec(&self, _cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
-        Ok(Vec::new())
+    /// Nothing, or under `preprod_probe` exactly one order-entry connection, the account's
+    /// trade socket (decision 0132 items 2 and 6): it authenticates in its frames, so its
+    /// handshake carries no header.
+    fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
+        if probe::mode(cfg)?.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![ExecEndpoint {
+            stream: exec::TRADE,
+            url: auth::opening_url(cfg)?,
+            handshake: Vec::new(),
+        }])
     }
 
+    /// Nothing, or under `preprod_probe` the codec in its probe mode, its credentials handed
+    /// to `src/auth` unread.
     fn exec_codec(
         &self,
-        _cfg: &VenueConfig,
-        _creds: Secrets,
+        cfg: &VenueConfig,
+        creds: Secrets,
     ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        None
+        let probe = match probe::mode(cfg) {
+            Ok(None) => return None,
+            Ok(Some(probe)) => probe,
+            Err(err) => return Some(Err(err.into())),
+        };
+        Some(
+            auth::TradeAuth::new(cfg, creds)
+                .map(|auth| Box::new(exec::QfexExec::probe(auth, probe)) as Box<dyn ExecCodec>),
+        )
     }
 
     fn test_connection(

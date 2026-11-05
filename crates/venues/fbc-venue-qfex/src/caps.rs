@@ -15,6 +15,16 @@ use fbc_core::{
     TouchSourceCaps, TradeCaps, VenueCaps,
 };
 
+/// Under decision 0132 item 6's pre-production probe mode: [`caps`] with the probe's
+/// [`ExecCaps`](fbc_core::ExecCaps), every other field unchanged, readiness `Record` included.
+pub(crate) fn probe_caps() -> VenueCaps {
+    VenueCaps {
+        exec: Some(crate::exec::probe_exec_caps()),
+        ..caps()
+    }
+}
+
+/// Market data only: `exec: None` (decisions 0117 and 0122).
 pub(crate) fn caps() -> VenueCaps {
     VenueCaps {
         exec: None,

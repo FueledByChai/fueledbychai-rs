@@ -61,6 +61,15 @@ impl<'a> Node<'a> {
         }
     }
 
+    /// Its text, when it is a string written with no escape: exactly the bytes between its
+    /// quotes. What the journal keeps in clear is judged on these bytes (decision 0134 item 3).
+    pub(crate) fn plain_str(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Str(Cow::Borrowed(text)) => Some(text),
+            _ => None,
+        }
+    }
+
     /// Whether an object anywhere in it names a member twice.
     pub(crate) fn repeats(&self) -> bool {
         match &self.kind {
@@ -246,6 +255,10 @@ mod tests {
         assert_eq!(&text[items[1].at.clone()], "-2e3");
         assert_eq!(items[2].str(), Some("x\"y"));
         assert_eq!(&text[items[2].scalar_span().unwrap()], r#"x\"y"#);
+        // A string written with an escape has no plain text; one without, its bytes.
+        assert_eq!(items[2].plain_str(), None);
+        assert_eq!(members[1].1.plain_str(), Some(""));
+        assert_eq!(items[0].plain_str(), None);
         assert_eq!(&text[items[3].scalar_span().unwrap()], "true");
         assert_eq!(items[5].scalar_span(), None);
         assert_eq!(members[1].1.scalar_span().unwrap().len(), 0);
