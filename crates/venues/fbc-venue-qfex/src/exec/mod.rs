@@ -1,9 +1,9 @@
 //! QFEX's trade WebSocket codec, recording-only (FBC-zeb0, BT-702): [`QfexExec`] authenticates
 //! each connection, subscribes to the account's private channels, feeds every rate refusal back
-//! to the shared provider-user budgets, and inspects the private state QFEX sends. It sends no
-//! command and normalizes nothing: `caps.exec` stays `None`, readiness `Record`, and the factory
-//! builds no order-entry codec (decisions 0117, 0122), so only a test or the probe builds this
-//! one.
+//! to the shared provider-user budgets, inspects the private state QFEX sends, and encodes the
+//! v1 order commands (FBC-blcw, `order.rs`). It normalizes nothing, and no reply settles a
+//! command: `caps.exec` stays `None`, readiness `Record`, and the factory builds no order-entry
+//! codec (decisions 0117, 0122), so only a test or the probe builds this one.
 //!
 //! - **Authentication.** On opening, the authentication frame from `src/auth` (its two nonces
 //!   reserved for the open, `nonces_for`) and a timer for QFEX's deadline: the server closes a
@@ -33,13 +33,23 @@
 //!   budget, as an echo naming no bucket does. Every other private state frame is inspected,
 //!   each number exactly ([`PrivateState`]), and ends the epoch with no order, fill, position or
 //!   resync event: nothing is normalized until FBC-jxau. A resync asks to reconnect.
+//! - **Commands.** A limit GTC, ALO (post-only) or limit IOC place, and a cancel or an order
+//!   query by the venue's order UUID, each one frame naming its request with the consumer's
+//!   deadline and labelled with its command's traffic class, sent only on an authenticated
+//!   epoch (`NotSent(Disconnected)` otherwise); everything else is refused unsent (`order.rs`).
+//!   No reply settles a request, whatever it names: an `order_response`, a fill, a page, an err
+//!   or an ack is read as above, and each sent request ends `Unknown` at its deadline. Reply
+//!   correlation stays candidate-only (`tests/correlation.rs`) until a decision, on evidence,
+//!   says otherwise.
 //!
 //! Each frame and its rate charge: the authentication as one tenth of a weight unit under
 //! `Control` (the rate page lists no weight for it, and `Control` charges both buckets), each
-//! subscription as the page's 0.1 under `Subscribe`, both Safety traffic.
+//! subscription as the page's 0.1 under `Subscribe`, both Safety traffic; each command as
+//! `order.rs` says.
 
 mod echo;
 mod json;
+mod order;
 mod private;
 
 use core::ops::Range;
@@ -48,7 +58,7 @@ use std::time::Duration;
 use fbc_core::{
     ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
     ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
-    NotSentReason, OpKind, PathStamps, RateCharge, RawFrame, RpcId, SpecTable, StreamId,
+    NotSentReason, OpKind, PathStamps, RateCharge, RawFrame, RpcCall, RpcId, SpecTable, StreamId,
     SubmitOutcome, TimerTag, TrafficClass, VenueCommand, VenueMeta, WireSlice,
 };
 
@@ -115,6 +125,8 @@ enum Phase {
 /// The recording-only order-entry codec for one QFEX account's trade WebSocket.
 pub struct QfexExec {
     auth: TradeAuth,
+    /// Each command's deadline, after which it ends `Unknown`.
+    rpc_timeout: Duration,
     phase: Phase,
     /// How many times a stream opened: the current epoch's number.
     opens: u32,
@@ -123,10 +135,13 @@ pub struct QfexExec {
 }
 
 impl QfexExec {
-    /// The codec for the account `auth` authenticates as.
-    pub fn new(auth: TradeAuth) -> QfexExec {
+    /// The codec for the account `auth` authenticates as, each command it sends awaiting its
+    /// reply for `rpc_timeout`, the consumer's request deadline (the probe mode's
+    /// `qfex.exec.rpc_timeout`, decision 0132 item 6).
+    pub fn new(auth: TradeAuth, rpc_timeout: Duration) -> QfexExec {
         QfexExec {
             auth,
+            rpc_timeout,
             phase: Phase::Closed,
             opens: 0,
             counts: QfexExecCounts::default(),
@@ -313,17 +328,33 @@ impl ExecCodec for QfexExec {
         });
     }
 
-    /// Every command is refused unsent: the encoder is FBC-blcw's.
+    /// One frame for a command `order.rs` sends, once the stream is authenticated; a command it
+    /// refuses is refused for what it is, whatever the epoch. QFEX signs no order and takes no
+    /// nonce, so the receipt is empty.
     fn encode(
         &mut self,
-        _cmd: &VenueCommand,
-        _rpc: RpcId,
-        _specs: &SpecTable,
+        cmd: &VenueCommand,
+        rpc: RpcId,
+        specs: &SpecTable,
         _ctx: &EncodeCtx,
         _t: &mut PathStamps<'_>,
-        _fx: &mut Effects,
+        fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
-        Err(NotSentReason::Unsupported)
+        let request = order::request(cmd, specs)?;
+        if self.phase != Phase::Authenticated {
+            return Err(NotSentReason::Disconnected);
+        }
+        fx.push(Effect::Send {
+            stream: TRADE,
+            frame: WireSlice::plain(request.frame),
+            rpc: Some(RpcCall {
+                id: rpc,
+                timeout: self.rpc_timeout,
+            }),
+            class: cmd.traffic_class(),
+            charge: request.charge,
+        });
+        Ok(EncodeReceipt::new())
     }
 
     fn on_frame(
@@ -394,6 +425,7 @@ impl ExecCodec for QfexExec {
         }
     }
 
+    /// Every sent command ends `Unknown` at its deadline: no reply settles one.
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
         sink.push(
             VenueMeta::NONE,

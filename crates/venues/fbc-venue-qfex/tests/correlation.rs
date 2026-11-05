@@ -295,7 +295,10 @@ fn an_echo_candidate_found_live_is_gone_from_the_journaled_frame() {
         auth::SECRET_KEY,
         Secret::new("synthetic-qfex-secret-0001".to_owned()),
     );
-    let codec = QfexExec::new(TradeAuth::new(&cfg, secrets).unwrap());
+    let codec = QfexExec::new(
+        TradeAuth::new(&cfg, secrets).unwrap(),
+        std::time::Duration::from_secs(2),
+    );
     let pending = [place(9, CID)];
     let echo = format!(
         r#"{{"ack":{{"incoming_message":{{"type":"add_order","params":{{"symbol":"AAPL-USD","client_order_id":"{CID}"}}}}}}}}"#

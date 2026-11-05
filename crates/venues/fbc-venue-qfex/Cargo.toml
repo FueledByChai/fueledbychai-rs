@@ -1,6 +1,6 @@
 [package]
 name = "fbc-venue-qfex"
-description = "QFEX public market-data adapter, the trade socket's offline HMAC signer and authentication, and its recording-only trade-socket codec; order entry is not enabled."
+description = "QFEX public market-data adapter, the trade socket's offline HMAC signer and authentication, and its recording-only trade-socket codec with an offline order encoder; order entry is not enabled."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
