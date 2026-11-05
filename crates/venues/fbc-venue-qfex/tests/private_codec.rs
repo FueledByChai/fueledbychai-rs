@@ -1211,6 +1211,65 @@ fn a_private_quantity_with_twenty_significant_digits_parses_exactly() {
     }
 }
 
+/// Codex P2 on 02c2d231 in PR #226: an exponent at or past the ends of `i32`, or a mantissa
+/// whose integer digits would overflow the decimal point's position, is refused as malformed
+/// private state, never a panic or a padding of gigabytes of zeros.
+#[test]
+fn an_exponent_at_the_ends_of_i32_or_past_them_is_refused_not_a_panic() {
+    let position = |written: &str| {
+        format!(r#"{{"position_response":{{"symbol":"AAPL-USD","position":{written}}}}}"#)
+    };
+    for written in [
+        // Codex's frame: serde_json accepts it, as a number that underflows to zero.
+        "1e-2147483648",
+        "1E-2147483648",
+        "-1.5e-2147483648",
+        "1e-2147483647",
+        "0e-2147483648",
+        "1e-99999999999",
+        "1e-65",
+        "1e65",
+        // Integer digits far past what a Decimal holds, brought back by an exponent.
+        &format!("1{}e-400", "0".repeat(500)),
+    ] {
+        let frame = position(written);
+        assert!(serde_json::from_str::<Value>(&frame).is_ok(), "{written}");
+        let mut codec = authed(SUB);
+        let out = text(&mut codec, &frame);
+        assert_eq!(out.result, Err(INVALID_STATE), "{written}");
+        assert!(out.reconnects(), "{written}");
+        assert_eq!(codec.last_private(), None, "{written}");
+    }
+    // Past f64's range serde_json refuses the frame itself: not a JSON object to the codec.
+    for written in ["1e2147483647", "1e+2147483647", "-1e400"] {
+        let frame = position(written);
+        assert!(serde_json::from_str::<Value>(&frame).is_err(), "{written}");
+        let out = text(&mut authed(SUB), &frame);
+        assert_eq!(out.result, Err(NOT_AN_OBJECT), "{written}");
+        assert!(out.reconnects(), "{written}");
+    }
+    // The ends of the range still read exactly.
+    for (written, value) in [
+        ("1e-28", "0.0000000000000000000000000001"),
+        ("0e64", "0"),
+        ("1e28", "10000000000000000000000000000"),
+    ] {
+        let mut codec = authed(SUB);
+        assert_eq!(
+            text(&mut codec, &position(written)).result,
+            Ok(()),
+            "{written}"
+        );
+        assert_eq!(
+            codec.last_private(),
+            Some(&PrivateState::Position {
+                position: Decimal::from_str_exact(value).unwrap()
+            }),
+            "{written}"
+        );
+    }
+}
+
 #[test]
 fn every_recognised_private_state_frame_ends_the_epoch_with_no_order_fill_position_or_resync_event()
 {
