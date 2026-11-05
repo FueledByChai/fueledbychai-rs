@@ -199,8 +199,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
   `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117) and,
   under `qfex.exec.mode` `preprod_probe` alone, a host-guarded pre-production probe's order
-  entry (`src/probe.rs`; its caps in `src/exec/caps.rs`; its REST reads' headers from
-  `src/auth`, `TradeAuth::rest_headers`; 0132 item 6),
+  entry (`src/probe.rs`; its caps in `src/exec/caps.rs`, account-wide cancel-on-disconnect
+  offering no disarm, which `caps_truthful` holds it to in `tests/conformance.rs`, 0141; its
+  REST reads' headers from `src/auth`, `TradeAuth::rest_headers`; 0132 item 6),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -239,6 +240,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `PxExact` price the venue states; 0120).
     `VenueCaps` keeps order and fill capabilities together in `exec: Option<ExecCaps>`,
     `None` for a market-data-only venue, which declares no fill source or fee sign (0015).
+    Each `CancelOnDisconnect` variant that takes an arm (`PerConnection`,
+    `AccountWide { offers_disarm }`, `DeadMan`) states `offers_disarm`, whether the venue
+    offers a disarm, `ArmCancelOnDisconnect(false)`; `None` takes neither (0141).
     Every codec names the credentials in what it receives (`redact_inbound`, `InboundSpans`;
     0028) so the journal keeps them only as keyed hashes. Credentials reach `exec_codec` and
     `test_connection` only as `Secrets` (`src/auth.rs`, a review path): no `Clone`, a `Debug`
@@ -560,8 +564,9 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     directory (one subdirectory per check that reads recorded data) and the setup its fixtures
     assume, one test per check, each check also a public function returning what it probed or
     every breach by capability; so far `caps_truthful` (every absence the caps declare refused
-    `NotSent(Unsupported)` with no effect, every flag conflict `NotSent(FlagConflict)`, an
-    instrument cancel-all never widened, a control per operation sent) and
+    `NotSent(Unsupported)` with no effect, a disarm where the protection offers none included,
+    every flag conflict `NotSent(FlagConflict)`, an instrument cancel-all never widened, a
+    control per operation sent, a disarm only where one is offered, 0141) and
     `commands_selfcontained` (every amend, cancel and query by each declared reference encoded
     by a fresh codec, alike after it saw the placement), `signing_golden` (each golden command
     the setup lists, encoded under its own `EncodeCtx` by a fresh codec, is one frame equal to

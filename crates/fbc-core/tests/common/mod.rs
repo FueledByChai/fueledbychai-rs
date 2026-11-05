@@ -59,6 +59,7 @@ pub fn synthetic_caps() -> VenueCaps {
                 cancel_on_disconnect: CancelOnDisconnect::PerConnection {
                     rearm_on_reconnect: true,
                     covers_open_orders: false,
+                    offers_disarm: true,
                 },
                 ack: AckModel::TwoPhase {
                     risk_reject_window: Duration::from_millis(250),

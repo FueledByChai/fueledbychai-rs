@@ -148,10 +148,13 @@ pub fn exec_caps() -> ExecCaps {
             // page says whether an arm on a new connection covers the orders already open when
             // it is enabled, so it is declared not to: the session cancels what a resync shows
             // resting before it places or amends on those markets, until FBC-8xr's testnet run
-            // shows otherwise and a new record flips it (FBC-nvxn).
+            // shows otherwise and a new record flips it (FBC-nvxn). The method page's `enabled`
+            // takes `true` or `false`, so it offers a disarm, `{"enabled":false}` (decision
+            // 0141).
             cancel_on_disconnect: CancelOnDisconnect::PerConnection {
                 rearm_on_reconnect: true,
                 covers_open_orders: false,
+                offers_disarm: true,
             },
             // "Create batch of orders": "Orders are queued for risk checking independently",
             // so an accepted order (status NEW) can still be closed by the risk check. The

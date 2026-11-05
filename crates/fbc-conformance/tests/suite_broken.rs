@@ -105,6 +105,9 @@ enum Twist {
     RefusesAll,
     /// An account-wide protection arm is refused despite the declared cap.
     RefusesArm,
+    /// Every disarm, `ArmCancelOnDisconnect(false)`, is refused `Unsupported` with no effect,
+    /// as a codec for a venue offering none refuses it (decision 0141); the arm is still sent.
+    RefusesDisarm,
     /// Every placement is refused `Unsupported`.
     RefusesPlacements,
     /// A placement's frames name no rpc.
@@ -346,6 +349,10 @@ impl ExecCodec for Twisted {
                 Err(NotSentReason::Unsupported)
             }
             (Twist::RefusesArm, _) if matches!(cmd, VenueCommand::ArmCancelOnDisconnect(_)) => {
+                fx.take();
+                Err(NotSentReason::Unsupported)
+            }
+            (Twist::RefusesDisarm, _) if *cmd == VenueCommand::ArmCancelOnDisconnect(false) => {
                 fx.take();
                 Err(NotSentReason::Unsupported)
             }
@@ -706,6 +713,7 @@ fn caps_truthful_names_limits_and_references_narrower_than_the_toy_takes() {
         o.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
             covers_open_orders: false,
+            offers_disarm: true,
         };
         // No one order is both IOC and FOK: the pair is not probed. An RPI FOK order is
         // refused for its undeclared parts before its conflict.
@@ -1061,6 +1069,7 @@ fn operations_the_caps_declare_are_controls_the_codec_must_send() {
         o.cancel_all_account = Support::Native;
         o.cancel_on_disconnect = CancelOnDisconnect::DeadMan {
             max_ttl: std::time::Duration::from_secs(10),
+            offers_disarm: true,
         };
     });
     let failure = failed(declared.caps_truthful());
@@ -1077,7 +1086,9 @@ fn operations_the_caps_declare_are_controls_the_codec_must_send() {
 fn account_wide_cod_declaration_requires_an_arm_and_disarm_the_codec_sends() {
     let broken = Broken {
         caps: Some(|caps| {
-            order(caps).cancel_on_disconnect = CancelOnDisconnect::AccountWide;
+            order(caps).cancel_on_disconnect = CancelOnDisconnect::AccountWide {
+                offers_disarm: true,
+            };
         }),
         builds: Builds::Codec(Twist::RefusesArm),
     };
@@ -1085,6 +1096,110 @@ fn account_wide_cod_declaration_requires_an_arm_and_disarm_the_codec_sends() {
     let refused = "refused as NotSent(Unsupported) though the caps declare it";
     assert!(said(&failure, "control: protection (arm)").starts_with(refused));
     assert!(said(&failure, "control: protection (disarm)").starts_with(refused));
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-3ymj's done line: a disarm held to `offers_disarm` (decision 0141).
+// ---------------------------------------------------------------------------------------------
+
+/// The probe a disarm meets where the caps take an arm and offer no disarm.
+const NO_DISARM: &str = "OrderCaps.cancel_on_disconnect offers no disarm";
+
+/// The toy's per-connection protection, offering no disarm.
+fn per_connection_without_disarm(caps: &mut VenueCaps) {
+    order(caps).cancel_on_disconnect = CancelOnDisconnect::PerConnection {
+        rearm_on_reconnect: true,
+        covers_open_orders: false,
+        offers_disarm: false,
+    };
+}
+
+/// Account-wide protection offering no disarm, as the QFEX probe declares (decision 0132).
+fn account_wide_without_disarm(caps: &mut VenueCaps) {
+    order(caps).cancel_on_disconnect = CancelOnDisconnect::AccountWide {
+        offers_disarm: false,
+    };
+}
+
+#[test]
+fn the_toy_declaring_a_disarm_sends_it_as_a_control_and_passes() {
+    // The toy as it is: per-connection protection offering a disarm, which its codec writes.
+    let caps = ToyFactory.caps(&VenueConfig::new()).unwrap();
+    let cod = caps.exec.unwrap().order.cancel_on_disconnect;
+    assert!(cod.offers_disarm(), "{cod:?}");
+    let probed = probed(Broken::twisted(Twist::None).caps_truthful());
+    for name in ["control: protection (arm)", "control: protection (disarm)"] {
+        assert!(probed.iter().any(|p| p == name), "{name}: {probed:?}");
+    }
+    assert!(!probed.iter().any(|p| p == NO_DISARM), "{probed:?}");
+}
+
+#[test]
+fn a_toy_declaring_no_disarm_yet_sending_one_fails_naming_offers_disarm() {
+    for caps in [per_connection_without_disarm, account_wide_without_disarm] {
+        let broken = Broken::declaring(caps);
+        let failure = failed(broken.caps_truthful());
+        assert_eq!(
+            said(&failure, NO_DISARM),
+            "sent (1 effect(s)) where the caps make it NotSent(Unsupported)",
+            "{failure}"
+        );
+        // Only the disarm: the arm is still a control the codec sends.
+        assert_eq!(failure.breaches.len(), 1, "{failure}");
+        assert!(!failure.names("control: protection (arm)"), "{failure}");
+    }
+}
+
+#[test]
+fn a_toy_declaring_no_disarm_and_refusing_it_passes_its_arm_still_a_control() {
+    for caps in [per_connection_without_disarm, account_wide_without_disarm] {
+        let refusing = Broken {
+            caps: Some(caps),
+            builds: Builds::Codec(Twist::RefusesDisarm),
+        };
+        let probed = probed(refusing.caps_truthful());
+        for name in ["control: protection (arm)", NO_DISARM] {
+            assert!(probed.iter().any(|p| p == name), "{name}: {probed:?}");
+        }
+        assert!(
+            !probed.iter().any(|p| p == "control: protection (disarm)"),
+            "{probed:?}"
+        );
+    }
+}
+
+#[test]
+fn a_toy_declaring_a_disarm_yet_refusing_it_fails_its_control() {
+    let failure = failed(Broken::twisted(Twist::RefusesDisarm).caps_truthful());
+    let what = said(&failure, "control: protection (disarm)");
+    assert!(
+        what.starts_with("refused as NotSent(Unsupported) though the caps declare it"),
+        "{failure}"
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+}
+
+#[test]
+fn a_dead_man_timer_offering_no_disarm_has_its_disarm_probed_as_an_absence() {
+    // The toy refreshes no timer, so the refresh control fails too; the disarm the toy still
+    // writes is named as the absence the caps declare, and the arm is a control it sends.
+    let broken = Broken::declaring(|caps| {
+        order(caps).cancel_on_disconnect = CancelOnDisconnect::DeadMan {
+            max_ttl: std::time::Duration::from_secs(10),
+            offers_disarm: false,
+        };
+    });
+    let failure = failed(broken.caps_truthful());
+    let sent = "sent (1 effect(s)) where the caps make it NotSent(Unsupported)";
+    assert_eq!(said(&failure, NO_DISARM), sent, "{failure}");
+    assert!(
+        failure.names("control: dead-man timer (refresh)"),
+        "{failure}"
+    );
+    assert!(!failure.names("control: protection (arm)"), "{failure}");
+    assert_eq!(failure.breaches.len(), 2, "{failure}");
+    // `None` takes no arm, so it offers no disarm either.
+    assert!(!CancelOnDisconnect::None.offers_disarm());
 }
 
 #[test]

@@ -521,7 +521,7 @@ impl fmt::Display for ExecSessionError {
                 let declared = match cod {
                     CancelOnDisconnect::None => "None",
                     CancelOnDisconnect::PerConnection { .. } => "PerConnection",
-                    CancelOnDisconnect::AccountWide => "AccountWide",
+                    CancelOnDisconnect::AccountWide { .. } => "AccountWide",
                     CancelOnDisconnect::DeadMan { .. } => "DeadMan",
                 };
                 write!(
@@ -1733,7 +1733,7 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
         gate_flags(&exec.order).map_err(ExecSessionError::CancelOnDisconnect)?;
     let account_wide = matches!(
         exec.order.cancel_on_disconnect,
-        CancelOnDisconnect::AccountWide
+        CancelOnDisconnect::AccountWide { .. }
     );
     if account_wide && config.account_wide_cod_authority.map(|a| a.account) != Some(config.acct) {
         return Err(ExecSessionError::AccountWideCodAuthority);
@@ -1846,11 +1846,14 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
 /// timer. One function for the live session and its decoder replay (FBC-tgt).
 pub(crate) fn gate_flags(order: &OrderCaps) -> Result<(bool, bool, bool), CancelOnDisconnect> {
     let (rearm, covers_open) = match order.cancel_on_disconnect {
+        // Whether the venue offers a disarm changes nothing here: the session sends none
+        // (decision 0141).
         CancelOnDisconnect::PerConnection {
             rearm_on_reconnect,
             covers_open_orders,
+            ..
         } => (rearm_on_reconnect, covers_open_orders),
-        CancelOnDisconnect::AccountWide => (true, true),
+        CancelOnDisconnect::AccountWide { .. } => (true, true),
         other => return Err(other),
     };
     // Our client id names one venue order where amends keep the venue id (decision 0080).
@@ -2527,13 +2530,22 @@ mod tests {
                 ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::PerConnection {
                     rearm_on_reconnect: false,
                     covers_open_orders: false,
+                    offers_disarm: true,
                 }),
                 "the venue declares cancel-on-disconnect PerConnection; a session places orders \
                  only behind supported protection",
             ),
             (
+                ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::AccountWide {
+                    offers_disarm: false,
+                }),
+                "the venue declares cancel-on-disconnect AccountWide; a session places orders \
+                 only behind supported protection",
+            ),
+            (
                 ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::DeadMan {
                     max_ttl: std::time::Duration::from_secs(1),
+                    offers_disarm: true,
                 }),
                 "the venue declares cancel-on-disconnect DeadMan; a session places orders only \
                  behind supported protection",

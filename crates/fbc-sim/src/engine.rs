@@ -723,7 +723,7 @@ impl SimEngine {
                     self.protected = false;
                 }
             }
-            CancelOnDisconnect::AccountWide => {
+            CancelOnDisconnect::AccountWide { .. } => {
                 if self.protected {
                     let at = At { mono: now, wall };
                     self.end_all(at, SimState::Canceled(CancelReason::Venue), |_| true);
@@ -773,9 +773,16 @@ impl SimEngine {
         }
     }
 
-    /// Turns the stood-in venue's cancel-on-disconnect on or off, as request `rpc`.
+    /// Turns the stood-in venue's cancel-on-disconnect on or off, as request `rpc`. A venue
+    /// with no protection takes neither, and one offering no disarm refuses turning it off
+    /// (decision 0141), leaving the protection as it was.
     fn protect(&mut self, rpc: u64, on: bool, at: At) {
-        let reply = match self.cancel_on_disconnect {
+        let cod = self.cancel_on_disconnect;
+        let reply = match cod {
+            _ if !on && !cod.offers_disarm() => Reply::Rejected {
+                rpc,
+                refusal: Refusal::NoProtection,
+            },
             CancelOnDisconnect::None => Reply::Rejected {
                 rpc,
                 refusal: Refusal::NoProtection,
@@ -792,11 +799,11 @@ impl SimEngine {
                 }
                 Reply::Done { rpc }
             }
-            CancelOnDisconnect::AccountWide => {
+            CancelOnDisconnect::AccountWide { .. } => {
                 self.protected = on;
                 Reply::Done { rpc }
             }
-            CancelOnDisconnect::DeadMan { max_ttl } => {
+            CancelOnDisconnect::DeadMan { max_ttl, .. } => {
                 self.dead_man = on.then(|| due(at, max_ttl));
                 Reply::Done { rpc }
             }
@@ -807,7 +814,7 @@ impl SimEngine {
     /// Restarts a dead-man venue's running timer, as request `rpc`.
     fn refresh(&mut self, rpc: u64, at: At) {
         let reply = match (self.cancel_on_disconnect, self.dead_man) {
-            (CancelOnDisconnect::DeadMan { max_ttl }, Some(_)) => {
+            (CancelOnDisconnect::DeadMan { max_ttl, .. }, Some(_)) => {
                 self.dead_man = Some(due(at, max_ttl));
                 Reply::Done { rpc }
             }
@@ -1199,7 +1206,10 @@ impl SimEngine {
             reduce_only: p.reduce_only,
             guarded: self.protected
                 && (!self.placing_other
-                    || self.cancel_on_disconnect == CancelOnDisconnect::AccountWide),
+                    || matches!(
+                        self.cancel_on_disconnect,
+                        CancelOnDisconnect::AccountWide { .. }
+                    )),
         }
     }
 

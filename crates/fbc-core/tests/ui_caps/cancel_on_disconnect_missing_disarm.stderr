@@ -1,0 +1,11 @@
+error[E0063]: missing field `offers_disarm` in initializer of `CancelOnDisconnect`
+ --> tests/ui_caps/cancel_on_disconnect_missing_disarm.rs:6:13
+  |
+6 |     let _ = CancelOnDisconnect::AccountWide {};
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `offers_disarm`
+
+error[E0063]: missing field `offers_disarm` in initializer of `CancelOnDisconnect`
+ --> tests/ui_caps/cancel_on_disconnect_missing_disarm.rs:7:13
+  |
+7 |     let _ = CancelOnDisconnect::PerConnection {
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `offers_disarm`

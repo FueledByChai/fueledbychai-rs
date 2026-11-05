@@ -100,6 +100,7 @@ impl VenueFactory for Held {
             order.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
                 rearm_on_reconnect: true,
                 covers_open_orders: true,
+                offers_disarm: true,
             };
         }
         Ok(caps)

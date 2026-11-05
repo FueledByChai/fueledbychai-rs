@@ -27,6 +27,7 @@ fn main() {
         cancel_all_instrument: Support::Unsupported,
         cancel_on_disconnect: CancelOnDisconnect::DeadMan {
             max_ttl: Duration::from_secs(10),
+            offers_disarm: true,
         },
         ack: AckModel::SinglePhase,
         client_id: ClientIdFormat::Uuid,

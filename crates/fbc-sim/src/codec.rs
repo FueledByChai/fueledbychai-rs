@@ -58,10 +58,11 @@ use crate::wire::{
 ///
 /// A venue that cancels on disconnect (FBC-fji) is placed through like any other: the engine
 /// ends what the venue would when the simulated stream closes or a dead-man timer lapses. The
-/// codec writes `ArmCancelOnDisconnect` for a venue whose `cancel_on_disconnect` is
-/// `PerConnection` or `DeadMan`, and `RefreshDeadMan` for a `DeadMan` one, each a control frame
-/// naming no instrument, answered as one outcome for the whole request; it refuses them
-/// (`Unsupported`) for any other.
+/// codec writes the arm, `ArmCancelOnDisconnect(true)`, for a venue whose `cancel_on_disconnect`
+/// is `PerConnection`, `AccountWide` or `DeadMan`, the disarm, `ArmCancelOnDisconnect(false)`,
+/// only where that protection offers one (decision 0141), and `RefreshDeadMan` for a `DeadMan`
+/// one, each a control frame naming no instrument, answered as one outcome for the whole
+/// request; it refuses them (`Unsupported`), nothing written, for any other.
 ///
 /// Each event is ordered as the stood-in venue's [`OrderingKey`] says (decision 0050): by the
 /// engine's sequence number, by the instant the venue acted as its timestamp or block time, or
@@ -305,8 +306,10 @@ impl SimCodec {
                 (Command::Query(query), OpKind::Query, Some(q.inst), 1)
             }
             // A control frame of the venue's session, naming no instrument.
+            // The arm where the venue takes one, the disarm only where it offers one (0141).
             VenueCommand::ArmCancelOnDisconnect(on)
-                if self.cancel_on_disconnect != CancelOnDisconnect::None =>
+                if self.cancel_on_disconnect != CancelOnDisconnect::None
+                    && (*on || self.cancel_on_disconnect.offers_disarm()) =>
             {
                 (Command::Protect(head, *on), OpKind::Control, None, 1)
             }

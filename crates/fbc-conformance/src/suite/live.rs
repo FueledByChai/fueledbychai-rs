@@ -235,9 +235,11 @@ impl<'s> Live<'s> {
                 cfg,
                 creds,
                 acct: ACCT,
-                account_wide_cod_authority: (self.order.cancel_on_disconnect
-                    == CancelOnDisconnect::AccountWide)
-                    .then(|| AccountWideCodAuthority::new(ACCT)),
+                account_wide_cod_authority: matches!(
+                    self.order.cancel_on_disconnect,
+                    CancelOnDisconnect::AccountWide { .. }
+                )
+                .then(|| AccountWideCodAuthority::new(ACCT)),
                 rpc_ids: RpcIds::default(),
                 ns: NAMESPACE,
                 specs: self.h.specs().clone(),
