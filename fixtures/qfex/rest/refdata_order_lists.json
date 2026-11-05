@@ -1,0 +1,61 @@
+{
+  "type": "refdata",
+  "data": [
+    {
+      "symbol": "MSFT-USD",
+      "clobPairId": "31",
+      "tick_size": "0.01",
+      "lot_size": "0.01",
+      "min_quantity": "0.01",
+      "max_quantity": "1000",
+      "base_asset": "MSFT",
+      "quote_asset": "USD",
+      "margin_asset": "USDC",
+      "order_time_in_force": ["GTC", "FOK"],
+      "order_types": ["LIMIT", "MARKET", "ALO"],
+      "status": "ACTIVE"
+    },
+    {
+      "symbol": "TSLA-USD",
+      "clobPairId": "32",
+      "tick_size": "0.01",
+      "lot_size": "0.01",
+      "min_quantity": "0.01",
+      "max_quantity": "1000",
+      "base_asset": "TSLA",
+      "quote_asset": "USD",
+      "margin_asset": "USDC",
+      "order_time_in_force": null,
+      "order_types": null,
+      "status": "ACTIVE"
+    },
+    {
+      "symbol": "META-USD",
+      "clobPairId": "33",
+      "tick_size": "0.01",
+      "lot_size": "0.01",
+      "min_quantity": "0.01",
+      "max_quantity": "1000",
+      "base_asset": "META",
+      "quote_asset": "USD",
+      "margin_asset": "USDC",
+      "order_time_in_force": ["NOT_A_QFEX_TIF", "GTC", "gtc", "GTC"],
+      "order_types": ["TAKE_PROFIT", "LIMIT", "STOP_LOSS", "STOP_MARKET", "TWAP_LIMIT", "alo", "NOT_A_QFEX_TYPE", "LIMIT"],
+      "status": "ACTIVE"
+    },
+    {
+      "symbol": "AMZN-USD",
+      "clobPairId": "34",
+      "tick_size": "0.01",
+      "lot_size": "0.01",
+      "min_quantity": "0.01",
+      "max_quantity": "1000",
+      "base_asset": "AMZN",
+      "quote_asset": "USD",
+      "margin_asset": "USDC",
+      "order_time_in_force": ["IOC"],
+      "order_types": ["TAKE_PROFIT", "STOP_LOSS"],
+      "status": "ACTIVE"
+    }
+  ]
+}

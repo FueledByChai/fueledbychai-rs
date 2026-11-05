@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `default` found for struct `OrderShapes` in the current scope
+ --> tests/ui_caps/order_shapes_default.rs:6:26
+  |
+6 |     let _ = OrderShapes::default();
+  |                          ^^^^^^^ associated function or constant not found in `OrderShapes`

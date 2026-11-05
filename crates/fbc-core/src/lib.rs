@@ -81,8 +81,8 @@ pub use ids::{
     Namespace, OrderRef, TradeId, UnderlyingId, VenueId, VenueOrderId, VenueSymbol,
 };
 pub use instrument::{
-    FundingSpec, InstrumentKind, InstrumentSpec, QtyError, QuantizeError, SigningParams, SizeStep,
-    TradingStatus, VenueNativeId,
+    FundingSpec, InstrumentKind, InstrumentSpec, OrderShapes, QtyError, QuantizeError,
+    SigningParams, SizeStep, TradingStatus, VenueNativeId,
 };
 pub use lease::{AccountLease, LeaseName, MAX_LOCK_FILE_NAME_LEN, MarketLease, NamedLeaseError};
 pub use mint::{CidMint, LeaseError, LeaseIo, NamespaceLease};

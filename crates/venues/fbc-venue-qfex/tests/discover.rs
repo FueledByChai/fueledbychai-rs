@@ -1,14 +1,20 @@
 //! FBC-e3g7: public `GET /refdata` supplies exact QFEX perpetual specs and a Java-era ticker
 //! rule, with missing or malformed values refused inside the decode scope.
+//!
+//! FBC-99w5 (decision 0136): each symbol's `order_types` and `order_time_in_force` become its
+//! draft's `order_shapes`, exactly the set it lists: `LIMIT` a plain limit, `ALO` the post-only
+//! form, `MARKET` a market order, and `GTC`, `IOC` and `FOK`; any other name is ignored, an
+//! empty or null list admits nothing of its kind, a missing list refuses the answer as
+//! `Missing` and anything but null or an array of strings as malformed.
 
 use std::time::Duration;
 
 use fbc_core::{
     AliasTable, AssetKey, AssetSym, ConfigError, DecodeError, Effect, FundingSpec, HttpFailure,
     HttpMethod, HttpResponse, InstrumentId, InstrumentKind, InstrumentResolver, Listing, Lots,
-    OpKind, PlanError, PriceGrid, RateCharge, ResolveError, SizeStep, SymbolError, TradingStatus,
-    TrafficClass, UnderlyingId, VenueConfig, VenueFactory, VenueId, WallNs, WireSlice, WireUrl,
-    dispatch_market_data,
+    OpKind, OrderKindTag, OrderShapes, PlanError, PriceGrid, RateCharge, ResolveError, SizeStep,
+    SymbolError, TagSet, TifTag, TradingStatus, TrafficClass, UnderlyingId, VenueConfig,
+    VenueFactory, VenueId, WallNs, WireSlice, WireUrl, dispatch_market_data,
 };
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex, discover::REFDATA_TAG};
 use rust_decimal::Decimal;
@@ -27,6 +33,15 @@ fn cfg() -> VenueConfig {
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("../../../../fixtures/qfex/rest/refdata.json")).unwrap()
+}
+
+/// The variant beside it: a symbol with no IOC, one listing null for both, one listing names
+/// outside the mapping (and duplicates), and one listing only names outside it.
+fn order_lists() -> Value {
+    serde_json::from_str(include_str!(
+        "../../../../fixtures/qfex/rest/refdata_order_lists.json"
+    ))
+    .unwrap()
 }
 
 fn discover_with(
@@ -222,6 +237,9 @@ fn ticker_rule_and_alias_table_resolve_verified_qfex_names() {
     assert_eq!(spec.id, AAPL);
     assert_eq!(spec.quote_ccy, sym("USD"));
     assert_eq!(spec.settle_ccy, sym("USDC"));
+    // The symbol's lists reach the spec the encoder reads (0136).
+    assert_eq!(spec.order_shapes, drafts[0].order_shapes);
+    assert!(spec.order_shapes.is_some());
     assert_eq!(
         resolver.resolve(
             VENUE,
@@ -376,4 +394,179 @@ fn discovery_refuses_invalid_configuration_and_http_failures() {
             failure: HttpFailure::TimedOut
         })
     );
+}
+
+// ----- The order types and times in force each symbol lists (FBC-99w5, decision 0136) -----
+
+fn shapes(kinds: &[OrderKindTag], post_only: bool, tifs: &[TifTag]) -> Option<OrderShapes> {
+    Some(OrderShapes {
+        kinds: TagSet::of(kinds),
+        post_only,
+        tifs: TagSet::of(tifs),
+    })
+}
+
+/// The refdata channel page (https://docs.qfex.com/websocket/channels/mds/refdata), whose
+/// payloads mirror the REST fields, lists `"order_types": ["LIMIT", "MARKET", "ALO"]` and
+/// `"order_time_in_force": ["GTC", "IOC", "FOK"]`, the OrderType and OrderTimeInForce names of
+/// the enums page (https://docs.qfex.com/api-reference/enums); post-only is the ALO order type.
+#[test]
+fn every_hand_built_refdata_entry_carries_both_lists_in_the_example_shape() {
+    let names = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .expect("an array")
+            .iter()
+            .map(|name| name.as_str().expect("a string").to_owned())
+            .collect()
+    };
+    let main = fixture();
+    let entries = main["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    for entry in entries {
+        for list in ["order_types", "order_time_in_force"] {
+            names(&entry[list]);
+        }
+    }
+    // The first entry lists exactly the page's example.
+    assert_eq!(
+        names(&entries[0]["order_types"]),
+        ["LIMIT", "MARKET", "ALO"]
+    );
+    assert_eq!(
+        names(&entries[0]["order_time_in_force"]),
+        ["GTC", "IOC", "FOK"]
+    );
+    // The variant carries both members on every entry too, arrays of strings but for the one
+    // symbol listing null for both.
+    let variant = order_lists();
+    let entries = variant["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    let mut null = Vec::new();
+    for entry in entries {
+        let object = entry.as_object().unwrap();
+        for list in ["order_types", "order_time_in_force"] {
+            match &object[list] {
+                Value::Null => null.push((entry["symbol"].as_str().unwrap(), list)),
+                other => {
+                    names(other);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        null,
+        [
+            ("TSLA-USD", "order_types"),
+            ("TSLA-USD", "order_time_in_force")
+        ]
+    );
+}
+
+#[test]
+fn each_symbol_decodes_to_exactly_the_order_shapes_it_lists() {
+    use OrderKindTag::{Limit, Market};
+    use TifTag::{Fok, Gtc, Ioc};
+    let drafts = decode(&fixture()).unwrap();
+    let listed: Vec<_> = drafts
+        .iter()
+        .map(|d| (d.venue_symbol.as_wire(), d.order_shapes))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            // LIMIT, MARKET and ALO with GTC, IOC and FOK: the page's example.
+            ("AAPL-USD", shapes(&[Limit, Market], true, &[Gtc, Ioc, Fok])),
+            // LIMIT without ALO: a plain limit, never post-only.
+            (
+                "ANTHROPIC-USD",
+                shapes(&[Limit, Market], false, &[Gtc, Ioc, Fok])
+            ),
+            // ALO without LIMIT: the post-only form, no plain limit.
+            ("NVDA-USD", shapes(&[], true, &[Gtc, Ioc])),
+            // Empty arrays: nothing of either kind.
+            ("GOLD-USD", shapes(&[], false, &[])),
+        ]
+    );
+    let drafts = decode(&order_lists()).unwrap();
+    let listed: Vec<_> = drafts
+        .iter()
+        .map(|d| (d.venue_symbol.as_wire(), d.order_shapes))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            // No IOC.
+            ("MSFT-USD", shapes(&[Limit, Market], true, &[Gtc, Fok])),
+            // Null for both: nothing of either kind, as for empty arrays.
+            ("TSLA-USD", shapes(&[], false, &[])),
+            // TAKE_PROFIT, STOP_LOSS, STOP_MARKET, TWAP_LIMIT (the enums page's stop and TWAP
+            // types), another spelling and an unknown string ignored; a repeat is one member.
+            ("META-USD", shapes(&[Limit], false, &[Gtc])),
+            // Only names outside the mapping: no kind and no post-only form.
+            ("AMZN-USD", shapes(&[], false, &[Ioc])),
+        ]
+    );
+    // Every other value each symbol states is read as before.
+    assert!(drafts.iter().all(|d| d.status == TradingStatus::Trading));
+    assert_eq!(drafts[1].asset, key("TSLA", "USD"));
+    assert_eq!(drafts[1].min_size, Lots::new(1).unwrap());
+}
+
+#[test]
+fn each_list_reads_on_its_own_and_one_null_admits_nothing_of_its_kind_alone() {
+    use OrderKindTag::{Limit, Market};
+    use TifTag::{Fok, Gtc, Ioc};
+    let mut doc = fixture();
+    doc["data"][0]["order_types"] = Value::Null;
+    let drafts = decode(&doc).unwrap();
+    assert_eq!(drafts[0].order_shapes, shapes(&[], false, &[Gtc, Ioc, Fok]));
+    let mut doc = fixture();
+    doc["data"][0]["order_time_in_force"] = json!([]);
+    let drafts = decode(&doc).unwrap();
+    assert_eq!(drafts[0].order_shapes, shapes(&[Limit, Market], true, &[]));
+    // One name of each.
+    let mut doc = fixture();
+    doc["data"][0]["order_types"] = json!(["MARKET"]);
+    doc["data"][0]["order_time_in_force"] = json!(["FOK"]);
+    let drafts = decode(&doc).unwrap();
+    assert_eq!(drafts[0].order_shapes, shapes(&[Market], false, &[Fok]));
+}
+
+#[test]
+fn a_missing_list_refuses_the_answer_and_a_malformed_one_too() {
+    for list in ["order_types", "order_time_in_force"] {
+        // Missing from any entry, the first or a later one: the whole answer, market data
+        // included, as for every field discovery reads.
+        for entry in [0, 3] {
+            let mut doc = fixture();
+            doc["data"][entry].as_object_mut().unwrap().remove(list);
+            assert_eq!(decode(&doc), Err(PlanError::Missing(list)), "{list}");
+        }
+        let mut doc = order_lists();
+        doc["data"][1].as_object_mut().unwrap().remove(list);
+        assert_eq!(decode(&doc), Err(PlanError::Missing(list)), "{list}");
+        // Neither null nor an array of strings, or an item that is not a string.
+        for value in [
+            json!("LIMIT"),
+            json!("GTC"),
+            json!(42),
+            json!(true),
+            json!({}),
+            json!({"LIMIT": true}),
+            json!([1]),
+            json!(["LIMIT", null]),
+            json!(["GTC", 7]),
+            json!([["LIMIT"]]),
+            json!([{"name": "GTC"}]),
+            json!([false]),
+        ] {
+            let mut doc = fixture();
+            doc["data"][2][list] = value.clone();
+            assert_eq!(
+                decode(&doc),
+                Err(PlanError::Decode(DecodeError::Malformed(list))),
+                "{list}: {value}"
+            );
+        }
+    }
 }

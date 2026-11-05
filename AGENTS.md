@@ -216,7 +216,13 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     closes, fail-closed across daylight-saving edges, and `next_closed(from)` gives the first
     instant at or after `from` it closes, never an occurrence a skipped hour swallows whole, so
     a codec can ask for a timer at a session's end, 0130; `None` where it closes nothing),
-    copied from the draft by the resolver, neither in `version` (0125).
+    copied from the draft by the resolver, neither in `version` (0125). It states
+    `order_shapes: Option<OrderShapes>` too (`kinds: TagSet<OrderKindTag>` for orders that are
+    not post-only, `post_only` for the post-only form, `tifs: TagSet<TifTag>`, each as the
+    venue lists it for the instrument, and `OrderShapes::lists(kind, post_only, tif)`, which
+    only ever narrows the venue-wide `OrderCaps`; `None` where the venue lists none per
+    instrument, which a venue that lists them may read as nothing listed), copied by the
+    resolver and not in `version` (0136).
     `MdEvent::Status { inst, status }` is an instrument's `TradingStatus` as the venue's market
     data shows it, reported each time it changes, a halt on the venue's schedule included: no
     book event and no feed's health, named in every match on `MdEvent` with a fallback arm, and

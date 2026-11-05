@@ -12,6 +12,11 @@
 //!   client-id cancel or query, every batch, cancel-many and cancel-all, and the
 //!   cancel-on-disconnect arm (on and off) are each refused with nothing written.
 //! - No reply frame settles a request: each sent command ends `Unknown` at its deadline.
+//! - FBC-99w5 (decision 0136): a place goes out only on a spec whose order shapes list its QFEX
+//!   `order_type` (`LIMIT`, or `ALO` for post-only) and its `order_time_in_force` (`GTC` or
+//!   `IOC`). One that omits either, lists nothing (empty or null in the refdata) or states none
+//!   is refused `Unsupported` with nothing written, on specs built here and on specs discovered
+//!   from `fixtures/qfex/rest/` through `InstrumentResolver::spec`.
 //!
 //! Every key, account, id and frame here is synthetic: the frames are built from the shapes
 //! QFEX's pages show (each test names the page), or from `fixtures/qfex/private` (its
@@ -23,19 +28,21 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AmendOrder, AssetSym, CancelOrder, CancelScope, Channel, CidMint, ClientOrderId,
-    ConnKey, ConnState, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent, ExecSink,
-    FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope, Lots, MonoNs, Namespace,
-    NamespaceLease, NewOrder, NonceBlock, NotSentReason, OpKind, OrderKind, OrderRef, PathStamps,
-    PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RpcCall, RpcId, Secret, Secrets, Side,
-    SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, TradingStatus, TrafficClass, UnderlyingId,
-    VenueCaps, VenueCommand, VenueConfig, VenueFactory, VenueId, VenueMeta, VenueOrderId, Via,
-    WallNs, dispatch, dispatch_market_data, encode_cid,
+    AccountKey, AliasTable, AmendOrder, AssetSym, CancelOrder, CancelScope, Channel, CidMint,
+    ClientOrderId, ConnKey, ConnState, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec,
+    ExecEvent, ExecSink, FundingSpec, HttpResponse, InstrumentId, InstrumentKind,
+    InstrumentResolver, InstrumentSpec, LimitScope, Listing, Lots, MonoNs, Namespace,
+    NamespaceLease, NewOrder, NonceBlock, NotSentReason, OpKind, OrderKind, OrderKindTag, OrderRef,
+    OrderShapes, PathStamps, PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RpcCall,
+    RpcId, Secret, Secrets, Side, SizeStep, SpecTable, SubmitOutcome, TagSet, Ticks, Tif,
+    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueFactory,
+    VenueId, VenueMeta, VenueOrderId, Via, WallNs, dispatch, dispatch_market_data, encode_cid,
 };
 use fbc_runtime::{BucketKey, RateLimiter, RateUserKey, Request, SafetyReserve};
 use fbc_venue_qfex::auth::{self, TradeAuth};
+use fbc_venue_qfex::discover::REFDATA_TAG;
 use fbc_venue_qfex::exec::{CLIENT_ID_FORMAT, QfexExec, TRADE};
-use fbc_venue_qfex::{KEY_MDS_URL, Qfex};
+use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
@@ -177,17 +184,18 @@ fn authed(account: &str) -> QfexExec {
     codec
 }
 
-/// What one encode gave, and what it pushed.
-fn encode(
+/// What one encode against `specs` gave, and what it pushed.
+fn encode_on(
     codec: &mut QfexExec,
     cmd: &VenueCommand,
     rpc: RpcId,
+    specs: &SpecTable,
 ) -> (Result<EncodeReceipt, NotSentReason>, Vec<Effect>) {
     let mut fx = Effects::new();
     let sent = codec.encode(
         cmd,
         rpc,
-        &specs(),
+        specs,
         &ctx(rpc.0),
         &mut PathStamps::off(),
         &mut fx,
@@ -206,7 +214,17 @@ fn sent(
     cmd: &VenueCommand,
     rpc: RpcId,
 ) -> (String, RateCharge, TrafficClass) {
-    let (result, effects) = encode(codec, cmd, rpc);
+    sent_on(codec, cmd, rpc, &specs())
+}
+
+/// One command sent against `specs`, checked as [`sent`] checks it.
+fn sent_on(
+    codec: &mut QfexExec,
+    cmd: &VenueCommand,
+    rpc: RpcId,
+    specs: &SpecTable,
+) -> (String, RateCharge, TrafficClass) {
+    let (result, effects) = encode_on(codec, cmd, rpc, specs);
     assert_eq!(result, Ok(EncodeReceipt::new()), "{cmd:?}");
     let [
         Effect::Send {
@@ -237,7 +255,11 @@ fn sent(
 }
 
 fn refused(codec: &mut QfexExec, cmd: &VenueCommand, why: NotSentReason) {
-    let (result, effects) = encode(codec, cmd, RpcId(900));
+    refused_on(codec, cmd, why, &specs());
+}
+
+fn refused_on(codec: &mut QfexExec, cmd: &VenueCommand, why: NotSentReason, specs: &SpecTable) {
+    let (result, effects) = encode_on(codec, cmd, RpcId(900), specs);
     assert_eq!(result, Err(why), "{cmd:?}");
     assert!(effects.is_empty(), "{cmd:?} wrote {effects:?}");
 }
@@ -286,8 +308,20 @@ fn spec(
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        // Every v1 shape listed: LIMIT and ALO, GTC and IOC (decision 0136).
+        order_shapes: Some(v1_lists()),
         version: 1,
         fetched_at: WallNs(0),
+    }
+}
+
+/// Lists naming exactly the v1 places' order types and times in force: `LIMIT` and `ALO`,
+/// `GTC` and `IOC`.
+fn v1_lists() -> OrderShapes {
+    OrderShapes {
+        kinds: TagSet::of(&[OrderKindTag::Limit]),
+        post_only: true,
+        tifs: TagSet::of(&[Tif::Gtc, Tif::Ioc]),
     }
 }
 
@@ -1033,4 +1067,292 @@ fn the_factory_still_offers_no_order_entry() {
     assert_eq!(caps.readiness_ceiling, Readiness::Record);
     assert!(Qfex.plan_exec(&full).unwrap().is_empty());
     assert!(Qfex.exec_codec(&full, secrets()).is_none());
+}
+
+// ----- The order types and times in force the symbol lists (FBC-99w5, decision 0136) -----
+
+fn lists(kinds: &[OrderKindTag], post_only: bool, tifs: &[Tif]) -> OrderShapes {
+    OrderShapes {
+        kinds: TagSet::of(kinds),
+        post_only,
+        tifs: TagSet::of(tifs),
+    }
+}
+
+/// The spec table with `AAPL-USD`'s order shapes replaced by `shapes`.
+fn aapl_listing(shapes: Option<OrderShapes>) -> SpecTable {
+    let mut table = specs();
+    let mut aapl = table.get(AAPL).unwrap().clone();
+    aapl.order_shapes = shapes;
+    table.insert(aapl);
+    table
+}
+
+/// QFEX's refdata lists its order types and times in force apart (the refdata channel page,
+/// https://docs.qfex.com/websocket/channels/mds/refdata), and post-only is the ALO type (the
+/// enums page). Each v1 place needs its type and its time in force listed, and nothing more.
+#[test]
+fn each_v1_place_encodes_on_a_spec_listing_just_its_type_and_time_in_force() {
+    use OrderKindTag::Limit;
+    let cases = [
+        (
+            gtc(),
+            lists(&[Limit], false, &[Tif::Gtc]),
+            add_order("AAPL-USD", "BUY", "LIMIT", "GTC", "1.5", "200.5", cid(0)),
+        ),
+        (
+            alo(),
+            lists(&[], true, &[Tif::Gtc]),
+            add_order("AAPL-USD", "SELL", "ALO", "GTC", "0.05", "201", cid(1)),
+        ),
+        (
+            ioc(),
+            lists(&[Limit], false, &[Tif::Ioc]),
+            add_order("AAPL-USD", "BUY", "LIMIT", "IOC", "1000", "199.99", cid(2)),
+        ),
+    ];
+    for account in ["primary", SUB] {
+        let mut codec = authed(account);
+        for (n, (o, shapes, frame)) in cases.iter().enumerate() {
+            let table = aapl_listing(Some(*shapes));
+            let (text, charge, _) =
+                sent_on(&mut codec, &place(o.clone()), RpcId(n as u64 + 1), &table);
+            assert_eq!(&text, frame, "{account}");
+            assert_eq!(charge, self::charge(OpKind::Place, AAPL, 10));
+        }
+    }
+}
+
+/// A place whose type or time in force its spec does not list, or whose spec lists nothing or
+/// states no lists, is refused `Unsupported` before any frame is written: QFEX signs no order
+/// (the add_order page's frame has no signature, and its HMAC signs only the authentication),
+/// so nothing is spent on it, and nothing reaches the shared buckets.
+#[test]
+fn a_place_its_spec_does_not_list_is_refused_unsupported_with_nothing_written() {
+    use OrderKindTag::{Limit, Market};
+    let v1 = v1_lists();
+    let without_type = |o: &NewOrder| {
+        if o.post_only {
+            OrderShapes {
+                post_only: false,
+                ..v1
+            }
+        } else {
+            OrderShapes {
+                kinds: TagSet::none(),
+                ..v1
+            }
+        }
+    };
+    let without_tif = |o: &NewOrder| {
+        let others: Vec<Tif> = v1.tifs.iter().filter(|tif| *tif != o.tif).collect();
+        OrderShapes {
+            tifs: TagSet::of(&others),
+            ..v1
+        }
+    };
+    for o in [gtc(), alo(), ioc()] {
+        let unlisted = [
+            Some(without_type(&o)),
+            Some(without_tif(&o)),
+            // Empty or null in the refdata: nothing of either kind.
+            Some(lists(&[], false, &[])),
+            // Only what v1 never sends: a market order, fill-or-kill.
+            Some(lists(&[Market], false, &[Tif::Fok])),
+            // The type listed and only the other time in force, or the reverse.
+            Some(lists(
+                &[Limit],
+                true,
+                if o.tif == Tif::Gtc {
+                    &[Tif::Ioc, Tif::Fok]
+                } else {
+                    &[Tif::Gtc, Tif::Fok]
+                },
+            )),
+            // No lists stated at all: QFEX treats that as nothing admitted.
+            None,
+        ];
+        for shapes in unlisted {
+            let table = aapl_listing(shapes);
+            // Before the connection is asked about, and on an authenticated epoch alike.
+            refused_on(
+                &mut fresh("primary"),
+                &place(o.clone()),
+                NotSentReason::Unsupported,
+                &table,
+            );
+            let mut codec = authed(SUB);
+            refused_on(
+                &mut codec,
+                &place(o.clone()),
+                NotSentReason::Unsupported,
+                &table,
+            );
+            // Nothing refused touched the epoch: the same place goes out on lists naming it.
+            sent(&mut codec, &place(o.clone()), RpcId(1));
+            // A cancel and a query are never held to the lists.
+            let cancel = cancel(OrderRef::Venue(venue_id(ORDER)), AAPL);
+            sent_on(&mut codec, &cancel, RpcId(2), &table);
+            let query = query(OrderRef::Venue(venue_id(ORDER)), AAPL);
+            sent_on(&mut codec, &query, RpcId(3), &table);
+        }
+    }
+    // A shape v1 never sends is refused for what it is, whatever the spec lists.
+    let mut codec = authed("primary");
+    let table = aapl_listing(Some(lists(
+        &[Limit, Market],
+        true,
+        &[Tif::Gtc, Tif::Ioc, Tif::Fok],
+    )));
+    let fok = NewOrder {
+        tif: Tif::Fok,
+        ..gtc()
+    };
+    let alo_ioc = NewOrder {
+        tif: Tif::Ioc,
+        ..alo()
+    };
+    let market = NewOrder {
+        kind: OrderKind::Market,
+        ..ioc()
+    };
+    refused_on(&mut codec, &place(fok), NotSentReason::Unsupported, &table);
+    refused_on(
+        &mut codec,
+        &place(alo_ioc),
+        NotSentReason::FlagConflict,
+        &table,
+    );
+    refused_on(
+        &mut codec,
+        &place(market),
+        NotSentReason::Unsupported,
+        &table,
+    );
+}
+
+/// The specs discovery gives for one hand-built `GET /refdata` answer, through
+/// `InstrumentResolver::spec`, each symbol listed under `first` and the ids after it, with its
+/// wire symbol.
+fn discovered(body: &str, first: u32) -> (SpecTable, Vec<(InstrumentId, String)>) {
+    let mut cfg = cfg("primary");
+    cfg.insert(KEY_REST_URL, "https://api.qfex.com");
+    cfg.insert(KEY_REST_TIMEOUT, "5000ms");
+    let plan = Qfex.discover(&cfg).unwrap();
+    let answer = HttpResponse {
+        status: 200,
+        headers: &[],
+        body: body.as_bytes(),
+    };
+    let drafts = dispatch_market_data(&caps(), |scope| {
+        plan.parse(&[(REFDATA_TAG, Ok(answer))], scope)
+    })
+    .unwrap()
+    .done()
+    .expect("one round");
+    let mut resolver = InstrumentResolver::new(AliasTable::empty());
+    let mut table = SpecTable::new();
+    let mut ids = Vec::new();
+    for (n, draft) in drafts.into_iter().enumerate() {
+        let id = InstrumentId::new(first + n as u32);
+        let listing = Listing {
+            id,
+            underlying: UnderlyingId::new(id.get()),
+        };
+        resolver
+            .list(VenueId::new(4), draft.asset, listing)
+            .unwrap();
+        ids.push((id, draft.venue_symbol.as_wire().to_owned()));
+        table.insert(resolver.spec(VenueId::new(4), draft, 1, WallNs(0)).unwrap());
+    }
+    (table, ids)
+}
+
+fn rest_fixture(name: &str) -> String {
+    fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../fixtures/qfex/rest")
+            .join(name),
+    )
+    .unwrap()
+}
+
+/// The specs discovered from `fixtures/qfex/rest/refdata.json` and its variant: each v1 place
+/// goes out on a symbol listing its type and time in force, as the add_order frame naming that
+/// symbol, and is refused with nothing written on every other. The encoder reads no status:
+/// whether a halted or delisted symbol is traded is fbc-oms's to judge.
+#[test]
+fn the_lists_discovered_from_refdata_decide_which_v1_places_each_symbol_takes() {
+    let (main, main_ids) = discovered(&rest_fixture("refdata.json"), 21);
+    let (variant, variant_ids) = discovered(&rest_fixture("refdata_order_lists.json"), 31);
+    // Which of the GTC, ALO and IOC places each symbol takes.
+    let want: [(&str, [bool; 3]); 8] = [
+        // LIMIT, MARKET and ALO with GTC, IOC and FOK.
+        ("AAPL-USD", [true, true, true]),
+        // LIMIT without ALO.
+        ("ANTHROPIC-USD", [true, false, true]),
+        // ALO without LIMIT, GTC and IOC.
+        ("NVDA-USD", [false, true, false]),
+        // Empty arrays.
+        ("GOLD-USD", [false, false, false]),
+        // No IOC.
+        ("MSFT-USD", [true, true, false]),
+        // Null for both.
+        ("TSLA-USD", [false, false, false]),
+        // LIMIT and GTC among names outside the mapping.
+        ("META-USD", [true, false, false]),
+        // Only names outside the mapping, and IOC.
+        ("AMZN-USD", [false, false, false]),
+    ];
+    let symbols = main_ids
+        .iter()
+        .map(|id| (id, &main))
+        .chain(variant_ids.iter().map(|id| (id, &variant)));
+    let mut codec = authed("primary");
+    let mut rpc = 100;
+    let mut seen = Vec::new();
+    for (((inst, symbol), table), (want_symbol, takes)) in symbols.zip(want) {
+        assert_eq!(symbol, want_symbol);
+        seen.push(symbol.as_str());
+        // A hundred lots at two thousand ticks: within every symbol's size limits and on its
+        // grid.
+        let at = |o: NewOrder| NewOrder {
+            inst: *inst,
+            qty: Lots::new(100).unwrap(),
+            kind: OrderKind::Limit { px: Ticks(2_000) },
+            ..o
+        };
+        let names = [("LIMIT", "GTC"), ("ALO", "GTC"), ("LIMIT", "IOC")];
+        for ((o, (order_type, tif)), takes) in [at(gtc()), at(alo()), at(ioc())]
+            .into_iter()
+            .zip(names)
+            .zip(takes)
+        {
+            rpc += 1;
+            let cmd = place(o);
+            if takes {
+                let (text, charge, _) = sent_on(&mut codec, &cmd, RpcId(rpc), table);
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(frame["params"]["symbol"], json!(symbol), "{text}");
+                assert_eq!(frame["params"]["order_type"], json!(order_type), "{text}");
+                assert_eq!(frame["params"]["order_time_in_force"], json!(tif), "{text}");
+                assert_eq!(charge, self::charge(OpKind::Place, *inst, 10));
+            } else {
+                refused_on(&mut codec, &cmd, NotSentReason::Unsupported, table);
+            }
+        }
+    }
+    assert_eq!(seen.len(), 8);
+    // The example's lists, discovered: the GTC place on AAPL-USD as the add_order page shows it.
+    let aapl = NewOrder {
+        inst: main_ids[0].0,
+        qty: Lots::new(1_500).unwrap(),
+        kind: OrderKind::Limit { px: Ticks(20_050) },
+        ..gtc()
+    };
+    let (text, _, _) = sent_on(&mut codec, &place(aapl), RpcId(999), &main);
+    assert_eq!(
+        text,
+        add_order("AAPL-USD", "BUY", "LIMIT", "GTC", "1.5", "200.5", cid(0))
+    );
 }

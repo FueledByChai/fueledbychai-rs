@@ -30,12 +30,16 @@
 //! - `Unsupported`: a market order, a fill-or-kill, the RPI channel, a post-only order with any
 //!   time in force but GTC (`FlagConflict` for IOC, the one other v1 time in force: the pair
 //!   the order-types page refuses together), and reduce-only, until a capture settles its
-//!   semantics; `modify_order`, until a capture settles whether its quantity is the total or
-//!   the remaining quantity and how a partly filled order is modified (the enums page names
-//!   `CANNOT_MODIFY_PARTIAL_FILL`); a cancel or query by client id, since a cancel by client id
-//!   "may cancel multiple orders" of the symbol; every batch, cancel-many and cancel-all; the
-//!   cancel-on-disconnect arm, on and off (FBC-mfey's, under decision 0132's probe mode only);
-//!   and a dead-man refresh and a fee query, which QFEX has no request for.
+//!   semantics; a place whose `order_type` or `order_time_in_force` its symbol's refdata does not
+//!   list (decision 0136: the spec's `order_shapes`, from discovery, must list `LIMIT`, or `ALO`
+//!   for a post-only order, and the time in force; a spec stating none lists nothing), which
+//!   QFEX could refuse (the enums page names `INVALID_ORDER_TYPE` and `INVALID_TIME_IN_FORCE`)
+//!   only once it was sent and charged; `modify_order`, until a capture settles whether its
+//!   quantity is the total or the remaining quantity and how a partly filled order is modified
+//!   (the enums page names `CANNOT_MODIFY_PARTIAL_FILL`); a cancel or query by client id, since
+//!   a cancel by client id "may cancel multiple orders" of the symbol; every batch, cancel-many
+//!   and cancel-all; the cancel-on-disconnect arm, on and off (FBC-mfey's, under decision 0132's
+//!   probe mode only); and a dead-man refresh and a fee query, which QFEX has no request for.
 //! - `Unencodable`: an instrument the spec table does not hold, a price off the grid or not
 //!   positive, a quantity of no lots or outside the spec's minimum and maximum, a venue order id
 //!   the one order-id rule refuses ([`super::is_venue_order_id`], which the private decoder reads
@@ -51,8 +55,8 @@ use std::num::NonZeroU32;
 
 use fbc_core::{
     CancelOrder, Channel, ClientOrderId, InstrumentId, InstrumentSpec, Lots, NewOrder,
-    NotSentReason, OpKind, OrderKind, OrderRef, QueryOrder, RateCharge, Side, SpecTable, Ticks,
-    Tif, VenueCommand, encode_cid,
+    NotSentReason, OpKind, OrderKind, OrderKindTag, OrderRef, QueryOrder, RateCharge, Side,
+    SpecTable, Ticks, Tif, VenueCommand, encode_cid,
 };
 use rust_decimal::Decimal;
 
@@ -107,6 +111,7 @@ fn shape(o: &NewOrder) -> Result<(&'static str, &'static str, Ticks), NotSentRea
 fn place(o: &NewOrder, specs: &SpecTable) -> Result<Request, NotSentReason> {
     let (order_type, tif, px) = shape(o)?;
     let spec = spec(specs, o.inst)?;
+    listed(spec, o.post_only, o.tif)?;
     let price = price(spec, px)?;
     let quantity = quantity(spec, o.qty)?;
     let cid = client_order_id(o.cid)?;
@@ -139,6 +144,18 @@ fn get_order(q: &QueryOrder, specs: &SpecTable) -> Result<Request, NotSentReason
         json_string(order_id),
     );
     Ok(charged(body, OpKind::Query, q.inst, TWO_UNITS))
+}
+
+/// `Unsupported` unless the symbol's lists name a limit of this form and time in force: its
+/// `order_types` `LIMIT`, or `ALO` for a post-only order, and its `order_time_in_force`
+/// (decision 0136). QFEX's refdata states lists for every symbol, so a spec stating none is read
+/// as listing nothing. An amend, once one is sent, takes the same check.
+fn listed(spec: &InstrumentSpec, post_only: bool, tif: Tif) -> Result<(), NotSentReason> {
+    let shapes = spec.order_shapes.ok_or(Unsupported)?;
+    if !shapes.lists(OrderKindTag::Limit, post_only, tif) {
+        return Err(Unsupported);
+    }
+    Ok(())
 }
 
 fn charged(body: String, op: OpKind, inst: InstrumentId, weight: NonZeroU32) -> Request {

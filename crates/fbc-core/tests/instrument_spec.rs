@@ -2,7 +2,8 @@
 //! price becomes an order price, and it is maker-safe on every kind of grid: a bid floors and
 //! an ask ceils onto the grid valid at the resulting price. `floor_qty` floors a size onto the
 //! size step and refuses one below the minimum. The spec below is synthetic, and states its
-//! signing parameters and its session calendar like every other field (decision 0125).
+//! signing parameters and its session calendar (decision 0125) and the order shapes its venue
+//! lists for it (decision 0136) like every other field.
 
 use std::time::Duration;
 
@@ -11,10 +12,11 @@ mod common;
 use common::market_data_only_caps;
 use fbc_core::{
     AssetSym, Bps, CalendarParts, DstRule, FeeRate, FeeSchedule, FundingSpec, InstrumentId,
-    InstrumentKind, InstrumentSpec, LocalTime, Lots, Money, Month, PriceGrid, PublishedRates,
-    QtyError, QuantizeError, SessionCalendar, Side, SigningParams, SizeStep, Ticks, TradingStatus,
-    Transition, UnderlyingId, UtcOffsetRule, VenueId, VenueNativeId, WallNs, WeekOfMonth, WeekTime,
-    Weekday, WeeklyClosure, dispatch_market_data,
+    InstrumentKind, InstrumentSpec, LocalTime, Lots, Money, Month, OrderKindTag, OrderShapes,
+    PriceGrid, PublishedRates, QtyError, QuantizeError, SessionCalendar, Side, SigningParams,
+    SizeStep, TagSet, Ticks, TifTag, TradingStatus, Transition, UnderlyingId, UtcOffsetRule,
+    VenueId, VenueNativeId, WallNs, WeekOfMonth, WeekTime, Weekday, WeeklyClosure,
+    dispatch_market_data,
 };
 use rust_decimal::Decimal;
 
@@ -114,8 +116,18 @@ fn spec(grid: PriceGrid) -> InstrumentSpec {
             underlying: 9,
             settlement: 6,
         }),
+        order_shapes: Some(limit_gtc_ioc_and_post_only()),
         version: 1,
         fetched_at: WallNs(1_759_363_200_000_000_000),
+    }
+}
+
+/// Plain limits and a post-only limit, good till cancelled or immediate or cancel.
+fn limit_gtc_ioc_and_post_only() -> OrderShapes {
+    OrderShapes {
+        kinds: TagSet::of(&[OrderKindTag::Limit]),
+        post_only: true,
+        tifs: TagSet::of(&[TifTag::Gtc, TifTag::Ioc]),
     }
 }
 
@@ -440,6 +452,101 @@ fn the_synthetic_spec_states_its_signing_and_sessions() {
     };
     assert_ne!(unscheduled, spec);
     assert_eq!(unscheduled.version, spec.version);
+}
+
+/// Decision 0136: a spec states the order kinds, the post-only form and the times in force its
+/// venue lists for the instrument, `None` where the venue lists none; they are not part of what
+/// the version indexes.
+#[test]
+fn the_synthetic_spec_states_its_order_shapes_outside_the_version() {
+    let spec = fixed("0.5");
+    assert_eq!(spec.order_shapes, Some(limit_gtc_ioc_and_post_only()));
+    let unlisted = InstrumentSpec {
+        order_shapes: None,
+        ..fixed("0.5")
+    };
+    assert_ne!(unlisted, spec);
+    assert_eq!(unlisted.version, spec.version);
+}
+
+/// Decision 0136: an order is listed when its form is (its kind, or the post-only form for a
+/// post-only limit) and so is its time in force. The lists name no pairs: which kind takes
+/// which time in force stays the venue's rule.
+#[test]
+fn order_shapes_list_an_order_only_when_its_form_and_its_time_in_force_are_listed() {
+    use OrderKindTag::{Limit, Market};
+    use TifTag::{Fok, Gtc, Ioc};
+    let every = [
+        (Limit, false),
+        (Limit, true),
+        (Market, false),
+        (Market, true),
+    ];
+    let listed = |shapes: OrderShapes| {
+        let mut out = Vec::new();
+        for (kind, post_only) in every {
+            for tif in [Gtc, Ioc, Fok] {
+                if shapes.lists(kind, post_only, tif) {
+                    out.push((kind, post_only, tif));
+                }
+            }
+        }
+        out
+    };
+    // Plain and post-only limits, GTC or IOC.
+    assert_eq!(
+        listed(limit_gtc_ioc_and_post_only()),
+        [
+            (Limit, false, Gtc),
+            (Limit, false, Ioc),
+            (Limit, true, Gtc),
+            (Limit, true, Ioc),
+        ]
+    );
+    // The post-only form without the plain limit: only post-only limits.
+    let post_only_only = OrderShapes {
+        kinds: TagSet::none(),
+        post_only: true,
+        tifs: TagSet::of(&[Gtc]),
+    };
+    assert_eq!(listed(post_only_only), [(Limit, true, Gtc)]);
+    // The plain limit and a market order without the post-only form: never post-only, and never
+    // a post-only market order, whatever is listed.
+    let no_post_only = OrderShapes {
+        kinds: TagSet::of(&[Limit, Market]),
+        post_only: false,
+        tifs: TagSet::of(&[Ioc, Fok]),
+    };
+    assert_eq!(
+        listed(no_post_only),
+        [
+            (Limit, false, Ioc),
+            (Limit, false, Fok),
+            (Market, false, Ioc),
+            (Market, false, Fok),
+        ]
+    );
+    let market_and_post_only = OrderShapes {
+        kinds: TagSet::of(&[Market]),
+        post_only: true,
+        tifs: TagSet::of(&[Gtc, Ioc, Fok]),
+    };
+    assert!(!market_and_post_only.lists(Market, true, Ioc));
+    assert!(market_and_post_only.lists(Limit, true, Gtc));
+    assert!(!market_and_post_only.lists(Limit, false, Gtc));
+    // A kind with no time in force, or a time in force with no kind, lists nothing.
+    let no_tif = OrderShapes {
+        kinds: TagSet::of(&[Limit, Market]),
+        post_only: true,
+        tifs: TagSet::none(),
+    };
+    let no_kind = OrderShapes {
+        kinds: TagSet::none(),
+        post_only: false,
+        tifs: TagSet::of(&[Gtc, Ioc, Fok]),
+    };
+    assert!(listed(no_tif).is_empty());
+    assert!(listed(no_kind).is_empty());
 }
 
 #[test]

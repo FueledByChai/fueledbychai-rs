@@ -221,6 +221,9 @@ fn draft(
         status,
         sessions: None,
         signing: None,
+        // Each symbol lists `orderTypes` and `timeInForce` (fixtures/binance-usdm/rest), which
+        // this market-data-only adapter places nothing by, so reads neither (0136).
+        order_shapes: None,
     }))
 }
 

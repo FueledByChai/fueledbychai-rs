@@ -26,7 +26,10 @@
 //! A spec also states when a venue's timetable closes the instrument
 //! ([`InstrumentSpec::sessions`], a [`SessionCalendar`]) and what its venue's signer packs for
 //! it beyond its grid, step and native id ([`InstrumentSpec::signing`], [`SigningParams`]).
-//! Neither is part of what the version indexes (decision 0125).
+//! Neither is part of what the version indexes (decision 0125). It states the order kinds, the
+//! post-only form and the times in force its venue lists for it ([`InstrumentSpec::order_shapes`],
+//! [`OrderShapes`]), where the venue lists them per instrument, also outside the version
+//! (decision 0136).
 
 use core::fmt;
 use core::fmt::Write as _;
@@ -37,6 +40,7 @@ use compact_str::CompactString;
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::calendar::SessionCalendar;
+use crate::caps::{OrderKindTag, TagSet, TifTag};
 use crate::fee::FeeSchedule;
 use crate::grid::PriceGrid;
 use crate::ids::{InstrumentId, UnderlyingId, VenueId, VenueSymbol};
@@ -100,6 +104,11 @@ pub struct InstrumentSpec {
     /// What the venue's signer packs for it beyond the fields above, `None` where it needs
     /// nothing more (decision 0125).
     pub signing: Option<SigningParams>,
+    /// The order kinds, the post-only form and the times in force the venue lists for it,
+    /// `None` where the venue lists none per instrument and its venue-wide
+    /// [`OrderCaps`](crate::OrderCaps) alone govern (decision 0136). A venue that does list them
+    /// may read `None` as listing nothing.
+    pub order_shapes: Option<OrderShapes>,
     /// The spec's version: a new tick or size step bumps it, and books resync and resting
     /// orders re-quantize.
     pub version: u32,
@@ -130,6 +139,37 @@ pub enum SigningParams {
         /// The settlement asset's decimal places.
         settlement: u8,
     },
+}
+
+/// The orders a venue lists for one instrument, each list as the venue states it: the order
+/// kinds, the post-only form and the times in force, named by their shape and never by a venue
+/// (decisions 0003, 0136). The lists name no pairs: which kind a venue takes with which time in
+/// force stays its rule, and its [`OrderCaps`](crate::OrderCaps) still govern; the lists only
+/// ever narrow them. No `Default`: no list nobody read is assumed to admit an order, or none.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct OrderShapes {
+    /// The kinds listed for an order that is not post-only: a limit here is one that may take
+    /// liquidity.
+    pub kinds: TagSet<OrderKindTag>,
+    /// A post-only limit is listed, whether the venue spells it as an order type of its own or
+    /// as a flag on a limit.
+    pub post_only: bool,
+    /// The times in force listed.
+    pub tifs: TagSet<TifTag>,
+}
+
+impl OrderShapes {
+    /// Whether the lists name an order of `kind`, post-only or not, with `tif`: its form (the
+    /// post-only form for a post-only limit, its kind otherwise; a post-only order that is not
+    /// a limit never) and its time in force must both be listed.
+    pub fn lists(self, kind: OrderKindTag, post_only: bool, tif: TifTag) -> bool {
+        let form = if post_only {
+            self.post_only && kind == OrderKindTag::Limit
+        } else {
+            self.kinds.contains(kind)
+        };
+        form && self.tifs.contains(tif)
+    }
 }
 
 /// What kind of contract an instrument is.

@@ -31,8 +31,8 @@ use crate::fee::FeeSchedule;
 use crate::grid::PriceGrid;
 use crate::ids::{InstrumentId, UnderlyingId, VenueId, VenueSymbol};
 use crate::instrument::{
-    FundingSpec, InstrumentKind, InstrumentSpec, SigningParams, SizeStep, TradingStatus,
-    VenueNativeId,
+    FundingSpec, InstrumentKind, InstrumentSpec, OrderShapes, SigningParams, SizeStep,
+    TradingStatus, VenueNativeId,
 };
 use crate::time::WallNs;
 use crate::units::{AssetSym, Bps, Lots, Money};
@@ -310,6 +310,7 @@ impl InstrumentResolver {
             status: draft.status,
             sessions: draft.sessions,
             signing: draft.signing,
+            order_shapes: draft.order_shapes,
             version,
             fetched_at,
         })
@@ -346,6 +347,7 @@ pub struct InstrumentSpecDraft {
     pub status: TradingStatus,
     pub sessions: Option<SessionCalendar>,
     pub signing: Option<SigningParams>,
+    pub order_shapes: Option<OrderShapes>,
 }
 
 #[cfg(test)]

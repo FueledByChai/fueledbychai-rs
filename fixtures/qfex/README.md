@@ -128,3 +128,24 @@ The optional fourth argument is a comma-separated list of channels, one subscrip
 ```sh
 node --test fixtures/qfex/capture_public.test.mjs
 ```
+
+`rest/refdata.json` and its variant `rest/refdata_order_lists.json` are hand-built `GET /refdata`
+answers in the shape of QFEX's
+[REST refdata](https://docs.qfex.com/api-reference/rest/market-data/refdata) contract (OpenAPI of
+2026-10-30), not captures of a live answer: each entry holds the members discovery reads and
+`clobPairId`, a subset of the contract's required fields. FBC-e3g7 wrote the first file's four
+entries; FBC-99w5 (decision 0136) gave every entry of both files `order_types` and
+`order_time_in_force`, in the shape the
+[refdata channel page](https://docs.qfex.com/websocket/channels/mds/refdata) shows (its payloads
+mirror the REST fields): arrays of the OrderType and OrderTimeInForce names of the
+[enums page](https://docs.qfex.com/api-reference/enums), all read 2026-11-04, except where an
+entry states null. In `refdata.json`, `AAPL-USD` lists the channel page's example exactly
+(`LIMIT`, `MARKET`, `ALO`; `GTC`, `IOC`, `FOK`), `ANTHROPIC-USD` `LIMIT` without `ALO`,
+`NVDA-USD` `ALO` without `LIMIT`, and `GOLD-USD` two empty arrays. In the variant, `MSFT-USD`
+lists no `IOC`, `TSLA-USD` null for both (the contract allows null; no page says what it means),
+`META-USD` `LIMIT` and `GTC` among names this adapter ignores (the enums page's `TAKE_PROFIT`,
+`STOP_LOSS`, `STOP_MARKET` and `TWAP_LIMIT`, a lower-case `alo` and `gtc`, made-up unknown names
+and a repeat), and `AMZN-USD` only ignored order types, with `IOC`. The variant's grids, sizes and
+`clobPairId`s are made up. `crates/venues/fbc-venue-qfex/tests/discover.rs` proves what each entry
+decodes to, and `tests/private_orders.rs` which v1 places the encoder sends on each symbol's
+discovered spec.
