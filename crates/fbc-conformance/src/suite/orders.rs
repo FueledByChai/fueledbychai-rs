@@ -7,6 +7,11 @@
 //! request's deadline passes only when the check says (decisions 0005, 0014, 0025).
 //!
 //! - `amend_ack`: an order the stub accepted is amended, and the stub accepts the amend. The
+//!   amend keeps the order inside its instrument's limits as the harness placed it (decision
+//!   0137, augmenting 0083): the valid price one step below, or one step above where the order's
+//!   notional falls short of `min_notional` below, else, where no such price is valid and
+//!   reaches it or the price is not amendable, a larger size within `max_order_size`; it is
+//!   skipped where none fits, naming each limit that ruled an amend out. The
 //!   amend's outcome is `Accepted`, and an `OrderUpdate` in state `Amended` names the order:
 //!   from the venue's event reporting the replaced order where `AmendCaps.ack` is
 //!   `ReplacedEvent`, synthesized by the codec from the reply where it is `RpcReplyOnly`. Every
@@ -41,8 +46,8 @@ use std::time::Duration;
 
 use fbc_core::{
     AckLevel, AckModel, AmendAck, AmendCaps, CidMatch, ClientOrderId, ExecEvent, FillEvent,
-    FillOrigin, ItemRef, Lots, OpKind, OrderKindTag, OrderUpdate, RpcId, Side, SubmitOutcome,
-    Ticks, TifTag, VenueOrderId, VenueOrderState,
+    FillOrigin, InstrumentSpec, ItemRef, Lots, Money, OpKind, OrderKindTag, OrderUpdate, RpcId,
+    Side, SubmitOutcome, Ticks, TifTag, VenueOrderId, VenueOrderState,
 };
 
 use super::harness::{Harness, Shape};
@@ -181,11 +186,69 @@ pub fn amend_ack(subject: &Subject<'static>) -> Result<Verdict, Failure> {
     })
 }
 
-/// The price and quantity an order the harness places is amended to: a valid price one step
-/// away where the price is amendable and one is valid, else twice the quantity, or the largest order where that
-/// is less (Codex r4222779033), where the quantity is; why there is none otherwise.
+/// Why no price one step from the harness's is amended to, where the price is amendable.
+#[derive(Clone, Copy)]
+enum Stepless {
+    /// No valid price lies one step from the harness's.
+    Invalid,
+    /// Every valid price one step away leaves the order short of its instrument's
+    /// `min_notional`.
+    Short,
+    /// Every one leaves it short of `min_notional`, or its notional too large to hold.
+    ShortOrUnheld,
+}
+
+impl Stepless {
+    /// Why `amend_ack` is skipped where, besides, the quantity is not amendable.
+    fn why(self) -> &'static str {
+        match self {
+            Stepless::Invalid => "no valid price lies one step from the harness's",
+            Stepless::Short => {
+                "the harness's order falls short of InstrumentSpec.min_notional at every valid \
+                 price one step from its own"
+            }
+            Stepless::ShortOrUnheld => {
+                "the harness's order falls short of InstrumentSpec.min_notional, or has a \
+                 notional too large to hold, at every valid price one step from its own"
+            }
+        }
+    }
+
+    /// Why it is skipped where, besides, `max_order_size` admits no larger size: naming
+    /// `min_notional` too where it ruled the price amend out, so a reader looks at both fields.
+    fn why_no_size(self) -> &'static str {
+        match self {
+            Stepless::Invalid => NO_SIZE,
+            Stepless::Short => {
+                "the harness's order falls short of InstrumentSpec.min_notional at every valid \
+                 price one step from its own, and InstrumentSpec.max_order_size admits no size \
+                 but its own to amend to"
+            }
+            Stepless::ShortOrUnheld => {
+                "the harness's order falls short of InstrumentSpec.min_notional, or has a \
+                 notional too large to hold, at every valid price one step from its own, and \
+                 InstrumentSpec.max_order_size admits no size but its own to amend to"
+            }
+        }
+    }
+}
+
+/// Why `amend_ack` is skipped where `max_order_size` admits no larger size and no price is
+/// amended to.
+const NO_SIZE: &str =
+    "InstrumentSpec.max_order_size admits no size but the harness's own to amend to";
+
+/// The price and quantity an order the harness places is amended to, inside the instrument's
+/// limits as the order is (decision 0137, augmenting 0083): where the price is amendable, the
+/// valid price one step below, or one step above where the order's notional falls short of the
+/// instrument's `min_notional` below (the harness sizes its order to the least that reaches it
+/// at its price); where neither is valid and reaches it, or the price is not amendable, twice the
+/// quantity, or the largest order where that is less (Codex r4222779033), where the quantity is
+/// amendable; why there is none otherwise, naming each limit that ruled an amend out.
 fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Result<(Ticks, Lots), &'static str> {
     let spec = h.specs().get(h.inst).expect("the harness's instrument");
+    // Why no price one step away is amended to, where the price is amendable.
+    let mut stepless = None;
     if amend.price {
         let grid = &spec.price_grid;
         let below =
@@ -196,19 +259,47 @@ fn amended(h: &Harness<'_>, amend: &AmendCaps) -> Result<(Ticks, Lots), &'static
             h.px.0
                 .checked_add(1)
                 .and_then(|px| grid.ceil_valid(Ticks(px)));
-        // Where no other price is valid, the quantity, where amendable (Codex r4224395215).
-        match below.or(above) {
-            Some(px) => return Ok((px, h.qty)),
-            None if !amend.qty => return Err("no valid price lies one step from the harness's"),
-            None => {}
+        let stepped: Vec<Ticks> = [below, above].into_iter().flatten().collect();
+        if let Some(&px) = stepped.iter().find(|&&px| reaches(spec, px, h.qty)) {
+            return Ok((px, h.qty));
         }
+        let unheld = stepped.iter().any(|&px| spec.notional(px, h.qty).is_none());
+        let why = match (stepped.is_empty(), unheld) {
+            (true, _) => Stepless::Invalid,
+            (false, false) => Stepless::Short,
+            (false, true) => Stepless::ShortOrUnheld,
+        };
+        // Where no other price is valid and keeps the order at the minimum notional, the
+        // quantity, where amendable (Codex r4224395215).
+        if !amend.qty {
+            return Err(why.why());
+        }
+        stepless = Some(why);
     } else if !amend.qty {
         return Err("AmendCaps declares neither the price nor the quantity amendable");
     }
     let doubled = Lots::new(h.qty.get().saturating_mul(2)).expect("a count");
     let qty = spec.max_order_size.map_or(doubled, |max| doubled.min(max));
-    let none = "InstrumentSpec.max_order_size admits no size but the harness's own to amend to";
-    (qty > h.qty).then_some((h.px, qty)).ok_or(none)
+    if qty <= h.qty {
+        return Err(stepless.map_or(NO_SIZE, Stepless::why_no_size));
+    }
+    // A larger order at the same price reaches the minimum the harness's reaches, unless its
+    // notional is too large to hold (the harness's own never is).
+    if !reaches(spec, h.px, qty) {
+        return Err(
+            "InstrumentSpec.min_notional cannot judge the harness's order at the size it would \
+             be amended to: its notional is too large to hold",
+        );
+    }
+    Ok((h.px, qty))
+}
+
+/// Whether an order of `qty` at `px` reaches `spec`'s `min_notional`, where it states one, with a
+/// notional it can hold ([`InstrumentSpec::notional`]), as the order the harness places does.
+fn reaches(spec: &InstrumentSpec, px: Ticks, qty: Lots) -> bool {
+    let notional = spec.notional(px, qty);
+    let reached = |min: Money| notional.is_some_and(|n| n.nanos >= min.nanos);
+    spec.min_notional.is_none_or(reached)
 }
 
 /// Every update in state `Amended` that `names` the order, in the order reported: a consumer

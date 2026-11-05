@@ -94,7 +94,11 @@
 //! one at which the largest order reaches it, where no size within that does at that price. A
 //! setup whose first instrument takes no such order fails those checks, naming
 //! `InstrumentSpec.max_order_size` (below `min_size`) or `InstrumentSpec.min_notional` (reached
-//! at no valid price), rather than send orders a codec may rightly refuse.
+//! at no valid price), rather than send orders a codec may rightly refuse. [`amend_ack`] amends
+//! that order inside the same limits (decision 0137, augmenting 0083): one valid price step
+//! below, or above where its notional falls short of `min_notional` below, else to a larger size
+//! within `max_order_size`, and is skipped where no amend the venue's `AmendCaps` allow fits,
+//! naming each limit that ruled one out.
 //!
 //! [`price_grid`] sizes its own orders, at the many prices it quantizes on every instrument, the
 //! same way price by price (FBC-7y5e): the prices around one of the grid's boundaries go at one
