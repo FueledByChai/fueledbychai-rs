@@ -23,18 +23,18 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AmendOrder, AssetSym, CancelOrder, CancelScope, Channel, CidMint, ClientIdFormat,
-    ClientOrderId, ConnKey, ConnState, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec,
-    ExecEvent, ExecSink, FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope,
-    Lots, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NotSentReason, OpKind,
-    OrderKind, OrderRef, PathStamps, PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness,
-    RpcCall, RpcId, Secret, Secrets, Side, SizeStep, SpecTable, SubmitOutcome, Ticks, Tif,
-    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueFactory,
-    VenueId, VenueMeta, VenueOrderId, Via, WallNs, dispatch, dispatch_market_data, encode_cid,
+    AccountKey, AmendOrder, AssetSym, CancelOrder, CancelScope, Channel, CidMint, ClientOrderId,
+    ConnKey, ConnState, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent, ExecSink,
+    FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope, Lots, MonoNs, Namespace,
+    NamespaceLease, NewOrder, NonceBlock, NotSentReason, OpKind, OrderKind, OrderRef, PathStamps,
+    PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RpcCall, RpcId, Secret, Secrets, Side,
+    SizeStep, SpecTable, SubmitOutcome, Ticks, Tif, TradingStatus, TrafficClass, UnderlyingId,
+    VenueCaps, VenueCommand, VenueConfig, VenueFactory, VenueId, VenueMeta, VenueOrderId, Via,
+    WallNs, dispatch, dispatch_market_data, encode_cid,
 };
 use fbc_runtime::{BucketKey, RateLimiter, RateUserKey, Request, SafetyReserve};
 use fbc_venue_qfex::auth::{self, TradeAuth};
-use fbc_venue_qfex::exec::{QfexExec, TRADE};
+use fbc_venue_qfex::exec::{CLIENT_ID_FORMAT, QfexExec, TRADE};
 use fbc_venue_qfex::{KEY_MDS_URL, Qfex};
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -346,7 +346,7 @@ fn cid(n: usize) -> ClientOrderId {
 
 /// A client id as QFEX's frame carries it.
 fn wire(cid: ClientOrderId) -> String {
-    encode_cid(&ClientIdFormat::Uuid, cid)
+    encode_cid(&CLIENT_ID_FORMAT, cid)
         .unwrap()
         .as_str()
         .to_owned()
