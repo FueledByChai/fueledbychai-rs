@@ -1,15 +1,21 @@
-//! The toy's market data (FBC-u1d): its two book channels on one connection and its keepalive.
-//! [`BOOK`] takes its snapshot in one frame; [`ANCHORED_BOOK`] declares `rest_anchor` and takes
-//! its snapshot over HTTP, holding its deltas until the snapshot comes. Both are sequenced plus
-//! one per instrument and channel.
+//! The toy's market data on its socket: its two book channels on one connection and its
+//! keepalive (FBC-u1d), and its trades, mark, index and funding (FBC-z2s, `feeds.rs`). [`BOOK`]
+//! takes its snapshot in one frame; [`ANCHORED_BOOK`] declares `rest_anchor` and takes its
+//! snapshot over HTTP, holding its deltas until the snapshot comes. Both are sequenced plus one
+//! per instrument and channel. Stats are not on the socket: they come from the poll endpoint
+//! (`stats.rs`), and a subscription to them is refused here, nothing sent, as a feed the caps do
+//! not declare is (Codex r4172917344, r4172649862).
 //!
-//! Out: `sub|add=<sym>@<book>,...|remove=...` per subscribe call (an empty part left out), one
-//! `Subscribe` unit counted against its instrument when the call names one; a `GET
-//! <anchor>/book/<sym>` per anchor ([`ANCHOR_TIMEOUT`], one `Rest` unit); the frame `ping` every
-//! [`KEEPALIVE_EVERY`] ([`MdCodec::keepalive`]).
+//! Out: `sub|add=<sym>@<channel>,...|remove=...` per subscribe call (an empty part left out),
+//! `<channel>` a book's id, `trades`, `mark`, `index` or `funding`, one `Subscribe` unit counted
+//! against its instrument when the call names one; a `GET <anchor>/book/<sym>` per anchor
+//! ([`ANCHOR_TIMEOUT`], one `Rest` unit); the frame `ping` every [`KEEPALIVE_EVERY`]
+//! ([`MdCodec::keepalive`]).
 //!
-//! In, one record per frame, `<levels>` being `bid=<px>:<qty>,...|ask=<px>:<qty>,...` (prices
-//! ticks, sizes lots, either list possibly empty):
+//! In, a `trade`, `mark`, `index` or `funding` record (`feeds.rs`) is pushed as its event, or
+//! dropped when its feed is not subscribed. Of books, one record per frame, `<levels>` being
+//! `bid=<px>:<qty>,...|ask=<px>:<qty>,...` (prices ticks, sizes lots, either list possibly
+//! empty):
 //!
 //! - `snap|sym|book|seq|ts?|<levels>`: [`BOOK`]'s whole snapshot, decoded whole or not at all
 //!   (record 0014 item 2). One before a sequence the channel had already seen, applied or
@@ -36,11 +42,11 @@
 //! A frame for a channel not subscribed is dropped; an anchor answered after its subscription
 //! was removed, or superseded, is ignored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
     BookId, BookSide, ConfigError, DecodeError, DecodeScope, Effect, Effects, Feed, FeedHealth,
-    HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
+    FeedSource, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound, InboundSpans,
     InstrumentId, Keepalive, KeepaliveKind, Lots, MdCodec, MdEvent, MdSink, MonoNs, OpKind,
     RateCharge, RawFrame, SpecTable, StreamId, Subscription, Ticks, TimerTag, TrafficClass,
     VenueError, VenueMeta, WallNs, WireSlice, WireUrl,
@@ -50,7 +56,7 @@ use super::decode::{Record, record};
 use super::url::{echoed, join, occurrences, secrets};
 use super::{
     ANCHOR_RETRY, ANCHOR_TIMEOUT, ANCHOR_URL_KEY, ANCHORED_BOOK, BOOK, KEEPALIVE_EVERY, MAX_HELD,
-    caps,
+    caps, feed_source, feeds,
 };
 use DecodeError::Malformed;
 
@@ -91,6 +97,8 @@ pub struct ToyMd {
     /// anchored channel is refused.
     anchor: Option<WireUrl>,
     chans: BTreeMap<(InstrumentId, BookId), Chan>,
+    /// The trades, mark, index and funding subscribed.
+    feeds: BTreeSet<Subscription>,
     /// The next tag an anchor's request and its retry timer share.
     next_tag: u64,
     /// The snapshots pushed, each one's `epoch`.
@@ -106,6 +114,7 @@ impl core::fmt::Debug for ToyMd {
             .field("stream", &self.stream)
             .field("anchor", &self.anchor)
             .field("chans", &self.chans)
+            .field("feeds", &self.feeds)
             .field("next_tag", &self.next_tag)
             .field("snapshots", &self.snapshots)
             .field("secrets", &self.secrets.len())
@@ -121,6 +130,7 @@ impl ToyMd {
             stream,
             anchor: None,
             chans: BTreeMap::new(),
+            feeds: BTreeSet::new(),
             next_tag: 1,
             snapshots: 0,
             secrets: Vec::new(),
@@ -150,22 +160,30 @@ impl ToyMd {
         self
     }
 
-    /// `sub` is a declared channel of an instrument in `specs`; its wire spelling.
+    /// `sub` is a feed the socket carries (its caps' source is `Stream`) of an instrument in
+    /// `specs`; its wire spelling.
     fn check(&self, sub: &Subscription, specs: &SpecTable) -> Result<String, VenueError> {
         let spec = specs.get(sub.inst);
         let spec = spec.ok_or(VenueError::UnknownInstrument(sub.inst))?;
-        let Feed::Book(book) = sub.feed else {
-            return Err(VenueError::UnsupportedFeed(*sub));
+        let channel = match (feed_source(sub.feed), sub.feed) {
+            (FeedSource::Stream, Feed::Book(book)) => {
+                let declared = caps().md.books.get(usize::from(book.0)).copied();
+                if declared.is_some_and(|b| b.rest_anchor) && self.anchor.is_none() {
+                    return Err(VenueError::Config(ConfigError::Invalid {
+                        key: ANCHOR_URL_KEY,
+                        reason: "no anchor URL is configured for the anchored book channel",
+                    }));
+                }
+                book.0.to_string()
+            }
+            (FeedSource::Stream, Feed::Trades) => "trades".into(),
+            (FeedSource::Stream, Feed::Mark) => "mark".into(),
+            (FeedSource::Stream, Feed::Index) => "index".into(),
+            (FeedSource::Stream, Feed::Funding) => "funding".into(),
+            // Stats come from the poll endpoint; anything else the caps do not declare.
+            _ => return Err(VenueError::UnsupportedFeed(*sub)),
         };
-        let declared = caps().md.books.get(usize::from(book.0)).copied();
-        let declared = declared.ok_or(VenueError::UnsupportedFeed(*sub))?;
-        if declared.rest_anchor && self.anchor.is_none() {
-            return Err(VenueError::Config(ConfigError::Invalid {
-                key: ANCHOR_URL_KEY,
-                reason: "no anchor URL is configured for the anchored book channel",
-            }));
-        }
-        Ok(format!("{}@{}", spec.venue_symbol.as_wire(), book.0))
+        Ok(format!("{}@{channel}", spec.venue_symbol.as_wire()))
     }
 
     /// Asks for `inst`'s anchor at `url` under a fresh tag, which it returns.
@@ -392,8 +410,9 @@ impl MdCodec for ToyMd {
     fn on_open(&mut self, _fx: &mut Effects) {}
 
     /// Checks every subscription before asking for anything: an instrument missing from
-    /// `specs`, a feed other than a declared book channel, or [`ANCHORED_BOOK`] without an
-    /// anchor URL is refused, nothing sent (Codex r4172917339). Every instrument, added or
+    /// `specs`, a feed the socket does not carry (a book channel the caps do not declare, a
+    /// touch channel, or stats, which are polled), or [`ANCHORED_BOOK`] without an anchor URL is
+    /// refused, nothing sent (Codex r4172917339, r4172917344). Every instrument, added or
     /// removed, is checked before any feed, so a missing one is named first (Codex
     /// r4216704345).
     fn subscribe(
@@ -433,16 +452,19 @@ impl MdCodec for ToyMd {
             charge: RateCharge::one(OpKind::Subscribe, inst),
         });
         for sub in remove {
-            if let Feed::Book(book) = sub.feed {
-                self.chans.remove(&(sub.inst, book));
+            match sub.feed {
+                Feed::Book(book) => _ = self.chans.remove(&(sub.inst, book)),
+                _ => _ = self.feeds.remove(sub),
             }
         }
         for sub in add {
-            if let Feed::Book(book) = sub.feed
-                && !self.chans.contains_key(&(sub.inst, book))
-            {
-                let chan = self.restart(sub.inst, book, specs, (Vec::new(), 0), fx);
-                self.chans.insert((sub.inst, book), chan);
+            match sub.feed {
+                Feed::Book(book) if !self.chans.contains_key(&(sub.inst, book)) => {
+                    let chan = self.restart(sub.inst, book, specs, (Vec::new(), 0), fx);
+                    self.chans.insert((sub.inst, book), chan);
+                }
+                Feed::Book(_) => {}
+                _ => _ = self.feeds.insert(*sub),
             }
         }
         Ok(())
@@ -451,7 +473,7 @@ impl MdCodec for ToyMd {
     fn on_frame(
         &mut self,
         f: RawFrame<'_>,
-        _scope: &DecodeScope<'_>,
+        scope: &DecodeScope<'_>,
         specs: &SpecTable,
         sink: &mut dyn MdSink,
         fx: &mut Effects,
@@ -459,6 +481,14 @@ impl MdCodec for ToyMd {
         let r = record(f)?;
         let inst = specs.by_symbol(r.get("sym")?);
         let inst = inst.ok_or(DecodeError::UnknownInstrument)?.id;
+        if !matches!(r.kind, "snap" | "delta") {
+            // A trade, mark, index or funding record, read whole, pushed when subscribed.
+            let (feed, meta, ev) = feeds::streamed(&r, inst, scope)?;
+            if self.feeds.contains(&Subscription { inst, feed }) {
+                sink.push(meta, ev);
+            }
+            return Ok(());
+        }
         let book = BookId(r.num("book")?);
         if caps().md.books.len() <= usize::from(book.0) {
             return Err(Malformed("book"));
@@ -480,11 +510,10 @@ impl MdCodec for ToyMd {
                 Ok(())
             }
             "snap" => Err(Malformed("an anchored book's snapshot comes over HTTP")),
-            "delta" => {
+            _ => {
                 self.delta((inst, book), s, specs, sink, fx);
                 Ok(())
             }
-            _ => Err(Malformed("kind")),
         }
     }
 

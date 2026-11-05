@@ -310,7 +310,7 @@ impl<'a> Record<'a> {
     }
 
     /// An optional count: `None` when absent, malformed when present and negative.
-    fn opt_lots(&self, key: &'static str) -> Result<Option<Lots>, DecodeError> {
+    pub(super) fn opt_lots(&self, key: &'static str) -> Result<Option<Lots>, DecodeError> {
         self.opt(key).map(|_| self.lots(key)).transpose()
     }
 
