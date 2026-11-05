@@ -75,7 +75,10 @@ fn secrets() -> Secrets {
 }
 
 fn fresh(account: &str) -> QfexExec {
-    QfexExec::new(TradeAuth::new(&cfg(account), secrets()).unwrap())
+    QfexExec::new(
+        TradeAuth::new(&cfg(account), secrets()).unwrap(),
+        Duration::from_secs(2),
+    )
 }
 
 fn caps() -> VenueCaps {
@@ -1456,8 +1459,9 @@ fn every_recognised_private_state_frame_ends_the_epoch_with_no_order_fill_positi
 
 // ----- What the codec does not do -----
 
+/// The commands FBC-blcw's encoder sends are `tests/private_orders.rs`'s; these stay refused.
 #[test]
-fn no_command_is_encoded_and_the_factory_still_offers_no_order_entry() {
+fn no_session_command_is_encoded_and_the_factory_still_offers_no_order_entry() {
     let mut codec = authed(SUB);
     for cmd in [
         VenueCommand::ArmCancelOnDisconnect(true),
