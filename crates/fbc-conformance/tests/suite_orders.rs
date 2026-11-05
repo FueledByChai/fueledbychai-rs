@@ -25,6 +25,14 @@
 //! (0123, 0128), while its market-data limits stay per account; a limit declared only there is
 //! waited out before the next placement or amend; and a variant whose order-entry limits mix
 //! user and account scopes fails naming `VenueCaps.exec_limits`.
+//!
+//! FBC-7s2a's done line: `amend_ack` passes the toy whose stub refuses an order or an amend below
+//! its instrument's `min_notional`, on setups where the harness's order is sized to just reach
+//! that minimum at its price, so one price step below it falls short. Around it (decision 0137):
+//! the step below still taken first where it reaches the minimum, exactly too, or none is stated;
+//! the quantity amended where no price one step away keeps that minimum; and the check skipped
+//! naming each limit that ruled an amend out, where the price alone is amendable there, where a
+//! step's or the larger size's notional is too large to hold, or where no larger size is allowed.
 
 mod toy_setup;
 
@@ -43,7 +51,7 @@ use fbc_core::{
     VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderState,
     WireSlice,
 };
-use fbc_core::{CancelOnDisconnect, ItemRef, RefKind, SnapshotSource, TagSet};
+use fbc_core::{CancelOnDisconnect, ItemRef, Lots, RefKind, SnapshotSource, TagSet, Ticks};
 use toy_setup::{FIXTURES, assumed, order_entry, replier};
 
 /// How a toy variant's codec departs from the toy's.
@@ -2584,6 +2592,319 @@ fn amend_ack_amends_the_quantity_within_the_instruments_largest_order() {
     let skipped = suite::amend_ack(&QTY_ONLY.subject(|| sized(6)));
     assert!(
         matches!(skipped, Ok(Verdict::Skipped { why, .. }) if why.contains("max_order_size")),
+        "{skipped:?}"
+    );
+}
+
+/// Ten USDC, in nanos.
+const TEN_USDC: i128 = 10_000_000_000;
+
+/// The toy's setup with its first instrument edited by `edit`, its stub rejecting each item of a
+/// placement or an amend whose notional at its price falls short of its instrument's
+/// `min_notional`, or is too large to hold, as a venue validating that minimum does (FBC-7s2a).
+fn notional_checked(edit: impl FnOnce(&mut fbc_core::InstrumentSpec)) -> Setup {
+    let mut specs = toy::specs();
+    let mut a = specs.get(toy::INST_A).unwrap().clone();
+    edit(&mut a);
+    specs.insert(a);
+    let table = specs.clone();
+    let short = move |item: &str| {
+        let field = |key| item.split('|').find_map(|kv| kv.strip_prefix(key));
+        let spec = table
+            .iter()
+            .find(|s| field("sym=") == Some(s.venue_symbol.as_wire()));
+        let px = field("px=").and_then(|px| px.parse().ok()).map(Ticks);
+        let qty = field("qty=")
+            .and_then(|qty| qty.parse().ok())
+            .and_then(Lots::new);
+        let notional = spec
+            .zip(px.zip(qty))
+            .map(|(spec, (px, qty))| spec.notional(px, qty));
+        let min = spec.and_then(|spec| spec.min_notional);
+        min.is_some_and(|min| notional.flatten().is_none_or(|n| n.nanos < min.nanos))
+    };
+    let mut stub = order_entry();
+    let inner = stub.reply.clone();
+    stub.reply = Replier::new(move |frame, answers| {
+        let request: &str = if let Frame::Text(t) = frame { t } else { "" };
+        // A batch's items follow its head; a placement or an amend is its head.
+        let mut lines = request.lines();
+        let head = lines.next().unwrap_or_default();
+        let items: Vec<&str> = if head.starts_with("batch|") {
+            lines.collect()
+        } else {
+            vec![head]
+        };
+        let answered = |(i, answer): (usize, &suite::Answer)| match items.get(i) {
+            Some(item) if short(item) => suite::Answer::Reject,
+            _ => answer.clone(),
+        };
+        let answers: Vec<_> = answers.iter().enumerate().map(answered).collect();
+        inner.reply(frame, &answers)
+    });
+    Setup {
+        specs,
+        order_entry: Some(stub),
+        ..assumed()
+    }
+}
+
+/// The toy's setup with its first instrument's orders at least 10 USDC of notional and at most
+/// `max` lots, its stub refusing an order or an amend short of that ([`notional_checked`]).
+fn floored(max: i64) -> Setup {
+    notional_checked(|a| {
+        a.min_notional = Some(fbc_core::Money::new(TEN_USDC, a.quote_ccy));
+        a.max_order_size = Some(Lots::new(max).unwrap());
+    })
+}
+
+/// The notional of `qty` lots at tick `px` on the toy's first instrument in `setup`, in nanos.
+fn notional(setup: &Setup, px: i64, qty: i64) -> Option<i128> {
+    let spec = setup.specs.get(toy::INST_A).unwrap();
+    let notional = spec.notional(Ticks(px), Lots::new(qty).unwrap());
+    notional.map(|n| n.nanos)
+}
+
+#[test]
+fn amend_ack_passes_a_venue_refusing_an_amend_below_the_instruments_min_notional() {
+    // FBC-7s2a's done line: the harness sizes its order to the least reaching the instrument's
+    // minimum notional at its price (FBC-fuis), so the price one step below it falls short, and
+    // a venue validating that minimum refuses an amend to it.
+    type Case = (fn() -> Setup, i64, i64);
+    let cases: [Case; 2] = [
+        // 200 lots at tick 100 (50.0) reach 10 USDC, within 500 lots.
+        (|| floored(500), 100, 200),
+        // No order of at most 100 lots reaches it at tick 100; 100 lots at tick 200 (100.0) do.
+        (|| floored(100), 200, 100),
+    ];
+    for (setup, px, qty) in cases {
+        let built = setup();
+        // Just reached: a lot less, or the price one step below, falls short of it.
+        assert_eq!(notional(&built, px, qty), Some(TEN_USDC));
+        assert!(notional(&built, px, qty - 1).unwrap() < TEN_USDC);
+        assert!(notional(&built, px - 1, qty).unwrap() < TEN_USDC);
+        // The stub refuses an order or an amend short of it, and takes one that reaches it.
+        let reply = built.order_entry.unwrap().reply;
+        let request = |kind: &str, px: i64| {
+            let frame = format!("{kind}|rpc=7|cid=c|vid=v|sym=TOYA-PERP|px={px}|qty={qty}");
+            let replied = reply.reply(&Frame::Text(frame), &[suite::Answer::Accept]);
+            replied.unwrap()
+        };
+        let refused = vec![Frame::text("item|rpc=7|i=0|res=rej|code=1002|msg=refused")];
+        assert_eq!(request("place", px - 1), refused);
+        assert_eq!(request("amend", px - 1), refused);
+        let placed = vec![Frame::text("item|rpc=7|i=0|res=ok|vid=toy-1")];
+        assert_eq!(request("place", px), placed);
+        // amend_ack amends it to a price where it still reaches the minimum.
+        let passed = suite::amend_ack(&ToyFactory.subject_for(setup));
+        assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    }
+    // A batch's items are each judged: the second, short, is refused; the third, unanswered,
+    // stays so.
+    let reply = floored(500).order_entry.unwrap().reply;
+    let item = |i, px| format!("place|i={i}|cid=c{i}|sym=TOYA-PERP|px={px}|qty=200");
+    let batch = format!(
+        "batch|rpc=8|n=3\n{}\n{}\n{}",
+        item(0, 100),
+        item(1, 99),
+        item(2, 100)
+    );
+    let answers = [
+        suite::Answer::Accept,
+        suite::Answer::Accept,
+        suite::Answer::Silent,
+    ];
+    let replied = reply.reply(&Frame::Text(batch), &answers).unwrap();
+    let expected = [
+        "item|rpc=8|i=0|res=ok|vid=toy-1",
+        "item|rpc=8|i=1|res=rej|code=1002|msg=refused",
+    ];
+    assert_eq!(replied, expected.map(Frame::text));
+}
+
+/// The toy's setup with its first instrument's grid allowing two prices only, 2^61 and 2^62
+/// ticks of 1e-18 (about 2.31 and 4.61), and its orders at least 3 USDC of notional and at most
+/// 1000 lots: no order reaches it at the lower price, so the harness's is the least that does at
+/// the higher, 651 lots, with no valid price above it (a band of step 2^61 from 1e-18, then one
+/// from 2^62 + 2 whose first multiple, 2^63 + 2, fits no `i64`); its stub refuses an order or an
+/// amend short of it ([`notional_checked`]).
+fn top_two() -> Setup {
+    top_two_within(1_000)
+}
+
+/// [`top_two`] with its orders at most `max` lots, 651 at least.
+fn top_two_within(max: i64) -> Setup {
+    notional_checked(|a| {
+        let f = |ticks: i128| rust_decimal::Decimal::from_i128_with_scale(ticks, 18);
+        let bands = [(f(1), f(1 << 61)), (f((1 << 62) + 2), f((1 << 62) + 1))];
+        a.price_grid = fbc_core::PriceGrid::banded(&bands).unwrap();
+        a.min_notional = Some(fbc_core::Money::new(3_000_000_000, a.quote_ccy));
+        a.max_order_size = Some(Lots::new(max).unwrap());
+    })
+}
+
+#[test]
+fn amend_ack_amends_the_quantity_where_no_price_one_step_away_keeps_the_min_notional() {
+    let built = top_two();
+    let (low, high) = (1 << 61, 1 << 62);
+    let grid = &built.specs.get(toy::INST_A).unwrap().price_grid;
+    assert_eq!(grid.floor_valid(Ticks(high - 1)), Some(Ticks(low)));
+    assert_eq!(grid.ceil_valid(Ticks(high + 1)), None);
+    let three = 3_000_000_000;
+    assert!(notional(&built, low, 1_000).unwrap() < three);
+    assert!(notional(&built, high, 650).unwrap() < three);
+    assert!(notional(&built, high, 651).unwrap() >= three);
+    // The quantity, where amendable: within the largest order, at the harness's price.
+    let passed = suite::amend_ack(&ToyFactory.subject_for(top_two));
+    assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    // Skipped by name where the price alone is.
+    let skipped = suite::amend_ack(&PRICE_ONLY.subject(top_two));
+    let why = "the harness's order falls short of InstrumentSpec.min_notional at every valid \
+               price one step from its own";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+        "{skipped:?}"
+    );
+}
+
+/// The toy's setup with its first instrument's contract worth 1e28 USDC a unit, its orders at
+/// least 200 lots and one nano of notional: the harness's order, 200 lots at tick 100 (50.0), is
+/// 1e38 nanos, which a `Money` holds, and twice it is not; its stub refuses an order or an amend
+/// short of the minimum or too large to hold ([`notional_checked`]).
+fn unheld() -> Setup {
+    notional_checked(|a| {
+        a.multiplier = rust_decimal::Decimal::from_i128_with_scale(10_i128.pow(28), 0);
+        a.min_size = Lots::new(200).unwrap();
+        a.min_notional = Some(fbc_core::Money::new(1, a.quote_ccy));
+    })
+}
+
+#[test]
+fn amend_ack_skips_a_quantity_amend_whose_notional_is_too_large_to_hold() {
+    let built = unheld();
+    assert_eq!(notional(&built, 100, 200), Some(10_i128.pow(38)));
+    assert_eq!(notional(&built, 100, 400), None);
+    let skipped = suite::amend_ack(&QTY_ONLY.subject(unheld));
+    let why = "InstrumentSpec.min_notional cannot judge the harness's order at the size it would \
+               be amended to: its notional is too large to hold";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+        "{skipped:?}"
+    );
+}
+
+/// `setup` with its stub refusing every amend to a price other than tick `px`, so `amend_ack`
+/// passes it only where it amends to that price.
+fn amends_only_to(mut setup: Setup, px: i64) -> Setup {
+    let mut stub = setup.order_entry.take().unwrap();
+    let inner = stub.reply.clone();
+    let wanted = px.to_string();
+    stub.reply = Replier::new(move |frame, answers| {
+        let request: &str = if let Frame::Text(t) = frame { t } else { "" };
+        let to = request.split('|').find_map(|kv| kv.strip_prefix("px="));
+        if request.starts_with("amend|") && to != Some(wanted.as_str()) {
+            let refused = vec![suite::Answer::Reject; answers.len()];
+            return inner.reply(frame, &refused);
+        }
+        inner.reply(frame, answers)
+    });
+    setup.order_entry = Some(stub);
+    setup
+}
+
+/// The toy's setup with its first instrument's orders at least 2.475 USDC of notional: the
+/// harness's order, the least reaching it at tick 100 (50.0), is 50 lots (2.5 USDC), and one
+/// price step below, at tick 99, exactly the minimum; its stub refuses an order or an amend
+/// short of it ([`notional_checked`]).
+fn just_reached_below() -> Setup {
+    notional_checked(|a| a.min_notional = Some(fbc_core::Money::new(2_475_000_000, a.quote_ccy)))
+}
+
+#[test]
+fn amend_ack_amends_one_price_step_below_where_the_order_still_reaches_the_min_notional() {
+    // Decision 0137: the step below first, wherever it reaches the minimum, exactly too, or no
+    // minimum is stated; a stub refusing every amend but to tick 99 passes only that one.
+    let built = just_reached_below();
+    assert_eq!(notional(&built, 100, 49), Some(2_450_000_000));
+    assert_eq!(notional(&built, 100, 50), Some(2_500_000_000));
+    assert_eq!(notional(&built, 99, 50), Some(2_475_000_000));
+    let reply = amends_only_to(assumed(), 99).order_entry.unwrap().reply;
+    let send = |frame: &str| {
+        let replied = reply.reply(&Frame::text(frame), &[suite::Answer::Accept]);
+        replied.unwrap()
+    };
+    let placed = send("place|rpc=6|cid=c|sym=TOYA-PERP|px=100|qty=50");
+    assert_eq!(placed, vec![Frame::text("item|rpc=6|i=0|res=ok|vid=toy-1")]);
+    let amend = |px: i64| {
+        let fields = format!("vid=toy-1|sym=TOYA-PERP|side=b|px={px}|qty=50|po=1|ro=0");
+        send(&format!("amend|rpc=7|{fields}"))
+    };
+    let refused = vec![Frame::text("item|rpc=7|i=0|res=rej|code=1002|msg=refused")];
+    assert_eq!(amend(101), refused);
+    assert_ne!(amend(99), refused);
+    let setups: [fn() -> Setup; 2] = [
+        || amends_only_to(assumed(), 99),
+        || amends_only_to(just_reached_below(), 99),
+    ];
+    for setup in setups {
+        let passed = suite::amend_ack(&ToyFactory.subject_for(setup));
+        assert!(matches!(passed, Ok(Verdict::Passed { .. })), "{passed:?}");
+    }
+}
+
+/// The toy's setup with its first instrument's contract worth 1e28 USDC a unit and its orders at
+/// least 1.69e29 USDC of notional: the harness's order, the least reaching it at tick 100
+/// (50.0), is 338 lots, 1.69e38 nanos, which a `Money` holds; one price step below it falls
+/// short, and one step above, 1.7069e38 nanos, is too large to hold; its stub refuses an order
+/// or an amend short of the minimum or too large to hold ([`notional_checked`]).
+fn unheld_above() -> Setup {
+    notional_checked(|a| {
+        a.multiplier = rust_decimal::Decimal::from_i128_with_scale(10_i128.pow(28), 0);
+        a.min_notional = Some(fbc_core::Money::new(169 * 10_i128.pow(36), a.quote_ccy));
+    })
+}
+
+#[test]
+fn amend_ack_skips_a_venue_amending_prices_only_where_one_step_up_is_too_large_to_hold() {
+    let built = unheld_above();
+    let min = 169 * 10_i128.pow(36);
+    assert!(notional(&built, 100, 337).unwrap() < min);
+    assert_eq!(notional(&built, 100, 338), Some(min));
+    assert!(notional(&built, 99, 338).unwrap() < min);
+    assert_eq!(notional(&built, 101, 338), None);
+    let skipped = suite::amend_ack(&PRICE_ONLY.subject(unheld_above));
+    let why = "the harness's order falls short of InstrumentSpec.min_notional, or has a notional \
+               too large to hold, at every valid price one step from its own";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+        "{skipped:?}"
+    );
+    // Where the quantity is amendable too, twice the order is too large to hold.
+    let skipped = suite::amend_ack(&ToyFactory.subject_for(unheld_above));
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why, .. }) if why.contains("too large to hold")),
+        "{skipped:?}"
+    );
+}
+
+#[test]
+fn amend_ack_skips_naming_both_limits_where_neither_a_price_step_nor_a_larger_size_fits() {
+    // The harness's order is the least reaching 3 USDC at the higher of two valid prices, 651
+    // lots, the largest order: the lower price leaves it short, and no larger size is allowed.
+    let skipped = suite::amend_ack(&ToyFactory.subject_for(|| top_two_within(651)));
+    let why = "the harness's order falls short of InstrumentSpec.min_notional at every valid \
+               price one step from its own, and InstrumentSpec.max_order_size admits no size but \
+               its own to amend to";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
+        "{skipped:?}"
+    );
+    // Where the price alone is amendable, the minimum alone is named.
+    let skipped = suite::amend_ack(&PRICE_ONLY.subject(|| top_two_within(651)));
+    let why = "the harness's order falls short of InstrumentSpec.min_notional at every valid \
+               price one step from its own";
+    assert!(
+        matches!(skipped, Ok(Verdict::Skipped { why: w, .. }) if w == why),
         "{skipped:?}"
     );
 }
