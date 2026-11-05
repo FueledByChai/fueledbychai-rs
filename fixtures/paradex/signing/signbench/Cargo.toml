@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# The source sits beside this manifest rather than in src/, so name it: without this,
+# `cargo run --release` here stops with "no targets specified in the manifest" (FBC-p8a).
+[[bin]]
+name = "signbench"
+path = "main.rs"
+
 [dependencies]
 starknet-crypto = "0.8.1"
 starknet-core = "0.16"
