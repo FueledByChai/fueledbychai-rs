@@ -239,12 +239,12 @@ use std::rc::Rc;
 use std::task::Poll;
 
 use fbc_core::{
-    AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, Effect, Effects, EncodeCtx,
-    EncodeReceipt, Envelope, ExecCodec, ExecEvent, ExecSink, Inbound, InboundSpans, KernelRxNs,
-    MonoNs, Namespace, NonceBlock, NonceRefused, NonceSource, NotSentReason, PathStamps, RpcCall,
-    RpcId, Secrets, SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps,
-    VenueCommand, VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs,
-    dispatch,
+    AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, DecodeError, Effect, Effects,
+    EncodeCtx, EncodeReceipt, Envelope, ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpResponse,
+    HttpTag, Inbound, InboundSpans, KernelRxNs, MonoNs, Namespace, NonceBlock, NonceRefused,
+    NonceSource, NotSentReason, OrderCaps, PathStamps, RawFrame, RpcCall, RpcId, Secrets,
+    SpecTable, Stamp, StreamId, SubmitHandle, TimerTag, TrafficClass, VenueCaps, VenueCommand,
+    VenueConfig, VenueError, VenueFactory, VenueMeta, VenueOrderSnapshot, WallNs, dispatch,
 };
 use fbc_journal::{ControlEvent, NonceSourceId, Record};
 use futures_util::{FutureExt, StreamExt};
@@ -568,11 +568,21 @@ impl From<RateError> for ExecSessionError {
 }
 
 /// Stops a running session when dropped, even while a write waits on a peer that stopped
-/// reading, or inside the session's own handler.
+/// reading, or inside the session's own handler. A decoder replay gives one too
+/// ([`ExecReplay::new`](crate::ExecReplay::new)): a replayed handler drops it where it dropped
+/// its session's, and is then handed nothing more, as live (FBC-tgt).
 #[derive(Debug)]
 pub struct ExecControl {
     /// Never sent on: its drop is the stop signal.
     _stop: watch::Sender<()>,
+}
+
+impl ExecControl {
+    /// A control, and what its drop is read through.
+    pub(crate) fn pair() -> (ExecControl, watch::Receiver<()>) {
+        let (stop, dropped) = watch::channel(());
+        (ExecControl { _stop: stop }, dropped)
+    }
 }
 
 /// What an order-entry session counted, besides the stale inputs [`ExecSession::stale`]
@@ -1237,10 +1247,12 @@ impl<H: ExecHandler> ExecSession<H> {
             own: self.stream,
             conn: self.conn,
         };
-        let (codec, stream, specs) = (&mut self.codec, self.stream, &self.specs);
-        let decoded = dispatch(&self.caps, self.ns, |scope| {
-            codec.on_frame(stream, raw, scope, specs, &mut sink, fx)
-        });
+        let decoding = Decoding {
+            caps: &self.caps,
+            ns: self.ns,
+            specs: &self.specs,
+        };
+        let decoded = decoding.frame(&mut *self.codec, self.stream, raw, &mut sink, fx);
         if decoded.is_err() {
             self.decode_errors += 1;
             self.handler.on_decode_error(stamp.conn);
@@ -1717,21 +1729,15 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
     let Some(exec) = &caps.exec else {
         return Err(ExecSessionError::NoOrderEntry);
     };
-    let (rearm, covers_open) = match exec.order.cancel_on_disconnect {
-        CancelOnDisconnect::PerConnection {
-            rearm_on_reconnect,
-            covers_open_orders,
-        } => (rearm_on_reconnect, covers_open_orders),
-        CancelOnDisconnect::AccountWide => {
-            if config.account_wide_cod_authority.map(|a| a.account) != Some(config.acct) {
-                return Err(ExecSessionError::AccountWideCodAuthority);
-            }
-            (true, true)
-        }
-        other => return Err(ExecSessionError::CancelOnDisconnect(other)),
-    };
-    // Our client id names one venue order where amends keep the venue id (decision 0080).
-    let one_id = exec.order.amend.is_none_or(|amend| amend.keeps_venue_id);
+    let (rearm, covers_open, one_id) =
+        gate_flags(&exec.order).map_err(ExecSessionError::CancelOnDisconnect)?;
+    let account_wide = matches!(
+        exec.order.cancel_on_disconnect,
+        CancelOnDisconnect::AccountWide
+    );
+    if account_wide && config.account_wide_cod_authority.map(|a| a.account) != Some(config.acct) {
+        return Err(ExecSessionError::AccountWideCodAuthority);
+    }
     config
         .limiter
         .check(caps.exec_limits.as_deref().unwrap_or(&caps.limits))?;
@@ -1767,7 +1773,7 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
         let slot = headers.get_mut(i);
         slot.map_or_else(HandshakeHeaders::none, std::mem::take)
     };
-    let (stop_tx, stop) = watch::channel(());
+    let (control, stop) = ExecControl::pair();
     let clock = config.clock.clone();
     // Endpoint `i` is stamped connection `conn + i`, each with epochs, pacing, timers and
     // requests of its own (decision 0115).
@@ -1828,8 +1834,28 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
         stop,
         conn: config.conn,
         legs: Legs::new(legs),
-        control: ExecControl { _stop: stop_tx },
+        control,
     })
+}
+
+/// What an order-entry session's gate is built with, from the venue's order caps (decisions
+/// 0058, 0080, 0121): whether its protection lapses with each connection, so every epoch arms it
+/// (an account-wide one is armed on each); whether an accepted arm covers the orders already
+/// open; and whether our client id names one venue order, its amends keeping the venue id (or
+/// none taken). The protection itself when a session takes none of it: none, or a dead-man
+/// timer. One function for the live session and its decoder replay (FBC-tgt).
+pub(crate) fn gate_flags(order: &OrderCaps) -> Result<(bool, bool, bool), CancelOnDisconnect> {
+    let (rearm, covers_open) = match order.cancel_on_disconnect {
+        CancelOnDisconnect::PerConnection {
+            rearm_on_reconnect,
+            covers_open_orders,
+        } => (rearm_on_reconnect, covers_open_orders),
+        CancelOnDisconnect::AccountWide => (true, true),
+        other => return Err(other),
+    };
+    // Our client id names one venue order where amends keep the venue id (decision 0080).
+    let one_id = order.amend.is_none_or(|amend| amend.keeps_venue_id);
+    Ok((rearm, covers_open, one_id))
 }
 
 /// Executes what `on_open` or the codec's resync asked for on epoch `key` of the connection
@@ -2175,13 +2201,14 @@ async fn next_leg(legs: &mut Legs, yield_first: bool) -> (usize, LegWake) {
 }
 
 /// Hands the events of a deadline that fell due while the session waits to connect to the
-/// handler, stamped `stamp`, until the control drops.
-struct Late<'a, H> {
-    handler: &'a mut H,
-    stop: &'a watch::Receiver<()>,
-    stamp: Stamp,
+/// handler, stamped `stamp`, until the control drops; and those of one a decoder replay finds
+/// journaled there (FBC-tgt).
+pub(crate) struct Late<'a, H> {
+    pub(crate) handler: &'a mut H,
+    pub(crate) stop: &'a watch::Receiver<()>,
+    pub(crate) stamp: Stamp,
     /// Names the deadline's firing as the input being handled while the handler hears it.
-    clock: &'a IngestClock,
+    pub(crate) clock: &'a IngestClock,
 }
 
 impl<H: ExecHandler> ExecSink for Late<'_, H> {
@@ -2191,6 +2218,49 @@ impl<H: ExecHandler> ExecSink for Late<'_, H> {
             let env = Envelope::new(stamp, meta, ev);
             self.clock.attributing(stamp, || handler.on_exec(env));
         }
+    }
+}
+
+/// What an order-entry codec decodes its inputs with: the venue's own caps, which lend the
+/// decode scope, the consumer's engine namespace and the spec table (decisions 0014, 0015). Its
+/// calls are the one way a frame or an HTTP result reaches the codec, live and in decoder replay
+/// (FBC-tgt).
+#[derive(Copy, Clone)]
+pub(crate) struct Decoding<'a> {
+    pub(crate) caps: &'a VenueCaps,
+    pub(crate) ns: Namespace,
+    pub(crate) specs: &'a SpecTable,
+}
+
+impl Decoding<'_> {
+    /// Hands `raw`, a frame that came on `stream`, to `codec`'s `on_frame` inside the venue's
+    /// decode scope.
+    pub(crate) fn frame(
+        self,
+        codec: &mut dyn ExecCodec,
+        stream: StreamId,
+        raw: RawFrame<'_>,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        dispatch(self.caps, self.ns, |scope| {
+            codec.on_frame(stream, raw, scope, self.specs, sink, fx)
+        })
+    }
+
+    /// Hands `resp`, the result of the HTTP request tagged `tag`, to `codec`'s `on_http` inside
+    /// the venue's decode scope.
+    pub(crate) fn http(
+        self,
+        codec: &mut dyn ExecCodec,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        dispatch(self.caps, self.ns, |scope| {
+            codec.on_http(tag, resp, scope, self.specs, sink, fx)
+        })
     }
 }
 
@@ -2274,11 +2344,14 @@ impl EpochInputs for Feed<'_> {
             own: self.own,
             conn: self.conn,
         };
-        let (codec, specs) = (&mut *self.codec, self.specs);
-        let decoded = dispatch(self.caps, self.ns, |scope| {
-            with_response(&done.result, |resp| {
-                codec.on_http(done.tag, resp, scope, specs, &mut sink, fx)
-            })
+        let decoding = Decoding {
+            caps: self.caps,
+            ns: self.ns,
+            specs: self.specs,
+        };
+        let codec = &mut *self.codec;
+        let decoded = with_response(&done.result, |resp| {
+            decoding.http(codec, done.tag, resp, &mut sink, fx)
         });
         if decoded.is_err() {
             *self.decode_errors += 1;
@@ -2336,52 +2409,94 @@ impl ExecSink for Sink<'_> {
         if self.stop.has_changed().is_err() {
             self.epochs.drop_ended(Input::Event);
         } else if let Ok(Admit::Current) = self.epochs.admit(Input::Event, self.stamp.conn) {
-            // The order connection's epoch the event counts for: its own input's, whose report
-            // of the order stream says whether that epoch is authenticated; another endpoint's
-            // counts for the order connection's authenticated epoch, if one is, and readies
-            // nothing itself (decision 0115).
-            let epoch = if self.stamp.conn.conn == self.conn {
-                let epoch = self.stamp.conn.epoch;
-                if let ExecEvent::Conn { stream, state } = &ev
-                    && *stream == self.own
-                {
-                    let authenticated = *state == ConnState::Authenticated;
-                    self.orders.set_ready(authenticated.then_some(epoch));
-                    if authenticated {
-                        self.orders.gate.borrow_mut().authenticated(epoch);
-                    }
-                }
-                Some(epoch)
-            } else {
-                self.orders.ready()
+            let stop = self.stop;
+            let order = OrderConn {
+                stream: self.own,
+                conn: self.conn,
             };
-            if let Some(epoch) = epoch {
-                // The arm's answer and the resync's end count as the handler is handed the
-                // event, so the handler hearing the one that opens the epoch sees places taken
-                // (PR #90 Reviewer B B1). What it submits then still goes out only once it has
-                // returned, so after fbc-oms has applied the ResyncEnd.
-                let settled = self.orders.gate.borrow().settles(epoch, &ev);
-                if let Some(settled) = settled {
-                    self.orders.gate.borrow_mut().settle(epoch, settled);
-                }
-                // What the event shows of the orders resting from an earlier epoch counts as it
-                // is handed over too (FBC-nvxn).
-                self.orders.gate.borrow_mut().observe(epoch, &ev);
-            }
-            // While the handler hears the event, what it submits is attributed to its input
-            // (decision 0100).
-            let (stamp, orders, handler) = (self.stamp, self.orders, &mut *self.handler);
-            let clock = orders.clock();
-            clock.attributing(stamp, || handler.on_exec(Envelope::new(stamp, meta, ev)));
-            // The epoch just became placing with orders unprotected: the handler is told them
-            // once, unless it stopped the session as it took the event.
-            let notice = epoch.and_then(|epoch| orders.gate.borrow_mut().notice(epoch));
-            if let Some(unprotected) = notice
-                && self.stop.has_changed().is_ok()
-            {
-                clock.attributing(stamp, || handler.on_unprotected(&unprotected));
+            let stopped = || stop.has_changed().is_err();
+            hand_on(
+                self.orders,
+                &mut *self.handler,
+                order,
+                self.stamp,
+                (meta, ev),
+                &stopped,
+            );
+        }
+    }
+}
+
+/// The order connection of a session: its stream and connection number, whose inputs' events
+/// alone authenticate its epochs (decisions 0058, 0115).
+#[derive(Copy, Clone)]
+pub(crate) struct OrderConn {
+    pub(crate) stream: StreamId,
+    pub(crate) conn: u16,
+}
+
+/// Hands event `ev`, pushed for the input stamped `stamp` on the current epoch of its
+/// connection, to `handler` as an order-entry session does, moving what the event moves in
+/// `orders`: the order connection's own input's report of its stream says whether that epoch is
+/// authenticated; the answer to its arm, the end of its resync and what the event shows of the
+/// orders resting from an earlier epoch count for that epoch (another endpoint's event for the
+/// order connection's authenticated epoch, if one is) as the handler is handed it; the handler
+/// hears it with its input named as being handled (decision 0100); and an epoch it makes
+/// placing with orders unprotected has them told, once, unless `stopped` says the control
+/// dropped as the handler took it (decisions 0053, 0058, 0080, 0115). One function for the live
+/// session and its decoder replay (FBC-tgt), so the replay's handler is handed events as the
+/// live one was.
+pub(crate) fn hand_on(
+    orders: &Shared,
+    handler: &mut dyn ExecHandler,
+    order: OrderConn,
+    stamp: Stamp,
+    (meta, ev): (VenueMeta, ExecEvent),
+    stopped: &dyn Fn() -> bool,
+) {
+    // The order connection's epoch the event counts for: its own input's, whose report of the
+    // order stream says whether that epoch is authenticated; another endpoint's counts for the
+    // order connection's authenticated epoch, if one is, and readies nothing itself (decision
+    // 0115).
+    let epoch = if stamp.conn.conn == order.conn {
+        let epoch = stamp.conn.epoch;
+        if let ExecEvent::Conn { stream, state } = &ev
+            && *stream == order.stream
+        {
+            let authenticated = *state == ConnState::Authenticated;
+            orders.set_ready(authenticated.then_some(epoch));
+            if authenticated {
+                orders.gate.borrow_mut().authenticated(epoch);
             }
         }
+        Some(epoch)
+    } else {
+        orders.ready()
+    };
+    if let Some(epoch) = epoch {
+        // The arm's answer and the resync's end count as the handler is handed the event, so
+        // the handler hearing the one that opens the epoch sees places taken (PR #90 Reviewer B
+        // B1). What it submits then still goes out only once it has returned, so after fbc-oms
+        // has applied the ResyncEnd.
+        let settled = orders.gate.borrow().settles(epoch, &ev);
+        if let Some(settled) = settled {
+            orders.gate.borrow_mut().settle(epoch, settled);
+        }
+        // What the event shows of the orders resting from an earlier epoch counts as it is
+        // handed over too (FBC-nvxn).
+        orders.gate.borrow_mut().observe(epoch, &ev);
+    }
+    // While the handler hears the event, what it submits is attributed to its input (decision
+    // 0100).
+    let clock = orders.clock();
+    clock.attributing(stamp, || handler.on_exec(Envelope::new(stamp, meta, ev)));
+    // The epoch just became placing with orders unprotected: the handler is told them once,
+    // unless it stopped the session as it took the event.
+    let notice = epoch.and_then(|epoch| orders.gate.borrow_mut().notice(epoch));
+    if let Some(unprotected) = notice
+        && !stopped()
+    {
+        clock.attributing(stamp, || handler.on_unprotected(&unprotected));
     }
 }
 

@@ -228,6 +228,24 @@ impl Shared {
         })
     }
 
+    /// What a decoder replay of a session hands its events through (FBC-tgt): the readiness and
+    /// gate the live session's events move, built with the venue's gate flags (as
+    /// [`Shared::new`] takes them), each event's input named on `clock` as it is handed on. It
+    /// takes no command, so it is ended at once and serves no account.
+    pub(crate) fn replaying(
+        rearm: bool,
+        covers_open: bool,
+        one_id: bool,
+        clock: IngestClock,
+    ) -> Rc<Shared> {
+        let bound = ReservedBound::new(1, 0).expect("one entry for Normal traffic is a bound");
+        let ids = RpcIds::default();
+        let acct = AccountKey::new(0);
+        let shared = Shared::new(acct, ids, rearm, covers_open, one_id, clock, bound);
+        shared.end();
+        shared
+    }
+
     /// The next request id, for a request the session sends of its own (its arm).
     pub(crate) fn next_rpc(&self) -> RpcId {
         self.ids.next()

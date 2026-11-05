@@ -602,8 +602,9 @@ fn fx() -> Effects {
 }
 
 /// Calls `f` with a journaled response as its codec is handed it: its status, headers in order
-/// (a secret one's value as the journal reads it back, blanked) and body.
-fn with_response<R>(rec: &HttpResponseRec, f: impl FnOnce(HttpResponse<'_>) -> R) -> R {
+/// (a secret one's value as the journal reads it back, blanked) and body. The market-data and
+/// the order-entry replay (FBC-tgt) both hand a result over through it.
+pub(crate) fn with_response<R>(rec: &HttpResponseRec, f: impl FnOnce(HttpResponse<'_>) -> R) -> R {
     let headers: Vec<(&str, &str)> = rec
         .headers
         .iter()
