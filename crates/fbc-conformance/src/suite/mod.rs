@@ -103,6 +103,19 @@
 //! limits, it fails naming `InstrumentSpec.max_order_size` or `InstrumentSpec.min_notional` of
 //! that instrument, with the prices, and sends nothing on it.
 //!
+//! An amend, cancel, batch-cancel item or query that [`caps_truthful`],
+//! [`commands_selfcontained`] or [`encode_deterministic`] builds names order `i` by our client
+//! id, minted under the suite's own lease, or by the venue's id that [`Setup::venue_order_ids`]
+//! gives for `i`, made in the venue's decode scope (decision 0004), or by both (FBC-6rfe). The
+//! suite cannot know the shape a venue's ids take, and an encoder may hold them to it (QFEX's
+//! cancels and queries take only a UUID's 8-4-4-4-12 hex form, Hibachi's signer only decimal
+//! digits), so the setup writes them as the venue issues them; [`uuid_venue_order_id`] writes
+//! UUIDs. A setup that gives two orders one id, or an id the core refuses (empty, or longer than
+//! [`MAX_VENUE_ID_LEN`](fbc_core::MAX_VENUE_ID_LEN) bytes), fails those three checks naming
+//! `Setup.venue_order_ids`. No other check reads them: [`price_grid`] only places, under our
+//! client id, and an order-entry check that names an order by the venue's id names it by the id
+//! the stub answered it with.
+//!
 //! # The order-entry checks
 //!
 //! The suite knows no venue's protocol, so a venue that declares order entry states, in
@@ -251,6 +264,25 @@ pub struct Setup {
     /// assume, its session authenticated; `None` for a venue whose codec encodes as built
     /// (the module documentation says how it is applied).
     pub bootstrap: Option<Bootstrap>,
+    /// Order `i`'s id as the venue writes one, which the commands [`caps_truthful`],
+    /// [`commands_selfcontained`] and [`encode_deterministic`] build name it by where they name
+    /// it by the venue's id: a different id for each `i`, in the shape the venue issues, since
+    /// its encoder may refuse any other (the module documentation says how they are used).
+    /// [`uuid_venue_order_id`] writes UUIDs.
+    pub venue_order_ids: fn(usize) -> String,
+}
+
+/// Order `i`'s venue id written as a UUID, for [`Setup::venue_order_ids`] where a venue's
+/// order ids are UUIDs: the 8-4-4-4-12 form in lowercase hex digits, version 4 (its third group
+/// starting `4`) and RFC 9562's variant (its fourth starting `8`), with `i`'s low 48 bits in the
+/// last group and the rest in the first, so each `i` has its own.
+pub fn uuid_venue_order_id(i: usize) -> String {
+    let i = i as u64;
+    format!(
+        "{:08x}-0000-4000-8000-{:012x}",
+        i >> 48,
+        i & 0xffff_ffff_ffff
+    )
 }
 
 /// The venue's recorded replies that take a freshly built order-entry codec, opened on

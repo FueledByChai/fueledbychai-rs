@@ -39,13 +39,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use fbc_core::{
-    Channel, Effects, InstrumentSpec, Lots, NewOrder, OrderCaps, OrderKind, OrderKindTag,
-    PriceGrid, QuantizeError, Side, Ticks, TifTag, VenueCommand,
+    Channel, ClientOrderId, Effects, InstrumentSpec, Lots, NewOrder, OrderCaps, OrderKind,
+    OrderKindTag, PriceGrid, QuantizeError, Side, Ticks, TifTag, VenueCommand,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
-use super::harness::{Harness, Ids, RPC, Shape, fits, inverted, least_size, within};
+use super::harness::{Harness, RPC, Shape, fits, inverted, least_size, within};
 use super::{Breach, Failure, Subject, Verdict};
 
 const CHECK: &str = "price_grid";
@@ -57,7 +57,8 @@ const TOP_POWER: u32 = 9;
 pub fn price_grid(subject: &Subject<'_>) -> Result<Verdict, Failure> {
     let h = Harness::new(CHECK, subject)?;
     let post_only = h.caps.exec.as_ref().and_then(|e| post_only_limit(&e.order));
-    let ids = Ids::new(&h, 1)?;
+    // It only places, so it mints our one client id and reads no venue id (FBC-6rfe).
+    let cid = h.cids(1)?[0];
     let mut breaches = Vec::new();
     let mut probed = Vec::new();
     for spec in h.specs().iter() {
@@ -83,7 +84,7 @@ pub fn price_grid(subject: &Subject<'_>) -> Result<Verdict, Failure> {
         }
         let sent = match post_only.map(|shape| (shape, orders(spec, &quoted))) {
             Some((shape, Ok(orders))) => {
-                let sent = send(&h, spec, shape, &ids, &orders, &mut breaches)?;
+                let sent = send(&h, spec, shape, cid, &orders, &mut breaches)?;
                 format!("{sent} post-only orders sent")
             }
             Some((_, Err(refused))) => {
@@ -282,13 +283,13 @@ fn listed(ticks: &BTreeSet<i64>) -> String {
 }
 
 /// Places each order in `orders`, a side, price and size, on `spec` as a post-only order of
-/// `shape`, each by a codec built fresh, and returns how many were sent; a refusal, a send
-/// without its request and two prices sent alike are breaches.
+/// `shape` under our client id `cid`, each by a codec built fresh, and returns how many were
+/// sent; a refusal, a send without its request and two prices sent alike are breaches.
 fn send(
     h: &Harness<'_>,
     spec: &InstrumentSpec,
     shape: Shape,
-    ids: &Ids,
+    cid: ClientOrderId,
     orders: &[(Side, Ticks, Lots)],
     breaches: &mut Vec<Breach>,
 ) -> Result<usize, Failure> {
@@ -297,7 +298,7 @@ fn send(
     let mut sent = 0;
     for &(side, px, qty) in orders {
         let cmd = VenueCommand::Place(NewOrder {
-            cid: ids.cids[0],
+            cid,
             inst: spec.id,
             side,
             qty,

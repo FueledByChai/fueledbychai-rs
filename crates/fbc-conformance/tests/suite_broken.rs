@@ -16,6 +16,12 @@
 //! probes is below `min_notional`, and fails, naming the spec field, a setup where no size within
 //! `max_order_size` reaches `min_notional` at a price it probes, sending nothing on it; and it
 //! sends no bid at a price of zero, on a banded grid whose first band starts there.
+//!
+//! FBC-6rfe's done line: both checks pass a toy whose cancels, batch cancels, amends and queries
+//! refuse a venue order id that is not a UUID's 8-4-4-4-12 hex form, as QFEX's do, on a setup
+//! whose venue ids are UUIDs (`suite::uuid_venue_order_id`); the same toy fails them on the
+//! toy's own ids, and a setup whose venue ids the suite cannot use fails, naming
+//! `Setup.venue_order_ids`.
 
 use std::collections::BTreeSet;
 
@@ -29,7 +35,7 @@ use fbc_core::{
     Lots, MdCodec, Money, MonoNs, NonceBlock, NotSentReason, OrderCaps, OrderKindTag, OrderRef,
     PathStamps, RawFrame, RefKind, RpcId, Secrets, Side, SpecTable, StreamId, Subscription,
     Support, SymbolError, TagSet, Ticks, TifTag, TimerTag, VenueCaps, VenueCommand, VenueConfig,
-    VenueError, VenueFactory, VenueMeta, WallNs,
+    VenueError, VenueFactory, VenueMeta, VenueOrderId, WallNs,
 };
 
 const FIXTURES: &str = concat!(
@@ -47,6 +53,7 @@ fn assumed() -> Setup {
         exec_stream: toy::EXEC_STREAM,
         order_entry: None,
         bootstrap: None,
+        venue_order_ids: |i| format!("toy-{i}"),
     }
 }
 
@@ -127,6 +134,9 @@ enum Twist {
     /// Every amend is refused `Unsupported` before anything else is read: its amends name an
     /// order by its placement nonce alone, which an amend never carries.
     AmendsUnnamed,
+    /// A cancel, batch cancel, amend or query naming a venue order id that is not a UUID's
+    /// 8-4-4-4-12 hex form is refused `Unencodable`, as QFEX's encoder refuses it (FBC-s8wq).
+    UuidVenueIds,
 }
 
 /// What a broken toy's factory builds for order entry.
@@ -268,6 +278,25 @@ fn timer() -> Effect {
         tag: TimerTag(9),
         after: core::time::Duration::from_secs(1),
     }
+}
+
+/// The venue order ids `cmd` names its orders by.
+fn venue_ids(cmd: &VenueCommand) -> impl Iterator<Item = &VenueOrderId> {
+    let targets: Vec<&OrderRef> = match cmd {
+        VenueCommand::Amend(a) => vec![&a.target],
+        VenueCommand::Cancel(c) => vec![&c.target],
+        VenueCommand::CancelMany(cs) => cs.iter().map(|c| &c.target).collect(),
+        VenueCommand::Query(q) => vec![&q.target],
+        _ => Vec::new(),
+    };
+    targets.into_iter().filter_map(OrderRef::venue)
+}
+
+/// Whether `id` is in a UUID's 8-4-4-4-12 form of hex digits, either case.
+fn uuid_form(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    let hex = |g: &&str| g.bytes().all(|b| b.is_ascii_hexdigit());
+    groups.iter().map(|g| g.len()).eq([8, 4, 4, 4, 12]) && groups.iter().all(hex)
 }
 
 /// Whether an order of `qty` at `px` (none for a market order) is outside what `spec` takes:
@@ -496,6 +525,10 @@ impl ExecCodec for Twisted {
             (Twist::AmendsUnnamed, _) if matches!(cmd, VenueCommand::Amend(_)) => {
                 fx.take();
                 Err(NotSentReason::Unsupported)
+            }
+            (Twist::UuidVenueIds, _) if !venue_ids(cmd).all(|vid| uuid_form(vid.as_str())) => {
+                fx.take();
+                Err(NotSentReason::Unencodable)
             }
             (_, result) => result,
         }
@@ -1760,4 +1793,232 @@ fn the_broken_toy_otherwise_delegates_to_the_toy() {
         );
         assert!(http.is_err());
     });
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-6rfe: venue order ids in the shape the setup gives.
+// ---------------------------------------------------------------------------------------------
+
+/// The toy's setup with its venue order ids written as UUIDs.
+fn uuid_ids() -> Setup {
+    Setup {
+        venue_order_ids: suite::uuid_venue_order_id,
+        ..assumed()
+    }
+}
+
+/// The toy taking only UUIDs for venue order ids.
+const UUID_ONLY: Broken = Broken::twisted(Twist::UuidVenueIds);
+
+/// The commands commands_selfcontained names an order by the venue's id with, on the toy's caps.
+const BY_VENUE_ID: [&str; 4] = [
+    "AmendCaps.refs has Venue: an amend",
+    "OrderCaps.cancel_refs has Venue: a cancel",
+    "CancelBatch.refs has Venue: a batch cancel",
+    "OrderCaps.query_refs has Venue: a query",
+];
+
+#[test]
+fn both_checks_pass_a_codec_taking_only_uuid_venue_ids_on_a_setup_giving_uuids() {
+    let subject = Subject::new(&UUID_ONLY, FIXTURES, uuid_ids).unwrap();
+    for check in [
+        suite::caps_truthful,
+        suite::commands_selfcontained,
+        suite::encode_deterministic,
+    ] {
+        let outcome = check(&subject);
+        assert!(matches!(outcome, Ok(Verdict::Passed { .. })), "{outcome:?}");
+        // Every command naming an order by the venue's id was probed, and sent.
+        if let Ok(Verdict::Passed {
+            check: "commands_selfcontained",
+            probed,
+        }) = outcome
+        {
+            for label in BY_VENUE_ID {
+                assert!(probed.iter().any(|p| p == label), "{label}: {probed:#?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn both_checks_fail_a_codec_taking_only_uuid_venue_ids_on_the_toys_own_ids() {
+    // The suite's ids are the setup's: the toy's, which this codec refuses.
+    let failure = failed(UUID_ONLY.commands_selfcontained());
+    for label in BY_VENUE_ID {
+        assert_eq!(
+            said(&failure, label),
+            "refused as NotSent(Unencodable) by a freshly built codec"
+        );
+    }
+    assert_eq!(failure.breaches.len(), BY_VENUE_ID.len(), "{failure}");
+    let failure = failed(UUID_ONLY.caps_truthful());
+    for control in [
+        "control: an amend",
+        "control: a cancel",
+        "control: a batch cancel",
+        "control: a query",
+    ] {
+        let what = said(&failure, control);
+        assert!(
+            what.starts_with("refused as NotSent(Unencodable) though the caps declare it"),
+            "{control}: {what}"
+        );
+    }
+}
+
+#[test]
+fn the_uuid_only_codec_refuses_every_other_venue_id_and_sends_a_uuid() {
+    let specs = toy::specs();
+    let encode = |cmd: &VenueCommand| {
+        let ctx = EncodeCtx {
+            wall: WallNs(1),
+            mono: MonoNs(1),
+            nonces: NonceBlock::new(vec![1, 2]),
+        };
+        let mut codec = Twisted::new(Twist::UuidVenueIds);
+        let (stamps, mut fx) = (&mut PathStamps::off(), Effects::new());
+        let result = codec.encode(cmd, RpcId(1), &specs, &ctx, stamps, &mut fx);
+        (result.err(), fx.len())
+    };
+    let vid = |wire: &str| toy::with_scope(|scope| scope.venue_order_id(wire)).unwrap();
+    let amend_by = |vid: VenueOrderId| {
+        let mut amend = amend_to(1, 100);
+        if let VenueCommand::Amend(a) = &mut amend {
+            a.target = OrderRef::Venue(vid);
+        }
+        amend
+    };
+    let cancel = |wire: &str| fbc_core::CancelOrder {
+        target: OrderRef::Venue(vid(wire)),
+        inst: toy::INST_A,
+        side: Side::Buy,
+        placement_nonce: None,
+    };
+    let commands = |wire: &str| {
+        [
+            VenueCommand::Cancel(cancel(wire)),
+            VenueCommand::CancelMany(vec![cancel(wire)]),
+            VenueCommand::Query(fbc_core::QueryOrder {
+                target: OrderRef::Venue(vid(wire)),
+                inst: toy::INST_A,
+                placement_nonce: None,
+            }),
+            amend_by(vid(wire)),
+        ]
+    };
+    let refused = (Some(NotSentReason::Unencodable), 0);
+    for wire in [
+        "toy-0",
+        "1759500000000000001",
+        // One hex digit short, one too many, a group out of place, and a digit not hex.
+        "00000000-0000-4000-8000-00000000000",
+        "00000000-0000-4000-8000-0000000000000",
+        "000000000-000-4000-8000-000000000000",
+        "00000000-0000-4000-8000-00000000000g",
+    ] {
+        for cmd in commands(wire) {
+            assert_eq!(encode(&cmd), refused, "{wire}: {cmd:?}");
+        }
+    }
+    for wire in [
+        "00000000-0000-4000-8000-000000000000",
+        "88888888-4444-4444-4444-1234567890AB",
+    ] {
+        for cmd in commands(wire) {
+            assert_eq!(encode(&cmd), (None, 1), "{wire}: {cmd:?}");
+        }
+    }
+}
+
+#[test]
+fn the_suites_uuids_are_one_per_order_in_the_uuid_form() {
+    let cases: [(usize, &str); 4] = [
+        (0, "00000000-0000-4000-8000-000000000000"),
+        (10, "00000000-0000-4000-8000-00000000000a"),
+        ((1 << 48) + 1, "00000001-0000-4000-8000-000000000001"),
+        (usize::MAX, "0000ffff-0000-4000-8000-ffffffffffff"),
+    ];
+    for (i, want) in cases {
+        assert_eq!(suite::uuid_venue_order_id(i), want);
+        assert!(uuid_form(want), "{want}");
+    }
+    let some: BTreeSet<String> = (0..1000).map(suite::uuid_venue_order_id).collect();
+    assert_eq!(some.len(), 1000);
+}
+
+#[test]
+fn a_setup_whose_venue_ids_the_suite_cannot_use_is_refused_naming_its_field() {
+    fn empty() -> Setup {
+        Setup {
+            venue_order_ids: |_| String::new(),
+            ..assumed()
+        }
+    }
+    fn too_long() -> Setup {
+        Setup {
+            venue_order_ids: |i| format!("{i:0>97}"),
+            ..assumed()
+        }
+    }
+    fn shared() -> Setup {
+        Setup {
+            venue_order_ids: |i| format!("toy-{}", i.min(1)),
+            ..assumed()
+        }
+    }
+    /// A check.
+    type Check = fn(&Subject<'_>) -> Result<Verdict, Failure>;
+    /// A setup and what its refusal says.
+    type Case = (fn() -> Setup, &'static str);
+    let field = "Setup.venue_order_ids";
+    // The checks that name an order by the venue's id.
+    let checks: [Check; 3] = [
+        suite::caps_truthful,
+        suite::commands_selfcontained,
+        suite::encode_deterministic,
+    ];
+    let cases: [Case; 2] = [
+        (
+            empty,
+            "order 0's id is not a venue order id: the venue id is empty",
+        ),
+        (
+            too_long,
+            "order 0's id is not a venue order id: the venue id is 97 bytes long; at most 96 \
+             are accepted",
+        ),
+    ];
+    for (setup, what) in cases {
+        let subject = Subject::new(&ToyFactory, FIXTURES, setup).unwrap();
+        for check in checks {
+            let failure = failed(check(&subject));
+            assert_eq!(said(&failure, field), what);
+            assert_eq!(failure.breaches.len(), 1, "{failure}");
+        }
+    }
+    // price_grid only places, under our client id: it reads no venue id, so none of these
+    // setups fails it, and it still sends its post-only orders.
+    for setup in [empty, too_long, shared] {
+        let subject = Subject::new(&ToyFactory, FIXTURES, setup).unwrap();
+        match suite::price_grid(&subject) {
+            Ok(Verdict::Passed { probed, .. }) => assert!(
+                probed.iter().all(|p| p.ends_with("post-only orders sent")),
+                "{probed:?}"
+            ),
+            other => panic!("price_grid read the setup's venue ids: {other:?}"),
+        }
+    }
+    // Orders 1 and 2 share an id: the checks naming one order alone use order 0's.
+    let subject = Subject::new(&ToyFactory, FIXTURES, shared).unwrap();
+    let failure = failed(suite::caps_truthful(&subject));
+    assert_eq!(
+        said(&failure, field),
+        r#"gives orders 1 and 2 the one id "toy-1""#
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+    for check in &checks[1..] {
+        let outcome = check(&subject);
+        assert!(matches!(outcome, Ok(Verdict::Passed { .. })), "{outcome:?}");
+    }
 }
