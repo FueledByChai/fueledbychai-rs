@@ -674,4 +674,89 @@ fn a_sink_by_default_records_the_owned_record_a_borrowed_one_stands_for() {
         Recorded::DroppedCounted
     );
     assert_eq!(sink.0, [offers[0].to_record(), owned]);
+    // Nor does it name its gaps unless it says so (decision 0139).
+    assert_eq!(sink.open_gap(), None);
+}
+
+/// The sink names the gap open now by its first dropped record's number, the `Degraded`
+/// marker's `from_seq`, from that drop until space returns, whichever class's record closes it
+/// (FBC-8pm, decision 0139: the runtime's journal tells each time the sink reaches its soft
+/// limit by it).
+#[test]
+fn the_sink_names_its_open_gap_from_its_first_drop_until_a_record_of_either_class_closes_it() {
+    let root = fresh_dir("sink_open_gap");
+    let config = SinkConfig {
+        budget_bytes: 4096,
+        soft_limit_pct: 75,
+    };
+    let (mut sink, drain) = journal_queue(config, key()).unwrap();
+    // The sink numbers every record offered, an omitted one included.
+    let mut seq = 0;
+    assert_eq!(sink.open_gap(), None);
+    // The writer is stalled: Normal records until the soft limit refuses one.
+    let first = loop {
+        let offered = sink.record(TrafficClass::Normal, NOW, &timer(seq));
+        seq += 1;
+        if offered == Recorded::DroppedCounted {
+            break seq - 1;
+        }
+        assert_eq!(sink.open_gap(), None);
+    };
+    assert_eq!(sink.open_gap(), Some(first));
+    // A Safety record kept from the reserve, and further drops, leave it open.
+    assert_eq!(
+        sink.record(TrafficClass::Safety, NOW, &timer(seq)),
+        Recorded::Ok
+    );
+    let reserved = seq;
+    seq += 1;
+    assert_eq!(
+        sink.record(TrafficClass::Normal, NOW, &timer(seq)),
+        Recorded::DroppedCounted
+    );
+    seq += 1;
+    assert_eq!(sink.open_gap(), Some(first));
+
+    // Space returns, and a Safety record, which fits under the soft limit with the marker,
+    // closes the gap.
+    let writer = drain
+        .spawn(JournalWriter::create(&root, 1, key()).unwrap())
+        .unwrap();
+    until_drained(&sink);
+    assert_eq!(
+        sink.record(TrafficClass::Safety, NOW, &timer(seq)),
+        Recorded::Ok
+    );
+    let closing = seq;
+    seq += 1;
+    assert_eq!(sink.open_gap(), None);
+    // The next drop opens another gap, named by its own first record.
+    assert_eq!(
+        sink.omit(TrafficClass::Normal, NOW),
+        Recorded::DroppedCounted
+    );
+    assert_eq!(sink.open_gap(), Some(seq));
+    let second = seq;
+    until_drained(&sink);
+    writer.close().unwrap();
+
+    let read = read_all(&root, 1);
+    let tail = &read[read.len() - 4..];
+    assert_eq!(
+        tail,
+        [
+            timer(reserved),
+            Record::Marker(Marker::Degraded {
+                from_seq: first,
+                dropped: 2,
+            }),
+            timer(closing),
+            Record::Marker(Marker::Degraded {
+                from_seq: second,
+                dropped: 1,
+            }),
+        ]
+    );
+    // Closed, it still names the gap it was left with.
+    assert_eq!(sink.open_gap(), Some(second));
 }

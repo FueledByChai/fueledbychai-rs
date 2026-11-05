@@ -25,7 +25,9 @@
 //! that record both fit under the soft limit: [`Marker::Degraded`] `{ from_seq, dropped }` is
 //! written first, naming the first dropped record's number and how many were dropped since,
 //! then the record. Safety records admitted from the reserve while the gap is open come before
-//! the marker. Markers the sink writes take no number. A gap still open when the sink closes
+//! the marker. [`open_gap`](JournalSink::open_gap) names the gap open now by that first number,
+//! so a caller can tell one gap from the next (decision 0139). Markers the sink writes take no
+//! number. A gap still open when the sink closes
 //! ([`WriterThread::close`], or the sink dropped) is marked by the writer as the journal's last
 //! record; records offered after that are dropped and counted, not marked.
 //!
@@ -98,6 +100,18 @@ pub trait JournalSink {
     /// the omission (a `Degraded` marker before the next record written) rather than reading as
     /// complete. Never blocks.
     fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded;
+
+    /// The gap open now, named by the number of the first record dropped into it (the
+    /// `from_seq` of the `Degraded` marker that will close it), or `None` when no gap is open.
+    /// A gap opens at a drop and closes only once space returns under the soft limit, so a gap
+    /// other than the one open at an earlier drop says the sink was back under its soft limit
+    /// between the two, whoever offered the records that closed it. fbc-runtime's journal reads
+    /// it to tell each time the sink reaches its soft limit (decision 0139). By default `None`:
+    /// a sink that does not name its gaps, whose soft limit the runtime's journal then counts
+    /// left only when the sink keeps a Normal record it offered.
+    fn open_gap(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Makes the journal queue: the sink the shard records into, which hashes redaction spans
@@ -316,6 +330,10 @@ impl JournalSink for QueueSink {
 
     fn omit(&mut self, class: TrafficClass, now: WallNs) -> Recorded {
         self.offer(class, now, None)
+    }
+
+    fn open_gap(&self) -> Option<u64> {
+        self.gap.as_ref().map(|gap| gap.from_seq)
     }
 }
 

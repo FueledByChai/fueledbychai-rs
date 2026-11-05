@@ -249,8 +249,8 @@ mod common;
 pub use audit::{AuditEntry, AuditSink};
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
 pub use entry::{
-    ArmRefusal, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry, StateRefusal,
-    TestnetRun,
+    ArmRefusal, CancelOnlyTrip, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry,
+    StateRefusal, TestnetRun,
 };
 pub use gates::{Batching, PlanVenue, RateScope, RateView};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};

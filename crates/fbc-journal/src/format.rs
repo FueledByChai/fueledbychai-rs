@@ -53,8 +53,13 @@
 //! sequence and changes nothing else: its flag byte is 2, followed by the sequence (`u64`), then
 //! its bytes; an annotation and an input the consumer journaled itself are written as version 8
 //! wrote them (flag 0 and 1). A version 8 segment holding flag 2 is malformed, and a reader of
-//! version 8 refuses a version 9 segment at its header, naming the version. The reader reads
-//! versions 2 to 9, so a journal written before reads back unchanged.
+//! version 8 refuses a version 9 segment at its header, naming the version.
+//!
+//! Version 10 (FBC-8pm, decision 0139) adds a marker and changes nothing else: `CancelOnly`,
+//! marker byte 3, with no field, where the journal's soft limit moved every Quoting market of
+//! the shard to Cancel-only. A version 2 to 9 segment holding it is malformed, and a reader of version 9
+//! refuses a version 10 segment at its header, naming the version. The reader reads versions 2
+//! to 10, so a journal written before reads back unchanged.
 
 use core::ops::Range;
 
@@ -80,8 +85,9 @@ pub const MAGIC: [u8; 4] = *b"FBCJ";
 /// frame was sent as (FBC-q7b) and adds the `InboundControl` kind (FBC-drf); version 6 adds the
 /// `StaleAuthorization` reason a write result may be not sent for (FBC-j5bw); version 7 adds the
 /// `RpcTimeout` kind (FBC-0hfl); version 8 adds the `Consumer` kind (FBC-hxkm); version 9 adds
-/// the ingest sequence of a consumer input the shard stamped (FBC-hvqi).
-pub const VERSION: u16 = 9;
+/// the ingest sequence of a consumer input the shard stamped (FBC-hvqi); version 10 adds the
+/// `CancelOnly` marker (FBC-8pm).
+pub const VERSION: u16 = 10;
 /// The oldest format version this crate reads: version 1 is refused (0024).
 pub const OLDEST_READABLE: u16 = 2;
 /// The most bytes one record may redact, its spans and secret header values together.
@@ -407,6 +413,7 @@ fn encode_body(
                     e.u64(*dropped);
                 }
                 Marker::Recovered => e.u8(2),
+                Marker::CancelOnly => e.u8(3),
             }
         }
         Record::Nonce { source, value } => {
@@ -1118,6 +1125,7 @@ pub(crate) fn decode_version(body: &[u8], version: u16) -> Result<(Record, Vec<S
                 dropped: d.u64()?,
             },
             2 => Marker::Recovered,
+            3 if version >= 10 => Marker::CancelOnly,
             _ => return Err("marker"),
         }),
         NONCE => Record::Nonce {
@@ -1842,7 +1850,7 @@ mod tests {
                 .concat(),
                 "feed",
             ),
-            ([MARKER, 3].to_vec(), "marker"),
+            ([MARKER, 4].to_vec(), "marker"),
             // An inbound frame with an unknown opcode or kernel_rx flag.
             (
                 [
@@ -2079,13 +2087,54 @@ mod tests {
         assert_eq!(round_trip(&empty), empty);
     }
 
+    /// FBC-8pm (decision 0139): the journal's move of the shard's markets to Cancel-only is a
+    /// marker of its own, byte 3, with no field and nothing redacted; a segment of version 9 or
+    /// earlier, which cannot hold one, refuses it as a marker it does not have, and reads the
+    /// markers before it as version 10 does.
+    #[test]
+    fn a_cancel_only_marker_round_trips_and_is_refused_before_version_10() {
+        assert_eq!(VERSION, 10);
+        let record = Record::Marker(Marker::CancelOnly);
+        assert_eq!(record.blanked(), record);
+        assert!(record.digests(&key()).is_empty());
+        let mut body = Vec::new();
+        encode(&record, &key(), &mut body).unwrap();
+        // The kind byte and the marker's byte: nothing else.
+        assert_eq!(body, [MARKER, 3]);
+        assert_eq!(decode(&body).unwrap(), (record.clone(), Vec::new()));
+        assert_eq!(round_trip(&record), record);
+        for version in OLDEST_READABLE..10 {
+            assert_eq!(decode_version(&body, version), Err("marker"));
+        }
+        // A byte after it is refused, and so is a marker byte no version has.
+        assert_eq!(decode(&[MARKER, 3, 0]), Err("bytes after the record"));
+        assert_eq!(decode(&[MARKER, 4]), Err("marker"));
+        for earlier in [
+            Marker::SessionStart {
+                header: Opaque(b"h".to_vec()),
+            },
+            Marker::Degraded {
+                from_seq: 3,
+                dropped: 2,
+            },
+            Marker::Recovered,
+        ] {
+            let record = Record::Marker(earlier);
+            let mut body = Vec::new();
+            encode(&record, &key(), &mut body).unwrap();
+            for version in OLDEST_READABLE..=VERSION {
+                assert_eq!(decode_version(&body, version).unwrap().0, record);
+            }
+        }
+    }
+
     /// FBC-hvqi: an input the shard stamped round-trips with its ingest sequence, which format
     /// version 9 holds after the flag (2); a version 8 segment, which has none, refuses that
     /// flag; an annotation, which no shard stamps, cannot be written with one, leaving the buffer
     /// as it was.
     #[test]
     fn a_stamped_consumer_input_round_trips_with_its_ingest_sequence_from_version_9() {
-        assert_eq!(VERSION, 9);
+        assert_eq!(VERSION, 10);
         let bytes = b"Stop".to_vec();
         for seq in [0, 41, u64::MAX] {
             let record = Record::Consumer {
@@ -2841,7 +2890,7 @@ mod tests {
                         ControlEvent::Closed(conn())
                     },
                 },
-                4 => Record::Marker(match self.below(3) {
+                4 => Record::Marker(match self.below(4) {
                     0 => Marker::SessionStart {
                         header: Opaque(self.any_bytes()),
                     },
@@ -2849,6 +2898,7 @@ mod tests {
                         from_seq: self.next(),
                         dropped: self.next(),
                     },
+                    2 => Marker::CancelOnly,
                     _ => Marker::Recovered,
                 }),
                 5 => Record::Nonce {

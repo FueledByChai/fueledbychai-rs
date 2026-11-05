@@ -164,6 +164,13 @@ pub enum Marker {
     Degraded { from_seq: u64, dropped: u64 },
     /// Records are no longer being dropped.
     Recovered,
+    /// The journal reached its soft limit and the runtime moved every Quoting market of the
+    /// shard to Cancel-only here: every market of each registry the shard's journal was given
+    /// that was in Quoting, until the owner's Start, Flatten or Wind-down; a market in Exit
+    /// stayed in Exit (decision 0139). The
+    /// runtime journals it under Safety, so it is kept from the reserve while Normal records
+    /// are dropped (0006). Format version 10.
+    CancelOnly,
 }
 
 /// A nonce source as the runtime numbers it: one per scope the venue's

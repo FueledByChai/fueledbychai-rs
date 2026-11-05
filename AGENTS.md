@@ -283,7 +283,13 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     each connection epoch's end (`MdHandler::on_epoch_end`, live and in replay), and every book
     that epoch fed is then gapped until its next snapshot (0039);
     a `Journal` (the consumer's `fbc-journal` sink) set on a session or venue records every input,
-    output and connection change under its traffic class and is never waited on (0006);
+    output and connection change under its traffic class and is never waited on (0006); given
+    the `CancelOnlyTrip` of each registry whose order entry runs on the shard
+    (`Journal::cancel_only_at_soft_limit`), it moves every market of them in Quoting to
+    Cancel-only, leaving the owner's Exit and its reducing orders as they are, each time the
+    sink drops one of its records from under the soft limit or into a gap other than the one it
+    reached it in (`JournalSink::open_gap`), and journals `Marker::CancelOnly` under Safety, from
+    the reserve, right after it (0139, `tests/journal_soft_limit.rs`);
     the `log` facade's TRACE level compiled out of every build that links it, since tungstenite
     logs each frame at TRACE (0079);
     `RateLimiter` keeps a sliding-window bucket per declared limit and scope key, charged by
@@ -449,7 +455,13 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
     Start, Flatten and Wind-down arming with the market lease (and the account lease where
     nonces are per account) and refused while Killed or the position is unknown, every change
-    advancing the market's `StateGeneration`; cancels and fills in every state (0012;
+    advancing the market's `StateGeneration`; the registry's `CancelOnlyTrip`, which the shard's
+    journal trips at its soft limit, moving every market in Quoting to Cancel-only, its armed
+    flag unchanged, read at once and applied at the registry's next mutating call, and a place,
+    batch or amend authorized in Quoting before it refused at submit
+    (`StaleAuthorization::CancelOnly`), while a market in Exit stays in Exit, its reducing
+    orders built and sent (0139, `tests/cancel_only_trip.rs`); cancels and fills in
+    every state (0012;
     `src/sweep.rs`, `tests/sweep.rs`): the kill switch's cancel everything an instrument
     cancel-all only under the held market lease after a trustworthy resync with no order not
     ours in view, otherwise our orders cancelled by explicit reference, named again on each
@@ -494,16 +506,18 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     consumer's `RedactionKey` (`src/redact.rs`, 0024; signatures kept verbatim), and a
     `JournalSink` that never blocks: a hand-written queue of atomic words (0021) with a consumer-configured byte budget, a soft
     limit for Normal records and a Safety reserve, drops counted by class, a `Degraded` marker
-    once space returns, and a writer thread draining it; the nonce, encode-context and cycle
+    once space returns, the gap open now named by its first dropped record (`open_gap`, 0139),
+    and a writer thread draining it; the nonce, encode-context and cycle
     records arrived in format version 3, and the keyed hashes of the credential spans a codec
     names in inbound frames and responses (`redact_inbound`, 0028) in version 4, the kind
     each outbound frame was sent as and the control frames received in version 5, the
     stale-authorization reason in version 6, a request deadline's firing in version 7
     (0090), the consumer's own records in version 8 (`Record::Consumer`: its inputs and
     annotations as opaque bytes with a kind and an input flag, written through the sink in the
-    shard's total order under the class the consumer picks; 0101), and the ingest sequence of a
-    consumer input the shard stamped in version 9 (0103), whose reader still reads version 2 to
-    8 journals), `crates/fbc-sim` (simulated venue and queue-position
+    shard's total order under the class the consumer picks; 0101), the ingest sequence of a
+    consumer input the shard stamped in version 9 (0103), and the `CancelOnly` marker of the
+    journal's move of the shard's Quoting markets at its soft limit in version 10 (0139), whose
+    reader still reads version 2 to 9 journals), `crates/fbc-sim` (simulated venue and queue-position
     fill-model code, never calibrations; it depends on `fbc-core`, `fbc-book` and
     `fbc-runtime` (for the in-process stream's peer, 0104; the runtime never depends on it): so
     far `QueueModel`, each modelled order's place in its level's queue under a `Bracket`
@@ -1043,7 +1057,9 @@ Design rules the records fix:
 - Never resend an order in `Unknown`; it counts as resting until the Unknown ladder resolves it,
   and filled quantity is the maximum of the venue's cumulative count and the deduplicated event
   sum, never their sum (0005).
-- Never let the journal block a cancel, a reducing order, an ack or a fill (0006).
+- Never let the journal block a cancel, a reducing order, an ack or a fill (0006); the one
+  exception is 0139's: once the soft limit moves a Quoting market to Cancel-only, that market
+  builds no reducing orders of its own, the owner's Flatten or Wind-down still reducing.
 - Always use the pinned toolchain; moving it is a ticket of its own (0008).
 
 ### Docs to keep current

@@ -14,11 +14,12 @@ its keyed hash.
 | `v6/` | one shard's journal (shard 1) in format version 6, the version before a request deadline's firing was a record (FBC-0hfl): the `v5/` records with, after the `SignFailed` write result, a write result not sent for `StaleAuthorization`, across the same two UTC hours | by `JournalWriter` at commit `ae61f2c` (format version 6), from `v6_records()` in `crates/fbc-journal/tests/cycle_records.rs` with that file's `key()` |
 | `v7/` | one shard's journal (shard 1) in format version 7, the version before the consumer's own records (FBC-hxkm): the `v6/` records with, after the `StaleAuthorization` write result, a request deadline's firing (`RpcTimeout`), across the same two UTC hours | by `JournalWriter` at commit `d7128b7` (format version 7), from `v7_records()` in `crates/fbc-journal/tests/cycle_records.rs` with that file's `key()` |
 | `v8/` | one shard's journal (shard 1) in format version 8, the version before a consumer input carried the ingest sequence the shard stamped it with (FBC-hvqi): the `v7/` records with, after the request deadline's firing, a consumer annotation and a consumer input, neither with an ingest sequence, across the same two UTC hours | by `JournalWriter` at commit `4e06866` (format version 8), from `v8_records()` in `crates/fbc-journal/tests/cycle_records.rs` with that file's `key()` |
+| `v9/` | one shard's journal (shard 1) in format version 9, the version before the journal's move of the shard's markets to Cancel-only was a marker (FBC-8pm, decision 0139): the `v8/` records with, after the consumer input, a consumer input the shard stamped with its ingest sequence, across the same two UTC hours | by `JournalWriter` at commit `ea51485` (format version 9), from `v9_records()` in `crates/fbc-journal/tests/cycle_records.rs` with that file's `key()` |
 
-`crates/fbc-journal/tests/cycle_records.rs` reads `v2/`, `v3/`, `v4/`, `v5/`, `v6/`, `v7/` and
-`v8/` with the current reader and checks every record and keyed hash against `v2_records()`,
-`v3_records()`, `v4_records()`, `v5_records()`, `v6_records()`, `v7_records()` and
-`v8_records()`; an outbound frame of versions 2 to 4 reads back with the
+`crates/fbc-journal/tests/cycle_records.rs` reads `v2/`, `v3/`, `v4/`, `v5/`, `v6/`, `v7/`,
+`v8/` and `v9/` with the current reader and checks every record and keyed hash against
+`v2_records()`, `v3_records()`, `v4_records()`, `v5_records()`, `v6_records()`, `v7_records()`,
+`v8_records()` and `v9_records()`; an outbound frame of versions 2 to 4 reads back with the
 kind its blanked bytes imply, so `v4/`'s second binary frame reads back as text, while `v5/`
 kept each frame's kind. Never rewrite
 these files with a newer writer: they stand for journals already on disk.

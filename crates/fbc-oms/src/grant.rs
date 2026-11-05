@@ -31,7 +31,11 @@
 //!   change of the market's state since its build refuses it; one built while its market is
 //!   in Exit goes through only while the market's position revision is also still the one it
 //!   was built under: a fill or a seed that moved the inventory since refuses it (decision
-//!   0066);
+//!   0066); and one authorized while its market is in Quoting only while its registry was not
+//!   tripped to Cancel-only since its authorization, which the shard's journal does at its soft
+//!   limit, before the registry applies the trip to the market's state (a trip before its
+//!   authorization, applied then, moved its generation; a trip leaves Exit as it is, so one
+//!   authorized in Exit is not held back by it; decision 0139);
 //! - an instrument cancel-all goes through only while 0005's I7 guard it was built under still
 //!   holds ([`Registry::cancel_everything`]): the registry's hold of the market's exclusive
 //!   lease has not changed since (no disarm, no arming of the disarmed market, no lease names
@@ -116,6 +120,14 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
+    /// The count in `cell` now, with the handle that tells later whether it moved.
+    pub(crate) fn on(cell: &Arc<AtomicU64>) -> Watch {
+        Watch {
+            cell: Arc::clone(cell),
+            at: cell.load(Ordering::SeqCst),
+        }
+    }
+
     /// The count when the command was built.
     pub(crate) fn at(&self) -> u64 {
         self.at
@@ -303,6 +315,13 @@ pub enum StaleAuthorization {
     /// adding side, which sized it too (decision 0108), and a fill or a resync moved the
     /// market's inventory since: sent, it could take the position across zero.
     PositionMoved(InstrumentId),
+    /// A place, a batch or an amend authorized while its market was in Quoting, and the
+    /// registry's [`CancelOnlyTrip`](crate::CancelOnlyTrip) moved every market of it in Quoting
+    /// to Cancel-only since: the journal of the shard its orders go out on reached its soft
+    /// limit (decision 0139). One tripped between its build and its authorization is refused as
+    /// [`StaleAuthorization::StateChanged`]: the authorization applied the trip. One authorized
+    /// in Exit is not refused for a trip, which leaves Exit as it is.
+    CancelOnly(InstrumentId),
 }
 
 impl fmt::Display for StaleAuthorization {
@@ -330,6 +349,12 @@ impl fmt::Display for StaleAuthorization {
                 "the position on market {} moved since the position-sized command was built",
                 market.get()
             ),
+            StaleAuthorization::CancelOnly(market) => write!(
+                f,
+                "market {} was moved from Quoting to Cancel-only with every Quoting market of its \
+                 registry since the command was authorized: the journal reached its soft limit",
+                market.get()
+            ),
         }
     }
 }
@@ -349,6 +374,9 @@ pub struct Authorization {
     generation: StateGeneration,
     cmd: VenueCommand,
     guard: Guard,
+    /// How many times the registry was tripped to Cancel-only, as it authorized a place, a
+    /// batch or an amend on a market in Quoting, the one state a trip moves (decision 0139).
+    trips: Option<Watch>,
 }
 
 impl Registry {
@@ -386,6 +414,11 @@ impl Registry {
         acct: AccountKey,
         cmd: PermittedCommand,
     ) -> Result<Authorization, IssueRefusal> {
+        // The registry's trips to Cancel-only, watched before the call applies those that came
+        // (decision 0139): one that came before is applied to the market's state, which moves
+        // the generation a place, batch or amend built in Quoting was built under, and one that
+        // comes after moves this count.
+        let trips = self.entries.watch_trips();
         self.reap_dropped();
         if cmd.origin() != self.instance() {
             return Err(IssueRefusal::OtherRegistry);
@@ -401,7 +434,15 @@ impl Registry {
         }
         self.issued(acct, &cmd);
         let generation = self.entries.generation(market);
-        Authorization::issue(acct, cmd, generation)
+        // Only a market in Quoting is moved by a trip: a place, batch or amend authorized in
+        // Exit, which builds only orders that reduce the position, is never held back by one
+        // (decisions 0006, 0139).
+        let tripped = self.entries.tripped_from(market);
+        let mut auth = Authorization::issue(acct, cmd, generation)?;
+        if auth.guard.state.is_some() && tripped {
+            auth.trips = Some(trips);
+        }
+        Ok(auth)
     }
 }
 
@@ -425,6 +466,7 @@ impl Authorization {
             generation,
             cmd,
             guard,
+            trips: None,
         })
     }
 
@@ -439,7 +481,10 @@ impl Authorization {
     /// ([`StaleAuthorization::ExclusiveLeaseChanged`]) or an order not ours was seen on its
     /// market since ([`StaleAuthorization::ForeignSeen`]), and not for any other change of
     /// state; a cancel or a cancel-many always goes through. It reads the market's live
-    /// counters without the registry, from any thread. A command that needs a guard and
+    /// counters without the registry, from any thread. A place, a batch or an amend authorized
+    /// while its market was in Quoting is refused first once its registry was tripped to
+    /// Cancel-only since ([`StaleAuthorization::CancelOnly`], decision 0139); one authorized in
+    /// Exit is not, as a trip leaves Exit as it is. A command that needs a guard and
     /// carries none is refused: it was not built here.
     pub fn check_at_submit(&self) -> Result<(), StaleAuthorization> {
         let moved = |watch: &Option<Watch>| watch.as_ref().is_none_or(|w| w.moved().is_some());
@@ -453,6 +498,11 @@ impl Authorization {
                 } else {
                     Ok(())
                 }
+            }
+            // A trip to Cancel-only since its authorization refuses it whether or not the
+            // registry has applied the trip to the market's state yet (decision 0139).
+            _ if self.trips.as_ref().and_then(Watch::moved).is_some() => {
+                Err(StaleAuthorization::CancelOnly(self.market))
             }
             _ => match self.guard.state.as_ref().map(Watch::moved) {
                 Some(None)

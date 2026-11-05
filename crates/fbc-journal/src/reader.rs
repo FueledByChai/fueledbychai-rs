@@ -243,17 +243,17 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{JournalWriter, Opaque, RedactionKey};
+    use crate::{JournalWriter, Marker, Opaque, RedactionKey};
     use fbc_core::{MonoNs, WallNs};
     use std::sync::Arc;
 
-    /// FBC-hxkm's done line, and FBC-hvqi's version: a reader of the previous format version
-    /// (now 8) refuses a journal of the current one at its segment's header, naming that
-    /// version, rather than part way through at the first stamped consumer input; the reader of
-    /// the current version reads the same journal whole.
+    /// FBC-hxkm's done line, and FBC-8pm's version: a reader of the previous format version
+    /// (now 9) refuses a journal of the current one at its segment's header, naming that
+    /// version, rather than part way through at the first `CancelOnly` marker (decision 0139);
+    /// the reader of the current version reads the same journal whole.
     #[test]
     fn a_reader_of_the_previous_version_refuses_the_new_one_naming_it() {
-        assert_eq!(VERSION, 9);
+        assert_eq!(VERSION, 10);
         // Unit tests get no CARGO_TARGET_TMPDIR: a directory of this process's own.
         let root = std::env::temp_dir().join(format!(
             "fbc-journal-reader-previous-{}",
@@ -262,19 +262,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let key = Arc::new(RedactionKey::new(&[1; 32]).unwrap());
         let mut writer = JournalWriter::create(&root, 1, key).unwrap();
-        let record = Record::Consumer {
-            at: MonoNs(1),
-            kind: 1,
-            input: true,
-            ingest_seq: Some(4),
-            bytes: Opaque(b"Start".to_vec()),
-        };
-        writer.append(WallNs(0), &record).unwrap();
+        let records = [
+            Record::Consumer {
+                at: MonoNs(1),
+                kind: 1,
+                input: true,
+                ingest_seq: Some(4),
+                bytes: Opaque(b"Start".to_vec()),
+            },
+            Record::Marker(Marker::CancelOnly),
+        ];
+        for record in &records {
+            writer.append(WallNs(0), record).unwrap();
+        }
         writer.flush().unwrap();
         drop(writer);
-        let current: Vec<_> = JournalReader::open(&root, 1).unwrap().collect();
-        assert_eq!(current.len(), 1);
-        assert_eq!(current[0].as_ref().unwrap(), &record);
+        let current: Vec<_> = JournalReader::open(&root, 1)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(current, records);
 
         let previous: Vec<_> = JournalReader::open_reading(&root, 1, VERSION - 1)
             .unwrap()
@@ -282,10 +289,10 @@ mod tests {
         let [Err(e @ JournalError::UnsupportedVersion { segment, version })] = &previous[..] else {
             panic!("{previous:?}");
         };
-        assert_eq!(*version, 9);
+        assert_eq!(*version, 10);
         assert_eq!(*segment, root.join("19700101/1-000000.fbcj"));
         let said = e.to_string();
-        assert!(said.contains("journal format version 9,"), "{said}");
+        assert!(said.contains("journal format version 10,"), "{said}");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -7,7 +7,8 @@
 //! - **Killed**: the kill switch is on. No place, amend, replace or batch item is built,
 //!   reduce-only, I6-reducing, flatten, force-close and wind-down ones included.
 //! - **Cancel-only**: the same for places and amends. Lifting the kill switch leads here and
-//!   nowhere else, and a disarm leads here from Exit or Quoting.
+//!   nowhere else, and a disarm leads here from Exit or Quoting, as does the registry's
+//!   [`CancelOnlyTrip`] at the journal's soft limit from Quoting (decision 0139).
 //! - **Exit**: entered only by the owner's Flatten or Wind-down. Only exit orders are built: a
 //!   place, amend, replace or batch item carrying the venue's reduce-only flag or the OMS's
 //!   reducing classification ([`NewOrder::reduces`](fbc_core::NewOrder::reduces)), on the side
@@ -41,7 +42,17 @@
 //! [`Authorization`](crate::Authorization) carries; a call that changes nothing does not. Lease
 //! names given again advance it too for every armed market whose held leases they cover
 //! differently, since what the market admits changed (decision 0060). Nothing else in the
-//! library, and no resync, fill, outcome or ladder timer, changes either.
+//! library, and no resync, fill, outcome or ladder timer, changes either, but one move toward
+//! Cancel-only that no consumer call makes: the registry's [`CancelOnlyTrip`], which the shard's
+//! journal trips when it reaches its soft limit (decision 0139), moves every market in Quoting
+//! to Cancel-only, its armed flag unchanged, and leaves a market in Exit as it is: Exit builds
+//! only orders that reduce the position, which a full journal never holds back (decision 0006).
+//! The market reads Cancel-only and builds no place or amend from the trip on; its generation
+//! advances at the registry's next mutating call, which applies the trip before anything else,
+//! so a Start, Flatten or Wind-down made after the trip stands; and a place, batch or amend
+//! authorized in Quoting before the trip is refused at submit
+//! ([`StaleAuthorization::CancelOnly`](crate::StaleAuthorization::CancelOnly)), one built before
+//! it and authorized after it as a change of state.
 //!
 //! A second count per market follows only whether the registry holds the market's exclusive
 //! lease under the names it has now (0005's I7, [`Registry::cancel_everything`]): it advances
@@ -53,6 +64,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
     AccountLease, InstrumentId, Lots, MarketLease, NonceScope, OrderCaps, Side, VenueSymbol,
@@ -67,8 +80,8 @@ use crate::registry::Registry;
 pub enum EntryState {
     /// The kill switch is on: no place or amend is built.
     Killed,
-    /// No place or amend is built; the state a fresh registry, a lifted kill switch and a
-    /// disarm leave a market in.
+    /// No place or amend is built; the state a fresh registry, a lifted kill switch, a disarm
+    /// and, from Quoting, a trip at the journal's soft limit (decision 0139) leave a market in.
     CancelOnly,
     /// The owner's exit: entered only by [`Registry::flatten`] or [`Registry::wind_down`].
     Exit(ExitKind),
@@ -418,6 +431,68 @@ impl fmt::Display for ExitRefusal {
 
 impl std::error::Error for ExitRefusal {}
 
+/// A handle on one registry that moves every market of it in Quoting to Cancel-only, from any
+/// thread: the shard's journal trips it when it reaches its soft limit (decision 0139;
+/// fbc-runtime's `Journal::cancel_only_at_soft_limit`). Each trip moves Quoting to Cancel-only
+/// with the armed flag unchanged, as the kill switch and its lift leave it, and leaves Exit,
+/// Killed and Cancel-only as they are: Exit, the owner's Flatten or Wind-down, builds only
+/// orders that reduce the position, which a full journal never holds back (decision 0006).
+/// Only the owner's Start, Flatten or Wind-down leaves Cancel-only again (decision 0012). It
+/// never moves a market toward Exit or Quoting. Only the registry hands one out
+/// ([`Registry::cancel_only_trip`]); cloning shares it.
+#[derive(Clone, Debug)]
+pub struct CancelOnlyTrip {
+    count: Arc<AtomicU64>,
+}
+
+impl CancelOnlyTrip {
+    /// Moves every market of the registry in Quoting to Cancel-only: it reads Cancel-only and
+    /// builds no place or amend from now on, and a place, batch or amend authorized in Quoting
+    /// before is refused at submit. A market in Exit stays in Exit. Never blocks.
+    pub fn trip(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many times the registry was tripped.
+    pub fn trips(&self) -> u64 {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+/// A registry's trips (decision 0139): how many were made through its [`CancelOnlyTrip`], and how
+/// many of them its market states reflect.
+#[derive(Debug, Default)]
+pub(crate) struct Trips {
+    count: Arc<AtomicU64>,
+    applied: u64,
+}
+
+impl Trips {
+    fn handle(&self) -> CancelOnlyTrip {
+        CancelOnlyTrip {
+            count: Arc::clone(&self.count),
+        }
+    }
+
+    /// Whether a trip came that the market states do not reflect yet.
+    fn pending(&self) -> bool {
+        self.count.load(Ordering::SeqCst) > self.applied
+    }
+
+    /// Whether a trip came since the last take; the states reflect every trip from now on.
+    fn take(&mut self) -> bool {
+        let now = self.count.load(Ordering::SeqCst);
+        let came = now > self.applied;
+        self.applied = now;
+        came
+    }
+
+    /// How many trips came so far, watched for a place, batch or amend about to be authorized.
+    fn watch(&self) -> Watch {
+        Watch::on(&self.count)
+    }
+}
+
 /// What a market's state admits once it admits a place or amend at all.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Admits {
@@ -460,6 +535,8 @@ pub(crate) struct Entries {
     generations: Generations,
     /// Per market, how many times whether the registry holds its exclusive lease changed.
     exclusive: Counters,
+    /// The trips that move every market in Quoting to Cancel-only (decision 0139).
+    trips: Trips,
 }
 
 impl Entries {
@@ -514,11 +591,52 @@ impl Entries {
         self.keys.as_ref()
     }
 
+    /// `market`'s state: Cancel-only for a market in Quoting once a trip came that the states
+    /// do not reflect yet (decision 0139).
     fn state(&self, market: InstrumentId) -> EntryState {
-        self.states
-            .get(&market)
-            .copied()
-            .unwrap_or(EntryState::CancelOnly)
+        match self.states.get(&market).copied() {
+            Some(EntryState::Quoting) if self.trips.pending() => EntryState::CancelOnly,
+            Some(state) => state,
+            None => EntryState::CancelOnly,
+        }
+    }
+
+    /// The registry's trip (decision 0139).
+    pub(crate) fn trip_handle(&self) -> CancelOnlyTrip {
+        self.trips.handle()
+    }
+
+    /// How many trips came so far, watched for a place, batch or amend about to be authorized,
+    /// which its authorization is checked against at submit (decision 0139).
+    pub(crate) fn watch_trips(&self) -> Watch {
+        self.trips.watch()
+    }
+
+    /// Whether a trip moves `market`: it is in Quoting as far as the trips applied so far go,
+    /// read from the state the registry holds, so a trip that comes after they were applied
+    /// still counts for it (decision 0139).
+    pub(crate) fn tripped_from(&self, market: InstrumentId) -> bool {
+        self.states.get(&market) == Some(&EntryState::Quoting)
+    }
+
+    /// Moves every market in Quoting to Cancel-only, its armed flag unchanged and its
+    /// generation advanced, when a trip came since the last time, leaving Exit as it is
+    /// (decision 0139).
+    pub(crate) fn apply_trips(&mut self) {
+        if !self.trips.take() {
+            return;
+        }
+        let mut moved: Vec<InstrumentId> = self
+            .states
+            .iter()
+            .filter(|(_, s)| **s == EntryState::Quoting)
+            .map(|(m, _)| *m)
+            .collect();
+        moved.sort();
+        for market in moved {
+            let armed = self.armed(market);
+            self.set(market, EntryState::CancelOnly, armed);
+        }
     }
 
     fn armed(&self, market: InstrumentId) -> bool {
@@ -759,9 +877,19 @@ impl Registry {
     }
 
     /// `market`'s armed flag, state and state generation: disarmed, Cancel-only and generation
-    /// 0 until a call changes it.
+    /// 0 until a call changes it. A Quoting market a trip moved reads Cancel-only from the trip
+    /// on, its generation advanced from the registry's next mutating call (decision 0139).
     pub fn entry(&self, market: InstrumentId) -> MarketEntry {
         self.entries.entry(market)
+    }
+
+    /// The registry's [`CancelOnlyTrip`]: the handle the consumer gives the journal of the shard
+    /// its order entry runs on (fbc-runtime's `Journal::cancel_only_at_soft_limit`), which
+    /// trips it when the journal reaches its soft limit, moving every market of the registry in
+    /// Quoting to Cancel-only and leaving Exit as it is (decision 0139). Every call hands out
+    /// the same trip.
+    pub fn cancel_only_trip(&self) -> CancelOnlyTrip {
+        self.entries.trip_handle()
     }
 
     /// The owner's Start (decision 0012): arms a disarmed market with `leases` and moves it to

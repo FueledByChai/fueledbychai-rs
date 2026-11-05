@@ -70,6 +70,8 @@ enum Why {
     Lease(InstrumentId),
     /// An Exit command's market's position moved (tests/exit_submit.rs).
     Position(InstrumentId),
+    /// The registry was tripped to Cancel-only (tests/cancel_only_trip.rs).
+    CancelOnly(InstrumentId),
 }
 
 impl From<StaleAuthorization> for Why {
@@ -81,6 +83,7 @@ impl From<StaleAuthorization> for Why {
             StaleAuthorization::ForeignSeen(market) => Why::Foreign(market),
             StaleAuthorization::ExclusiveLeaseChanged(market) => Why::Lease(market),
             StaleAuthorization::PositionMoved(market) => Why::Position(market),
+            StaleAuthorization::CancelOnly(market) => Why::CancelOnly(market),
         }
     }
 }

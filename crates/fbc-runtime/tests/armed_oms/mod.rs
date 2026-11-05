@@ -205,6 +205,12 @@ impl Oms {
     /// that the venue acknowledged as `V-2` (an order a resync showed is never amended): the
     /// registry is told the acknowledgement directly, as no session here wrote that order.
     pub fn armed() -> Oms {
+        Oms::armed_holding(0)
+    }
+
+    /// [`Oms::armed`], the resync having shown the market's position at `position` lots
+    /// (positive long) rather than flat.
+    pub fn armed_holding(position: i64) -> Oms {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let account = format!("acct-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         let caps = order_caps();
@@ -233,7 +239,7 @@ impl Oms {
                 post_only: None,
                 reduce_only: None,
             }],
-            positions: vec![(INST_A, SignedLots(0))],
+            positions: vec![(INST_A, SignedLots(position))],
         };
         let ladder = LadderConfig::new(
             Duration::from_secs(1),
