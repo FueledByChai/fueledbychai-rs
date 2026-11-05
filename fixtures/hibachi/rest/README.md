@@ -1,9 +1,10 @@
 # Hibachi REST fixtures
 
 Hand-built answers in the shapes Hibachi publishes, for `crates/venues/fbc-venue-hibachi`'s
-discovery and funding tests (FBC-jyyl). Nothing here was recorded from Hibachi, and no test
-sends anything to it; `SYNTHETIC` says where the values come from. The status poll's answers
-(FBC-1632) are in [`status/`](status/README.md), with a `SYNTHETIC` file of their own.
+discovery and funding tests (FBC-jyyl, and FBC-ord5 for the maintenance windows). Nothing here
+was recorded from Hibachi, and no test sends anything to it; `SYNTHETIC` says where the values
+come from. The status poll's answers (FBC-1632) are in [`status/`](status/README.md), with a
+`SYNTHETIC` file of their own.
 
 Sources, cited below by name:
 
@@ -37,10 +38,11 @@ Sources, cited below by name:
 
 The answer's top level: `feeConfig` (SPEC `ExchangeFeeConfig`, made-up rates, with no
 `instantWithdrawDstPublicKey`: the published examples' value is key-shaped and is not copied),
-`futureContracts`, `instantWithdrawalLimit`, `maintenanceWindow` (empty) and `status`
-`NORMAL` (SPEC; AD's example). Each contract has the fields SPEC's `ContractData`, SDK's
-`FutureContract` and AD's example share, but for `status`, which AD's older example states as
-`"live": true` instead: `id` (a whole number, SPEC `u32`), `symbol`
+`futureContracts`, `instantWithdrawalLimit`, `maintenanceWindow` (empty, so no contract's
+calendar holds a window: ETH, SOL and the other crypto contracts with neither market timestamp
+have no calendar) and `status` `NORMAL` (SPEC; AD's example). Each contract has the fields
+SPEC's `ContractData`, SDK's `FutureContract` and AD's example share, but for `status`, which
+AD's older example states as `"live": true` instead: `id` (a whole number, SPEC `u32`), `symbol`
 (`<underlying>/<quote>-P`), `displayName`, `underlyingSymbol`, `settlementSymbol`,
 `underlyingDecimals` and `settlementDecimals` (whole numbers), `tickSize`, `stepSize`,
 `minOrderSize` and `minNotional` (decimal strings), `orderbookGranularities` (decimal strings),
@@ -67,7 +69,8 @@ Each is a complete answer of a few of the contracts above, changed in one way.
 
 | File | Change | Expected |
 | --- | --- | --- |
-| `exchange_info_scheduled_maintenance.json` | `status` `SCHEDULED_MAINTENANCE`, with the `currentMaintenanceWindow` SPEC requires then and the window in `maintenanceWindow`, its bounds JSON numbers as in SDK's test data | every contract halted, ETH and EUR `LIVE` included |
+| `exchange_info_scheduled_maintenance.json` | `status` `SCHEDULED_MAINTENANCE`, with the `currentMaintenanceWindow` SPEC requires then (not read) and the window in `maintenanceWindow`, its bounds JSON numbers as in SDK's test data | every contract halted, ETH and EUR `LIVE` included; the window, 1830000000 to 1830007200, on every contract's calendar |
+| `exchange_info_maintenance_windows.json` | `status` `NORMAL`, ETH, EUR and DOGE as in the scheduled maintenance answer and WIF as in the main fixture, and two windows in `maintenanceWindow`, each on a Wednesday morning UTC: 1815544800 to 1815552000.5 with its bounds JSON numbers (SDK's types and test data), and `"1816149600.25"` to `"1816156800"` with its bounds strings (SPEC's types) | each window a `ClosedWindow` on every contract's calendar, closed from its begin until its end, outside EUR's weekend and inside WIF's open and close; ETH, with no other calendar, gains one of the windows alone; every status as listed (ETH, EUR and WIF trading, DOGE halted) |
 | `exchange_info_unscheduled_maintenance.json` | `status` `UNSCHEDULED_MAINTENANCE` | every contract halted |
 | `exchange_info_status_absent.json` | SOL without `status`, with `"live": true` instead, as AD's older example shows its contracts | refused: `status` missing |
 | `exchange_info_status_null.json` | SOL's `status` `null` | refused: `status` missing |

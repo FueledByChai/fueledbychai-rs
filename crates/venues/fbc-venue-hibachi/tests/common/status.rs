@@ -1,8 +1,8 @@
 //! What the status poll's tests share (FBC-1632, decision 0130): the spec table discovery reads
-//! from `fixtures/hibachi/rest/status/live.json` (ETH/USDT-P, EUR/USDT-P and WIF/USDT-P), the
-//! hand-built answers of that directory, the poll endpoint `plan_md` plans, and [`Sim`], which
-//! runs the poll's codec as the runtime does (each timer at its due instant, each request held
-//! until the test answers it) on a wall clock the test moves.
+//! from `fixtures/hibachi/rest/status/live.json` (ETH/USDT-P, EUR/USDT-P and WIF/USDT-P), or from
+//! another answer listing them, the hand-built answers of that directory, the poll endpoint
+//! `plan_md` plans, and [`Sim`], which runs the poll's codec as the runtime does (each timer at
+//! its due instant, each request held until the test answers it) on a wall clock the test moves.
 
 #![allow(dead_code)]
 
@@ -56,14 +56,19 @@ pub fn answer_json(name: &str) -> serde_json::Value {
 
 /// ETH/USDT-P, EUR/USDT-P and WIF/USDT-P as discovery reads them from `live.json`.
 pub fn specs() -> SpecTable {
-    let body = answer("live");
+    specs_from(&answer("live"))
+}
+
+/// ETH/USDT-P, EUR/USDT-P and WIF/USDT-P as discovery reads them from `body`, an exchange-info
+/// answer listing them.
+pub fn specs_from(body: &[u8]) -> SpecTable {
     let cfg = super::config();
     let plan = Hibachi.discover(&cfg).unwrap();
     let caps = Hibachi.caps(&cfg).unwrap();
     let response = HttpResponse {
         status: 200,
         headers: &[],
-        body: &body,
+        body,
     };
     let drafts = dispatch_market_data(&caps, |scope| {
         plan.parse(&[(EXCHANGE_INFO_TAG, Ok(response))], scope)
@@ -185,10 +190,26 @@ impl Sim {
         sim
     }
 
+    /// The poll's codec as [`Sim::new`] gives it, its markets' calendars from `specs` in place
+    /// of `live.json`'s.
+    pub fn on_specs(specs: SpecTable, start: i64) -> Sim {
+        let mut sim = Sim::unstarted_on(&super::config(), &subs(), start, specs);
+        sim.fire_due();
+        sim
+    }
+
     /// The same before any timer fires: the reads have not begun.
     pub fn unstarted(cfg: &VenueConfig, subs: &BTreeSet<Subscription>, start: i64) -> Sim {
+        Sim::unstarted_on(cfg, subs, start, specs())
+    }
+
+    fn unstarted_on(
+        cfg: &VenueConfig,
+        subs: &BTreeSet<Subscription>,
+        start: i64,
+        specs: SpecTable,
+    ) -> Sim {
         let plan = poll_plan(cfg, subs);
-        let specs = specs();
         let mut sim = Sim {
             codec: HibachiStatus::new(plan.stream, cfg),
             specs,

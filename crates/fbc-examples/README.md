@@ -62,8 +62,8 @@ start read's, and holds there for the whole run in both directions:
   after Hibachi reopens it. An FX pair started during its weekend still reads closed after Sunday
   17:00 New York time, while its `TOUCH` and `BOOK` lines flow.
 - A contract the read finds trading stays open, but for its calendar: a halt Hibachi lists later
-  does not close it, and nor does a maintenance window, which the calendar does not hold yet
-  (FBC-ord5).
+  does not close it, and nor does a maintenance window published after the start read. A window
+  the start read published is in the calendar, so `MARKET` reads closed through it (FBC-ord5).
 
 The status poll re-reads the status while md_watch runs (FBC-1632, decision 0130): Hibachi's plan
 holds it beside `/ws/market`, a `GET /market/exchange-info` every `--hibachi-status` seconds, and

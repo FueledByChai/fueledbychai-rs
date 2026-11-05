@@ -22,11 +22,34 @@
 //!   `UNSCHEDULED_MAINTENANCE`): required, refused as missing or malformed under the name
 //!   `exchange status`, since a contract has a `status` of its own. Any value but `NORMAL`, the
 //!   SDK's `NORMAL, MAINTENANCE` comment included, makes every contract
-//!   [`TradingStatus::Halted`]. `currentMaintenanceWindow` and `maintenanceWindow` are not read
-//!   here: the status poll's re-read of `/market/exchange-info` (`status.rs`, decision 0130)
-//!   reads `maintenanceWindow` and halts each market at a window's begin. So no contract's
-//!   session calendar holds them as `ClosedWindow`s yet, which decision 0125's Consequences
-//!   expect; FBC-ord5 maps them.
+//!   [`TradingStatus::Halted`].
+//! - `maintenanceWindow` (the SDK's `MaintenanceWindow`s; [SPEC] `MaintenanceWindow`), a list of
+//!   `{ begin, end, note }`, is the venue's published maintenance: each window is a
+//!   [`ClosedWindow`] on every contract's session calendar, closed from its begin, inclusive,
+//!   until its end, exclusive (decision 0125's Consequences; FBC-ord5). Each bound is a decimal
+//!   count of Unix seconds in a JSON number or a string ([SPEC] types both as strings, [SDK] and
+//!   its test data as numbers), no later than 2100-01-01T00:00:00Z, so a count of milliseconds is
+//!   refused, and the end is after the begin as written; the begin rounds down and the end up to
+//!   whole nanoseconds, toward closed. A string is a plain decimal string (as below), read
+//!   exactly. A JSON number is read as `serde_json` holds it: one written as a whole number
+//!   exactly, and any other, written with a fraction or an exponent, as the nearest `f64`, within
+//!   about a quarter of a microsecond of what is written through 2100, which is then rounded
+//!   toward closed. So a number in range written with an exponent is read as its plain form is,
+//!   and a fraction finer than the `f64` holds can move a bound by that much either way (none of
+//!   [SPEC], [SDK] or its test data shows a bound finer than a second); one so small that
+//!   `serde_json` prints it with an exponent, under 1e-5 seconds, is refused. Absent, `null` or
+//!   empty publishes none. Anything else (not a list, a window that is not an object, a bound
+//!   missing or not so written, an end not after its begin) refuses the answer as malformed
+//!   naming `maintenanceWindow`. The status poll reads the list through the same function and
+//!   halts each market at a window's begin (`status.rs`, decision 0130). The windows are the
+//!   calendar as of this answer, so one Hibachi withdraws later still closes the calendar
+//!   discovery built (decision 0125: a calendar only closes, and a re-read never reopens it), and
+//!   the status poll halts a market on that calendar too. The `note` is not read, and nor is
+//!   `currentMaintenanceWindow`, which [SPEC] gives with `SCHEDULED_MAINTENANCE`, a status that
+//!   already halts every contract: should it ever name a window the list does not hold, no
+//!   calendar closes for it, but every contract is halted while the exchange's status says so,
+//!   and the status poll holds each market for the window after the first read showing it
+//!   trading again.
 //! - A contract's `status` ([SPEC] `ContractStatus`: `LISTED`, `PRE_OPEN`, `LIVE`, `PAUSED`,
 //!   `CLOSED`, none described), matched exactly: `LIVE` is [`TradingStatus::Trading`] while the
 //!   exchange is `NORMAL`; `LISTED`, `PRE_OPEN`, `PAUSED` and `CLOSED` are each
@@ -115,12 +138,12 @@
 use core::time::Duration;
 
 use fbc_core::{
-    AssetKey, AssetSym, CalendarParts, DecodeError, DecodeScope, DstRule, Effect, Effects,
-    FundingSpec, HttpMethod, HttpPlan, HttpRequest, HttpTag, InstrumentKind, InstrumentSpecDraft,
-    LocalTime, Lots, Money, Month, OpKind, PlanError, PriceGrid, RateCharge, SessionCalendar,
-    SigningParams, SizeStep, SymbolError, TradingStatus, TrafficClass, Transition, UtcOffsetRule,
-    VenueConfig, VenueError, VenueNativeId, WallNs, WeekOfMonth, WeekTime, Weekday, WeeklyClosure,
-    WireSlice, WireUrl, common_symbol_parts,
+    AssetKey, AssetSym, CalendarParts, ClosedWindow, DecodeError, DecodeScope, DstRule, Effect,
+    Effects, FundingSpec, HttpMethod, HttpPlan, HttpRequest, HttpTag, InstrumentKind,
+    InstrumentSpecDraft, LocalTime, Lots, Money, Month, OpKind, PlanError, PriceGrid, RateCharge,
+    SessionCalendar, SigningParams, SizeStep, SymbolError, TradingStatus, TrafficClass, Transition,
+    UtcOffsetRule, VenueConfig, VenueError, VenueNativeId, WallNs, WeekOfMonth, WeekTime, Weekday,
+    WeeklyClosure, WireSlice, WireUrl, common_symbol_parts,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -187,6 +210,9 @@ const NANOS: i64 = 1_000_000_000;
 /// The exchange-level `status`'s name in a refusal, apart from a contract's `status`.
 const EXCHANGE_STATUS: &str = "exchange status";
 
+/// The published maintenance windows' name, and a refused window's.
+const MAINTENANCE_WINDOW: &str = "maintenanceWindow";
+
 /// Discovery's plan under `cfg`: one `GET` of [`EXCHANGE_INFO_PATH`] on the market-data REST
 /// origin, waiting the REST timeout, read by [`decode_exchange_info`]. Only those two keys are
 /// read.
@@ -221,10 +247,11 @@ pub(crate) fn request(tag: HttpTag, url: WireUrl, timeout: Duration) -> Effect {
     }
 }
 
-/// The drafts of an exchange-info answer's contracts, in the answer's order. Refused, naming the
-/// part: a body that is not a JSON object, the exchange status missing or not a string,
-/// `futureContracts` missing or not a list, a contract that is not an object, missing a required
-/// field or stating one not as documented.
+/// The drafts of an exchange-info answer's contracts, in the answer's order, each calendar
+/// holding the published maintenance windows. Refused, naming the part: a body that is not a JSON
+/// object, the exchange status missing or not a string, `futureContracts` missing or not a list,
+/// a contract that is not an object, missing a required field or stating one not as documented,
+/// and `maintenanceWindow` not as documented.
 pub fn decode_exchange_info(
     body: &[u8],
     scope: &DecodeScope<'_>,
@@ -232,9 +259,10 @@ pub fn decode_exchange_info(
     let doc = answer_doc(body)?;
     let normal = exchange_normal(&doc)?;
     let contracts = future_contracts(&doc)?;
+    let windows = maintenance_windows(&doc)?;
     let mut drafts = Vec::with_capacity(contracts.len());
     for contract in contracts {
-        drafts.push(draft(contract, normal, scope)?);
+        drafts.push(draft(contract, normal, &windows, scope)?);
     }
     Ok(drafts)
 }
@@ -286,10 +314,56 @@ pub(crate) fn contract_status(
     }
 }
 
-/// One contract as a draft; `normal` is whether the exchange's status is `NORMAL`.
+/// `maintenanceWindow` (the module docs): none when absent or `null`, otherwise a list of windows
+/// each with a `begin` and an `end` in decimal Unix seconds, a number or a string, no later than
+/// 2100, the end after the begin as written, each window rounded toward closed; anything else
+/// refused as malformed naming `maintenanceWindow`. Discovery and the status poll (decision 0130)
+/// read the list through it.
+pub(crate) fn maintenance_windows(
+    doc: &Map<String, Value>,
+) -> Result<Vec<ClosedWindow>, PlanError> {
+    let list = match doc.get(MAINTENANCE_WINDOW) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => return Err(malformed(MAINTENANCE_WINDOW).into()),
+    };
+    let bad = || PlanError::from(malformed(MAINTENANCE_WINDOW));
+    list.iter()
+        .map(|window| maintenance_window(window).ok_or_else(bad))
+        .collect()
+}
+
+/// One published window: closed from its `begin`, rounded down, until its `end`, rounded up,
+/// when both are bounds ([`window_bound`]) and the end is after the begin as written.
+fn maintenance_window(window: &Value) -> Option<ClosedWindow> {
+    let window = window.as_object()?;
+    let begin = window_bound(window.get("begin"))?;
+    let end = window_bound(window.get("end"))?;
+    // Compared as written, so two bounds finer than a nanosecond apart, rounding away from each
+    // other, never make a window of an end that is not after its begin.
+    if end <= begin {
+        return None;
+    }
+    ClosedWindow::new(instant(begin, Round::Down)?, instant(end, Round::Up)?)
+}
+
+/// A window's bound: decimal Unix seconds ([`seconds`]) in a string, read exactly, or in a JSON
+/// number, read as `serde_json` holds it (an `f64` unless written as a whole number; the module
+/// docs).
+fn window_bound(value: Option<&Value>) -> Option<Decimal> {
+    match value? {
+        Value::String(text) => seconds(text),
+        Value::Number(n) => seconds(&n.to_string()),
+        _ => None,
+    }
+}
+
+/// One contract as a draft; `normal` is whether the exchange's status is `NORMAL`, and `windows`
+/// the published maintenance windows its calendar holds.
 fn draft(
     m: &Map<String, Value>,
     normal: bool,
+    windows: &[ClosedWindow],
     scope: &DecodeScope<'_>,
 ) -> Result<InstrumentSpecDraft, PlanError> {
     let status = contract_status(m, normal)?;
@@ -324,7 +398,7 @@ fn draft(
     let sessions = SessionCalendar::new(CalendarParts {
         first_open,
         final_close,
-        windows: Vec::new(),
+        windows: windows.to_vec(),
         weekly: if fx { vec![FX_WEEKEND] } else { Vec::new() },
     });
 
@@ -412,8 +486,19 @@ pub(crate) fn advertised(
 /// `text`, a count of Unix seconds in a plain decimal string ([`plain_decimal`]), as an instant
 /// rounded `round` to whole nanoseconds; `None` when it is not one, or lies after
 /// 2100-01-01T00:00:00Z (as a count of milliseconds would).
-pub(crate) fn unix_seconds(text: &str, round: Round) -> Option<WallNs> {
-    let secs = plain_decimal(text).filter(|secs| *secs <= Decimal::from(LATEST_SECS))?;
+fn unix_seconds(text: &str, round: Round) -> Option<WallNs> {
+    instant(seconds(text)?, round)
+}
+
+/// `text` read exactly as a count of Unix seconds: a plain decimal string ([`plain_decimal`]) no
+/// later than 2100-01-01T00:00:00Z.
+fn seconds(text: &str) -> Option<Decimal> {
+    plain_decimal(text).filter(|secs| *secs <= Decimal::from(LATEST_SECS))
+}
+
+/// `secs` Unix seconds, never negative nor after 2100 ([`seconds`]), as an instant rounded
+/// `round` to whole nanoseconds.
+fn instant(secs: Decimal, round: Round) -> Option<WallNs> {
     let nanos = secs * Decimal::from(NANOS);
     let nanos = match round {
         Round::Up => nanos.ceil(),
@@ -510,4 +595,38 @@ pub(crate) fn parse_fbc_common_symbol(s: &str) -> Result<AssetKey, SymbolError> 
         quote,
         kind: InstrumentKind::Perpetual,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_bound_reads_alike_as_a_number_and_a_string() {
+        let as_number = window_bound(Some(&serde_json::json!(1_830_000_000)));
+        let as_float = window_bound(Some(&serde_json::json!(1_830_000_000.0)));
+        let as_text = window_bound(Some(&serde_json::json!("1830000000")));
+        let secs = Some(Decimal::from(1_830_000_000));
+        assert_eq!((as_number, as_float, as_text), (secs, secs, secs));
+        // A JSON number written with an exponent, in range, is held as an f64 and read as its
+        // plain form is; a string so written is not a plain decimal.
+        let number = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(window_bound(Some(&number("1.83e9"))), secs);
+        assert_eq!(window_bound(Some(&number("18300000000e-1"))), secs);
+        assert_eq!(window_bound(Some(&serde_json::json!("1.83e9"))), None);
+        // Milliseconds, a negative count, a count past 2100 (which serde_json prints with an
+        // exponent, 1e21), one under 1e-5 seconds (likewise printed with an exponent), a boolean:
+        // none is a bound.
+        for refused in [
+            serde_json::json!(1_830_000_000_000_u64),
+            serde_json::json!(-5),
+            serde_json::json!(1e21),
+            serde_json::json!(1e-7),
+            serde_json::json!(true),
+            serde_json::json!("1830000000000"),
+        ] {
+            assert_eq!(window_bound(Some(&refused)), None, "{refused}");
+        }
+        assert_eq!(window_bound(None), None);
+    }
 }

@@ -36,13 +36,16 @@
 //! refusing the answer; each contract's `symbol`, and its `marketOpenTimestamp` and
 //! `marketCloseTimestamp` read as discovery reads them (decimal Unix seconds in a string, none
 //! after 2100-01-01 UTC). It also reads `maintenanceWindow`, a list of `{ begin, end, note }`
-//! (the SDK's `MaintenanceWindow`; its README: seconds since the Unix epoch): each bound a decimal
-//! count of Unix seconds in a JSON number or a string (the Market API spec types both as strings,
-//! the SDK and its test data as numbers), by the same rule and bound, the begin rounded down and
-//! the end up to whole nanoseconds, the end after the begin; an absent or `null` list publishes
-//! none. A JSON number with a fraction is read at the precision `serde_json` holds it in, an
-//! `f64`'s, under a microsecond at these magnitudes. Anything else refuses the answer, naming the
-//! part, and so does a symbol listed twice. No other field of a contract is read here.
+//! (the SDK's `MaintenanceWindow`; its README: seconds since the Unix epoch), through the one
+//! function discovery reads it with, which puts the same windows on each contract's calendar
+//! (FBC-ord5): each bound a decimal count of Unix seconds in a JSON number or a string (the Market
+//! API spec types both as strings, the SDK and its test data as numbers), by the same rule and
+//! bound, the end after the begin as written, the begin rounded down and the end up to whole
+//! nanoseconds; an absent, `null` or empty list publishes none. A JSON number written with a
+//! fraction or an exponent is read as the nearest `f64`, as `serde_json` holds it, within about a
+//! quarter of a microsecond through 2100, before it is rounded (discovery's module docs).
+//! Anything else refuses the answer, naming the part, and so does a symbol listed twice. No other
+//! field of a contract is read here.
 //!
 //! # What is reported
 //!
@@ -97,8 +100,9 @@
 //! - the begin of each maintenance window the schedule below holds (kept, once begun, until its
 //!   end and the reopening window after it have passed every read still in flight);
 //! - the end of a session in the contract's calendar (its spec's [`SessionCalendar`]: an FX
-//!   pair's New York weekend, the final close and first open discovery read; decision 0125),
-//!   found by [`SessionCalendar::next_closed`];
+//!   pair's New York weekend, the final close and first open discovery read, and the maintenance
+//!   windows its answer published, which halt the market though no later read publishes them;
+//!   decision 0125), found by [`SessionCalendar::next_closed`];
 //! - and the close (`marketCloseTimestamp`) the schedule holds for it, so the earlier of that and
 //!   the calendar's end.
 //!
@@ -200,22 +204,18 @@ use core::time::Duration;
 use std::collections::{BTreeMap, BTreeSet};
 
 use fbc_core::{
-    ConfigError, DecodeError, DecodeScope, Effect, Effects, HttpFailure, HttpResponse, HttpTag,
-    Inbound, InboundSpans, InstrumentId, Keepalive, MdCodec, MdEvent, MdSink, MonoNs, PlanError,
-    RawFrame, SessionCalendar, SpecTable, StreamId, Subscription, TimerTag, TradingStatus,
-    VenueConfig, VenueError, VenueMeta, WallNs, WireUrl,
+    ClosedWindow, ConfigError, DecodeError, DecodeScope, Effect, Effects, HttpFailure,
+    HttpResponse, HttpTag, Inbound, InboundSpans, InstrumentId, Keepalive, MdCodec, MdEvent,
+    MdSink, MonoNs, PlanError, RawFrame, SessionCalendar, SpecTable, StreamId, Subscription,
+    TimerTag, TradingStatus, VenueConfig, VenueError, VenueMeta, WallNs, WireUrl,
 };
-use serde_json::{Map, Value};
 
 use crate::config::Settings;
 use crate::discover::{
     self, EXCHANGE_INFO_PATH, Round, advertised, answer_doc, contract_status, exchange_normal,
-    future_contracts, malformed, text, unix_seconds,
+    future_contracts, maintenance_windows, malformed, text,
 };
 use crate::md;
-
-/// The name a refused maintenance window is refused under.
-const MAINTENANCE_WINDOW: &str = "maintenanceWindow";
 
 /// What the status poll counted.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
@@ -234,13 +234,6 @@ pub struct HibachiStatusCounts {
     pub stale_timers: u64,
 }
 
-/// A published maintenance window: closed from `begin` until `end`.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-struct Window {
-    begin: WallNs,
-    end: WallNs,
-}
-
 /// What one answer lists of a contract.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 struct Listed {
@@ -256,7 +249,7 @@ struct Listed {
 struct Answer {
     /// Each contract it lists, by symbol.
     contracts: BTreeMap<String, Listed>,
-    windows: Vec<Window>,
+    windows: Vec<ClosedWindow>,
 }
 
 /// One read sent.
@@ -276,7 +269,7 @@ struct Advertised {
     /// Each contract's advertised open and close, by symbol.
     contracts: BTreeMap<String, (Option<WallNs>, Option<WallNs>)>,
     /// Its published maintenance windows.
-    windows: Vec<Window>,
+    windows: Vec<ClosedWindow>,
 }
 
 /// The open and close the answers in `schedule` advertise for `symbol`: the latest open and the
@@ -338,7 +331,7 @@ pub struct HibachiStatus {
     schedule: Vec<Advertised>,
     /// The windows of answers replaced that had begun, kept while their end and the reopening
     /// window after it may still meet a read in flight.
-    begun: Vec<Window>,
+    begun: Vec<ClosedWindow>,
     /// Halts counted so far, each a market's.
     halts: u64,
     last_timer: u64,
@@ -555,7 +548,7 @@ impl HibachiStatus {
         let begun = (self.begun.iter())
             .chain(replaced.iter().flat_map(|a| a.windows.iter()))
             .copied()
-            .filter(|w| w.begin <= at && horizon < later(w.end, after));
+            .filter(|w| w.from() <= at && horizon < later(w.to(), after));
         self.begun = begun.collect();
         self.begun.sort_unstable();
         self.begun.dedup();
@@ -565,7 +558,7 @@ impl HibachiStatus {
     }
 
     /// The published windows the schedule holds: every answer's in it, and those kept once begun.
-    fn schedule_windows(&self) -> Vec<Window> {
+    fn schedule_windows(&self) -> Vec<ClosedWindow> {
         let mut windows = self.begun.clone();
         windows.extend(self.schedule.iter().flat_map(|a| a.windows.iter().copied()));
         windows.sort_unstable();
@@ -650,7 +643,7 @@ impl Span {
         sessions: Option<&SessionCalendar>,
         open: Option<WallNs>,
         close: Option<WallNs>,
-        windows: &[Window],
+        windows: &[ClosedWindow],
     ) -> bool {
         let Span { from, to, after } = self;
         // Closed at some instant from `after` before the span until its end.
@@ -660,7 +653,7 @@ impl Span {
         });
         let maintained = windows
             .iter()
-            .any(|w| w.begin <= to && from < later(w.end, after));
+            .any(|w| w.from() <= to && from < later(w.to(), after));
         calendar || self.advertised(open, close) || maintained
     }
 
@@ -699,14 +692,14 @@ fn later(at: WallNs, by: i64) -> WallNs {
 fn next_halt(
     sessions: Option<&SessionCalendar>,
     close: Option<WallNs>,
-    windows: &[Window],
+    windows: &[ClosedWindow],
     at: WallNs,
 ) -> Option<WallNs> {
     let calendar = sessions
         .filter(|cal| cal.is_open(at))
         .and_then(|cal| cal.next_closed(at));
     let close = close.filter(|close| *close > at);
-    let window = windows.iter().map(|w| w.begin).filter(|b| *b > at).min();
+    let window = windows.iter().map(|w| w.from()).filter(|b| *b > at).min();
     [calendar, close, window].into_iter().flatten().min()
 }
 
@@ -733,36 +726,6 @@ fn decode(body: &[u8]) -> Result<Answer, PlanError> {
     }
     let windows = maintenance_windows(&doc)?;
     Ok(Answer { contracts, windows })
-}
-
-/// `maintenanceWindow`: none when absent or `null`, otherwise a list of windows each with a
-/// `begin` and an `end` in decimal Unix seconds, a number or a string, the end after the begin.
-fn maintenance_windows(doc: &Map<String, Value>) -> Result<Vec<Window>, PlanError> {
-    let list = match doc.get(MAINTENANCE_WINDOW) {
-        None | Some(Value::Null) => return Ok(Vec::new()),
-        Some(Value::Array(list)) => list,
-        Some(_) => return Err(malformed(MAINTENANCE_WINDOW).into()),
-    };
-    let bad = || PlanError::from(malformed(MAINTENANCE_WINDOW));
-    list.iter()
-        .map(|window| {
-            let window = window.as_object().ok_or_else(bad)?;
-            let begin = bound(window.get("begin"), Round::Down).ok_or_else(bad)?;
-            let end = bound(window.get("end"), Round::Up).ok_or_else(bad)?;
-            (end > begin)
-                .then_some(Window { begin, end })
-                .ok_or_else(bad)
-        })
-        .collect()
-}
-
-/// A window's bound: decimal Unix seconds in a JSON number, as it is written, or a string.
-fn bound(value: Option<&Value>, round: Round) -> Option<WallNs> {
-    match value? {
-        Value::String(text) => unix_seconds(text, round),
-        Value::Number(n) => unix_seconds(&n.to_string(), round),
-        _ => None,
-    }
 }
 
 /// The decode error an answer is refused with, naming the part.
@@ -957,26 +920,6 @@ impl MdCodec for HibachiStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_window_bound_reads_alike_as_a_number_and_a_string() {
-        let as_number = bound(Some(&serde_json::json!(1_830_000_000)), Round::Down);
-        let as_float = bound(Some(&serde_json::json!(1_830_000_000.0)), Round::Down);
-        let as_text = bound(Some(&serde_json::json!("1830000000")), Round::Down);
-        let at = Some(WallNs(1_830_000_000 * 1_000_000_000));
-        assert_eq!((as_number, as_float, as_text), (at, at, at));
-        // Milliseconds, a negative count, an exponent, a boolean: none is a bound.
-        for refused in [
-            serde_json::json!(1_830_000_000_000_u64),
-            serde_json::json!(-5),
-            serde_json::json!(1e21),
-            serde_json::json!(true),
-            serde_json::json!("1830000000000"),
-        ] {
-            assert_eq!(bound(Some(&refused), Round::Down), None, "{refused}");
-        }
-        assert_eq!(bound(None, Round::Up), None);
-    }
 
     #[test]
     fn a_refusal_names_the_part() {

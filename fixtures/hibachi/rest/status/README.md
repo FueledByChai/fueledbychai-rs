@@ -12,7 +12,12 @@ Every answer holds three contracts of [`../exchange_info.json`](../exchange_info
 the New York weekend calendar, FX) and `WIF/USDT-P` (a temp market, TEMP), each `LIVE` with both
 market timestamps `null` unless the table says otherwise, the exchange `NORMAL` and
 `maintenanceWindow` empty. The tests discover their spec table from `live.json`, so no calendar
-holds an advertised close or open; a later answer's advertised close or open is the poll's alone.
+holds an advertised close or open or a maintenance window; a later answer's advertised close or
+open, and its windows, are the poll's alone. One test (FBC-ord5) discovers its spec table from
+[`../exchange_info_maintenance_windows.json`](../exchange_info_maintenance_windows.json)
+instead, so each calendar holds that answer's two windows, and answers its reads with `live.json`,
+which publishes none: the first window still halts every market at its begin and holds it for
+the window after its end.
 
 The instants are Unix seconds chosen for a test's timeline: 1792584000 is
 2026-10-21T12:00:00Z, a Wednesday; 1792788600 is 2026-10-23T20:50:00Z, ten minutes before the FX

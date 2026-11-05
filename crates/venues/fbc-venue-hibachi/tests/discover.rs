@@ -4,16 +4,21 @@
 //! each contract's status is mapped conservatively; the advertised open and close are read as
 //! decimal Unix seconds; a contract missing a required field, or stating one not as documented,
 //! refuses the answer; and `X/USDT` is `X/USDT-P`. FBC-204c: every perpetual's funding is
-//! `FundingSpec::Known`, hourly, capped at 125 bps per hour (decision 0131).
+//! `FundingSpec::Known`, hourly, capped at 125 bps per hour (decision 0131). FBC-ord5: each
+//! published `maintenanceWindow` is a `ClosedWindow` on every contract's calendar, begin inclusive
+//! and end exclusive, rounded toward closed, and a window not in decimal Unix seconds no later than
+//! 2100, or not ending after its begin, refuses the answer naming `maintenanceWindow` (decision
+//! 0125's Consequences).
 
 use std::time::Duration;
 
 use fbc_core::{
-    AliasTable, AssetKey, AssetSym, Bps, DecodeError, Effect, FundingSpec, HttpFailure, HttpMethod,
-    HttpRequest, HttpResponse, InstrumentId, InstrumentKind, InstrumentResolver,
-    InstrumentSpecDraft, Listing, Lots, Money, OpKind, PlanError, PriceGrid, RateCharge,
-    SigningParams, SizeStep, SymbolError, TradingStatus, TrafficClass, UnderlyingId, VenueConfig,
-    VenueFactory, VenueId, VenueNativeId, WallNs, WireSlice, WireUrl, dispatch_market_data,
+    AliasTable, AssetKey, AssetSym, Bps, CalendarParts, ClosedWindow, DecodeError, Effect,
+    FundingSpec, HttpFailure, HttpMethod, HttpRequest, HttpResponse, InstrumentId, InstrumentKind,
+    InstrumentResolver, InstrumentSpecDraft, Listing, Lots, Money, OpKind, PlanError, PriceGrid,
+    RateCharge, SigningParams, SizeStep, SymbolError, TradingStatus, TrafficClass, UnderlyingId,
+    VenueConfig, VenueFactory, VenueId, VenueNativeId, WallNs, WireSlice, WireUrl,
+    dispatch_market_data,
 };
 use fbc_venue_hibachi::discover::{EXCHANGE_INFO_TAG, FX_UNDERLYINGS, FX_WEEKEND};
 use fbc_venue_hibachi::{
@@ -39,6 +44,8 @@ const CLOSE_MS: &str =
     include_str!("../../../../fixtures/hibachi/rest/exchange_info_close_ms.json");
 const CLOSE_NOT_NUMBER: &str =
     include_str!("../../../../fixtures/hibachi/rest/exchange_info_close_not_number.json");
+const WINDOWS: &str =
+    include_str!("../../../../fixtures/hibachi/rest/exchange_info_maintenance_windows.json");
 
 const NS: i64 = 1_000_000_000;
 const VENUE: VenueId = VenueId::new(6);
@@ -661,6 +668,314 @@ fn a_close_in_milliseconds_or_not_a_number_refuses_the_answer() {
         .clone();
     assert_eq!(parts.first_open, Some(WallNs(1_800_000_000 * NS + 1)));
     assert_eq!(parts.final_close, Some(at(1_830_000_000)));
+}
+
+/// The two windows `exchange_info_maintenance_windows.json` publishes, each from its begin until
+/// its end: the first's bounds JSON numbers (the SDK's shape), the second's strings (the Market API
+/// spec's), each on a Wednesday morning UTC, outside the FX weekend and inside WIF's open and close.
+fn published() -> Vec<ClosedWindow> {
+    vec![
+        ClosedWindow::new(at(1_815_544_800), WallNs(1_815_552_000 * NS + 500_000_000)).unwrap(),
+        ClosedWindow::new(WallNs(1_816_149_600 * NS + 250_000_000), at(1_816_156_800)).unwrap(),
+    ]
+}
+
+/// The windows on `symbol`'s calendar in `drafts`, none when it has no calendar.
+fn windows_of(drafts: &[InstrumentSpecDraft], symbol: &str) -> Vec<ClosedWindow> {
+    let sessions = find(drafts, symbol).sessions.as_ref();
+    sessions.map_or_else(Vec::new, |cal| cal.parts().windows.clone())
+}
+
+/// The windows fixture with `maintenanceWindow` stated as `list`.
+fn with_windows(list: Value) -> Value {
+    let mut doc = json_of(WINDOWS);
+    doc["maintenanceWindow"] = list;
+    doc
+}
+
+#[test]
+fn each_published_maintenance_window_closes_every_contracts_calendar() {
+    // The fixture: one window's bounds JSON numbers, the other's strings.
+    let doc = json_of(WINDOWS);
+    let listed = doc["maintenanceWindow"].as_array().unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(listed[0]["begin"].is_number() && listed[0]["end"].is_number());
+    assert!(listed[1]["begin"].is_string() && listed[1]["end"].is_string());
+    assert_eq!(doc["status"], "NORMAL");
+    let drafts = decode_body(WINDOWS.as_bytes()).unwrap();
+    assert_eq!(drafts.len(), 4);
+    let windows = published();
+    for draft in &drafts {
+        let symbol = draft.venue_symbol.as_wire();
+        let calendar = draft.sessions.as_ref().expect("a calendar");
+        assert_eq!(calendar.parts().windows, windows, "{symbol}");
+        // Closed from the begin, inclusive, until the end, exclusive; open just outside.
+        for w in &windows {
+            assert!(calendar.is_open(WallNs(w.from().0 - 1)), "{symbol} {w:?}");
+            assert!(!calendar.is_open(w.from()), "{symbol} {w:?}");
+            assert!(!calendar.is_open(WallNs(w.to().0 - 1)), "{symbol} {w:?}");
+            assert!(calendar.is_open(w.to()), "{symbol} {w:?}");
+        }
+    }
+    // ETH, with no advertised open or close and not FX, has no calendar without the windows (the
+    // main fixture) and gains one of the windows alone.
+    assert_eq!(find(&main_drafts(), "ETH/USDT-P").sessions, None);
+    let eth = find(&drafts, "ETH/USDT-P").sessions.as_ref().unwrap();
+    assert_eq!(
+        eth.parts(),
+        &CalendarParts {
+            first_open: None,
+            final_close: None,
+            windows: windows.clone(),
+            weekly: Vec::new(),
+        }
+    );
+    // Its next close is each window's begin in turn, and nothing after the last.
+    assert_eq!(eth.next_closed(at(1_815_500_000)), Some(windows[0].from()));
+    assert_eq!(eth.next_closed(windows[0].to()), Some(windows[1].from()));
+    assert_eq!(eth.next_closed(windows[1].to()), None);
+    // EUR keeps its weekend and WIF its advertised open and close beside them.
+    let eur = find(&drafts, "EUR/USDT-P").sessions.as_ref().unwrap();
+    assert_eq!(eur.parts().weekly, vec![FX_WEEKEND]);
+    let wif = find(&drafts, "WIF/USDT-P").sessions.as_ref().unwrap();
+    assert_eq!(
+        wif.parts().first_open,
+        Some(WallNs(1_800_000_000 * NS + 250_000_000))
+    );
+    assert_eq!(
+        wif.parts().final_close,
+        Some(WallNs(1_830_000_000 * NS + 500_000_000))
+    );
+    // A window closes the calendar, never the status: what is LIVE stays trading.
+    for (symbol, status) in [
+        ("ETH/USDT-P", TradingStatus::Trading),
+        ("EUR/USDT-P", TradingStatus::Trading),
+        ("WIF/USDT-P", TradingStatus::Trading),
+        ("DOGE/USDT-P", TradingStatus::Halted),
+    ] {
+        assert_eq!(find(&drafts, symbol).status, status, "{symbol}");
+    }
+    // Listed in either order, the windows are the same calendar.
+    let mut reversed = listed.clone();
+    reversed.reverse();
+    let drafts = decode(&with_windows(Value::Array(reversed))).unwrap();
+    assert_eq!(windows_of(&drafts, "ETH/USDT-P"), windows);
+}
+
+#[test]
+fn the_scheduled_maintenance_window_is_on_every_contracts_calendar_too() {
+    let window = ClosedWindow::new(at(1_830_000_000), at(1_830_007_200)).unwrap();
+    let drafts = decode_body(SCHEDULED.as_bytes()).unwrap();
+    for symbol in ["ETH/USDT-P", "EUR/USDT-P", "DOGE/USDT-P"] {
+        assert_eq!(windows_of(&drafts, symbol), vec![window], "{symbol}");
+    }
+    // currentMaintenanceWindow is not read: without it the calendars are the same.
+    let mut doc = json_of(SCHEDULED);
+    doc.as_object_mut()
+        .unwrap()
+        .remove("currentMaintenanceWindow");
+    assert_eq!(decode(&doc).unwrap(), drafts);
+}
+
+#[test]
+fn a_window_bound_finer_than_a_nanosecond_rounds_toward_closed() {
+    // The begin rounds down and the end up: the window holds every instant written. The strings
+    // are read exactly; the numbers' fractions (.75, .25) are exact in an f64, so they round
+    // nothing here (a JSON number is first held as the nearest f64: the next test).
+    let doc = with_windows(json!([
+        {"begin": "1815544800.0000000009", "end": "1815552000.0000000001"},
+        {"begin": 1_816_149_600.75, "end": 1_816_156_800.25},
+    ]));
+    let drafts = decode(&doc).unwrap();
+    assert_eq!(
+        windows_of(&drafts, "ETH/USDT-P"),
+        vec![
+            ClosedWindow::new(at(1_815_544_800), WallNs(1_815_552_000 * NS + 1)).unwrap(),
+            ClosedWindow::new(
+                WallNs(1_816_149_600 * NS + 750_000_000),
+                WallNs(1_816_156_800 * NS + 250_000_000)
+            )
+            .unwrap(),
+        ]
+    );
+    // Written apart by less than a nanosecond, the end is still after the begin.
+    let doc = with_windows(json!([
+        {"begin": "1815544800.0000000001", "end": "1815544800.0000000002"},
+    ]));
+    let drafts = decode(&doc).unwrap();
+    assert_eq!(
+        windows_of(&drafts, "ETH/USDT-P"),
+        vec![ClosedWindow::new(at(1_815_544_800), WallNs(1_815_544_800 * NS + 1)).unwrap()]
+    );
+    // A window may end at 2100-01-01T00:00:00Z itself, which is not after it.
+    let doc = with_windows(json!([{"begin": "4102444799", "end": "4102444800"}]));
+    let drafts = decode(&doc).unwrap();
+    assert_eq!(
+        windows_of(&drafts, "ETH/USDT-P"),
+        vec![ClosedWindow::new(at(4_102_444_799), at(4_102_444_800)).unwrap()]
+    );
+}
+
+/// The windows fixture with one window from `begin` to `end`, each JSON text as written.
+fn window_as_written(begin: &str, end: &str) -> Value {
+    let list = format!(r#"[{{"begin": {begin}, "end": {end}}}]"#);
+    with_windows(serde_json::from_str(&list).unwrap())
+}
+
+#[test]
+fn a_window_bound_in_a_json_number_is_held_as_the_nearest_f64_then_rounded_toward_closed() {
+    let whole = |begin, end| vec![ClosedWindow::new(at(begin), at(end)).unwrap()];
+    // A number in range written with an exponent is read as its plain form is.
+    for (begin, end) in [
+        ("1.8155448e9", "1.815552e9"),
+        ("18155448000e-1", "18155520000E-1"),
+        ("1815544800", "1815552000.0"),
+    ] {
+        let drafts = decode(&window_as_written(begin, end)).unwrap();
+        assert_eq!(
+            windows_of(&drafts, "ETH/USDT-P"),
+            whole(1_815_544_800, 1_815_552_000),
+            "{begin} {end}"
+        );
+    }
+    // A fraction finer than the f64 holds (its spacing is 2^-22 s, about 0.24 us, from 2004 to
+    // 2038) is first held as the nearest f64 and only then rounded toward closed: written as
+    // numbers, a begin 100 ns before a whole second and an end 100 ns after one each move to that
+    // second, the window 100 ns shorter at each end than written ...
+    let drafts = decode(&window_as_written(
+        "1815544799.9999999",
+        "1815552000.0000001",
+    ))
+    .unwrap();
+    assert_eq!(
+        windows_of(&drafts, "ETH/USDT-P"),
+        whole(1_815_544_800, 1_815_552_000)
+    );
+    // ... while the same bounds as strings are read exactly.
+    let drafts = decode(&window_as_written(
+        r#""1815544799.9999999""#,
+        r#""1815552000.0000001""#,
+    ))
+    .unwrap();
+    assert_eq!(
+        windows_of(&drafts, "ETH/USDT-P"),
+        vec![
+            ClosedWindow::new(
+                WallNs(1_815_544_799 * NS + 999_999_900),
+                WallNs(1_815_552_000 * NS + 100)
+            )
+            .unwrap()
+        ]
+    );
+}
+
+#[test]
+fn a_window_not_in_decimal_unix_seconds_or_not_ending_after_its_begin_refuses_the_answer() {
+    let begin = json!(1_815_544_800);
+    let end = json!("1815552000");
+    let good = json!({"begin": begin, "end": end});
+    let one = |window: Value| json!([window]);
+    for (name, list) in [
+        (
+            "begin in milliseconds",
+            one(json!({"begin": 1_815_544_800_000_u64, "end": end})),
+        ),
+        (
+            "end in milliseconds, a string",
+            one(json!({"begin": begin, "end": "1815552000000"})),
+        ),
+        (
+            "end after 2100",
+            one(json!({"begin": begin, "end": "4102444800.000000001"})),
+        ),
+        (
+            "end after 2100, a number",
+            one(json!({"begin": begin, "end": 4_102_444_801_u64})),
+        ),
+        ("begin negative", one(json!({"begin": -1, "end": end}))),
+        (
+            "begin signed",
+            one(json!({"begin": "+1815544800", "end": end})),
+        ),
+        (
+            "begin an exponent",
+            one(json!({"begin": "1.8155448e9", "end": end})),
+        ),
+        (
+            "end past 2100, a number serde_json prints with an exponent",
+            one(json!({"begin": begin, "end": 1e21})),
+        ),
+        (
+            "begin a date",
+            one(json!({"begin": "2027-07-14T06:00:00Z", "end": end})),
+        ),
+        ("begin empty", one(json!({"begin": "", "end": end}))),
+        (
+            "begin a bare point",
+            one(json!({"begin": ".5", "end": end})),
+        ),
+        ("begin a boolean", one(json!({"begin": true, "end": end}))),
+        ("begin a list", one(json!({"begin": [begin], "end": end}))),
+        ("begin null", one(json!({"begin": null, "end": end}))),
+        ("no begin", one(json!({"end": end, "note": "Synthetic"}))),
+        ("no end", one(json!({"begin": begin}))),
+        (
+            "end equal to the begin",
+            one(json!({"begin": begin, "end": "1815544800"})),
+        ),
+        (
+            "end equal to the begin, finer than a nanosecond",
+            one(json!({
+                "begin": "1815544800.0000000001",
+                "end": "1815544800.0000000001",
+            })),
+        ),
+        (
+            "end before the begin",
+            one(json!({"begin": "1815552000", "end": begin})),
+        ),
+        ("a window not an object", json!([1_815_544_800])),
+        ("a window null", json!([null])),
+        (
+            "a bad window after a good one",
+            json!([good, {"begin": begin}]),
+        ),
+        ("an object, not a list", good.clone()),
+        ("a string, not a list", json!("1815544800-1815552000")),
+        ("a number, not a list", json!(1_815_544_800)),
+    ] {
+        assert_eq!(
+            decode(&with_windows(list)),
+            malformed("maintenanceWindow"),
+            "{name}"
+        );
+    }
+    // Whatever the contracts: on the main fixture too.
+    let mut doc = json_of(MAIN);
+    doc["maintenanceWindow"] = one(json!({"begin": begin, "end": begin}));
+    assert_eq!(decode(&doc), malformed("maintenanceWindow"));
+}
+
+#[test]
+fn an_absent_null_or_empty_window_list_publishes_none() {
+    for (name, list) in [
+        ("absent", None),
+        ("null", Some(Value::Null)),
+        ("empty", Some(json!([]))),
+    ] {
+        let mut doc = json_of(WINDOWS);
+        let top = doc.as_object_mut().unwrap();
+        match list {
+            None => top.remove("maintenanceWindow"),
+            Some(list) => top.insert("maintenanceWindow".into(), list),
+        };
+        let drafts = decode(&doc).unwrap();
+        assert_eq!(find(&drafts, "ETH/USDT-P").sessions, None, "{name}");
+        assert_eq!(find(&drafts, "DOGE/USDT-P").sessions, None, "{name}");
+        for symbol in ["EUR/USDT-P", "WIF/USDT-P"] {
+            assert_eq!(windows_of(&drafts, symbol), Vec::new(), "{name} {symbol}");
+        }
+    }
 }
 
 /// The contract fields discovery requires: the Market API spec's `Contract` and `ContractData`

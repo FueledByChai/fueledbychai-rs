@@ -106,10 +106,12 @@
 //! An FX contract (an underlying [`discover::FX_UNDERLYINGS`] lists) closes every week from
 //! Friday 17:00 to Sunday 17:00 New York time, a rule stated as data (decision 0125); a
 //! contract's advertised `marketOpenTimestamp` and `marketCloseTimestamp` are its calendar's first
-//! open and final close. ETH, like every crypto contract with neither, has no calendar. The
-//! published maintenance windows are not in any calendar yet (decision 0125's Consequences
-//! expect them as `ClosedWindow`s; FBC-ord5 maps them), so `is_open` does not see them; the
-//! status poll halts each market at a window's begin.
+//! open and final close. Each maintenance window the answer publishes (`maintenanceWindow`) is a
+//! `ClosedWindow` on every contract's calendar (decision 0125's Consequences; FBC-ord5), so
+//! `is_open` sees it: ETH, like every crypto contract with no advertised open or close, has a
+//! calendar of the windows alone, and none while no window is published. The calendar is
+//! discovery's answer; the status poll re-reads the windows and halts each market at a window's
+//! begin, one published after discovery included.
 //!
 //! # Funding
 //!

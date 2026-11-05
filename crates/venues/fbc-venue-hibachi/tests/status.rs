@@ -32,6 +32,8 @@
 //! does it. `tests/status_oracle.rs` checks the guarantee at random against a venue drawn from a
 //! seed.
 //! `tests/status_stub.rs` runs the same codec in the runtime against the conformance stub.
+//! FBC-ord5: a maintenance window discovery put on each market's calendar halts it at its begin
+//! and holds it for the window after its end, though no read the poll sends publishes it.
 
 mod common;
 
@@ -490,6 +492,50 @@ fn a_window_bound_reads_alike_as_a_number_and_as_a_string() {
     assert_eq!(
         friday_window("window_number"),
         friday_window("window_string")
+    );
+}
+
+/// The reads of a window's timeline from `t` until `t + 7440`, every one answered `live.json`
+/// at once, which publishes no window: what was reported.
+fn reads_publishing_no_window(mut sim: Sim, t: i64) -> Seen {
+    assert_eq!(answer_json("live")["maintenanceWindow"], json!([]));
+    sim.answer_next("live");
+    for k in 1..=124 {
+        sim.read_at(t + k * INTERVAL, "live");
+    }
+    sim.since(0, t)
+}
+
+#[test]
+fn a_calendar_window_halts_every_market_at_its_begin_and_holds_it_the_window_after_its_end() {
+    // FBC-ord5: the spec table discovered from the answer publishing two maintenance windows, the
+    // first from 1815544800 to 1815552000.5 on every market's calendar. Hibachi has withdrawn it
+    // since: no read the poll sends publishes a window.
+    let windows =
+        include_bytes!("../../../../fixtures/hibachi/rest/exchange_info_maintenance_windows.json");
+    let specs = common::status::specs_from(windows);
+    let (begin, end) = (
+        WallNs(1_815_544_800 * NS),
+        WallNs(1_815_552_000 * NS + NS / 2),
+    );
+    for inst in MARKETS {
+        let calendar = specs.get(inst).unwrap().sessions.as_ref().unwrap();
+        assert_eq!(calendar.parts().windows[0].from(), begin);
+        assert_eq!(calendar.parts().windows[0].to(), end);
+    }
+    let t = 1_815_544_800 - 90;
+    let seen = reads_publishing_no_window(Sim::on_specs(specs, t), t);
+    // Halted at the begin on the calendar's timer, between reads, and held through the window and
+    // the window after it (to t+7410.5): the first read sent after that, at t+7440, lifts it.
+    assert_eq!(end.0 + AFTER * NS, (t + 7410) * NS + NS / 2);
+    let mut expected = each(0.0, &MARKETS, TRADING);
+    expected.extend(each(90.0, &MARKETS, HALTED));
+    expected.extend(each(7440.0, &MARKETS, TRADING));
+    assert_eq!(seen, expected);
+    // On live.json's calendars, which hold no window, the same reads halt nothing.
+    assert_eq!(
+        reads_publishing_no_window(Sim::new(t), t),
+        each(0.0, &MARKETS, TRADING)
     );
 }
 
