@@ -284,6 +284,16 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     virtual), each input restamped with the shard's next ingest sequence and its recorded
     instant, so the host's passes, `Cycle` records and the sessions' answers run among the
     records as live, then it ends the sessions after a settle time;
+    `ExecReplay` feeds an order-entry session's journal back as `MdReplay`'s decoder replay
+    does, not closed-loop (FBC-tgt, 0138): one codec of its venue across the journal's epochs,
+    each `on_open`, codec timer, resync and encode given the context the journal holds where it
+    places it, the session's own cancel-on-disconnect arm where the live session's gate sends it
+    (sent where its frame is journaled next) and a consumer's command as the caller supplies it
+    by request id, frames, HTTP results and request deadlines at their recorded stamps, each
+    event handed on through the live session's own call, effects not executed, and a control the
+    replayed handler drops where it dropped its session's, after which it is handed nothing; a
+    journal it replays holds one order-entry session's records, since a context names no
+    connection (another's requests counted) (`tests/exec_replay.rs`);
     every connection reads through `Tcp`, which on Linux keeps the `SO_TIMESTAMPNS` kernel
     receive time beneath TLS and WebSocket (nix, Linux only), so a frame's stamp carries
     `kernel_rx`, and a session reports each Safety write attributed to such a frame, the

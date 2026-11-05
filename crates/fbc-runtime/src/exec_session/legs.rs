@@ -12,14 +12,12 @@ use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-use fbc_core::{
-    ConnKey, CtxCall, Effects, ExecCodec, Inbound, KernelRxNs, Stamp, StreamId, dispatch,
-};
+use fbc_core::{ConnKey, CtxCall, Effects, ExecCodec, Inbound, KernelRxNs, Stamp, StreamId};
 use fbc_journal::ControlEvent;
 use futures_util::{FutureExt, StreamExt};
 use tokio::time::Instant;
 
-use super::{ExecHandler, ExecSessionError, Feed, Sink, context, together};
+use super::{Decoding, ExecHandler, ExecSessionError, Feed, Sink, context, together};
 use crate::auth::HandshakeHeaders;
 use crate::in_process::Link;
 use crate::journal::Journal;
@@ -206,10 +204,12 @@ impl Leg {
             own: feed.own,
             conn: feed.conn,
         };
-        let (codec, stream, specs) = (&mut *feed.codec, self.stream, feed.specs);
-        let decoded = dispatch(feed.caps, feed.ns, |scope| {
-            codec.on_frame(stream, raw, scope, specs, &mut sink, fx)
-        });
+        let decoding = Decoding {
+            caps: feed.caps,
+            ns: feed.ns,
+            specs: feed.specs,
+        };
+        let decoded = decoding.frame(&mut *feed.codec, self.stream, raw, &mut sink, fx);
         if decoded.is_err() {
             *feed.decode_errors += 1;
             feed.handler.on_decode_error(stamp.conn);

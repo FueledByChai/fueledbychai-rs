@@ -84,7 +84,12 @@
 //! paced by the consumer's [`ReconnectPacing`]. It takes a venue whose cancel-on-disconnect
 //! is per connection (0058), or an account-wide venue only with explicit account-bound
 //! authority (0121), and arms it and resyncs before it places or amends.
-//! Its journal comes with a later ticket.
+//! With a [`Journal`] set it records what crosses its boundary (FBC-2pr, decision 0078), and
+//! [`ExecReplay`] feeds that journal back to one codec of its venue through the same calls, with
+//! the recorded stamps and the contexts and nonces the journal holds, so a recorded session
+//! rebuilds the same execution events (FBC-tgt); the caller supplies what the session ran with
+//! and the commands the consumer submitted, and hands the replayed handler the replay's control
+//! where the session's went. A journal it replays holds one order-entry session's records.
 //!
 //! [`ShardHost`] is the shard host (FBC-ct0, decisions 0002, 0100): one loop over a shard's
 //! sessions, run as its [`Member`]s on one task, that drains every input they have ready, journals
@@ -120,6 +125,7 @@ mod epoch;
 mod error;
 mod exec_gate;
 mod exec_orders;
+mod exec_replay;
 mod exec_session;
 pub mod http;
 mod in_process;
@@ -169,6 +175,7 @@ pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
 pub use exec_orders::{ExecOrders, RpcIds, SubmitRefusal};
+pub use exec_replay::{ExecReplay, ExecReplayConfig, ExecReplayCounters};
 pub use exec_session::{
     AccountWideCodAuthority, ExecControl, ExecCounters, ExecHandler, ExecSession,
     ExecSessionConfig, ExecSessionError,
