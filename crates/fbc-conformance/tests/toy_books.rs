@@ -16,8 +16,8 @@ use fbc_core::{
     Feed, FeedHealth, HttpFailure, HttpMethod, HttpRequest, HttpResponse, HttpTag, Inbound,
     InboundSpans, InstrumentId, Keepalive, KeepaliveKind, Lots, MdCodec, MdEvent, MdSink,
     MdTransport, MonoNs, OpKind, RateCharge, RawFrame, StreamId, Subscription, Ticks, TimerTag,
-    TrafficClass, VenueConfig, VenueError, VenueFactory, VenueMeta, Via, WallNs, WireSlice,
-    WireUrl, dispatch_market_data,
+    TouchSourceId, TrafficClass, VenueConfig, VenueError, VenueFactory, VenueMeta, Via, WallNs,
+    WireSlice, WireUrl, dispatch_market_data,
 };
 use fbc_runtime::{MdBooks, TradingBooks};
 
@@ -335,12 +335,13 @@ fn a_book_id_outside_the_declared_channels_is_refused_with_nothing_sent() {
     let outside = sub(INST_A, BookId(2));
     let refused = rig.subscribe(&[sub(INST_A, BOOK), outside], &[]);
     assert_eq!(refused, Err(VenueError::UnsupportedFeed(outside)));
-    let trades = Subscription {
+    // A feed the socket does not carry: stats come only from the poll endpoint (FBC-z2s).
+    let stats = Subscription {
         inst: INST_A,
-        feed: Feed::Trades,
+        feed: Feed::Stats,
     };
-    let refused = rig.subscribe(&[], &[trades]);
-    assert_eq!(refused, Err(VenueError::UnsupportedFeed(trades)));
+    let refused = rig.subscribe(&[], &[stats]);
+    assert_eq!(refused, Err(VenueError::UnsupportedFeed(stats)));
     let unknown = sub(InstrumentId::new(99), BOOK);
     let refused = rig.subscribe(&[unknown], &[]);
     assert_eq!(refused, Err(VenueError::UnknownInstrument(unknown.inst)));
@@ -400,16 +401,16 @@ fn a_book_id_outside_the_declared_channels_is_refused_with_nothing_sent() {
 fn an_unknown_instrument_is_named_before_any_feed_in_either_list() {
     // Codex r4216704345: the codec checks every instrument, added or removed, before any feed,
     // so a missing one is named even behind a known instrument's undeclared feed.
-    let trades = Subscription {
+    let touch = Subscription {
         inst: INST_A,
-        feed: Feed::Trades,
+        feed: Feed::Touch(TouchSourceId(0)),
     };
     let unknown = sub(InstrumentId::new(99), BOOK);
     let mut rig = Rig::new();
     let calls: [(&[Subscription], &[Subscription]); 4] = [
-        (&[trades, unknown], &[]),
-        (&[trades], &[unknown]),
-        (&[], &[trades, unknown]),
+        (&[touch, unknown], &[]),
+        (&[touch], &[unknown]),
+        (&[], &[touch, unknown]),
         (&[sub(INST_A, BookId(2))], &[unknown]),
     ];
     for (add, remove) in calls {

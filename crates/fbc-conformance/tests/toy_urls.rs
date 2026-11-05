@@ -11,7 +11,8 @@ use std::ops::Range;
 use fbc_conformance::toy::{
     self, ANCHOR_URL_KEY, ANCHOR_URL_REDACT_KEY, ANCHORED_BOOK, BOOK, EXEC_STREAM, EXEC_URL_KEY,
     EXEC_URL_REDACT_KEY, INST_A, INST_B, MD_STREAM, MD_URL_KEY, MD_URL_REDACT_KEY,
-    MIN_CREDENTIAL_LEN, REST_URL_KEY, REST_URL_REDACT_KEY, ToyFactory, ToyMd,
+    MIN_CREDENTIAL_LEN, REST_URL_KEY, REST_URL_REDACT_KEY, STATS_STREAM, STATS_URL_KEY,
+    STATS_URL_REDACT_KEY, ToyFactory, ToyMd,
 };
 use fbc_core::{
     ConfigError, ConfigScope, Effect, Effects, EncodeCtx, EndpointPlan, ExecEndpoint, Feed,
@@ -45,6 +46,11 @@ fn cfg() -> VenueConfig {
             REST_URL_KEY,
             REST_URL_REDACT_KEY,
             "http://127.0.0.1:9/rest/",
+        ),
+        (
+            STATS_URL_KEY,
+            STATS_URL_REDACT_KEY,
+            "https://toy.invalid/stats/",
         ),
     ] {
         let (text, spans, _) = marked(head, "");
@@ -130,6 +136,34 @@ fn configured_urls_keep_the_spans_their_configuration_marks() {
         [url("https://toy.invalid/rest/", "/book/TOYB-PERP")]
     );
     hidden(format!("{anchors:?}"));
+
+    // Stats are planned on a poll endpoint of their own under the stats base, and polled under
+    // it, the base's span kept (FBC-z2s).
+    let polled = [Subscription {
+        inst: INST_A,
+        feed: Feed::Stats,
+    }];
+    let poll = ToyFactory
+        .plan_md(&cfg, &specs, &BTreeSet::from(polled))
+        .unwrap();
+    let want = EndpointPlan {
+        stream: STATS_STREAM,
+        transport: MdTransport::Poll {
+            base_url: url("https://toy.invalid/stats/", ""),
+        },
+        subs: polled.to_vec(),
+    };
+    assert_eq!(poll, [want]);
+    hidden(format!("{poll:?}"));
+    let mut codec = ToyFactory.md_codec(&cfg, &poll[0]);
+    let mut fx = Effects::new();
+    codec.subscribe(&polled, &[], &specs, &mut fx).unwrap();
+    let polls = http_urls(fx.take());
+    assert_eq!(
+        polls,
+        [url("https://toy.invalid/stats/", "/stats/TOYA-PERP")]
+    );
+    hidden(format!("{polls:?}"));
 
     // So is a resync over REST, under the REST base.
     let mut exec = ToyFactory
@@ -400,6 +434,8 @@ fn the_factorys_schema_names_every_url_and_its_spans() {
             ANCHOR_URL_REDACT_KEY,
             REST_URL_KEY,
             REST_URL_REDACT_KEY,
+            STATS_URL_KEY,
+            STATS_URL_REDACT_KEY,
         ]
     );
     for field in schema {

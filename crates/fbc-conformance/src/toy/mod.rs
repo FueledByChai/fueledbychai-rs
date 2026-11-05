@@ -22,7 +22,10 @@
 //! and (FBC-ja3) its URLs from the configuration with the credential spans it marks
 //! (`url.rs`), a resync over REST retried until it is decoded whole ([`ToyExec::rest_resync`])
 //! and a ping on its order-entry connection ([`ToyExec::pinging`]), both as its factory builds
-//! it. Trades, funding, mark, index and stats arrive with FBC-z2s.
+//! it; and (FBC-z2s) its other feeds, each on the transport its caps' source names
+//! ([`feed_source`]): [`ToyMd`] decodes trades, mark, index and funding on its socket, and
+//! [`ToyStats`] polls volume and open interest over HTTP on a poll endpoint of their own under
+//! its own timer, until the last stats subscription is removed (`feeds.rs`, `stats.rs`).
 //!
 //! Protocol: its own, describing no real venue, as `fbc-core`'s toy: one record per line,
 //! `kind|key=value|...`. A request's first record names its `rpc`; a batch's first record
@@ -33,9 +36,11 @@
 mod decode;
 mod exec;
 mod factory;
+mod feeds;
 mod md;
 mod session;
 mod signer;
+mod stats;
 mod url;
 
 use core::num::NonZeroU32;
@@ -44,7 +49,7 @@ use core::time::Duration;
 use fbc_core::{
     AckModel, AmendAck, AmendCaps, AmendQty, AssetSym, Batch, BookCaps, BookId, Cadence,
     CancelBatch, CancelOnDisconnect, Channel, Charset, ClientIdFormat, ConnTopology, Continuity,
-    DecodeScope, Encoding, ExecCaps, Feature, FeedSource, FillCaps, FillSource, FundingCaps,
+    DecodeScope, Encoding, ExecCaps, Feature, Feed, FeedSource, FillCaps, FillSource, FundingCaps,
     FundingSpec, InstrumentId, InstrumentKind, InstrumentSpec, LimitScope, Lots, MatchingCaps,
     MdCaps, Namespace, NonceScope, OpKind, OrderCaps, OrderKindTag, OrderingKey, PriceGrid,
     QueueModelQuality, RateLimit, Readiness, RefKind, SizeStep, SnapshotReads, SnapshotSource,
@@ -57,10 +62,11 @@ pub use decode::{REJECT_CODES, reject_kind};
 pub use exec::ToyExec;
 pub use factory::{
     EXEC_URL_KEY, EXEC_URL_REDACT_KEY, MD_STREAM, MD_URL_KEY, MD_URL_REDACT_KEY, REST_URL_KEY,
-    REST_URL_REDACT_KEY, ToyFactory,
+    REST_URL_REDACT_KEY, STATS_STREAM, STATS_URL_KEY, STATS_URL_REDACT_KEY, ToyFactory,
 };
 pub use md::ToyMd;
 pub use signer::ToySigner;
+pub use stats::ToyStats;
 
 /// The order-entry stream every request is written to.
 pub const EXEC_STREAM: StreamId = StreamId(1);
@@ -98,6 +104,10 @@ pub const MAX_HELD: usize = 64;
 pub const ANCHOR_URL_KEY: &str = "toy.md.anchor_url";
 /// The configuration key of the credential spans in [`ANCHOR_URL_KEY`]'s URL (`url.rs`).
 pub const ANCHOR_URL_REDACT_KEY: &str = "toy.md.anchor_url.redact";
+/// How often the stats poll asks for every subscribed instrument's stats ([`ToyStats`]).
+pub const STATS_EVERY: Duration = Duration::from_secs(5);
+/// How long a stats poll's request may take.
+pub const STATS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The fewest bytes a credential span in a configured URL may hold (`url.rs`; Codex
 /// r4220116602): each codec names a credential wherever a frame or response holds it, and a
@@ -142,9 +152,32 @@ pub enum FillIds {
 }
 
 /// What the toy declares, its fills carrying venue fill ids. Of market data it declares its two
-/// book channels so far; FBC-z2s adds the other feeds.
+/// book channels, trades, mark, index and funding on its socket, and stats polled over REST; it
+/// declares no touch channel and no trading status.
 pub fn caps() -> VenueCaps {
     caps_for(FillIds::Venue)
+}
+
+/// Where the toy's [`caps`] say `feed` comes from: its book channels, trades, mark, index and
+/// funding are streamed on its market-data socket, stats polled over REST, and a book id or a
+/// touch channel it does not declare come from nowhere. Each of its codecs takes only the feeds
+/// of its transport and its factory plans each feed on that one (FBC-z2s; Codex r4172917344,
+/// r4172649862).
+pub fn feed_source(feed: Feed) -> FeedSource {
+    let md = caps().md;
+    let declared = |there: bool| match there {
+        true => FeedSource::Stream,
+        false => FeedSource::None,
+    };
+    match feed {
+        Feed::Touch(touch) => declared(usize::from(touch.0) < md.touch_sources.len()),
+        Feed::Book(book) => declared(usize::from(book.0) < md.books.len()),
+        Feed::Trades => md.trades.source,
+        Feed::Mark => md.mark,
+        Feed::Index => md.index,
+        Feed::Funding => md.funding.source,
+        Feed::Stats => md.stats,
+    }
 }
 
 /// What the toy declares with fill ids as `fill_ids` says; nothing else differs.
@@ -242,19 +275,23 @@ pub fn caps_for(fill_ids: FillIds) -> VenueCaps {
             encoding: Encoding::Text,
             touch_sources: Vec::new(),
             books: vec![book_caps("book", false), book_caps("rpi_book", true)],
+            // Every trade names its aggressor and its numeric trade id (`feeds.rs`).
             trades: TradeCaps {
-                source: FeedSource::None,
-                aggressor: false,
-                trade_id: false,
+                source: FeedSource::Stream,
+                aggressor: true,
+                trade_id: true,
             },
+            // Every funding rate states its interval and the next funding time.
             funding: FundingCaps {
-                source: FeedSource::None,
-                interval_reported: false,
-                next_time_reported: false,
+                source: FeedSource::Stream,
+                interval_reported: true,
+                next_time_reported: true,
             },
-            stats: FeedSource::None,
-            mark: FeedSource::None,
-            index: FeedSource::None,
+            // Volume and open interest only over REST, polled on an endpoint of their own
+            // (`stats.rs`; record 0014 item 9).
+            stats: FeedSource::Poll,
+            mark: FeedSource::Stream,
+            index: FeedSource::Stream,
             // The toy reports no trading status: its market data carries none (decision 0130).
             status: FeedSource::None,
             ts_precision: Duration::from_nanos(1),
