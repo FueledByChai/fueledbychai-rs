@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -36,6 +37,50 @@ fn bench<F: FnMut()>(name: &str, iters: usize, mut f: F) {
 }
 
 // ---------------------------------------------------------------- Paradex (Stark curve, SNIP-12 rev0)
+//
+// Oracles for the hand-written hash (FBC-p8a). Two oracles: the first decides; the second checks
+// everything after the domain against an independent implementation and keeps the TypedData
+// timing below running.
+//
+// 1. The buy_limit hash in ../paradex-vectors.tsv, which the Java ParadexTypedDataSigner wrote
+//    (../ParadexHashOracle.java, FBC-6) for this benchmark's order, account, key and chain. It is
+//    the oracle that decides: independent of this code and of starknet-core, and it holds the
+//    whole message hash under Paradex's own domain, StarkNetDomain(name, chainId, version), which
+//    is what Paradex checks. The row's signature r and s are checked too, against the RFC 6979
+//    signature of that hash under the benchmark's key.
+// 2. starknet-core's TypedData message hash under starknet-core's own domain separator, as
+//    FBC-6's crates/venues/fbc-venue-paradex/tests/typed_data_oracle.rs does. starknet-core 0.16
+//    accepts only its own revision 0 domain, StarkNetDomain(name, version, chainId), and refuses
+//    Paradex's order of the same fields ("invalid domain type definition for revision 0"), so it
+//    cannot hash a Paradex message whole. Given starknet-core's domain separator, the hand-written
+//    hasher is compared on everything after the domain: the prefix, the account, the type hash,
+//    the field felts and the Pedersen chains. This also keeps the TypedData timing below.
+
+/// The Java signer's vectors: `# key=value` header lines, then a tab-separated table whose first
+/// row names the columns (every value synthetic; ../SYNTHETIC says where each comes from).
+const JAVA_VECTORS: &str = include_str!("../paradex-vectors.tsv");
+
+/// The header of the Java vectors and their row `name`, each by key.
+fn java_vector(name: &str) -> (HashMap<&'static str, &'static str>, HashMap<&'static str, &'static str>) {
+    let mut header = HashMap::new();
+    let mut columns: Option<Vec<&'static str>> = None;
+    for line in JAVA_VECTORS.lines() {
+        if let Some(comment) = line.strip_prefix("# ") {
+            header.extend(comment.split(' ').filter_map(|pair| pair.split_once('=')));
+            continue;
+        }
+        let cells: Vec<&'static str> = line.split('\t').collect();
+        match &columns {
+            None => columns = Some(cells),
+            Some(names) if cells[0] == name => {
+                assert_eq!(cells.len(), names.len(), "row width of {name}");
+                return (header, names.iter().copied().zip(cells).collect());
+            }
+            Some(_) => {}
+        }
+    }
+    panic!("no row {name} in paradex-vectors.tsv");
+}
 
 fn hash_on_elements(els: &[Felt]) -> Felt {
     let mut h = Felt::ZERO;
@@ -51,17 +96,28 @@ struct ParadexOrderHasher {
 }
 
 impl ParadexOrderHasher {
+    /// The hasher under Paradex's domain, the one Paradex checks.
     fn new(account: Felt, chain_id: Felt) -> Self {
-        let domain_type = starknet_keccak(b"StarkNetDomain(name:felt,chainId:felt,version:felt)");
-        let order_type = starknet_keccak(
-            b"Order(timestamp:felt,market:felt,side:felt,orderType:felt,size:felt,price:felt)",
-        );
-        let domain_hash = hash_on_elements(&[
-            domain_type,
+        Self::with_domain_hash(account, Self::paradex_domain_hash(chain_id))
+    }
+
+    /// Paradex's domain separator: StarkNetDomain with its fields in Paradex's order, name,
+    /// chainId, version ("Paradex", chain_id, 1).
+    fn paradex_domain_hash(chain_id: Felt) -> Felt {
+        hash_on_elements(&[
+            starknet_keccak(b"StarkNetDomain(name:felt,chainId:felt,version:felt)"),
             cairo_short_string_to_felt("Paradex").unwrap(),
             chain_id,
             Felt::ONE,
-        ]);
+        ])
+    }
+
+    /// The hasher under the domain separator `domain_hash`, computed elsewhere (starknet-core's,
+    /// for oracle 2).
+    fn with_domain_hash(account: Felt, domain_hash: Felt) -> Self {
+        let order_type = starknet_keccak(
+            b"Order(timestamp:felt,market:felt,side:felt,orderType:felt,size:felt,price:felt)",
+        );
         let mut h = Felt::ZERO;
         for e in [cairo_short_string_to_felt("StarkNet Message").unwrap(), domain_hash, account] {
             h = pedersen_hash(&h, &e);
@@ -110,16 +166,48 @@ fn paradex() {
     let hasher = ParadexOrderHasher::new(account, chain_id);
     let fast = hasher.order_hash(ts, market, side, otype, size, price);
 
-    // Oracle: the same JSON the Java ParadexTypedDataSigner builds, hashed by starknet-core.
+    // Oracle 1: the Java signer's buy_limit vector, whose inputs are this order on this account,
+    // key and chain, hashed under Paradex's domain and signed.
+    let (header, buy_limit) = java_vector("buy_limit");
+    assert_eq!(Felt::from_hex(header["account"]).unwrap(), account, "vector account");
+    assert_eq!(Felt::from_hex(header["key"]).unwrap(), priv_key, "vector key");
+    assert_eq!(Felt::from_hex(header["chain_id"]).unwrap(), chain_id, "vector chain id");
+    assert_eq!(buy_limit["timestamp"].parse::<u64>().unwrap(), ts, "vector timestamp");
+    assert_eq!(cairo_short_string_to_felt(buy_limit["market"]).unwrap(), market, "vector market");
+    assert_eq!((buy_limit["side"], side), ("BUY", Felt::ONE), "vector side");
+    assert_eq!(cairo_short_string_to_felt(buy_limit["order_type"]).unwrap(), otype, "vector type");
+    assert_eq!(Felt::from_dec_str(buy_limit["chain_size"]).unwrap(), size, "vector size");
+    assert_eq!(Felt::from_dec_str(buy_limit["chain_price"]).unwrap(), price, "vector price");
+    let java = Felt::from_hex(buy_limit["hash"]).unwrap();
+    println!("hand-rolled hash == Java signer's buy_limit hash (paradex-vectors.tsv): {}  ({:#x})", fast == java, fast);
+    assert_eq!(fast, java);
+    let sig = sign(&priv_key, &fast, &rfc6979_generate_k(&fast, &priv_key, None)).unwrap();
+    let java_sig = (Felt::from_hex(buy_limit["r"]).unwrap(), Felt::from_hex(buy_limit["s"]).unwrap());
+    println!("rfc6979 signature of it == Java signer's buy_limit r, s: {}", (sig.r, sig.s) == java_sig);
+    assert_eq!((sig.r, sig.s), java_sig);
+
+    // Oracle 2: the JSON the Java ParadexTypedDataSigner builds, but with starknet-core's revision
+    // 0 domain field order (name, version, chainId), hashed by starknet-core; the hand-written
+    // hasher is given that domain's separator. The two separators differ, so the substitution is
+    // visible rather than silently equal.
     let chain_hex = format!("0x{}", hex::encode(chain_id.to_bytes_be()).trim_start_matches('0').to_uppercase());
     let json = format!(
-        r#"{{"types":{{"StarkNetDomain":[{{"name":"name","type":"felt"}},{{"name":"chainId","type":"felt"}},{{"name":"version","type":"felt"}}],"Order":[{{"name":"timestamp","type":"felt"}},{{"name":"market","type":"felt"}},{{"name":"side","type":"felt"}},{{"name":"orderType","type":"felt"}},{{"name":"size","type":"felt"}},{{"name":"price","type":"felt"}}]}},"primaryType":"Order","domain":{{"name":"Paradex","chainId":"{chain_hex}","version":"1"}},"message":{{"timestamp":{ts},"market":"BTC-USD-PERP","side":"1","orderType":"LIMIT","size":"1000000","price":"6512345000000"}}}}"#
+        r#"{{"types":{{"StarkNetDomain":[{{"name":"name","type":"felt"}},{{"name":"version","type":"felt"}},{{"name":"chainId","type":"felt"}}],"Order":[{{"name":"timestamp","type":"felt"}},{{"name":"market","type":"felt"}},{{"name":"side","type":"felt"}},{{"name":"orderType","type":"felt"}},{{"name":"size","type":"felt"}},{{"name":"price","type":"felt"}}]}},"primaryType":"Order","domain":{{"name":"Paradex","version":"1","chainId":"{chain_hex}"}},"message":{{"timestamp":{ts},"market":"BTC-USD-PERP","side":"1","orderType":"LIMIT","size":"1000000","price":"6512345000000"}}}}"#
     );
     let td: TypedData = serde_json::from_str(&json).expect("typed data parse");
+    let core_domain = td.encoder().domain().encoded_hash();
+    assert_ne!(core_domain, ParadexOrderHasher::paradex_domain_hash(chain_id), "the domains differ");
     let oracle = td.message_hash(account).expect("oracle hash");
-    println!("hand-rolled hash == starknet-core TypedData hash: {}  ({:#x})", fast == oracle, fast);
-    assert_eq!(fast, oracle);
+    let under_core_domain =
+        ParadexOrderHasher::with_domain_hash(account, core_domain).order_hash(ts, market, side, otype, size, price);
+    println!(
+        "hand-rolled hash under starknet-core's domain == starknet-core TypedData hash: {}  ({:#x})",
+        under_core_domain == oracle,
+        oracle
+    );
+    assert_eq!(under_core_domain, oracle);
 
+    // Under starknet-core's domain (see oracle 2); the domain's field order does not change the cost.
     bench("paradex: typed-data hash via starknet-core TypedData (json)", 2000, || {
         let td: TypedData = serde_json::from_str(black_box(&json)).unwrap();
         black_box(td.message_hash(account).unwrap());
