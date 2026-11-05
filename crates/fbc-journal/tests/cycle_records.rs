@@ -9,7 +9,9 @@
 //! (`fixtures/journal/v6`), before a request deadline's firing was a record (FBC-0hfl), and one
 //! in format version 7 (`fixtures/journal/v7`), before the consumer's own records (FBC-hxkm,
 //! decision 0101), and one in format version 8 (`fixtures/journal/v8`), before a consumer input
-//! carried the ingest sequence the shard stamped it with (FBC-hvqi).
+//! carried the ingest sequence the shard stamped it with (FBC-hvqi), and one in format version 9
+//! (`fixtures/journal/v9`), before the journal's move of the shard's markets to Cancel-only was a
+//! marker (FBC-8pm, decision 0139).
 //!
 //! Every secret here is synthetic, and each is assembled at run time so no credential-shaped
 //! literal sits in the source.
@@ -385,6 +387,26 @@ fn v8_records() -> Vec<(WallNs, Record)> {
     out
 }
 
+/// What `fixtures/journal/v9` holds: the version 8 records with, after the consumer input, an
+/// input the shard stamped with its ingest sequence, which version 9 added, all written by the
+/// version 9 writer (its README says how).
+fn v9_records() -> Vec<(WallNs, Record)> {
+    let mut out = v8_records();
+    let at = 1 + out
+        .iter()
+        .position(|(_, r)| matches!(r, Record::Consumer { input: true, .. }))
+        .unwrap();
+    let stamped = Record::Consumer {
+        at: MonoNs(97),
+        kind: 2,
+        input: true,
+        ingest_seq: Some(41),
+        bytes: Opaque(b"Start".to_vec()),
+    };
+    out.insert(at, (NOON, stamped));
+    out
+}
+
 /// A frame written at `at` as `opcode`, with its credential span.
 fn binary_outbound(at: u64, bytes: Vec<u8>, span: std::ops::Range<u32>, opcode: Opcode) -> Record {
     Record::Outbound {
@@ -452,6 +474,14 @@ fn a_journal_written_before_the_consumer_kind_reads_back_unchanged() {
 #[test]
 fn a_journal_written_before_stamped_consumer_inputs_reads_back_unchanged() {
     reads_back_unchanged("v8", 8, v8_records());
+}
+
+/// FBC-8pm: a journal written in format version 9, before the journal's move of the shard's
+/// markets to Cancel-only was a marker (decision 0139), reads back unchanged, its stamped
+/// consumer input included.
+#[test]
+fn a_journal_written_before_the_cancel_only_marker_reads_back_unchanged() {
+    reads_back_unchanged("v9", 9, v9_records());
 }
 
 /// FBC-q7b's done line: a binary frame whose only bytes that are not UTF-8 lie inside its

@@ -322,7 +322,7 @@ fn a_segment_of_an_earlier_version_holding_a_consumer_record_is_malformed() {
     drop(writer);
     let path = root.join("20261003/1-000000.fbcj");
     assert_eq!(version_at(&path), VERSION);
-    assert_eq!(VERSION, 9);
+    assert_eq!(VERSION, 10);
     // Read as written, then relabelled as each earlier version: no writer of those wrote one,
     // so the segment is damaged, not newer. The record before it reads as it did.
     let back: Vec<_> = JournalReader::open(&root, 1).unwrap().collect();

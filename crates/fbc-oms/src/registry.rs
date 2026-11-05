@@ -1307,8 +1307,12 @@ impl Registry {
     /// what it counted (decision 0084). Every mutating call, the consuming builders included,
     /// runs it first, so a dropped command's orders count in no build, judgement, plan or event
     /// after its drop; a read of the registry before its next mutating call still shows them
-    /// held.
+    /// held. It applies a trip of the registry's markets to Cancel-only that came since first
+    /// (decision 0139).
     pub(crate) fn reap_dropped(&mut self) {
+        // A trip of the registry's markets to Cancel-only first (decision 0139): whatever the
+        // call does comes after it, so a Start, Flatten or Wind-down made since stands.
+        self.entries.apply_trips();
         for cid in self.dropped.take() {
             if let Some(rec) = self.orders.get_mut(&cid) {
                 rec.withdraw_place(NotSentReason::StaleAuthorization);

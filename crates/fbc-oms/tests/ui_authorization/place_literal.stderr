@@ -12,4 +12,4 @@ error: cannot construct `Authorization` with struct literal syntax due to privat
 11 |         cmd: VenueCommand::Place(order),
    |         ------------------------------- private field
    |
-   = note: ...and other private field `guard` that was not provided
+   = note: ...and other private fields `guard` and `trips` that were not provided
