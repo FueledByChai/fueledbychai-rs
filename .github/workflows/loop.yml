@@ -44,6 +44,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
       # Add toolchain steps below this line.
+      # The runner's free disk no longer holds the workspace's debug, release and
+      # coverage-instrumented builds together: the coverage build of run 42002300979 died with
+      # "No space left on device" (FBC-q49i). Remove preinstalled toolchains the check never
+      # uses, and print the free space before and after.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.97"
