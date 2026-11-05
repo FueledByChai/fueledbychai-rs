@@ -52,7 +52,8 @@ fn fee_seal_does_not_compile() {
 /// cannot be written without saying whether a resync reads the open orders and the positions at
 /// one instant, and `SnapshotReads` has no `default()` (decision 0095), nor without saying how
 /// long the venue's open-order snapshot may lag its order stream (FBC-i8lp). Neither
-/// `SigningParams` nor `SessionCalendar` has a `default()` (decision 0125).
+/// `SigningParams` nor `SessionCalendar` has a `default()` (decision 0125), nor `OrderShapes`
+/// (decision 0136).
 #[test]
 fn caps_and_specs_declare_every_field() {
     let cases = trybuild::TestCases::new();

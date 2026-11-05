@@ -59,8 +59,8 @@ use fbc_core::{
     common_symbol_parts, decode_cid, dispatch, dispatch_market_data, encode_cid,
 };
 use fbc_core::{
-    CalendarParts, ClosedWindow, ConfigScope, FieldUnit, Header, Secret, Secrets, SessionCalendar,
-    SigningParams,
+    CalendarParts, ClosedWindow, ConfigScope, FieldUnit, Header, OrderShapes, Secret, Secrets,
+    SessionCalendar, SigningParams,
 };
 use rust_decimal::Decimal;
 
@@ -751,6 +751,7 @@ fn draft(line: &str, scope: &DecodeScope<'_>) -> Result<InstrumentSpecDraft, Pla
         status,
         sessions: None,
         signing: None,
+        order_shapes: None,
     })
 }
 
@@ -1081,6 +1082,7 @@ fn specs() -> SpecTable {
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        order_shapes: None,
         version: 1,
         fetched_at: WallNs(0),
     });
@@ -1931,6 +1933,7 @@ fn discovery_is_a_plan_of_http_effects_whose_parser_builds_drafts_in_the_decode_
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        order_shapes: None,
     };
     assert_eq!(drafts[0], expected);
     assert_eq!(drafts[1].status, TradingStatus::Halted);
@@ -1981,6 +1984,23 @@ fn a_draft_and_a_java_era_ticker_resolve_to_one_instrument_through_the_alias_tab
     assert_eq!(resolved.sessions, scheduled.sessions);
     assert_eq!(resolved.signing, Some(signing));
     assert!(resolved.sessions.is_some());
+    // And so do the order shapes the venue lists for it (0136): a post-only limit without the
+    // plain one, good till cancelled only, reaches the spec as the draft states it.
+    let shapes = OrderShapes {
+        kinds: TagSet::none(),
+        post_only: true,
+        tifs: TagSet::of(&[TifTag::Gtc]),
+    };
+    let listed = InstrumentSpecDraft {
+        order_shapes: Some(shapes),
+        ..scheduled.clone()
+    };
+    let resolved = resolver.spec(TOY_VENUE, listed, 1, WallNs(0)).unwrap();
+    assert_eq!(resolved.order_shapes, Some(shapes));
+    assert_eq!(resolved.sessions, scheduled.sessions);
+    assert_eq!(resolved.signing, Some(signing));
+    // The toy lists none, so its venue-wide caps alone govern.
+    assert_eq!(drafts[0].order_shapes, None);
 
     // Nothing is guessed: a market the consumer did not list, or the same keys read without
     // the aliases, resolve to nothing.

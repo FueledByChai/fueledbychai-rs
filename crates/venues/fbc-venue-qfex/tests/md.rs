@@ -106,6 +106,7 @@ fn specs_for(symbol: &str) -> SpecTable {
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        order_shapes: None,
         version: 1,
         fetched_at: WallNs(0),
     });

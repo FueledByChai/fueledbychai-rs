@@ -26,6 +26,7 @@ fn draft(asset: AssetKey, venue_symbol: VenueSymbol, settle_ccy: AssetSym) -> In
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        order_shapes: None,
     }
 }
 

@@ -213,6 +213,7 @@ fn the_documented_answer_decodes_into_one_draft_per_perpetual_in_the_decode_scop
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        order_shapes: None,
     };
     assert_eq!(drafts[0], expected);
     let eth = &drafts[1];

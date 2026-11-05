@@ -11,6 +11,8 @@
       "base_asset": "AAPL",
       "quote_asset": "USD",
       "margin_asset": "USDC",
+      "order_time_in_force": ["GTC", "IOC", "FOK"],
+      "order_types": ["LIMIT", "MARKET", "ALO"],
       "status": "ACTIVE"
     },
     {
@@ -23,6 +25,8 @@
       "base_asset": "ANTHROPIC",
       "quote_asset": "USD",
       "margin_asset": "USDC",
+      "order_time_in_force": ["GTC", "IOC", "FOK"],
+      "order_types": ["LIMIT", "MARKET"],
       "status": "ACTIVE"
     },
     {
@@ -35,6 +39,8 @@
       "base_asset": "NVDA",
       "quote_asset": "USD",
       "margin_asset": "USDC",
+      "order_time_in_force": ["GTC", "IOC"],
+      "order_types": ["ALO"],
       "status": "INACTIVE"
     },
     {
@@ -47,6 +53,8 @@
       "base_asset": "GOLD",
       "quote_asset": "USD",
       "margin_asset": "USDC",
+      "order_time_in_force": [],
+      "order_types": [],
       "status": "DELISTED"
     }
   ]

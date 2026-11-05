@@ -8,6 +8,17 @@
 //! not specify funding, fees or position limits. Its changing absolute `min_price` and
 //! `max_price` are not a static basis-point band, so `price_band` remains unset.
 //!
+//! Each symbol's `order_types` and `order_time_in_force` become its `order_shapes` (decision
+//! 0136), each an array of strings or null in the OpenAPI contract, named as the
+//! [enums page](https://docs.qfex.com/api-reference/enums)'s OrderType and OrderTimeInForce and
+//! shown in the [refdata channel page](https://docs.qfex.com/websocket/channels/mds/refdata)'s
+//! example (`["LIMIT", "MARKET", "ALO"]`, `["GTC", "IOC", "FOK"]`). `LIMIT` is a plain limit,
+//! `MARKET` a market order and `ALO` the post-only form, a limit order type of its own in QFEX's
+//! terms; `GTC`, `IOC` and `FOK` are the times in force. Every other name, the stop and TWAP
+//! types among them, is one this adapter never sends and is ignored. An empty or null list admits
+//! nothing of its kind (no page says what null means; 0054's conservative value), a missing one
+//! refuses the answer as `Missing`, and anything but null or an array of strings as malformed.
+//!
 //! QFEX's Java registry uppercased `BASE/QUOTE` and converted it to `BASE-QUOTE`; the matching
 //! draft key keeps the venue's stated quote asset. The resolver's explicit alias table may
 //! subsequently equate USD, USDT and USDC.
@@ -18,8 +29,9 @@ use std::time::Duration;
 use fbc_core::{
     AssetKey, AssetSym, ConfigError, DecodeError, DecodeScope, Effect, Effects, FundingSpec,
     HttpMethod, HttpPlan, HttpRequest, HttpTag, InstrumentKind, InstrumentSpecDraft, Lots, OpKind,
-    PlanError, PriceGrid, RateCharge, SizeStep, SymbolError, TradingStatus, TrafficClass,
-    VenueConfig, VenueError, WireSlice, WireUrl, common_symbol_parts,
+    OrderKindTag, OrderShapes, PlanError, PriceGrid, RateCharge, SizeStep, SymbolError, TagSet,
+    TifTag, TradingStatus, TrafficClass, VenueConfig, VenueError, WireSlice, WireUrl,
+    common_symbol_parts,
 };
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -185,6 +197,7 @@ fn draft(
     if maximum_steps.get() < minimum_steps.get() {
         return Err(malformed("max_quantity").into());
     }
+    let order_shapes = order_shapes(m)?;
     Ok(InstrumentSpecDraft {
         asset: AssetKey {
             base,
@@ -211,7 +224,51 @@ fn draft(
         status,
         sessions: None,
         signing: None,
+        order_shapes: Some(order_shapes),
     })
+}
+
+/// The symbol's `order_types` and `order_time_in_force` as its order shapes: what this adapter
+/// can send of what it lists, so always stated, an empty or null list admitting nothing.
+fn order_shapes(m: &Map<String, Value>) -> Result<OrderShapes, PlanError> {
+    let mut kinds = Vec::new();
+    let mut post_only = false;
+    for name in names(m, "order_types")? {
+        match name {
+            "LIMIT" => kinds.push(OrderKindTag::Limit),
+            "MARKET" => kinds.push(OrderKindTag::Market),
+            "ALO" => post_only = true,
+            // TAKE_PROFIT, STOP_LOSS, STOP_MARKET, TWAP_LIMIT and anything unknown: never sent.
+            _ => {}
+        }
+    }
+    let mut tifs = Vec::new();
+    for name in names(m, "order_time_in_force")? {
+        match name {
+            "GTC" => tifs.push(TifTag::Gtc),
+            "IOC" => tifs.push(TifTag::Ioc),
+            "FOK" => tifs.push(TifTag::Fok),
+            _ => {}
+        }
+    }
+    Ok(OrderShapes {
+        kinds: TagSet::of(&kinds),
+        post_only,
+        tifs: TagSet::of(&tifs),
+    })
+}
+
+/// A list of names that may be null (read without [`required`], which takes null as missing):
+/// none for null, refused as missing when absent and as malformed unless an array of strings.
+fn names<'a>(m: &'a Map<String, Value>, name: &'static str) -> Result<Vec<&'a str>, PlanError> {
+    match m.get(name).ok_or(PlanError::Missing(name))? {
+        Value::Null => Ok(Vec::new()),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| item.as_str().ok_or(malformed(name).into()))
+            .collect(),
+        _ => Err(malformed(name).into()),
+    }
 }
 
 fn malformed(name: &'static str) -> DecodeError {

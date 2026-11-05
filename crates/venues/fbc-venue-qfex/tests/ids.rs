@@ -23,11 +23,11 @@ use fbc_core::{
     AccountKey, AssetSym, CancelOrder, Channel, CidMatch, CidMint, ClientIdFormat, ClientOrderId,
     ConnState, DecodeError, Effect, Effects, EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent,
     ExecSink, FundingSpec, IdError, InstrumentId, InstrumentKind, InstrumentSpec, Lots, MonoNs,
-    Namespace, NamespaceLease, NewOrder, NonceBlock, NotSentReason, OrderKind, OrderRef,
-    PathStamps, PriceGrid, QueryOrder, RawFrame, RpcId, Secret, Secrets, Side, SizeStep, SpecTable,
-    Ticks, Tif, TradingStatus, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueFactory,
-    VenueId, VenueMeta, VenueOrderId, WallNs, decode_cid, dispatch, dispatch_market_data,
-    encode_cid,
+    Namespace, NamespaceLease, NewOrder, NonceBlock, NotSentReason, OrderKind, OrderKindTag,
+    OrderRef, OrderShapes, PathStamps, PriceGrid, QueryOrder, RawFrame, RpcId, Secret, Secrets,
+    Side, SizeStep, SpecTable, TagSet, Ticks, Tif, TradingStatus, UnderlyingId, VenueCaps,
+    VenueCommand, VenueConfig, VenueFactory, VenueId, VenueMeta, VenueOrderId, WallNs, decode_cid,
+    dispatch, dispatch_market_data, encode_cid,
 };
 use fbc_venue_qfex::auth::{self, TradeAuth};
 use fbc_venue_qfex::exec::{
@@ -262,6 +262,12 @@ fn specs() -> SpecTable {
         status: TradingStatus::Trading,
         sessions: None,
         signing: None,
+        // Lists admitting the places these tests send: LIMIT and ALO, GTC and IOC (0136).
+        order_shapes: Some(OrderShapes {
+            kinds: TagSet::of(&[OrderKindTag::Limit]),
+            post_only: true,
+            tifs: TagSet::of(&[Tif::Gtc, Tif::Ioc]),
+        }),
         version: 1,
         fetched_at: WallNs(0),
     });

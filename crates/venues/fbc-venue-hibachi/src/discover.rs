@@ -429,6 +429,7 @@ fn draft(
         status,
         sessions,
         signing: Some(signing),
+        order_shapes: None,
     })
 }
 
