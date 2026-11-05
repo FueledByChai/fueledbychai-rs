@@ -209,7 +209,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0034).
     A spec states `signing: Option<SigningParams>` (`AssetDecimals { underlying, settlement }`,
     its contract id kept in `native_id`) and `sessions: Option<SessionCalendar>`
-    (`src/calendar.rs`: an earliest open, a close that never reopens, dated `ClosedWindow`s and
+    (`src/calendar.rs`: an earliest open, a close that never reopens, dated `ClosedWindow`s (a
+    venue's published maintenance windows, Hibachi's from discovery, FBC-ord5) and
     `WeeklyClosure`s in a zone's wall time under a POSIX-style `UtcOffsetRule`, evaluated by
     integer civil-date arithmetic with no zone data and no clock; `is_open(at)` only ever
     closes, fail-closed across daylight-saving edges, and `next_closed(from)` gives the first
@@ -669,8 +670,12 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     as native id, `tickSize` as price grid and the finest listed granularity at or above it as
     quote grid where it is coarser (`None`, fbc-core's meaning, where it is the tick or there is
     none: quoted on the tick), the sizes,
-    `SigningParams::AssetDecimals` and a session calendar from the advertised open and close
-    and, for the FX underlyings the docs name, the New York weekend (0125); only `LIVE` on a
+    `SigningParams::AssetDecimals` and a session calendar from the advertised open and close,
+    each published `maintenanceWindow` as a `ClosedWindow` on every contract's calendar (begin
+    inclusive, end exclusive, rounded toward closed; a bound not decimal Unix seconds, a number or
+    a string, no later than 2100, or an end not after its begin, refusing the answer naming
+    `maintenanceWindow`; FBC-ord5) and, for the FX underlyings the docs name, the New York
+    weekend (0125); only `LIVE` on a
     `NORMAL` exchange trading, every other listed status `Halted`, an absent, null or
     undocumented one refused; `FUNDING_SETTLEMENT_INTERVAL` one hour and every perpetual's
     funding `FundingSpec::Known` at it, capped at `FUNDING_RATE_CAP`, 125 bps an hour (the docs'
@@ -706,8 +711,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     and its codec stay open while the venue's market data runs; `GET /market/exchange-info` sent
     from a timer every required `hibachi.status_interval` (whole seconds, zero refused), each
     answer judged at the wall time of a timer asked for once it arrives, read by discovery's own
-    status mapping and timestamp parsing plus `maintenanceWindow` (decimal Unix seconds, a number
-    or a string, none after 2100); each market's status reported as `MdEvent::Status` once each time it changes,
+    status mapping, timestamp parsing and `maintenanceWindow` reading (decimal Unix seconds, a
+    number or a string, none after 2100); each market's status reported as `MdEvent::Status` once each time it changes,
     every market halted while a read fails or is refused, a market a read leaves out halted, a
     market halted between reads on a timer at a published window's begin, its calendar's next close
     and its advertised close (the schedule the endpoint's, whichever markets are subscribed: an
@@ -770,11 +775,12 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   in Paradex's documented shape. `fixtures/binance-usdm/` holds hand-written frames (`md/`) and REST
   responses (`rest/`) in Binance's documented shapes, its README citing the pages.
   `fixtures/hibachi/rest/` (marked `SYNTHETIC`) holds hand-built `/market/exchange-info` answers,
-  with a variant for each status and timestamp refusal, and a funding-history answer, its README
-  citing each field's source; `fixtures/hibachi/rest/status/` (marked `SYNTHETIC`) the status
-  poll's answers, each a change of three of those contracts at instants its tests' timelines
-  name (a pause, either maintenance, a window as numbers, as strings and in milliseconds, an
-  advertised close, a market left out, each refusal), its README saying what each pins;
+  with a variant for each status and timestamp refusal and one publishing two maintenance windows,
+  and a funding-history answer, its README citing each field's source;
+  `fixtures/hibachi/rest/status/` (marked `SYNTHETIC`) the status poll's answers, each a change of
+  three of those contracts at instants its tests' timelines name (a pause, either maintenance, a
+  window as numbers, as strings and in milliseconds, an advertised close, a market left out, each
+  refusal), its README saying what each pins;
   `fixtures/hibachi/md/` (marked `SYNTHETIC`) hand-built `/ws/market`
   frames, one per file, shaped as Hibachi's docs, SDK and the Java library show them and as the
   owner's capture showed in words only, its README citing each shape; and
