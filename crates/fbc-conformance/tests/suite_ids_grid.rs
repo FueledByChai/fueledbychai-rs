@@ -7,7 +7,9 @@
 //! refuses them or sends them without their request, a banded grid with nothing below it, no
 //! post-only order, no order entry, and no codec built. And FBC-2905's done line: a toy
 //! resyncing over REST passes `restart_cid` from a case whose resync an `http` line answers,
-//! and fails it when that answer shows nothing of ours resting.
+//! and fails it when that answer shows nothing of ours resting. And, for FBC-7y5e, a codec that
+//! rounds prices still fails `price_grid` where each price is sized inside its instrument's
+//! limits: the prices around one boundary go at one size.
 
 mod toy_setup;
 
@@ -22,8 +24,8 @@ use fbc_core::{
     AccountSummary, AssetKey, CidMatch, ClientIdFormat, ConfigError, CtxCall, DecodeError,
     DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt, EndpointPlan, ExecCodec, ExecEndpoint,
     ExecEvent, ExecSink, FieldSpec, FillEvent, FillOrigin, HttpFailure, HttpPlan, HttpResponse,
-    HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, MdCodec, NotSentReason, OrderKind,
-    PathStamps, PriceGrid, RawFrame, RpcId, Secrets, SpecTable, StreamId, Subscription,
+    HttpTag, Inbound, InboundSpans, InstrumentSpecDraft, Lots, MdCodec, Money, NotSentReason,
+    OrderKind, PathStamps, PriceGrid, RawFrame, RpcId, Secrets, SpecTable, StreamId, Subscription,
     SymbolError, TagSet, Ticks, TimerTag, VenueCaps, VenueCommand, VenueConfig, VenueError,
     VenueFactory, VenueMeta, WallNs,
 };
@@ -327,6 +329,18 @@ fn banded() -> Setup {
         (Decimal::new(2000, 1), Decimal::new(15, 1)),
     ];
     a.price_grid = PriceGrid::banded(&bands).unwrap();
+    specs.insert(a);
+    Setup { specs, ..assumed() }
+}
+
+/// The toy's setup with its first instrument's orders at least 10 USDC of notional and at most
+/// 2223 lots: one lot (0.001) at tick 9 (4.5 USDC), the lowest price `price_grid` probes, is
+/// 0.0045 USDC, and 2223 lots reach the minimum there.
+fn floored() -> Setup {
+    let mut specs = toy::specs();
+    let mut a = specs.get(toy::INST_A).unwrap().clone();
+    a.min_notional = Some(Money::new(10_000_000_000, a.quote_ccy));
+    a.max_order_size = Some(Lots::new(2223).unwrap());
     specs.insert(a);
     Setup { specs, ..assumed() }
 }
@@ -729,6 +743,34 @@ fn price_grid_fails_a_codec_that_rounds_the_prices_it_is_given() {
         first.what,
         "encoded exactly as a post-only ask at tick 10: the codec does not send the price it is \
          given"
+    );
+}
+
+#[test]
+fn price_grid_sends_the_prices_around_a_boundary_at_one_size_so_a_rounding_codec_still_fails() {
+    // Each at its own least size, ticks 10 and 11 would go as 2000 and 1819 lots, and the ask
+    // at tick 11, sent at tick 10, would not encode as the one at tick 10. Around tick 10 every
+    // order goes at 2223 lots, the least that reaches 10 USDC at tick 9.
+    let variant = Variant {
+        setup: floored,
+        ..Variant::twisted(Twist::RoundsPrices)
+    };
+    let failure = failed(variant.run(suite::price_grid));
+    let first = &failure.breaches[0];
+    assert_eq!(first.capability, "a post-only ask on TOYA-PERP at tick 11");
+    assert_eq!(
+        first.what,
+        "encoded exactly as a post-only ask at tick 10: the codec does not send the price it is \
+         given"
+    );
+    // The toy itself sends every price there at that size.
+    let variant = Variant {
+        setup: floored,
+        ..Variant::declaring(|_| {})
+    };
+    assert_eq!(
+        probed(variant.run(suite::price_grid))[0],
+        "TOYA-PERP: 45 model prices quantized to 54 order prices, 54 post-only orders sent"
     );
 }
 

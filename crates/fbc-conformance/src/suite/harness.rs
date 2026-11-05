@@ -12,11 +12,11 @@ use fbc_core::{
     AccountKey, AmendOrder, BookId, CancelOrder, CapTag, Channel, CidMint, ClientOrderId,
     ConnState, ConnTopology, CtxCall, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
     EndpointPlan, ExecCodec, ExecEvent, ExecSink, Feature, Feed, HttpResponse, HttpTag,
-    InstrumentId, InstrumentSpec, Lots, MdCodec, MdTransport, MonoNs, Namespace, NamespaceLease,
-    NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag, OrderRef, PathStamps,
-    QueryOrder, RawFrame, RefKind, RpcId, Side, SpecTable, StreamId, Subscription, TagSet, Ticks,
-    TifTag, VenueCaps, VenueCommand, VenueMeta, VenueOrderId, WallNs, WireUrl, dispatch,
-    dispatch_market_data,
+    InstrumentId, InstrumentSpec, Lots, MdCodec, MdTransport, Money, MonoNs, Namespace,
+    NamespaceLease, NewOrder, NonceBlock, NotSentReason, OrderCaps, OrderKind, OrderKindTag,
+    OrderRef, PathStamps, QueryOrder, RawFrame, RefKind, RpcId, Side, SpecTable, StreamId,
+    Subscription, TagSet, Ticks, TifTag, VenueCaps, VenueCommand, VenueMeta, VenueOrderId, WallNs,
+    WireUrl, dispatch, dispatch_market_data,
 };
 
 use super::{BootReply, Bootstrap, Failure, Subject};
@@ -579,66 +579,118 @@ pub(crate) fn placement_nonce(i: usize) -> u64 {
 }
 
 /// The price and size an order the checks build starts from: the valid price at or above
-/// [`PX`] on the instrument's grid (the lowest valid where none is), and its `min_size`, one lot
-/// at least, so an amend always leaves something to rest.
+/// [`PX`] on the instrument's grid (the lowest valid where none is), and its least size
+/// ([`least_lots`]).
 fn start(spec: &InstrumentSpec) -> (Ticks, Lots) {
     let grid = &spec.price_grid;
     let px = grid
         .ceil_valid(PX)
         .or_else(|| grid.lowest_valid())
         .unwrap_or(PX);
-    let qty = Lots::new(spec.min_size.get().max(1)).expect("a positive count");
-    (px, qty)
+    (px, least_lots(spec))
+}
+
+/// The least size of an order on `spec`: its `min_size`, one lot at least, so an amend always
+/// leaves something to rest.
+fn least_lots(spec: &InstrumentSpec) -> Lots {
+    Lots::new(spec.min_size.get().max(1)).expect("a positive count")
+}
+
+/// Why `spec` takes no order at any price, by the spec field: its `max_order_size` below its
+/// least size ([`least_lots`]).
+pub(crate) fn inverted(spec: &InstrumentSpec) -> Option<(&'static str, String)> {
+    let least = least_lots(spec);
+    let most = spec.max_order_size.filter(|&most| most < least)?;
+    let what = format!(
+        "{} takes orders of at most {} lots, fewer than its least, {} lots (its min_size, and \
+         one lot at least): no order fits to probe with",
+        spec.venue_symbol.as_wire(),
+        most.get(),
+        least.get()
+    );
+    Some(("InstrumentSpec.max_order_size", what))
+}
+
+/// `spec`'s `max_order_size` as a clause of what a refusal says, empty where it sets none.
+pub(crate) fn within(spec: &InstrumentSpec) -> String {
+    match spec.max_order_size {
+        Some(max) => format!(" within its max_order_size of {} lots", max.get()),
+        None => String::new(),
+    }
+}
+
+/// Whether `q` lots at `px` on `spec` reach `min` of notional ([`InstrumentSpec::notional`]):
+/// rising with the price and the size, a notional too large to hold reaches any minimum.
+fn reaches(spec: &InstrumentSpec, min: Money, px: Ticks, q: i64) -> bool {
+    let notional = spec.notional(px, Lots::new(q).expect("a count"));
+    notional.is_none_or(|n| n.nanos >= min.nanos)
+}
+
+/// Whether the notional of `q` lots at `px` on `spec` is one it can hold, and reaches `min`.
+fn holds(spec: &InstrumentSpec, min: Money, px: Ticks, q: i64) -> bool {
+    let notional = spec.notional(px, Lots::new(q).expect("a count"));
+    notional.is_some_and(|n| n.nanos >= min.nanos)
+}
+
+/// The least size of an order at `px` inside `spec`'s limits (Codex r4189398089): from its least
+/// size ([`least_lots`]), the least whose notional ([`InstrumentSpec::notional`], in its quote
+/// currency, as `min_notional` is stated) reaches its `min_notional`, never past its
+/// `max_order_size`. A binary search over the spec's own notional. `None` where no size within
+/// them reaches it, or the least that does has a notional too large to hold.
+pub(crate) fn least_size(spec: &InstrumentSpec, px: Ticks) -> Option<Lots> {
+    let least = least_lots(spec).get();
+    let most = spec.max_order_size.map_or(i64::MAX, Lots::get);
+    let q = match spec.min_notional {
+        None => (least <= most).then_some(least)?,
+        Some(min) => {
+            let q = least_true(least, most, |q| reaches(spec, min, px, q))?;
+            holds(spec, min, px, q).then_some(q)?
+        }
+    };
+    Lots::new(q)
+}
+
+/// Whether an order of `q` at `px` is inside `spec`'s limits: no smaller than its least size
+/// ([`least_lots`]), no larger than its `max_order_size`, and, where it sets a `min_notional`,
+/// of a notional it can hold that reaches it.
+pub(crate) fn fits(spec: &InstrumentSpec, px: Ticks, q: Lots) -> bool {
+    q >= least_lots(spec)
+        && spec.max_order_size.is_none_or(|most| q <= most)
+        && spec
+            .min_notional
+            .is_none_or(|min| holds(spec, min, px, q.get()))
 }
 
 /// The price and size of the orders the checks build on `spec`, inside its limits (Codex
-/// r4189398089): from [`start`], the size raised until the order's notional reaches the spec's
-/// `min_notional`, never past its `max_order_size`; where no size within that reaches it at that
-/// price, the lowest valid price above at which the largest does, with the least size that
-/// reaches it there. The notional is the spec's own ([`InstrumentSpec::notional`]), in its quote
-/// currency, as `min_notional` is stated. Why no order fits, by the spec field, where none does.
+/// r4189398089): from [`start`], the least size there ([`least_size`]); where no size within
+/// its `max_order_size` reaches its `min_notional` at that price, the lowest valid price above at
+/// which the largest does, with the least size that reaches it there. Why no order fits, by the
+/// spec field, where none does.
 fn probe(spec: &InstrumentSpec) -> Result<(Ticks, Lots), (&'static str, String)> {
     let (px, least) = start(spec);
-    let symbol = spec.venue_symbol.as_wire();
-    if let Some(most) = spec.max_order_size.filter(|&most| most < least) {
-        let what = format!(
-            "{symbol} takes orders of at most {} lots, fewer than its least, {} lots (its \
-             min_size, and one lot at least): no order fits to probe with",
-            most.get(),
-            least.get()
-        );
-        return Err(("InstrumentSpec.max_order_size", what));
+    if let Some(unfit) = inverted(spec) {
+        return Err(unfit);
     }
     let Some(min) = spec.min_notional else {
         return Ok((px, least));
     };
     let most = spec.max_order_size.map_or(i64::MAX, Lots::get);
-    let notional = |px: Ticks, q: i64| spec.notional(px, Lots::new(q).expect("a count"));
-    // Rising with the price and the size: a notional too large to hold reaches any minimum.
-    let reaches = |px: Ticks, q: i64| notional(px, q).is_none_or(|n| n.nanos >= min.nanos);
-    // The least size reaching it at `px`, where one that it can hold does.
-    let sized = |px: Ticks| {
-        let q = least_true(least.get(), most, |q| reaches(px, q))?;
-        let held = notional(px, q).is_some_and(|n| n.nanos >= min.nanos);
-        held.then(|| (px, Lots::new(q).expect("a count")))
-    };
+    let sized = |px: Ticks| least_size(spec, px).map(|q| (px, q));
     let raised = || {
-        let t = least_true(px.0, i64::MAX, |t| reaches(Ticks(t), most))?;
+        let t = least_true(px.0, i64::MAX, |t| reaches(spec, min, Ticks(t), most))?;
         spec.price_grid.ceil_valid(Ticks(t))
     };
     let unfit = || {
-        let within = match spec.max_order_size {
-            Some(max) => format!(" within its max_order_size of {} lots", max.get()),
-            None => String::new(),
-        };
         let what = format!(
-            "no order of {symbol}{within} reaches its min_notional at a valid price: no order \
-             fits to probe with"
+            "no order of {}{} reaches its min_notional at a valid price: no order fits to probe \
+             with",
+            spec.venue_symbol.as_wire(),
+            within(spec)
         );
         ("InstrumentSpec.min_notional", what)
     };
     sized(px)
-        .or_else(|| raised().and_then(&sized))
+        .or_else(|| raised().and_then(sized))
         .ok_or_else(unfit)
 }
 
@@ -765,6 +817,34 @@ mod tests {
         assert_eq!(probed(&banded), (603, 100));
         banded.min_notional = None;
         assert_eq!(probed(&banded), (200, 1));
+    }
+
+    #[test]
+    fn the_least_size_at_a_price_reaches_the_minimum_within_the_largest_order() {
+        const USDC: i128 = 1_000_000_000;
+        let lots = |n: i64| Lots::new(n).unwrap();
+        // One lot (0.001) at tick 9 (4.5) is 0.0045 USDC: 2223 lots reach 10 USDC, and 2000 at
+        // tick 10 (5.0).
+        let spec = limited(Some(10 * USDC), Some(2223));
+        assert_eq!(least_size(&spec, Ticks(9)), Some(lots(2223)));
+        assert_eq!(least_size(&spec, Ticks(10)), Some(lots(2000)));
+        assert!(fits(&spec, Ticks(10), lots(2223)));
+        assert!(!fits(&spec, Ticks(10), lots(1999)));
+        assert!(!fits(&spec, Ticks(10), lots(2224)));
+        assert_eq!(
+            least_size(&limited(Some(10 * USDC), Some(2222)), Ticks(9)),
+            None
+        );
+        // No minimum: the least size wherever the largest order takes it.
+        let mut spec = limited(None, Some(1));
+        assert_eq!(least_size(&spec, Ticks(9)), Some(lots(1)));
+        assert_eq!(inverted(&spec), None);
+        spec.min_size = lots(2);
+        assert_eq!(least_size(&spec, Ticks(9)), None);
+        assert!(!fits(&spec, Ticks(9), lots(1)));
+        assert_eq!(inverted(&spec).unwrap().0, "InstrumentSpec.max_order_size");
+        assert_eq!(within(&spec), " within its max_order_size of 1 lots");
+        assert_eq!(within(&limited(None, None)), "");
     }
 
     #[test]

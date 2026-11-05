@@ -11,6 +11,11 @@
 //! `min_size` at the probe's price is below `min_notional`; `caps_truthful` passes a toy whose
 //! identical cancel-all frames go to each instrument's own stream, and accepts `Unsupported`
 //! for a flag-conflict amend where `AmendCaps.refs` names no reference an amend can carry.
+//!
+//! And FBC-7y5e's: `price_grid` passes that codec on a setup whose `min_size` at the prices it
+//! probes is below `min_notional`, and fails, naming the spec field, a setup where no size within
+//! `max_order_size` reaches `min_notional` at a price it probes, sending nothing on it; and it
+//! sends no bid at a price of zero, on a banded grid whose first band starts there.
 
 use std::collections::BTreeSet;
 
@@ -1450,6 +1455,237 @@ fn an_amend_no_declared_reference_can_name_may_be_refused_unsupported_before_its
     }
     // The toy's codec sends the IOC placements its caps now refuse.
     assert!(failure.names("OrderCaps allows no order: the first it names"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-7y5e: price_grid's orders sized inside each instrument's limits, price by price.
+// ---------------------------------------------------------------------------------------------
+
+/// `price_grid` run on `broken` under `setup`.
+fn price_grid(broken: &Broken, setup: fn() -> Setup) -> Result<Verdict, Failure> {
+    suite::price_grid(&Subject::new(broken, FIXTURES, setup).unwrap())
+}
+
+/// What a passing `outcome` probed.
+fn probed(outcome: Result<Verdict, Failure>) -> Vec<String> {
+    match outcome {
+        Ok(Verdict::Passed { probed, .. }) => probed,
+        other => panic!("expected a pass, got {other:?}"),
+    }
+}
+
+/// What a size-checking codec does with `cmd` under `specs`: why it refused it, and how many
+/// effects it left.
+fn size_checked(specs: &SpecTable, cmd: &VenueCommand) -> (Option<NotSentReason>, usize) {
+    let ctx = EncodeCtx {
+        wall: WallNs(1),
+        mono: MonoNs(1),
+        nonces: NonceBlock::new(vec![1]),
+    };
+    let mut codec = Twisted::new(Twist::ChecksSize);
+    let (stamps, mut fx) = (&mut PathStamps::off(), Effects::new());
+    let result = codec.encode(cmd, RpcId(1), specs, &ctx, stamps, &mut fx);
+    (result.err(), fx.len())
+}
+
+#[test]
+fn price_grid_passes_a_codec_refusing_orders_outside_the_instruments_size_limits() {
+    // The lowest price price_grid probes on the toy's grid is tick 9 (4.5 USDC), where one lot
+    // (0.001) is 0.0045 USDC against the 10 USDC minimum: 2223 lots reach it there, 2000 at
+    // tick 10, 203 at tick 99 and one from tick 20000. Within 2223 lots each price takes a size.
+    let checks_size = Broken::twisted(Twist::ChecksSize);
+    let probed = probed(price_grid(&checks_size, || floored(2223)));
+    assert_eq!(
+        probed,
+        [
+            "TOYA-PERP: 45 model prices quantized to 54 order prices, 54 post-only orders sent",
+            "TOYB-PERP: 45 model prices quantized to 54 order prices, 54 post-only orders sent",
+        ]
+    );
+    // The codec refuses what the limits refuse at tick 9, and sends what they take.
+    let specs = floored(2223).specs;
+    let refused = (Some(NotSentReason::Unencodable), 0);
+    // One lot and 2222 lots at tick 9, under 10 USDC; 2224 lots at tick 10, past 2223.
+    for (qty, px) in [(1, 9), (2222, 9), (2224, 10)] {
+        let cmd = amend_to(qty, px);
+        assert_eq!(
+            size_checked(&specs, &cmd),
+            refused,
+            "{qty} lots at tick {px}"
+        );
+    }
+    assert_eq!(size_checked(&specs, &amend_to(2223, 9)), (None, 1));
+}
+
+#[test]
+fn price_grid_refuses_a_setup_where_no_size_within_its_largest_order_reaches_the_minimum() {
+    /// A setup and what its refusal says.
+    type Case = (fn() -> Setup, &'static str);
+    let cases: [Case; 2] = [
+        // 2222 lots at tick 9 are 9.999 USDC; at tick 10, 2000 lots reach 10 USDC.
+        (
+            || floored(2222),
+            "no order of TOYA-PERP within its max_order_size of 2222 lots reaches its \
+             min_notional at tick 9, a price its grid's boundaries quantize to: no order fits to \
+             probe it with",
+        ),
+        // 500 lots reach it from tick 40 (20.0 USDC) up: not around tick 10.
+        (
+            || floored(500),
+            "no order of TOYA-PERP within its max_order_size of 500 lots reaches its \
+             min_notional at ticks 9, 10 and 11, prices its grid's boundaries quantize to: no \
+             order fits to probe them with",
+        ),
+    ];
+    for (setup, what) in cases {
+        // Whether the codec checks sizes or not, the refusal is the one breach.
+        for twist in [Twist::ChecksSize, Twist::None] {
+            let failure = failed(price_grid(&Broken::twisted(twist), setup));
+            assert_eq!(
+                said(&failure, "InstrumentSpec.min_notional of TOYA-PERP"),
+                what
+            );
+            assert_eq!(failure.breaches.len(), 1, "{failure}");
+        }
+        // Nothing is sent on the refused instrument: a codec refusing every placement breaches
+        // for each order sent, all 54 on the other instrument and none on it.
+        let failure = failed(price_grid(
+            &Broken::twisted(Twist::RefusesPlacements),
+            setup,
+        ));
+        assert_eq!(placed_on(&failure, "TOYA-PERP"), 0, "{failure}");
+        assert_eq!(placed_on(&failure, "TOYB-PERP"), 54, "{failure}");
+        assert_eq!(failure.breaches.len(), 1 + 54, "{failure}");
+    }
+    // Where the setup takes a size at every price, that codec breaches for each order sent on
+    // the first instrument too.
+    let failure = failed(price_grid(
+        &Broken::twisted(Twist::RefusesPlacements),
+        || floored(2223),
+    ));
+    assert_eq!(placed_on(&failure, "TOYA-PERP"), 54, "{failure}");
+}
+
+/// How many of `failure`'s breaches name a post-only order sent on `symbol`.
+fn placed_on(failure: &Failure, symbol: &str) -> usize {
+    let on = format!(" on {symbol} at tick ");
+    failure
+        .breaches
+        .iter()
+        .filter(|b| b.capability.starts_with("a post-only ") && b.capability.contains(&on))
+        .count()
+}
+
+/// The toy's setup with its first instrument on a banded grid whose first band starts at zero
+/// (steps of 0.5 up to 100.0, of 1.0 from there), its orders at least 10 USDC of notional and at
+/// most 20000 lots: the bid at the model price 0.25 floors to a price of zero, where no size
+/// reaches the minimum, and 20000 lots (0.001 each) reach it at 0.5, tick 1.
+fn from_zero() -> Setup {
+    let mut specs = toy::specs();
+    let mut a = specs.get(toy::INST_A).unwrap().clone();
+    let bands = [
+        (
+            rust_decimal::Decimal::ZERO,
+            rust_decimal::Decimal::new(5, 1),
+        ),
+        (
+            rust_decimal::Decimal::ONE_HUNDRED,
+            rust_decimal::Decimal::ONE,
+        ),
+    ];
+    a.price_grid = fbc_core::PriceGrid::banded(&bands).unwrap();
+    a.min_notional = Some(Money::new(10_000_000_000, a.quote_ccy));
+    a.max_order_size = Some(Lots::new(20_000).unwrap());
+    specs.insert(a);
+    Setup { specs, ..assumed() }
+}
+
+#[test]
+fn price_grid_sends_no_bid_at_zero_on_a_banded_grid_starting_there() {
+    // The bid at 0.25 is judged, at tick 0, and not sent: sizing it would refuse the setup, as
+    // no order at a price of zero reaches a minimum notional.
+    for twist in [Twist::ChecksSize, Twist::None] {
+        let probed = probed(price_grid(&Broken::twisted(twist), from_zero));
+        assert_eq!(
+            probed[0],
+            "TOYA-PERP: 52 model prices quantized to 47 order prices, 47 post-only orders sent",
+            "{twist:?}"
+        );
+    }
+    // The bid at 0.5, tick 1, is sent, at the 20000 lots that reach 10 USDC there.
+    let failure = failed(price_grid(
+        &Broken::twisted(Twist::RefusesPlacements),
+        from_zero,
+    ));
+    let named = |capability: &str| failure.breaches.iter().any(|b| b.capability == capability);
+    assert!(named("a post-only bid on TOYA-PERP at tick 1"), "{failure}");
+    assert!(
+        !named("a post-only bid on TOYA-PERP at tick 0"),
+        "{failure}"
+    );
+    let specs = from_zero().specs;
+    let refused = (Some(NotSentReason::Unencodable), 0);
+    assert_eq!(size_checked(&specs, &amend_to(19_999, 1)), refused);
+    assert_eq!(size_checked(&specs, &amend_to(20_000, 1)), (None, 1));
+}
+
+#[test]
+fn price_grid_names_the_field_no_order_fits_and_sizes_nothing_where_it_sends_nothing() {
+    /// Its least order, ten lots, is more than its largest, five.
+    fn inverted() -> Setup {
+        let mut specs = toy::specs();
+        let mut a = specs.get(toy::INST_A).unwrap().clone();
+        a.min_size = Lots::new(10).unwrap();
+        a.max_order_size = Some(Lots::new(5).unwrap());
+        specs.insert(a);
+        Setup { specs, ..assumed() }
+    }
+    /// No order reaches its minimum notional at any price.
+    fn unreachable() -> Setup {
+        let mut specs = toy::specs();
+        let mut a = specs.get(toy::INST_A).unwrap().clone();
+        a.min_notional = Some(Money::new(i128::MAX, a.quote_ccy));
+        specs.insert(a);
+        Setup { specs, ..assumed() }
+    }
+    let toy = Broken::twisted(Twist::None);
+    let failure = failed(price_grid(&toy, inverted));
+    assert_eq!(
+        said(&failure, "InstrumentSpec.max_order_size of TOYA-PERP"),
+        "TOYA-PERP takes orders of at most 5 lots, fewer than its least, 10 lots (its min_size, \
+         and one lot at least): no order fits to probe with"
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+    // Every price, with no largest order to name.
+    let failure = failed(price_grid(&toy, unreachable));
+    let what = said(&failure, "InstrumentSpec.min_notional of TOYA-PERP");
+    assert!(
+        what.starts_with(
+            "no order of TOYA-PERP reaches its min_notional at ticks 9, 10, 11, 99, 100, 101, \
+             999,"
+        ),
+        "{what}"
+    );
+    assert!(
+        what.ends_with(
+            " 1000000000 and 1000000001, prices its grid's boundaries quantize to: no order fits \
+             to probe them with"
+        ),
+        "{what}"
+    );
+    assert_eq!(failure.breaches.len(), 1, "{failure}");
+    // A venue that sends no post-only order sizes none, whatever its instrument's limits.
+    let no_post_only = Broken::declaring(|caps| order(caps).post_only = false);
+    let md_only = Broken {
+        caps: Some(|caps| caps.exec = None),
+        builds: Builds::Nothing,
+    };
+    for broken in [no_post_only, md_only] {
+        for setup in [inverted, unreachable] {
+            let probed = probed(price_grid(&broken, setup));
+            assert!(probed[0].ends_with("no post-only limit order the caps allow to send"));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
