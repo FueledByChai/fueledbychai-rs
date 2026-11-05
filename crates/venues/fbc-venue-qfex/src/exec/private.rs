@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use fbc_core::{DecodeScope, FillId, VenueOrderId};
 use rust_decimal::Decimal;
 
+use super::ids;
 use super::json::{self, Kind, Member, Node};
 
 /// The private-state envelopes the codec recognises, each the frame's only top-level member.
@@ -197,26 +198,27 @@ fn unique<T: Eq + std::hash::Hash>(ids: &[T], what: &'static str) -> Result<(), 
         .ok_or(what)
 }
 
-/// A UUID's wire form, 8-4-4-4-12 hex digits; no page restricts its version or case.
-fn uuid<'n>(row: &'n [Member<'_>], key: &'static str) -> Result<&'n str, &'static str> {
+/// The id `key` names, when `rule` accepts it.
+fn id<'n>(
+    row: &'n [Member<'_>],
+    key: &'static str,
+    rule: fn(&str) -> bool,
+) -> Result<&'n str, &'static str> {
     let id = json::get(row, key).and_then(Node::str).ok_or(key)?;
-    let shaped = id.len() == 36
-        && id.bytes().enumerate().all(|(at, byte)| match at {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_hexdigit(),
-        });
-    shaped.then_some(id).ok_or("a UUID")
+    rule(id).then_some(id).ok_or("a UUID")
 }
 
+/// An order id, by the one order-id rule the encoder's cancels and queries share.
 fn order_id(row: &[Member<'_>], scope: &DecodeScope<'_>) -> Result<VenueOrderId, &'static str> {
     scope
-        .venue_order_id(uuid(row, "order_id")?)
+        .venue_order_id(id(row, "order_id", ids::is_venue_order_id)?)
         .map_err(|_| "order_id")
 }
 
+/// A trade id, in a UUID's wire form.
 fn fill_id(row: &[Member<'_>], scope: &DecodeScope<'_>) -> Result<FillId, &'static str> {
     scope
-        .fill_id(uuid(row, "trade_id")?)
+        .fill_id(id(row, "trade_id", ids::uuid_form)?)
         .map_err(|_| "trade_id")
 }
 

@@ -61,6 +61,7 @@
 //! `order.rs` says.
 
 mod echo;
+mod ids;
 mod json;
 mod order;
 mod private;
@@ -81,6 +82,7 @@ use crate::auth::TradeAuth;
 use crate::rate;
 
 pub use self::echo::ErrCode;
+pub use self::ids::{CLIENT_ID_FORMAT, is_venue_order_id};
 pub use self::private::{OrderStatus, PrivateState};
 
 /// The trade WebSocket, the codec's one stream.

@@ -1,0 +1,14 @@
+# Client ids other systems send QFEX, each of which must read as Unparseable, never as one of
+# ours (FBC-s8wq). The shapes are QFEX's documented example client ids: a random (version 4)
+# UUID, lowercase as the get_order and get_user_orders pages' example responses write it, and
+# in upper case; short hyphenated labels, as the cancel_order, errors and order pages write
+# them; and the decimal millisecond counter the public Java library's QfexBroker writes
+# (String.valueOf of an AtomicLong seeded with System.currentTimeMillis(), incremented per id).
+# Every value is made up here: none is a page's example or an id any system sent.
+3c9e1f02-8a4d-4b7e-a1c3-5f60d2e8b947
+9D2B7E41-06F3-4C58-B8A1-E3F04C6D2A75
+bid-aapl-0001
+quote-sell-042
+hedge-nvda-7
+1762290000001
+1762290000002

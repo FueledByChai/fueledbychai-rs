@@ -38,8 +38,9 @@
 //!   and a dead-man refresh and a fee query, which QFEX has no request for.
 //! - `Unencodable`: an instrument the spec table does not hold, a price off the grid or not
 //!   positive, a quantity of no lots or outside the spec's minimum and maximum, a venue order id
-//!   that is not a UUID version 4 (the cancel_order page's `order_id`), and a client id that
-//!   does not fit the wire format.
+//!   the one order-id rule refuses ([`super::is_venue_order_id`], which the private decoder reads
+//!   `order_id` by too), and a client id that does not fit the client-id format
+//!   ([`super::CLIENT_ID_FORMAT`], in which every `client_order_id` is written).
 //!
 //! Each frame's charge is in tenths of QFEX's weight unit ([rate
 //! page](https://docs.qfex.com/websocket/rate)), on the provider user's shared buckets
@@ -49,18 +50,14 @@
 use std::num::NonZeroU32;
 
 use fbc_core::{
-    CancelOrder, Channel, ClientIdFormat, ClientOrderId, InstrumentId, InstrumentSpec, Lots,
-    NewOrder, NotSentReason, OpKind, OrderKind, OrderRef, QueryOrder, RateCharge, Side, SpecTable,
-    Ticks, Tif, VenueCommand, encode_cid,
+    CancelOrder, Channel, ClientOrderId, InstrumentId, InstrumentSpec, Lots, NewOrder,
+    NotSentReason, OpKind, OrderKind, OrderRef, QueryOrder, RateCharge, Side, SpecTable, Ticks,
+    Tif, VenueCommand, encode_cid,
 };
 use rust_decimal::Decimal;
 
+use super::ids::{CLIENT_ID_FORMAT, is_venue_order_id};
 use NotSentReason::{FlagConflict, Unencodable, Unsupported};
-
-/// How a client id is written in `client_order_id`: a lowercase hyphenated UUID, the shape of
-/// the get_order page's example `client_order_id`. FBC-s8wq makes this the crate's one cited
-/// format, which the order caps then declare.
-const CLIENT_ID_FORMAT: ClientIdFormat = ClientIdFormat::Uuid;
 
 /// `add_order` and `cancel_order` weigh 1.0, ten tenths, on the rate page.
 const ONE_UNIT: NonZeroU32 = NonZeroU32::new(10).expect("ten is not zero");
@@ -201,7 +198,7 @@ fn quantity(spec: &InstrumentSpec, lots: Lots) -> Result<Decimal, NotSentReason>
         .ok_or(Unencodable)
 }
 
-/// Our client id as `client_order_id` carries it.
+/// Our client id as `client_order_id` carries it, in the crate's one client-id format.
 fn client_order_id(cid: ClientOrderId) -> Result<String, NotSentReason> {
     encode_cid(&CLIENT_ID_FORMAT, cid)
         .map(|wire| wire.as_str().to_owned())
@@ -209,60 +206,17 @@ fn client_order_id(cid: ClientOrderId) -> Result<String, NotSentReason> {
 }
 
 /// The venue's order id a cancel or query names: `Unsupported` for a reference that carries
-/// none (QFEX cancels and queries by our client id are not sent), `Unencodable` for one that is
-/// not a UUID version 4. FBC-s8wq gives the order-id rule one home shared with the decoder.
+/// none (QFEX cancels and queries by our client id are not sent), `Unencodable` for one the
+/// order-id rule the private decoder shares refuses.
 fn venue_order_id(target: &OrderRef) -> Result<&str, NotSentReason> {
     let id = target.venue().ok_or(Unsupported)?.as_str();
-    if !uuid_v4(id) {
+    if !is_venue_order_id(id) {
         return Err(Unencodable);
     }
     Ok(id)
 }
 
-/// A hyphenated UUID of version 4 and the RFC variant, in either case.
-fn uuid_v4(id: &str) -> bool {
-    id.len() == 36
-        && id.bytes().enumerate().all(|(at, byte)| match at {
-            8 | 13 | 18 | 23 => byte == b'-',
-            14 => byte == b'4',
-            19 => matches!(byte.to_ascii_lowercase(), b'8' | b'9' | b'a' | b'b'),
-            _ => byte.is_ascii_hexdigit(),
-        })
-}
-
 /// `value` as a JSON string, escaped: a venue symbol comes from the venue.
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("a string serializes")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_uuid_v4_is_hyphenated_versioned_and_of_the_rfc_variant() {
-        for id in [
-            "2f05173c-992a-426b-bcaf-6b341644bb62",
-            "5B309929-206F-40EC-804D-CBE46E81AFC1",
-            "11111111-1111-4111-8111-111111111111",
-            "11111111-1111-4111-9111-111111111111",
-            "11111111-1111-4111-a111-111111111111",
-            "11111111-1111-4111-B111-111111111111",
-        ] {
-            assert!(uuid_v4(id), "{id}");
-        }
-        for id in [
-            "",
-            "not-a-uuid",
-            "2f05173c-992a-426b-bcaf-6b341644bb6",
-            "2f05173c-992a-426b-bcaf-6b341644bb622",
-            "2f05173c0992a-426b-bcaf-6b341644bb62",
-            "2f05173c-992a-426b-bcaf-6b341644bbg2",
-            "2f05173c-992a-726b-bcaf-6b341644bb62",
-            "2f05173c-992a-426b-ccaf-6b341644bb62",
-            "2f05173c-992a-426b-bcaf-6b341644bb6\u{e9}",
-        ] {
-            assert!(!uuid_v4(id), "{id}");
-        }
-    }
 }
