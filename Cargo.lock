@@ -678,6 +678,7 @@ name = "fbc-venue-qfex"
 version = "0.0.1"
 dependencies = [
  "fbc-book",
+ "fbc-conformance",
  "fbc-core",
  "fbc-journal",
  "fbc-runtime",

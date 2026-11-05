@@ -171,6 +171,7 @@ fn every_order_and_fill_capability_is_the_value_the_record_states() {
         CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
             covers_open_orders: false,
+            offers_disarm: true,
         }
     );
     assert_eq!(

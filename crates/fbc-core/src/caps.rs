@@ -128,9 +128,14 @@ pub struct OrderCaps {
 }
 
 /// What a venue cancels when a connection drops.
+///
+/// Every variant that takes an arm, `ArmCancelOnDisconnect(true)`, states whether the venue also
+/// offers a disarm, `ArmCancelOnDisconnect(false)`, which turns the protection off (decision
+/// 0141): `offers_disarm` is `true` only where a venue document names that request, and a codec
+/// refuses every disarm `NotSent(Unsupported)`, with no effect, where it is `false`.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum CancelOnDisconnect {
-    /// Nothing: orders outlive the connection.
+    /// Nothing: orders outlive the connection. No arm is taken, so no disarm either.
     None,
     /// The orders placed on the connection; with `rearm_on_reconnect`, the protection must be
     /// requested again on each new connection.
@@ -142,17 +147,40 @@ pub enum CancelOnDisconnect {
         /// says so it is `false`, and the order-entry session cancels the orders its resync
         /// shows resting before it places or amends on their markets (FBC-nvxn).
         covers_open_orders: bool,
+        /// The venue offers a request that turns the protection off on the connection
+        /// (decision 0141).
+        offers_disarm: bool,
     },
     /// An armed connection's drop cancels every order on the account, including orders
     /// opened through other connections after the arm. The arm lapses on disconnect and
     /// must be accepted again on every new connection (0121). A consumer must explicitly
     /// authorize this account-wide effect before an execution session starts.
-    AccountWide,
+    AccountWide {
+        /// The venue offers a request that turns the protection off on the connection
+        /// (decision 0141).
+        offers_disarm: bool,
+    },
     /// Everything, unless a dead-man timer of at most `max_ttl` is refreshed in time.
     DeadMan {
         /// The longest timer the venue accepts.
         max_ttl: Duration,
+        /// The venue offers a request that stops the timer (decision 0141).
+        offers_disarm: bool,
     },
+}
+
+impl CancelOnDisconnect {
+    /// Whether the venue takes a disarm, `ArmCancelOnDisconnect(false)`: the variant's
+    /// `offers_disarm`, and `false` for [`CancelOnDisconnect::None`], which takes no arm
+    /// (decision 0141).
+    pub const fn offers_disarm(self) -> bool {
+        match self {
+            CancelOnDisconnect::None => false,
+            CancelOnDisconnect::PerConnection { offers_disarm, .. }
+            | CancelOnDisconnect::AccountWide { offers_disarm }
+            | CancelOnDisconnect::DeadMan { offers_disarm, .. } => offers_disarm,
+        }
+    }
 }
 
 /// How a venue amends an order.
@@ -823,11 +851,49 @@ mod tests {
         let at_arm = CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
             covers_open_orders: true,
+            offers_disarm: true,
         };
-        assert_ne!(CancelOnDisconnect::AccountWide, at_arm);
+        let account_wide = CancelOnDisconnect::AccountWide {
+            offers_disarm: true,
+        };
+        assert_ne!(account_wide, at_arm);
         assert_eq!(
-            CancelOnDisconnect::AccountWide,
-            CancelOnDisconnect::AccountWide
+            account_wide,
+            CancelOnDisconnect::AccountWide {
+                offers_disarm: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_disarm_is_offered_only_where_the_variant_says_so() {
+        let ttl = Duration::from_secs(10);
+        for offers_disarm in [false, true] {
+            for cod in [
+                CancelOnDisconnect::PerConnection {
+                    rearm_on_reconnect: true,
+                    covers_open_orders: false,
+                    offers_disarm,
+                },
+                CancelOnDisconnect::AccountWide { offers_disarm },
+                CancelOnDisconnect::DeadMan {
+                    max_ttl: ttl,
+                    offers_disarm,
+                },
+            ] {
+                assert_eq!(cod.offers_disarm(), offers_disarm, "{cod:?}");
+            }
+        }
+        // `None` takes no arm, so no disarm.
+        assert!(!CancelOnDisconnect::None.offers_disarm());
+        // The same protection with and without a disarm are different capabilities.
+        assert_ne!(
+            CancelOnDisconnect::AccountWide {
+                offers_disarm: false
+            },
+            CancelOnDisconnect::AccountWide {
+                offers_disarm: true
+            }
         );
     }
 

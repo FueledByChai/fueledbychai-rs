@@ -644,6 +644,8 @@ fn order_caps() -> OrderCaps {
         cancel_on_disconnect: CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
             covers_open_orders: false,
+            // Hibachi's sources send only an enable (decision 0141); the planner reads neither.
+            offers_disarm: false,
         },
         ack: AckModel::SinglePhase,
         client_id: ClientIdFormat::Uuid,

@@ -670,7 +670,11 @@ static MIXED_ORDER_ENTRY_SCOPES: Variant = Variant {
 };
 /// The toy's connection arm has an account-wide effect, authorized for the suite's ACCT.
 static ACCOUNT_WIDE_COD: Variant = Variant {
-    caps: |c| c.exec.as_mut().unwrap().order.cancel_on_disconnect = CancelOnDisconnect::AccountWide,
+    caps: |c| {
+        c.exec.as_mut().unwrap().order.cancel_on_disconnect = CancelOnDisconnect::AccountWide {
+            offers_disarm: true,
+        }
+    },
     twist: Twist::None,
 };
 

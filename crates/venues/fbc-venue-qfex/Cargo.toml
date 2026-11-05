@@ -21,6 +21,9 @@ time.workspace = true
 
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
+# tests/conformance.rs runs fbc-conformance's caps_truthful on the pre-production probe's caps
+# (FBC-3ymj, decision 0141). scripts/check-deps.sh does not count dev-dependencies.
+fbc-conformance = { path = "../../fbc-conformance" }
 # tests/signing.rs journals the authentication and private frames and reads them back
 # (decisions 0006 and 0028). scripts/check-deps.sh does not count dev-dependencies.
 fbc-journal = { path = "../../fbc-journal" }

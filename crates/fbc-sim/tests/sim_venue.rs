@@ -2426,11 +2426,14 @@ fn per_connection(rearm_on_reconnect: bool, covers_open_orders: bool) -> Venue {
     protected(CancelOnDisconnect::PerConnection {
         rearm_on_reconnect,
         covers_open_orders,
+        offers_disarm: true,
     })
 }
 
 fn account_wide() -> Venue {
-    protected(CancelOnDisconnect::AccountWide)
+    protected(CancelOnDisconnect::AccountWide {
+        offers_disarm: true,
+    })
 }
 
 /// The dead-man venue's longest timer, which SimVenue's timer runs from each arm or refresh.
@@ -2439,11 +2442,42 @@ const TTL: u64 = 100 * MS;
 fn dead_man() -> Venue {
     protected(CancelOnDisconnect::DeadMan {
         max_ttl: Duration::from_nanos(TTL),
+        offers_disarm: true,
     })
 }
 
 const ARM: VenueCommand = VenueCommand::ArmCancelOnDisconnect(true);
 const DISARM: VenueCommand = VenueCommand::ArmCancelOnDisconnect(false);
+
+/// Per-connection protection requested again on each connection, offering no disarm.
+fn per_connection_cod() -> CancelOnDisconnect {
+    CancelOnDisconnect::PerConnection {
+        rearm_on_reconnect: true,
+        covers_open_orders: false,
+        offers_disarm: false,
+    }
+}
+
+/// Account-wide protection offering no disarm, as the QFEX probe declares (decision 0132).
+fn account_wide_cod() -> CancelOnDisconnect {
+    CancelOnDisconnect::AccountWide {
+        offers_disarm: false,
+    }
+}
+
+/// A dead-man timer of [`TTL`] offering no disarm.
+fn dead_man_cod() -> CancelOnDisconnect {
+    CancelOnDisconnect::DeadMan {
+        max_ttl: Duration::from_nanos(TTL),
+        offers_disarm: false,
+    }
+}
+
+/// A venue standing in for one with protection `cod`, which offers no disarm (decision 0141).
+fn without_disarm(cod: CancelOnDisconnect) -> Venue {
+    assert!(!cod.offers_disarm(), "{cod:?}");
+    protected(cod)
+}
 
 impl Venue {
     /// The simulated stream closes at `mono`.
@@ -2884,16 +2918,21 @@ fn a_frame_still_in_flight_when_its_stream_closes_never_reaches_the_venue() {
 fn the_codec_sends_protection_commands_only_to_a_venue_that_takes_them() {
     // Placements now go to every one of these venues (Codex r4184778435 on PR #58), and each
     // takes the protection commands its caps declare, as control frames naming no
-    // instrument; the rest are refused, nothing written.
+    // instrument; the rest are refused, nothing written. A disarm goes only where the
+    // protection offers one (decision 0141).
     let cases = [
-        (Venue::new(Bracket::Middle), false, false),
-        (per_connection(true, false), true, false),
-        (per_connection(false, true), true, false),
-        (dead_man(), true, true),
+        (Venue::new(Bracket::Middle), false, false, false),
+        (per_connection(true, false), true, true, false),
+        (per_connection(false, true), true, true, false),
+        (account_wide(), true, true, false),
+        (dead_man(), true, true, true),
+        (without_disarm(per_connection_cod()), true, false, false),
+        (without_disarm(account_wide_cod()), true, false, false),
+        (without_disarm(dead_man_cod()), true, false, true),
     ];
-    for (mut v, protection, refresh) in cases {
+    for (mut v, protection, disarm, refresh) in cases {
         assert!(v.encode(&limit(cid(), Side::Buy, 199, 1), 1, T0).is_ok());
-        for (cmd, takes) in [(ARM, protection), (DISARM, protection)]
+        for (cmd, takes) in [(ARM, protection), (DISARM, disarm)]
             .into_iter()
             .chain([(VenueCommand::RefreshDeadMan, refresh)])
         {
@@ -2919,6 +2958,45 @@ fn the_codec_sends_protection_commands_only_to_a_venue_that_takes_them() {
             assert_eq!(*class, cmd.traffic_class());
             assert_eq!(*charge, RateCharge::one(OpKind::Control, None));
         }
+    }
+}
+
+#[test]
+fn the_engine_refuses_a_disarm_the_stood_in_venue_does_not_offer_and_keeps_protecting() {
+    // A disarm frame the codec never writes for these venues (decision 0141): the engine
+    // answers it refused, `no_protection`, and the protection armed before it still cancels.
+    for cod in [per_connection_cod(), account_wide_cod(), dead_man_cod()] {
+        let mut v = without_disarm(cod);
+        v.snapshot(T0, &[(199, 5)], &[(201, 5)]);
+        v.protect(ARM, 1, T0);
+        let vid = v.rest(limit(cid(), Side::Buy, 199, 1), 2, T0 + 10 * MS);
+        let disarm = format!("protect|rpc=3|mono={}|wall=0|on=0", T0 + 20 * MS);
+        v.engine.on_order_frame(disarm.as_bytes()).unwrap();
+        v.tick(T0 + 25 * MS);
+        let got = v.events();
+        let [(_, refused)] = got.as_slice() else {
+            panic!("{cod:?}: {got:?}")
+        };
+        let Some((_, SubmitOutcome::Rejected(r))) = outcome_of(refused) else {
+            panic!("{cod:?}: {got:?}")
+        };
+        assert_eq!(
+            (r.kind, r.venue_code.as_deref()),
+            (RejectKind::Other, Some("no_protection")),
+            "{cod:?}"
+        );
+        // Still protected: the close cancels the order where the protection is per connection
+        // or account-wide, and the dead-man timer, still running, lapses.
+        match cod {
+            CancelOnDisconnect::DeadMan { .. } => v.tick(T0 + 30 * MS + TTL),
+            _ => v.close(T0 + 30 * MS),
+        }
+        let ended = venue_canceled(&v.events());
+        assert_eq!(
+            ended.into_iter().map(|(v, _)| v).collect::<Vec<_>>(),
+            [vid],
+            "{cod:?}"
+        );
     }
 }
 
@@ -5707,6 +5785,7 @@ fn a_close_cancels_a_protected_order_held_for_its_risk_check() {
     config.exec.order.cancel_on_disconnect = CancelOnDisconnect::PerConnection {
         rearm_on_reconnect: true,
         covers_open_orders: false,
+        offers_disarm: true,
     };
     let mut v = Venue::with(config);
     v.snapshot(T0, &[(199, 5)], &[(201, 5)]);

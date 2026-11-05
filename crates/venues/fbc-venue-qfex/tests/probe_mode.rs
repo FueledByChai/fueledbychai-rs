@@ -809,7 +809,12 @@ fn under_the_mode_the_factory_declares_item_6s_exec_caps_and_one_order_entry_end
 
         // Item 6's list.
         let o = &exec.order;
-        assert_eq!(o.cancel_on_disconnect, CancelOnDisconnect::AccountWide);
+        assert_eq!(
+            o.cancel_on_disconnect,
+            CancelOnDisconnect::AccountWide {
+                offers_disarm: false
+            }
+        );
         assert_eq!(o.snapshot_source, SnapshotSource::Untrustworthy);
         assert_eq!(o.snapshot_reads, SnapshotReads::Separate);
         assert_eq!(o.amend, None);

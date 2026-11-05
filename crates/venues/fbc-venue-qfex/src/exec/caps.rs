@@ -84,8 +84,12 @@ pub fn probe_exec_caps() -> ExecCaps {
             cancel_all_instrument: Support::Unsupported,
             // `cancel_on_disconnect`: an armed connection's drop cancels every open order of
             // the authenticated account, "you need to opt in again whenever you reconnect";
-            // decision 0132 items 1 and 2 widen 0121's authority for QFEX's arm.
-            cancel_on_disconnect: CancelOnDisconnect::AccountWide,
+            // decision 0132 items 1 and 2 widen 0121's authority for QFEX's arm. The page
+            // documents the opt-in and no request that turns it off, and the codec refuses
+            // every disarm unsent (decision 0132 item 1): no disarm offered (decision 0141).
+            cancel_on_disconnect: CancelOnDisconnect::AccountWide {
+                offers_disarm: false,
+            },
             // `add_order` answers with an `order_response` whose status is `ACK`, "Order
             // accepted" (enums page), and non-ALO orders wait in a 500 ms speed bump
             // (architecture page) no page places the `ACK` before or after: two-phase, with a

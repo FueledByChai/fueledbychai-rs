@@ -211,6 +211,7 @@ pub fn order_caps() -> OrderCaps {
         cancel_on_disconnect: CancelOnDisconnect::PerConnection {
             rearm_on_reconnect: true,
             covers_open_orders: false,
+            offers_disarm: true,
         },
         ack: AckModel::SinglePhase,
         client_id: ClientIdFormat::Uuid,

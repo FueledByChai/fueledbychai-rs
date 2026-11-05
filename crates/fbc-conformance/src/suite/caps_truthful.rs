@@ -11,9 +11,11 @@
 //!   `NotSent(FlagConflict)` (a pair no one order can carry, such as IOC with FOK, is not
 //!   probed);
 //! - an absent operation (amend, batch placement, batch cancel, an account or instrument
-//!   cancel-all, cancel-on-disconnect, or a dead-man refresh without a dead-man timer), a
-//!   batch longer than its `max_items` (one item, for a `max_items` of zero), and an amend, cancel, batch-cancel item or query
-//!   naming only references the caps leave out for it are refused `NotSent(Unsupported)`;
+//!   cancel-all, cancel-on-disconnect, a disarm where the protection offers none (decision
+//!   0141), or a dead-man refresh without a dead-man timer), a batch longer than its
+//!   `max_items` (one item, for a `max_items` of zero), and an amend, cancel, batch-cancel item
+//!   or query naming only references the caps leave out for it are refused
+//!   `NotSent(Unsupported)`;
 //! - a refusal asks for no effect: no frame, no HTTP request, no timer;
 //! - an instrument cancel-all the caps declare is sent charged as a cancel-all of that
 //!   instrument and nothing wider (an account-wide request's charge names no instrument), and
@@ -29,11 +31,12 @@
 //! such order fails, naming the spec field.
 //!
 //! Beside the probes, one control per operation the caps declare (the plainest allowed
-//! placement, batch, amend, cancel, batch cancel and query, an account cancel-all, arming and
-//! disarming cancel-on-disconnect, a dead-man refresh) must be sent, carrying its request: a
-//! codec that refuses everything would otherwise pass (Codex r4188835150). Which amend fields may change (`AmendCaps`'s
-//! `price`, `qty` and `flags`) is not probed: an amend carries the whole amended order and no
-//! codec holds the original to compare it with, so those are the OMS's permits to hold.
+//! placement, batch, amend, cancel, batch cancel and query, an account cancel-all, arming
+//! cancel-on-disconnect, disarming it where the caps offer a disarm, a dead-man refresh) must
+//! be sent, carrying its request: a codec that refuses everything would otherwise pass (Codex
+//! r4188835150). Which amend fields may change (`AmendCaps`'s `price`, `qty` and `flags`) is
+//! not probed: an amend carries the whole amended order and no codec holds the original to
+//! compare it with, so those are the OMS's permits to hold.
 //!
 //! A venue whose caps declare no order entry passes when its factory builds no order-entry
 //! codec, and fails when it builds one.
@@ -586,11 +589,14 @@ fn operations(h: &Harness<'_>, o: &OrderCaps, push: Push<'_>) {
         }
     }
     // Arming and disarming cancel-on-disconnect, and refreshing a dead-man timer: sent where
-    // the caps declare them, refused where they do not.
-    let (protection, dead_man) = match o.cancel_on_disconnect {
+    // the caps declare them, refused where they do not. A variant that takes an arm states
+    // whether it offers a disarm (decision 0141).
+    let cod = o.cancel_on_disconnect;
+    let (protection, dead_man) = match cod {
         CancelOnDisconnect::None => (false, false),
-        CancelOnDisconnect::PerConnection { .. } => (true, false),
-        CancelOnDisconnect::AccountWide => (true, false),
+        CancelOnDisconnect::PerConnection { .. } | CancelOnDisconnect::AccountWide { .. } => {
+            (true, false)
+        }
         CancelOnDisconnect::DeadMan { .. } => (true, true),
     };
     let expect = |declared| if declared { Expect::Sent } else { refused };
@@ -605,11 +611,11 @@ fn operations(h: &Harness<'_>, o: &OrderCaps, push: Push<'_>) {
         expect(protection),
     );
     let disarm = VenueCommand::ArmCancelOnDisconnect(false);
-    push(
-        label(protection, "protection (disarm)"),
-        disarm,
-        expect(protection),
-    );
+    let disarm_label = match (protection, cod.offers_disarm()) {
+        (true, false) => "OrderCaps.cancel_on_disconnect offers no disarm".to_owned(),
+        (declared, _) => label(declared, "protection (disarm)"),
+    };
+    push(disarm_label, disarm, expect(cod.offers_disarm()));
     let refresh = VenueCommand::RefreshDeadMan;
     push(
         label(dead_man, "dead-man timer (refresh)"),

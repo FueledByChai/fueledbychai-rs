@@ -151,15 +151,23 @@ impl VenueFactory for ReadyToy {
         let order = &mut caps.exec.as_mut().unwrap().order;
         match cfg.get(COD) {
             Some("none") => order.cancel_on_disconnect = CancelOnDisconnect::None,
-            Some("account") => order.cancel_on_disconnect = CancelOnDisconnect::AccountWide,
+            Some("account") => {
+                order.cancel_on_disconnect = CancelOnDisconnect::AccountWide {
+                    offers_disarm: true,
+                }
+            }
             Some("deadman") => {
                 let max_ttl = Duration::from_secs(10);
-                order.cancel_on_disconnect = CancelOnDisconnect::DeadMan { max_ttl };
+                order.cancel_on_disconnect = CancelOnDisconnect::DeadMan {
+                    max_ttl,
+                    offers_disarm: true,
+                };
             }
             Some("once") => {
                 let once = CancelOnDisconnect::PerConnection {
                     rearm_on_reconnect: false,
                     covers_open_orders: false,
+                    offers_disarm: true,
                 };
                 order.cancel_on_disconnect = once;
             }
@@ -1406,7 +1414,10 @@ fn a_venue_without_per_connection_protection_is_refused_at_start_naming_it() {
     let max_ttl = Duration::from_secs(10);
     assert_eq!(
         dead_man,
-        ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::DeadMan { max_ttl })
+        ExecSessionError::CancelOnDisconnect(CancelOnDisconnect::DeadMan {
+            max_ttl,
+            offers_disarm: true
+        })
     );
     assert!(dead_man.to_string().contains("DeadMan"), "{dead_man}");
     assert!(venue.calls().is_empty());
