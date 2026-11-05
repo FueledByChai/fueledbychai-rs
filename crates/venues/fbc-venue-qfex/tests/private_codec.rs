@@ -1,7 +1,8 @@
 //! FBC-zeb0: QFEX's trade WebSocket codec, recording-only (`caps.exec` stays `None`).
 //!
 //! - It authenticates and then subscribes to `order_responses`, `fills` and `positions`, for the
-//!   primary account and for a subaccount.
+//!   primary account and for a subaccount; the stream is reported authenticated only once QFEX
+//!   confirms all three (FBC-bsou, `tests/private_subscribe.rs`).
 //! - A RateLimited err in either documented envelope, with either documented hint form, and an
 //!   order whose status is `RATE_LIMITED`, each hold the shared provider-user budget and settle
 //!   or reconnect nothing (decisions 0126, 0134 item 5).
@@ -175,12 +176,31 @@ fn deadline(effects: &[Effect]) -> TimerTag {
     }
 }
 
-/// Opens epoch `n` and authenticates it, checking it did.
+/// QFEX's confirmation of the subscription to `channel`.
+fn confirm(channel: &str) -> String {
+    format!(r#"{{"subscribed":"{channel}"}}"#)
+}
+
+/// Confirms the three subscriptions of an epoch whose auth reply came, checking the last
+/// confirmation, and only it, reported the stream authenticated (FBC-bsou).
+fn confirm_all(codec: &mut QfexExec) {
+    for channel in &CHANNELS[..2] {
+        let out = text(codec, &confirm(channel));
+        assert_eq!(out, Out::quiet(), "{channel}");
+    }
+    let out = text(codec, &confirm(CHANNELS[2]));
+    assert_eq!(out.events, [authenticated()], "{out:?}");
+    assert!(out.effects.is_empty() && out.result.is_ok(), "{out:?}");
+}
+
+/// Opens epoch `n` and authenticates it, checking it did: the auth reply sends the three
+/// subscriptions and reports nothing, and their last confirmation reports the stream.
 fn authenticate(codec: &mut QfexExec, n: u64) {
     open(codec, n);
     let out = text(codec, AUTHENTICATED);
-    assert_eq!(out.events, [authenticated()], "{out:?}");
+    assert!(out.events.is_empty(), "{out:?}");
     assert_eq!(out.effects.len(), 3);
+    confirm_all(codec);
 }
 
 fn authed(account: &str) -> QfexExec {
@@ -283,7 +303,8 @@ fn authentication_then_the_three_subscriptions_for_a_primary_and_a_subaccount() 
 
         let out = text(&mut codec, reply);
         assert_eq!(out.result, Ok(()));
-        assert_eq!(out.events, [authenticated()]);
+        // Reported only once QFEX confirms the three subscriptions (FBC-bsou).
+        assert!(out.events.is_empty(), "{out:?}");
         assert_eq!(out.effects.len(), CHANNELS.len());
         for (effect, channel) in out
             .effects
@@ -309,10 +330,7 @@ fn authentication_then_the_three_subscriptions_for_a_primary_and_a_subaccount() 
             // One tenth of a weight unit: the rate page's 0.1 for a subscribe.
             assert_eq!(*charge, RateCharge::one(OpKind::Subscribe, None));
         }
-        for channel in CHANNELS {
-            let reply = format!(r#"{{"subscribed":"{channel}"}}"#);
-            assert_eq!(text(&mut codec, &reply), Out::quiet(), "{channel}");
-        }
+        confirm_all(&mut codec);
         assert_eq!(codec.counts().subscribed, 3);
     }
 }
@@ -406,12 +424,15 @@ fn every_documented_rate_refusal_holds_the_budget_and_settles_or_reconnects_noth
             }]
         );
     }
-    // A RateLimited err holds before authentication too, and the epoch stays open for its reply.
+    // A RateLimited err holds before authentication too, and the epoch stays open for its reply
+    // and the confirmations.
     let mut codec = fresh(SUB);
     open(&mut codec, 1);
     let (frame, hold) = refusals().remove(3);
+    assert_eq!(text(&mut codec, &frame), Out::effects(vec![hold.clone()]));
+    assert!(text(&mut codec, AUTHENTICATED).events.is_empty());
     assert_eq!(text(&mut codec, &frame), Out::effects(vec![hold]));
-    assert_eq!(text(&mut codec, AUTHENTICATED).events, [authenticated()]);
+    confirm_all(&mut codec);
 }
 
 #[test]
@@ -583,13 +604,16 @@ fn a_generic_ack_is_recognised_and_keeps_the_epoch_open_settling_nothing() {
     ];
     let mut codec = fresh(SUB);
     open(&mut codec, 1);
-    // Before authentication too: the deadline still bounds the wait for the reply.
+    // Before authentication too: the deadline still bounds the wait for the reply and the
+    // confirmations, which an ack is not (FBC-bsou).
     assert_eq!(text(&mut codec, &acks[0]), Out::quiet());
-    assert_eq!(text(&mut codec, AUTHENTICATED).events, [authenticated()]);
+    assert!(text(&mut codec, AUTHENTICATED).events.is_empty());
+    assert_eq!(text(&mut codec, &acks[1]), Out::quiet());
+    confirm_all(&mut codec);
     for ack in &acks {
         assert_eq!(text(&mut codec, ack), Out::quiet());
     }
-    assert_eq!(codec.counts().acks, 3);
+    assert_eq!(codec.counts().acks, 4);
     let err = nested("InvalidOrder", "null", ADD_ORDER);
     assert_eq!(text(&mut codec, &err), Out::quiet());
 }
@@ -676,7 +700,7 @@ fn the_journal_keeps_errs_and_acks_as_0134_lists_and_their_replay_gives_the_same
     let get_order =
         r#"{"type":"get_order","params":{"order_id":"11111111-1111-4111-8111-111111111111"}}"#;
     let mut steps = vec![Step::Open(1), frame(AUTHENTICATED)];
-    steps.extend(CHANNELS.map(|c| frame(&format!(r#"{{"subscribed":"{c}"}}"#))));
+    steps.extend(CHANNELS.map(|c| frame(&confirm(c))));
     steps.extend(refusals().into_iter().map(|(f, _)| Step::Frame(f)));
     for code in REQUEST_CODES {
         steps.push(Step::Frame(nested(code.wire(), r#""rejected""#, ADD_ORDER)));
@@ -711,11 +735,9 @@ fn the_journal_keeps_errs_and_acks_as_0134_lists_and_their_replay_gives_the_same
         fixture("order_response.json"),
     ];
     for (n, last) in ending.iter().enumerate() {
-        steps.extend([
-            Step::Open(2 + n as u64),
-            frame(AUTH_OK),
-            Step::Frame(last.clone()),
-        ]);
+        steps.extend([Step::Open(2 + n as u64), frame(AUTH_OK)]);
+        steps.extend(CHANNELS.map(|c| frame(&confirm(c))));
+        steps.push(Step::Frame(last.clone()));
     }
     // And the epochs that end before authentication.
     steps.extend([
@@ -919,7 +941,7 @@ fn the_journal_keeps_errs_and_acks_as_0134_lists_and_their_replay_gives_the_same
             counts.private_state,
             counts.undecodable,
         ),
-        (1, 2, 11, 3, 1, 5)
+        (1, 2, 11, 3 * (1 + ending.len() as u64), 1, 5)
     );
     assert_eq!(counts.errs(ErrCode::RateLimited), 10);
     // The frames kept whole are read as no err at all, so counted as undecodable only.
@@ -1120,10 +1142,15 @@ fn an_auth_failure_a_missing_auth_reply_and_a_malformed_frame_each_end_their_own
         timer(&mut codec, second).is_empty(),
         "the epoch already ended"
     );
-    // After the reply, the deadline does nothing.
+    // After the reply it still ends the epoch while a confirmation is missing (FBC-bsou), and
+    // once all three came it does nothing.
     let third = deadline(&open(&mut codec, 3));
-    assert_eq!(text(&mut codec, AUTH_OK).events, [authenticated()]);
-    assert!(timer(&mut codec, third).is_empty());
+    assert!(text(&mut codec, AUTH_OK).events.is_empty());
+    assert!(Out::effects(timer(&mut codec, third)).reconnects());
+    let fourth = deadline(&open(&mut codec, 4));
+    assert!(text(&mut codec, AUTH_OK).events.is_empty());
+    confirm_all(&mut codec);
+    assert!(timer(&mut codec, fourth).is_empty());
 
     // An authentication that cannot be signed ends the epoch before anything is sent.
     let mut codec = fresh(SUB);
@@ -1442,7 +1469,7 @@ fn every_recognised_private_state_frame_ends_the_epoch_with_no_order_fill_positi
         fixture("balance_response.json"),
         fixture("stop_order_response.json"),
         r#"{"subscribed":"balances"}"#.to_owned(),
-        r#"{"unsubscribed":"fills"}"#.to_owned(),
+        r#"{"unsubscribed":"balances"}"#.to_owned(),
         r#"{"subscribed":"fills","x":1}"#.to_owned(),
         AUTHENTICATED.to_owned(),
     ] {

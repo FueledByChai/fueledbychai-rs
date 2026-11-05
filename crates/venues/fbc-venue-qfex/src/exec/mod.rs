@@ -13,10 +13,23 @@
 //!   ([trade.yaml](https://docs.qfex.com/websocket/trade.yaml)); anything else, or no reply when
 //!   the deadline fires, ends the epoch. The deadline's tag names the epoch's opening, so a
 //!   timer of an earlier epoch does nothing.
-//! - **Subscriptions.** Once authenticated, `order_responses`, `fills` and `positions`, one
-//!   frame each, as the AsyncAPI's `subscribe_orders`, `subscribe_fills` and
-//!   `subscribe_positions` show; a `{"subscribed":…}` naming one of them keeps the epoch open.
-//!   When the stream is reported authenticated is FBC-bsou's to change (0132 item 1).
+//! - **Subscriptions, and when the stream is authenticated (FBC-bsou, decision 0132 item 1).**
+//!   A successful auth reply sends `order_responses`, `fills` and `positions`, one frame each,
+//!   as the AsyncAPI's `subscribe_orders`, `subscribe_fills` and `subscribe_positions` show,
+//!   and pushes no connection event. The stream is reported authenticated once per epoch, on
+//!   the last of the three `{"subscribed":…}` confirmations, in any order: the session sends its
+//!   cancel-on-disconnect arm and resync on that report, so none of the epoch's subscriptions
+//!   is outstanding when they go out, and what the arm cancels reaches a confirmed channel.
+//!   Only a channel's first confirmation in the epoch confirms it; a repeat keeps the epoch
+//!   open, and an ack (whose echoed channel the journal spans, 0134 item 4) confirms nothing.
+//!   Every other frame meanwhile takes the path it takes once the stream is authenticated, and
+//!   a confirmation of a channel the codec never subscribes is not recognised. Before the last
+//!   confirmation, an err other than RateLimited ends the epoch (0134 item 5), and a
+//!   RateLimited one holds the budget with the confirmation still pending. An
+//!   `{"unsubscribed":…}` naming one of the three ends the epoch, before or after the report:
+//!   the codec never unsubscribes, and without them the session would not hear its cancels and
+//!   fills. The authentication deadline runs until the last confirmation, so a confirmation
+//!   that never comes ends that epoch only.
 //! - **Errs and acks (decision 0134).** The journal keeps an err or an ack that echoes a request
 //!   as its shape and the few values item 3 lists (`echo.rs`), and the codec decides from what it
 //!   keeps, live as in replay: it blanks the spans `redact_inbound` names before it reads any
@@ -76,7 +89,8 @@ pub const TRADE: StreamId = StreamId(0);
 /// The private channels subscribed once authenticated, in this order.
 pub const CHANNELS: [&str; 3] = ["order_responses", "fills", "positions"];
 
-/// QFEX's authentication deadline, from the authenticate page.
+/// QFEX's authentication deadline, from the authenticate page, which the codec also holds the
+/// confirmations of its subscriptions to (FBC-bsou).
 pub const AUTH_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The authentication deadline's tag is this, plus the number of the opening it belongs to.
@@ -96,8 +110,10 @@ pub struct QfexExecCounts {
     pub acks: u64,
     /// `Effect::RateLimited` holds asked for, by RateLimited errs and `RATE_LIMITED` orders.
     pub rate_holds: u64,
-    /// `subscribed` replies naming one of [`CHANNELS`].
+    /// `subscribed` replies naming one of [`CHANNELS`], repeats included.
     pub subscribed: u64,
+    /// `unsubscribed` replies naming one of [`CHANNELS`]; each ended its epoch.
+    pub unsubscribed: u64,
     /// Private state frames inspected, valid or not; each ended its epoch.
     pub private_state: u64,
     /// Frames refused as not a JSON object, a repeated member, or two envelopes at once.
@@ -118,9 +134,15 @@ enum Phase {
     Closed,
     /// Authentication was sent; its reply has not come.
     Awaiting,
-    /// The stream was reported authenticated.
+    /// Authentication succeeded and the subscriptions were sent: bit `i` is set once QFEX has
+    /// confirmed `CHANNELS[i]` in this epoch.
+    Subscribing(u8),
+    /// Every subscription was confirmed, and the stream reported authenticated.
     Authenticated,
 }
+
+/// Every channel confirmed.
+const ALL_CONFIRMED: u8 = (1 << CHANNELS.len()) - 1;
 
 /// The recording-only order-entry codec for one QFEX account's trade WebSocket.
 pub struct QfexExec {
@@ -228,7 +250,7 @@ impl QfexExec {
         }
     }
 
-    fn on_auth_reply(&mut self, top: &[Member<'_>], sink: &mut dyn ExecSink, fx: &mut Effects) {
+    fn on_auth_reply(&mut self, top: &[Member<'_>], fx: &mut Effects) {
         let text = |name: &str| json::get(top, name).and_then(Node::str);
         let documented = text("type") == Some("auth")
             && text("result") == Some("success")
@@ -238,14 +260,8 @@ impl QfexExec {
         if !(documented || observed) {
             return self.end(fx, "QFEX did not authenticate the stream");
         }
-        self.phase = Phase::Authenticated;
-        sink.push(
-            VenueMeta::NONE,
-            ExecEvent::Conn {
-                stream: TRADE,
-                state: ConnState::Authenticated,
-            },
-        );
+        // Not yet reported: that waits for the last confirmation.
+        self.phase = Phase::Subscribing(0);
         for channel in CHANNELS {
             let body = format!(r#"{{"type":"subscribe","params":{{"channels":["{channel}"]}}}}"#);
             fx.push(Effect::Send {
@@ -258,20 +274,57 @@ impl QfexExec {
         }
     }
 
+    /// QFEX confirmed the subscription of `CHANNELS[at]`. The confirmation that completes the
+    /// epoch's three reports the stream authenticated; a repeat, or one once reported, changes
+    /// nothing.
+    fn confirmed(&mut self, at: usize, sink: &mut dyn ExecSink) {
+        self.counts.subscribed += 1;
+        let Phase::Subscribing(mask) = self.phase else {
+            return;
+        };
+        let mask = mask | 1 << at;
+        if mask != ALL_CONFIRMED {
+            self.phase = Phase::Subscribing(mask);
+            return;
+        }
+        self.phase = Phase::Authenticated;
+        sink.push(
+            VenueMeta::NONE,
+            ExecEvent::Conn {
+                stream: TRADE,
+                state: ConnState::Authenticated,
+            },
+        );
+    }
+
+    /// A frame past the auth reply, whether or not every subscription is confirmed yet.
     fn on_private(
         &mut self,
         top: &[Member<'_>],
         scope: &DecodeScope<'_>,
+        sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        // `{"subscribed":…}` and `{"unsubscribed":…}`, each the frame's one member, naming one
+        // of the channels the epoch subscribed (the AsyncAPI's replies to a subscribe and an
+        // unsubscribe).
         if let [(name, value)] = top
-            && name == "subscribed"
-            && value
+            && let Some(at) = value
                 .str()
-                .is_some_and(|channel| CHANNELS.contains(&channel))
+                .and_then(|channel| CHANNELS.iter().position(|ours| *ours == channel))
         {
-            self.counts.subscribed += 1;
-            return Ok(());
+            match name.as_ref() {
+                "subscribed" => {
+                    self.confirmed(at, sink);
+                    return Ok(());
+                }
+                "unsubscribed" => {
+                    self.counts.unsubscribed += 1;
+                    self.end(fx, "QFEX unsubscribed a private channel");
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
         if let [(name, value)] = top
             && name == "order_response"
@@ -393,10 +446,12 @@ impl ExecCodec for QfexExec {
             }
             Envelope::Other => match self.phase {
                 Phase::Awaiting => {
-                    self.on_auth_reply(top, sink, fx);
+                    self.on_auth_reply(top, fx);
                     Ok(())
                 }
-                Phase::Authenticated => self.on_private(top, scope, fx),
+                Phase::Subscribing(_) | Phase::Authenticated => {
+                    self.on_private(top, scope, sink, fx)
+                }
                 Phase::Closed => {
                     self.end(fx, "a QFEX trade frame after the epoch ended");
                     Ok(())
@@ -419,9 +474,18 @@ impl ExecCodec for QfexExec {
         ))
     }
 
+    /// QFEX's authentication deadline, which runs from the opening until the last subscription
+    /// is confirmed: past it, the epoch ends.
     fn on_timer(&mut self, tag: TimerTag, _ctx: &EncodeCtx, fx: &mut Effects) {
-        if self.phase == Phase::Awaiting && tag == self.deadline() {
-            self.end(fx, "QFEX authentication unanswered within 60 s");
+        if tag != self.deadline() {
+            return;
+        }
+        match self.phase {
+            Phase::Awaiting => self.end(fx, "QFEX authentication unanswered within 60 s"),
+            Phase::Subscribing(_) => {
+                self.end(fx, "QFEX private subscriptions unconfirmed within 60 s");
+            }
+            Phase::Closed | Phase::Authenticated => {}
         }
     }
 

@@ -135,11 +135,21 @@ fn frame(codec: &mut QfexExec, text: &str) -> (Vec<ExecEvent>, Vec<Effect>) {
     (sink.0, fx.take())
 }
 
-/// Opens epoch `n` and authenticates it, checking it did.
-fn authenticate(codec: &mut QfexExec, n: u64) {
-    let mut fx = Effects::new();
-    codec.on_open(TRADE, &ctx(n), &mut fx);
-    let (events, effects) = frame(codec, AUTHENTICATED);
+/// QFEX's confirmations of the three private subscriptions, the last of which reports the
+/// stream authenticated (FBC-bsou).
+const CONFIRMATIONS: [&str; 3] = [
+    r#"{"subscribed":"order_responses"}"#,
+    r#"{"subscribed":"fills"}"#,
+    r#"{"subscribed":"positions"}"#,
+];
+
+/// Confirms the three subscriptions of an epoch whose auth reply came, checking that the last
+/// confirmation, and only it, reported the stream authenticated.
+fn confirm_all(codec: &mut QfexExec) {
+    for confirmation in &CONFIRMATIONS[..2] {
+        assert_eq!(frame(codec, confirmation), (vec![], vec![]));
+    }
+    let (events, effects) = frame(codec, CONFIRMATIONS[2]);
     assert_eq!(
         events,
         [ExecEvent::Conn {
@@ -147,8 +157,18 @@ fn authenticate(codec: &mut QfexExec, n: u64) {
             state: ConnState::Authenticated,
         }]
     );
-    // The three private subscriptions.
+    assert!(effects.is_empty(), "{effects:?}");
+}
+
+/// Opens epoch `n` and authenticates it, checking it did: the auth reply sends the three private
+/// subscriptions and reports nothing, and their last confirmation reports the stream.
+fn authenticate(codec: &mut QfexExec, n: u64) {
+    let mut fx = Effects::new();
+    codec.on_open(TRADE, &ctx(n), &mut fx);
+    let (events, effects) = frame(codec, AUTHENTICATED);
+    assert!(events.is_empty(), "{events:?}");
     assert_eq!(effects.len(), 3, "{effects:?}");
+    confirm_all(codec);
 }
 
 fn authed(account: &str) -> QfexExec {
@@ -815,7 +835,8 @@ fn each_refused_command_writes_nothing() {
 }
 
 /// A supported command goes out only on an authenticated epoch: not before a stream opens, not
-/// while authentication is unanswered, and not once the epoch has ended.
+/// while authentication is unanswered, not while a subscription is unconfirmed (FBC-bsou), and
+/// not once the epoch has ended.
 #[test]
 fn a_supported_command_waits_for_an_authenticated_epoch() {
     let supported = [
@@ -836,6 +857,13 @@ fn a_supported_command_waits_for_an_authenticated_epoch() {
     codec.on_open(TRADE, &ctx(1), &mut fx);
     disconnected(&mut codec);
     let (events, _) = frame(&mut codec, AUTHENTICATED);
+    assert!(events.is_empty(), "{events:?}");
+    disconnected(&mut codec);
+    for confirmation in &CONFIRMATIONS[..2] {
+        frame(&mut codec, confirmation);
+        disconnected(&mut codec);
+    }
+    let (events, _) = frame(&mut codec, CONFIRMATIONS[2]);
     assert_eq!(events.len(), 1);
     for (n, cmd) in supported.iter().enumerate() {
         sent(&mut codec, cmd, RpcId(n as u64 + 1));
