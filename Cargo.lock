@@ -547,6 +547,8 @@ dependencies = [
  "fbc-venue-binance-usdm",
  "fbc-venue-hibachi",
  "fbc-venue-paradex",
+ "fbc-venue-qfex",
+ "futures-util",
  "log",
  "rust_decimal",
  "serde_json",
