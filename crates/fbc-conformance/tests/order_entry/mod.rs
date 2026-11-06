@@ -15,7 +15,8 @@
 //! A script may also close its connection ([`Script::close_with`]) and take the session's
 //! reconnect ([`Script::reopen`]), whose opening is answered the same way on the new connection;
 //! the scenario moves the paused clock past the reconnect pacing ([`Run::reopened`]). A run may
-//! journal into a sink the test holds ([`play_journaled`], FBC-xx0).
+//! journal into a sink the test holds ([`play_journaled`], FBC-xx0). A scenario may amend an order
+//! through its Live permit ([`Run::amend`], FBC-mwm6), reported sent as the amend in flight.
 
 #![allow(dead_code)]
 
@@ -222,6 +223,8 @@ pub struct State {
     ladder: LadderConfig,
     /// The order and operation of each request submitted here.
     sent: HashMap<RpcId, (ClientOrderId, OrderOp)>,
+    /// The price and total quantity each amend submitted here asked for.
+    amends: HashMap<RpcId, (Ticks, Lots)>,
     collecting: Option<ResyncSnapshot>,
     authenticated_at: Option<MonoNs>,
     /// When the last event arrived, on the session's monotonic clock: a submission's send time.
@@ -319,8 +322,8 @@ impl State {
         self.collecting.as_mut().expect("a resync begun")
     }
 
-    /// Records a submission sent: a placement's send time, a cancel in flight. Every one here
-    /// is sent, since no deadline passes and the toy's buckets have room.
+    /// Records a submission sent: a placement's send time, a cancel or an amend in flight. Every
+    /// one here is sent, since no deadline passes and the toy's buckets have room.
     fn on_submitted(&mut self, handle: SubmitHandle) {
         let (cid, op) = self.sent[&handle.rpc];
         handle.receipt.expect("sent");
@@ -329,7 +332,11 @@ impl State {
         let recorded = match op {
             OrderOp::Place => self.reg.placement_sent(cid, self.last, wall),
             OrderOp::Cancel(rpc) => self.reg.cancel_sent(cid, rpc, self.last).map(drop),
-            OrderOp::Amend(_) => unreachable!("no script here amends"),
+            OrderOp::Amend(rpc) => {
+                let (px, qty) = self.amends[&rpc];
+                let sent = self.reg.amend_sent(cid, px, qty, rpc, self.last);
+                sent.map(|sent| assert!(sent, "the amended order is not terminal"))
+            }
         };
         recorded.expect("the registry records it sent");
     }
@@ -452,6 +459,20 @@ impl Run<'_> {
         rpc
     }
 
+    /// Amends order `cid` to `px` and `qty` (the total) through its Live permit, authorized and
+    /// submitted: its request id.
+    pub fn amend(&mut self, cid: ClientOrderId, px: Ticks, qty: Lots) -> RpcId {
+        let mut st = self.st.borrow_mut();
+        let caps = st.caps.clone();
+        let live = st.reg.live(cid).unwrap();
+        let cmd = live.amend(&caps, px, qty, false).unwrap();
+        let auth = st.reg.authorize(ACCT, cmd).unwrap();
+        let rpc = self.orders.submit(auth).unwrap();
+        st.sent.insert(rpc, (cid, OrderOp::Amend(rpc)));
+        st.amends.insert(rpc, (px, qty));
+        rpc
+    }
+
     /// Waits until the stub has read the next request the script answers and the glue has
     /// applied every frame of its reply: the barrier after it has passed.
     pub async fn replied(&mut self) {
@@ -549,6 +570,7 @@ pub fn play_journaled<T>(
         caps: order,
         ladder: LadderConfig::new(second, Duration::ZERO, 10 * second, 1).unwrap(),
         sent: HashMap::new(),
+        amends: HashMap::new(),
         collecting: None,
         authenticated_at: None,
         last: MonoNs(0),
