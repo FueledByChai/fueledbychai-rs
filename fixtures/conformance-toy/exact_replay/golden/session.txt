@@ -1,0 +1,8 @@
+# FBC-qwq's exact-replay golden, written by crates/fbc-runtime/tests/exact_replay.rs; refresh it with scripts/check.sh --refresh-goldens, never by hand.
+rest_url=http://127.0.0.1:51845/acct/2222222222222222222
+rest_url.redact=28..47
+place=2
+amend=3
+cancel=4
+query=5
+fees=6

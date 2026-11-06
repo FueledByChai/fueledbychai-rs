@@ -59,11 +59,15 @@
 //! Effects the codec asks for are not executed, and the outbound frames, write results, HTTP
 //! requests, nonce records and what became of each submission are outputs, not fed to anything
 //! nor handed to the handler ([`ExecHandler::on_submitted`] and
-//! [`ExecHandler::on_tick_to_wire`] are not called): reproducing the outbound bytes is exact
-//! replay's (FBC-qwq). A consumer's own record (decision 0101) is passed over. Records the sink
-//! dropped leave a `Degraded` marker, counted as a gap: a replay across one is not exact, and a
-//! call whose context it dropped (an `on_open` or `on_timer`, whose contexts go under Normal) is
-//! not made and is counted ([`ExecReplayCounters::lost_contexts`]).
+//! [`ExecHandler::on_tick_to_wire`] are not called). Exact replay (FBC-qwq, decisions 0006 and
+//! 0142), when the configuration asks for it ([`ExecReplayConfig::compare_outbound`]), compares
+//! each frame and HTTP request the codec asks for with the outbound frames and HTTP requests the
+//! journal holds of the session, outside their redaction spans, signatures included
+//! ([`ExecReplay::exact`]; [`ExactReport`] says how). A consumer's own record
+//! (decision 0101) is passed over. Records the sink dropped leave a `Degraded` marker, counted as
+//! a gap: a replay across one is not exact, and a call whose context it dropped (an `on_open` or
+//! `on_timer`, whose contexts go under Normal) is not made and is counted
+//! ([`ExecReplayCounters::lost_contexts`]).
 //!
 //! What the journal does not say, the replay cannot reproduce:
 //!
@@ -96,13 +100,14 @@
 use std::rc::Rc;
 
 use fbc_core::{
-    ConnKey, Effects, EncodeCtx, ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpTag, Namespace,
-    PathStamps, RawFrame, RpcId, Secrets, SpecTable, Stamp, StreamId, TimerTag, VenueCaps,
-    VenueCommand, VenueConfig, VenueFactory, VenueMeta,
+    ConnKey, Effects, EncodeCtx, ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpTag, MonoNs,
+    Namespace, PathStamps, RawFrame, RpcId, Secrets, SpecTable, Stamp, StreamId, TimerTag,
+    VenueCaps, VenueCommand, VenueConfig, VenueFactory, VenueMeta,
 };
 use fbc_journal::{ControlEvent, HttpResponseRec, JournalError, Marker, Opcode, Record};
 use tokio::sync::watch;
 
+use crate::exact::{Exact, ExactReport};
 use crate::exec_orders::Shared;
 use crate::exec_session::{
     Decoding, ExecControl, ExecHandler, ExecSessionError, Late, OrderConn, gate_flags, hand_on,
@@ -123,6 +128,14 @@ pub struct ExecReplayConfig {
     /// The session's connection number, its order connection's: endpoint `i` of the venue's
     /// plan is `conn + i`, and records of every other connection are skipped.
     pub conn: u16,
+    /// Whether the replay compares what the codec asks for with the outbound frames and HTTP
+    /// requests the journal holds (exact replay, decisions 0006 and 0142, FBC-qwq;
+    /// [`ExecReplay::exact`]). The comparison keeps each difference it finds, the journal's
+    /// record and the replay's, to the end, but for those a `Degraded` marker excludes, and what
+    /// the codec asked for until it is matched or settled, so a replay that only rebuilds the
+    /// session's events, a decoder replay supplying no commands for one, leaves it off and keeps
+    /// nothing of them.
+    pub compare_outbound: bool,
 }
 
 /// What a replay counted.
@@ -168,10 +181,10 @@ pub struct ExecReplayCounters {
 
 /// The call the context the journal holds next was given to.
 enum Call {
-    /// `on_open` of endpoint `endpoint`'s epoch.
-    Open { endpoint: usize },
-    /// `on_timer` of the timer tagged so.
-    Timer(TimerTag),
+    /// `on_open` of endpoint `endpoint`'s epoch `key`.
+    Open { endpoint: usize, key: ConnKey },
+    /// `on_timer` of the timer tagged `tag`, of epoch `key`.
+    Timer { key: ConnKey, tag: TimerTag },
 }
 
 /// Where a replay finds a consumer's command by its request id.
@@ -201,6 +214,9 @@ pub struct ExecReplay<H> {
     stop: watch::Receiver<()>,
     commands: Option<Commands>,
     counters: ExecReplayCounters,
+    /// The comparison of what the codec asks for with what the journal holds, when the caller
+    /// asked for it (FBC-qwq).
+    exact: Option<Exact>,
     handler: H,
 }
 
@@ -240,6 +256,7 @@ impl<H: ExecHandler> ExecReplay<H> {
             ns,
             specs,
             conn,
+            compare_outbound,
         } = config;
         let caps = venue.caps(&cfg).map_err(SessionError::Config)?;
         let exec = caps.exec.as_ref().ok_or(ExecSessionError::NoOrderEntry)?;
@@ -269,6 +286,7 @@ impl<H: ExecHandler> ExecReplay<H> {
             stop,
             commands: None,
             counters: ExecReplayCounters::default(),
+            exact: compare_outbound.then(Exact::default),
             handler,
         };
         Ok((replay, control))
@@ -286,8 +304,19 @@ impl<H: ExecHandler> ExecReplay<H> {
         self.counters
     }
 
+    /// What exact replay found so far (decisions 0006 and 0142, FBC-qwq): each outbound frame and
+    /// HTTP request the journal holds of the session compared with the ones the codec asked for,
+    /// outside their redaction spans, what the codec asked for and the journal holds none of
+    /// counted unwritten, and what a `Degraded` span may explain counted excluded. `None` unless
+    /// the configuration asked for the comparison ([`ExecReplayConfig::compare_outbound`]).
+    pub fn exact(&self) -> Option<ExactReport> {
+        self.exact.as_ref().map(Exact::report)
+    }
+
     /// Feeds every record of `records` in order ([`ExecReplay::feed`]): a whole journal, as
-    /// [`JournalReader`](fbc_journal::JournalReader) reads it.
+    /// [`JournalReader`](fbc_journal::JournalReader) reads it, stopping at the first record it
+    /// could not read. Exact replay's count of records is the sink's only when they are one
+    /// sink's from its first ([`ExactReport`]).
     pub fn run(
         &mut self,
         records: impl IntoIterator<Item = Result<Record, JournalError>>,
@@ -301,6 +330,9 @@ impl<H: ExecHandler> ExecReplay<H> {
     /// Feeds one record; records of other connections and outputs are skipped. A text frame
     /// whose bytes are not UTF-8, which no session journals, is refused.
     pub fn feed(&mut self, record: &Record) -> Result<(), ReplayError> {
+        if let Some(exact) = &mut self.exact {
+            exact.read(record);
+        }
         if let Some(arm) = self.arm.take() {
             self.written(arm, record);
         }
@@ -339,7 +371,8 @@ impl<H: ExecHandler> ExecReplay<H> {
                 if let Some(endpoint) = self.endpoint(stamp.conn) {
                     self.input();
                     if self.current(endpoint, stamp.conn) {
-                        self.next = Some(Call::Timer(*tag));
+                        let (key, tag) = (stamp.conn, *tag);
+                        self.next = Some(Call::Timer { key, tag });
                     } else {
                         self.counters.stale += 1;
                     }
@@ -354,6 +387,46 @@ impl<H: ExecHandler> ExecReplay<H> {
             // A ping, pong or close reached no codec live (0041).
             Record::InboundControl { stamp, .. } if self.endpoint(stamp.conn).is_some() => {
                 self.input();
+            }
+            // What the session wrote and asked for, compared with what the codec asked for.
+            Record::Outbound {
+                conn,
+                rpc,
+                opcode,
+                frame,
+                ..
+            } if self.endpoint(*conn).is_some() => {
+                if let Some(exact) = &mut self.exact {
+                    let (at, conn, rpc, opcode) = (MonoNs(0), *conn, *rpc, *opcode);
+                    let frame = frame.clone();
+                    let wire = Record::Outbound {
+                        at,
+                        conn,
+                        rpc,
+                        opcode,
+                        frame,
+                    };
+                    exact.journaled(conn, wire, record);
+                }
+            }
+            Record::HttpRequest {
+                conn,
+                tag,
+                rpc,
+                req,
+                ..
+            } if self.endpoint(*conn).is_some() => {
+                if let Some(exact) = &mut self.exact {
+                    let (at, conn, tag, rpc, req) = (MonoNs(0), *conn, *tag, *rpc, req.clone());
+                    let wire = Record::HttpRequest {
+                        at,
+                        conn,
+                        tag,
+                        rpc,
+                        req,
+                    };
+                    exact.journaled(conn, wire, record);
+                }
             }
             // Only order entry names a request (0057, 0081): another connection's is another
             // order-entry session's.
@@ -415,7 +488,10 @@ impl<H: ExecHandler> ExecReplay<H> {
                         self.end(endpoint, open);
                     }
                     self.open[endpoint] = Some(*key);
-                    self.next = Some(Call::Open { endpoint });
+                    self.next = Some(Call::Open {
+                        endpoint,
+                        key: *key,
+                    });
                     self.counters.epochs += 1;
                 }
             }
@@ -440,6 +516,9 @@ impl<H: ExecHandler> ExecReplay<H> {
                 self.orders.set_ready(None);
             }
         }
+        if let Some(exact) = &mut self.exact {
+            exact.ended(key);
+        }
         self.handler.on_epoch_end(key);
     }
 
@@ -448,11 +527,13 @@ impl<H: ExecHandler> ExecReplay<H> {
     fn context(&mut self, rpc: Option<RpcId>, ctx: &EncodeCtx) {
         let mut fx = Effects::new();
         match (rpc, self.next.take()) {
-            (None, Some(Call::Open { endpoint })) => {
+            (None, Some(Call::Open { endpoint, key })) => {
                 self.codec.on_open(self.streams[endpoint], ctx, &mut fx);
+                self.asked(&mut fx, key);
             }
-            (None, Some(Call::Timer(tag))) => {
+            (None, Some(Call::Timer { key, tag })) => {
                 self.codec.on_timer(tag, ctx, &mut fx);
+                self.asked(&mut fx, key);
                 self.counters.timers += 1;
             }
             (None, None) => self.resync(ctx),
@@ -469,7 +550,9 @@ impl<H: ExecHandler> ExecReplay<H> {
             self.counters.unplaced += 1;
             return;
         };
-        self.codec.resync(ctx, &mut Effects::new());
+        let mut fx = Effects::new();
+        self.codec.resync(ctx, &mut fx);
+        self.asked(&mut fx, key);
         self.orders.gate.borrow_mut().resync_asked(key.epoch);
         self.counters.resyncs += 1;
     }
@@ -497,6 +580,7 @@ impl<H: ExecHandler> ExecReplay<H> {
         let encoded = self
             .codec
             .encode(&cmd, rpc, &self.specs, ctx, &mut t, &mut fx);
+        self.asked(&mut fx, key);
         self.counters.encodes += 1;
         if arm {
             // Whether the session wrote an arm the codec encoded, the next record says.
@@ -521,13 +605,9 @@ impl<H: ExecHandler> ExecReplay<H> {
         };
         let stream = self.streams[endpoint];
         let mut sink = deliver!(self, stamp, true);
-        let fed = decoding.frame(
-            &mut *self.codec,
-            stream,
-            raw,
-            &mut sink,
-            &mut Effects::new(),
-        );
+        let mut fx = Effects::new();
+        let fed = decoding.frame(&mut *self.codec, stream, raw, &mut sink, &mut fx);
+        self.asked(&mut fx, stamp.conn);
         self.counters.frames += 1;
         self.decoded(stamp, fed.is_ok());
     }
@@ -559,8 +639,16 @@ impl<H: ExecHandler> ExecReplay<H> {
             }),
             Err(e) => decoding.http(codec, tag, Err(*e), &mut sink, &mut fx),
         };
+        self.asked(&mut fx, stamp.conn);
         self.counters.http += 1;
         self.decoded(stamp, fed.is_ok());
+    }
+
+    /// What a call on epoch `origin` asked for, `fx`, to compare with what the journal holds.
+    fn asked(&mut self, fx: &mut Effects, origin: ConnKey) {
+        if let Some(exact) = &mut self.exact {
+            exact.asked(fx, origin, &self.streams, &self.open);
+        }
     }
 
     /// Counts a frame or result the codec could not decode and tells the handler, as live.

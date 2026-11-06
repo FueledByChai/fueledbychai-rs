@@ -74,3 +74,10 @@ REST base, and no credentials). Nor do
 they run the order-entry session against the stub server, which answers as the setup's
 order-entry stub states (`crates/fbc-conformance/tests/toy_setup/mod.rs`, decisions 0083 and
 0085).
+
+One subdirectory here belongs to no suite check: `exact_replay/` holds exact replay's golden
+(FBC-qwq, decisions 0006 and 0142). It is a conformance-toy order-entry session's journal, which
+`crates/fbc-runtime/tests/exact_replay.rs` replays to every outbound byte it holds outside its
+redaction spans. It is rewritten only under `FBC_REFRESH_GOLDENS=1`, which
+`scripts/check.sh --refresh-goldens` sets for that one test and the check otherwise unsets. Its
+own README says what it holds and how it was made.

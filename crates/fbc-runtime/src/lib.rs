@@ -89,7 +89,11 @@
 //! the recorded stamps and the contexts and nonces the journal holds, so a recorded session
 //! rebuilds the same execution events (FBC-tgt); the caller supplies what the session ran with
 //! and the commands the consumer submitted, and hands the replayed handler the replay's control
-//! where the session's went. A journal it replays holds one order-entry session's records.
+//! where the session's went. A journal it replays holds one order-entry session's records. Its
+//! exact replay ([`ExecReplay::exact`], FBC-qwq, decisions 0006 and 0142), when its
+//! configuration asks for it, compares every frame and HTTP request the codec asks for with
+//! those the journal holds, outside their redaction spans, signatures included, and excludes
+//! what a `Degraded` span may explain ([`ExactReport`]).
 //!
 //! [`ShardHost`] is the shard host (FBC-ct0, decisions 0002, 0100): one loop over a shard's
 //! sessions, run as its [`Member`]s on one task, that drains every input they have ready, journals
@@ -123,6 +127,7 @@ mod bounds;
 mod connector;
 mod epoch;
 mod error;
+mod exact;
 mod exec_gate;
 mod exec_orders;
 mod exec_replay;
@@ -174,6 +179,7 @@ pub use bounds::{BoundError, InFlight, ReservedBound};
 pub use connector::{Connector, ProxyConfig};
 pub use epoch::{Admit, EpochError, Epochs, Input};
 pub use error::{Cause, NetError, Step};
+pub use exact::{ExactReport, OutboundDiff};
 pub use exec_orders::{ExecOrders, RpcIds, SubmitRefusal};
 pub use exec_replay::{ExecReplay, ExecReplayConfig, ExecReplayCounters};
 pub use exec_session::{

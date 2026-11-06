@@ -6,11 +6,26 @@
 #
 #   scripts/check.sh            everything
 #   scripts/check.sh --fast     skip the coverage ratchet (the check to run while iterating)
+#   scripts/check.sh --refresh-goldens
+#                               first rewrite the exact-replay golden from a session recorded
+#                               afresh (scripts/golden-refresh.sh refresh), then check as usual
+#                               (FBC-qwq); it combines with --fast
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 FAST=0
-for arg in "$@"; do case "$arg" in --fast) FAST=1 ;; *) echo "unknown flag: $arg" >&2; exit 2 ;; esac; done
+REFRESH=0
+for arg in "$@"; do
+  case "$arg" in
+    --fast) FAST=1 ;;
+    --refresh-goldens) REFRESH=1 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+# A golden test rewrites its golden only under this variable, which --refresh-goldens has
+# scripts/golden-refresh.sh set for its refresh alone: never one the shell running the check
+# exported.
+unset FBC_REFRESH_GOLDENS
 step() { printf '\n== %s\n' "$1"; }
 started=$(date +%s)
 . loop/templates/check/common.sh
@@ -33,6 +48,19 @@ if [ -f Cargo.toml ]; then
   cargo fmt --all --check
   step "lint"
   cargo clippy --workspace --all-targets --quiet -- -D warnings
+  # Exact replay's golden (decisions 0006 and 0142, FBC-qwq): a conformance-toy order-entry
+  # session's journal, which crates/fbc-runtime/tests/exact_replay.rs replays to every outbound
+  # byte it holds outside redaction spans, signatures included. --refresh-goldens rewrites every
+  # file of it from the session that test records afresh; nothing else may change it, which the
+  # "golden unchanged" step checks at the end of every run. The self-test proves the refresh fails
+  # unless it rewrote every file, and the checksum sees any change, on a golden of its own.
+  step "golden refresh self-test"
+  scripts/golden-refresh.sh --self-test
+  if [ "$REFRESH" = 1 ]; then
+    step "golden refresh"
+    scripts/golden-refresh.sh refresh
+  fi
+  golden_before="$(scripts/golden-refresh.sh sum)"
   step "tests"
   cargo test --workspace --quiet
   step "build"
@@ -63,9 +91,6 @@ if [ -f Cargo.toml ]; then
   step "dependency direction"
   scripts/check-deps.sh --self-test
   scripts/check-deps.sh
-  # TODO: exact-replay and signing goldens run as cargo tests; a refresh flag is needed only if
-  # a golden must be regenerated. Waits on: the exec path (BT-402), since exact-replay goldens
-  # compare outbound bytes; fbc-journal exists (0006), but nothing yet replays exec traffic.
 else
   step "stack"; echo "skipped: no Cargo.toml yet"
 fi
@@ -75,6 +100,11 @@ if [ "$FAST" = 0 ]; then
   # There is nothing to measure before the workspace exists; the ticket that creates it records
   # the first floor with `scripts/coverage-ratchet.sh --set`.
   if [ -f Cargo.toml ]; then ratchet; else step "coverage ratchet"; echo "skipped: no Cargo.toml yet"; fi
+fi
+
+if [ -n "${golden_before:-}" ]; then
+  step "golden unchanged"
+  scripts/golden-refresh.sh unchanged "$golden_before"
 fi
 
 printf '\nALL CHECKS PASSED (%ss)\n' "$(( $(date +%s) - started ))"

@@ -16,6 +16,13 @@
 //! journal lost or no epoch can take, a command not supplied, an arm the codec refused or the
 //! session did not write, a deadline fired while the session waited to reconnect, epochs whose
 //! opening or closing the journal lost, gaps, a second planned endpoint, and a control dropped.
+//!
+//! Exact replay's comparison (FBC-qwq, decisions 0006 and 0142; its done line is
+//! `tests/exact_replay.rs`) is held here to hand-built records too: frames and requests matched
+//! outside their spans, where the spans lie compared, a request matched wherever it lies, ones
+//! that differ and what each is paired with, ones the replay asked for that the journal never
+//! holds, a frame for a stream with no connection open, a frame routed to another endpoint's
+//! stream and written late, and what a `Degraded` span covers.
 
 mod armed_oms;
 mod common;
@@ -39,11 +46,12 @@ use exec_toy::{
 };
 use fbc_core::{
     AccountSummary, AckLevel, AssetKey, CancelOnDisconnect, ConfigError, ConnKey, ConnState,
-    EncodeCtx, EndpointPlan, Envelope, ExecCodec, ExecEndpoint, ExecEvent, FieldSpec, HttpFailure,
-    HttpMethod, HttpPlan, HttpTag, InstrumentSpecDraft, MdCodec, MonoNs, NonceBlock, NonceSource,
-    OrderRef, QueryOrder, RawFrame, RpcId, Secrets, SpecTable, Stamp, StreamId, SubmitOutcome,
-    Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps, VenueCommand, VenueConfig,
-    VenueError, VenueFactory, VenueOrderSnapshot, WallNs, WireSlice, WireUrl, encode_cid,
+    Effect, EncodeCtx, EndpointPlan, Envelope, ExecCodec, ExecEndpoint, ExecEvent, FieldSpec,
+    Header, HttpFailure, HttpMethod, HttpPlan, HttpTag, InstrumentSpecDraft, MdCodec, MonoNs,
+    NonceBlock, NonceSource, OrderRef, QueryOrder, RawFrame, RpcId, Secrets, SpecTable, Stamp,
+    StreamId, SubmitOutcome, Subscription, SymbolError, TimerTag, TrafficClass, VenueCaps,
+    VenueCommand, VenueConfig, VenueError, VenueFactory, VenueOrderSnapshot, WallNs, WireSlice,
+    WireUrl, encode_cid,
 };
 use fbc_journal::{
     ControlEvent, HttpRequestRec, HttpResponseRec, JournalError, JournalReader, JournalSink,
@@ -52,9 +60,10 @@ use fbc_journal::{
 };
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
-    Connector, ExecControl, ExecHandler, ExecReplay, ExecReplayConfig, ExecReplayCounters,
-    ExecSession, ExecSessionConfig, ExecSessionError, IngestClock, Journal, ProxyConfig,
-    RateLimiter, ReconnectPacing, ReplayError, RpcIds, SafetyReserve, SessionError, WriteStall,
+    Connector, ExactReport, ExecControl, ExecHandler, ExecReplay, ExecReplayConfig,
+    ExecReplayCounters, ExecSession, ExecSessionConfig, ExecSessionError, IngestClock, Journal,
+    OutboundDiff, ProxyConfig, RateLimiter, ReconnectPacing, ReplayError, RpcIds, SafetyReserve,
+    SessionError, WriteStall,
 };
 use tokio::time::advance;
 
@@ -372,6 +381,8 @@ fn replay_config(cfg: VenueConfig) -> ExecReplayConfig {
         ns: OWN_NS,
         specs: exec_toy::specs(),
         conn: CONN,
+        // Decoder replay; exact replay's comparison is asked for where it is tested.
+        compare_outbound: false,
     }
 }
 
@@ -399,6 +410,8 @@ fn replay(
         .run(JournalReader::open(root, SHARD).unwrap())
         .unwrap();
     let counters = replay.counters();
+    // Not asked for, exact replay's comparison found nothing, and kept nothing.
+    assert_eq!(replay.exact(), None);
     drop(replay);
     (log.heard(), counters)
 }
@@ -608,6 +621,8 @@ fn stopping_replay(root: &Path, at: fn(&ExecEvent) -> bool) -> (Vec<Heard>, Exec
         .run(JournalReader::open(root, SHARD).unwrap())
         .unwrap();
     let counters = replay.counters();
+    // Not asked for, exact replay's comparison found nothing, and kept nothing.
+    assert_eq!(replay.exact(), None);
     drop(replay);
     (log.heard(), counters)
 }
@@ -795,6 +810,8 @@ enum Odd {
     TwoEndpoints,
     /// Its codec refuses to encode the cancel-on-disconnect arm.
     RefusesArm,
+    /// Its codec puts [`HEADERS`] on every HTTP request its resync asks for.
+    Headed,
 }
 
 struct OddVenue(Odd);
@@ -877,9 +894,10 @@ impl VenueFactory for OddVenue {
         match self.0 {
             Odd::NoCodec => None,
             Odd::BadCodec => Some(Err(VenueError::NoDiscovery)),
-            Odd::RefusesArm => {
+            Odd::RefusesArm | Odd::Headed => {
                 let toy = TOY.exec_codec(cfg, creds)?;
-                Some(toy.map(|toy| Box::new(NoArm(toy)) as Box<dyn ExecCodec>))
+                let odd = self.0;
+                Some(toy.map(|toy| Box::new(Tweaked { odd, toy }) as Box<dyn ExecCodec>))
             }
             _ => TOY.exec_codec(cfg, creds),
         }
@@ -894,16 +912,28 @@ impl VenueFactory for OddVenue {
     }
 }
 
-/// The toy's codec, refusing to encode the cancel-on-disconnect arm.
-struct NoArm(Box<dyn ExecCodec>);
+/// The headers [`Odd::Headed`]'s codec puts on each HTTP request its resync asks for: a
+/// credential by its name (`SECRET_HEADERS`), one it marks itself, and a plain one, each as its
+/// name, value and mark.
+const HEADERS: [(&str, &str, bool); 3] = [
+    ("Authorization", "Bearer replayed-token", false),
+    ("X-Toy-Key", "replayed-key", true),
+    ("X-Toy-Trace", "trace-1", false),
+];
 
-impl ExecCodec for NoArm {
+/// The toy's codec as [`Odd::RefusesArm`] or [`Odd::Headed`] has it.
+struct Tweaked {
+    odd: Odd,
+    toy: Box<dyn ExecCodec>,
+}
+
+impl ExecCodec for Tweaked {
     fn nonces_for(&self, call: fbc_core::CtxCall) -> u16 {
-        self.0.nonces_for(call)
+        self.toy.nonces_for(call)
     }
 
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut fbc_core::Effects) {
-        self.0.on_open(stream, ctx, fx);
+        self.toy.on_open(stream, ctx, fx);
     }
 
     fn encode(
@@ -915,10 +945,11 @@ impl ExecCodec for NoArm {
         t: &mut fbc_core::PathStamps<'_>,
         fx: &mut fbc_core::Effects,
     ) -> Result<fbc_core::EncodeReceipt, fbc_core::NotSentReason> {
-        if matches!(cmd, VenueCommand::ArmCancelOnDisconnect(_)) {
+        let arm = matches!(cmd, VenueCommand::ArmCancelOnDisconnect(_));
+        if arm && matches!(self.odd, Odd::RefusesArm) {
             return Err(fbc_core::NotSentReason::Unsupported);
         }
-        self.0.encode(cmd, rpc, specs, ctx, t, fx)
+        self.toy.encode(cmd, rpc, specs, ctx, t, fx)
     }
 
     fn on_frame(
@@ -930,7 +961,7 @@ impl ExecCodec for NoArm {
         sink: &mut dyn fbc_core::ExecSink,
         fx: &mut fbc_core::Effects,
     ) -> Result<(), fbc_core::DecodeError> {
-        self.0.on_frame(stream, f, scope, specs, sink, fx)
+        self.toy.on_frame(stream, f, scope, specs, sink, fx)
     }
 
     fn on_http(
@@ -942,23 +973,36 @@ impl ExecCodec for NoArm {
         sink: &mut dyn fbc_core::ExecSink,
         fx: &mut fbc_core::Effects,
     ) -> Result<(), fbc_core::DecodeError> {
-        self.0.on_http(tag, resp, scope, specs, sink, fx)
+        self.toy.on_http(tag, resp, scope, specs, sink, fx)
     }
 
     fn on_timer(&mut self, tag: TimerTag, ctx: &EncodeCtx, fx: &mut fbc_core::Effects) {
-        self.0.on_timer(tag, ctx, fx);
+        self.toy.on_timer(tag, ctx, fx);
     }
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn fbc_core::ExecSink) {
-        self.0.on_rpc_timeout(rpc, sink);
+        self.toy.on_rpc_timeout(rpc, sink);
     }
 
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut fbc_core::Effects) {
-        self.0.resync(ctx, fx);
+        self.toy.resync(ctx, fx);
+        if matches!(self.odd, Odd::Headed) {
+            for mut effect in fx.take() {
+                if let Effect::Http { req, .. } = &mut effect {
+                    req.headers
+                        .extend(HEADERS.map(|(name, value, redact)| Header {
+                            name,
+                            value: value.to_owned(),
+                            redact,
+                        }));
+                }
+                fx.push(effect);
+            }
+        }
     }
 
     fn redact_inbound(&self, input: fbc_core::Inbound<'_>) -> fbc_core::InboundSpans {
-        self.0.redact_inbound(input)
+        self.toy.redact_inbound(input)
     }
 }
 
@@ -1482,4 +1526,635 @@ fn once_the_replays_control_drops_its_handler_is_handed_no_event() {
         (counters.http, counters.frames, counters.deadlines),
         (1, 3, 1)
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Exact replay's comparison (FBC-qwq), on hand-built records.
+// ---------------------------------------------------------------------------------------------
+
+/// A frame the session wrote on epoch `key`, naming request `rpc`, as the journal holds it.
+fn wrote(key: ConnKey, rpc: Option<u64>, text: &str) -> Record {
+    wrote_at(MonoNs(4), key, rpc, text)
+}
+
+/// [`wrote`], at instant `at`: at zero, as a replay reports what its codec asked for.
+fn wrote_at(at: MonoNs, key: ConnKey, rpc: Option<u64>, text: &str) -> Record {
+    Record::Outbound {
+        at,
+        conn: key,
+        rpc: rpc.map(RpcId),
+        opcode: Opcode::Text,
+        frame: WireSlice::plain(text.as_bytes().to_vec()),
+    }
+}
+
+/// The toy's authentication at wall time `wall` as the session wrote it on epoch `key`, its
+/// token's span holding `token`, of the toy's token's length.
+fn authenticated_with(key: ConnKey, wall: i64, token: &str) -> Record {
+    let head = format!("auth|ts={wall}|token=");
+    let span = head.len() as u32..(head.len() + token.len()) as u32;
+    let frame = format!("{head}{token}").into_bytes();
+    Record::Outbound {
+        at: MonoNs(3),
+        conn: key,
+        rpc: None,
+        opcode: Opcode::Text,
+        frame: WireSlice::redacted(frame, vec![span]).unwrap(),
+    }
+}
+
+/// An HTTP request a codec of epoch `key` asked for under `tag`, as the journal holds it.
+fn asked_for(key: ConnKey, tag: u64, url: &str) -> Record {
+    asked_at(MonoNs(7), key, tag, url)
+}
+
+/// [`asked_for`], at instant `at`.
+fn asked_at(at: MonoNs, key: ConnKey, tag: u64, url: &str) -> Record {
+    Record::HttpRequest {
+        at,
+        conn: key,
+        tag: HttpTag(tag),
+        rpc: None,
+        req: HttpRequestRec {
+            method: HttpMethod::Get,
+            url: WireUrl::plain(url),
+            headers: Vec::new(),
+            body: WireSlice::plain(Vec::new()),
+        },
+    }
+}
+
+/// The toy's order query `rpc` as it writes it.
+fn queried(rpc: u64, vid: &str) -> String {
+    format!("query|rpc={rpc}|vid={vid}|sym=TOYA-PERP")
+}
+
+/// The toy's first epoch opened, authenticated with its token's span holding other bytes than
+/// the toy's, and armed (request 1), each frame written as the codec asks for it.
+fn opened_and_armed() -> Vec<Record> {
+    vec![
+        opened(key(0)),
+        ctx(None, 10, &[]),
+        authenticated_with(key(0), 10, "XXXXXXXXXXXXXXXXX"),
+        frame(1, key(0), AUTH_ACK),
+        ctx(Some(1), 11, &[100]),
+        arm_written(key(0), 1),
+    ]
+}
+
+/// [`toy_replay`], exact replay's comparison asked for.
+fn comparing_replay(log: &Log) -> (ExecReplay<Log>, ExecControl) {
+    let config = ExecReplayConfig {
+        compare_outbound: true,
+        ..replay_config(toy_cfg("ws://127.0.0.1:1/replayed", "http://127.0.0.1:1"))
+    };
+    ExecReplay::new(config, log.clone()).unwrap()
+}
+
+/// A [`comparing_replay`] of the toy into `log` that supplies an order query of `V-1` for every
+/// request, and its control.
+fn querying_replay(log: &Log) -> (ExecReplay<Log>, ExecControl) {
+    let (mut replay, control) = comparing_replay(log);
+    replay.set_commands(|_| Some(VenueCommand::Query(query())));
+    (replay, control)
+}
+
+/// Every frame and request the journal holds that the codec asked for is matched, byte for byte
+/// outside its spans: the authentication whose token's span holds other bytes than the codec
+/// wrote there, the arm and the resync's request.
+#[test]
+fn exact_replay_matches_every_byte_outside_the_spans() {
+    let log = Log::default();
+    let (mut replay, _control) = comparing_replay(&log);
+    let mut records = opened_and_armed();
+    records.extend([
+        ctx(None, 12, &[]),
+        asked_for(key(0), 1, "http://127.0.0.1:1/resync?ts=12"),
+    ]);
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    assert_eq!(
+        report,
+        ExactReport {
+            matched: 3,
+            ..ExactReport::default()
+        }
+    );
+}
+
+/// A span's place and length are compared, though not what it holds: the journal's
+/// authentication with its token's span cut in two, every byte the same once blanked, is a
+/// difference, paired with the authentication the codec asked for, whose one span covers it.
+#[test]
+fn exact_replay_compares_where_each_span_lies() {
+    let log = Log::default();
+    let (mut replay, _control) = comparing_replay(&log);
+    let mut records = opened_and_armed();
+    let Record::Outbound { frame, .. } = &mut records[2] else {
+        panic!("not the authentication: {:?}", records[2]);
+    };
+    let span = frame.redactions()[0].clone();
+    let cut = span.start + 1;
+    let spans = vec![span.start..cut, cut..span.end];
+    *frame = WireSlice::redacted(frame.bytes().to_vec(), spans).unwrap();
+    let split = records[2].blanked();
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    // The arm is matched; the authentication differs by where its spans lie alone.
+    assert_eq!((matched, unwritten, excluded), (1, 0, 0), "{report:?}");
+    let [diff] = &report.differences[..] else {
+        panic!("not one difference: {report:?}");
+    };
+    assert_eq!(diff.journaled, split);
+    let (
+        Record::Outbound {
+            frame: journaled, ..
+        },
+        Some(Record::Outbound {
+            frame: replayed, ..
+        }),
+    ) = (&diff.journaled, &diff.replayed)
+    else {
+        panic!("not two frames: {diff:?}");
+    };
+    assert_eq!(journaled.bytes(), replayed.bytes());
+    assert_eq!(replayed.redactions(), [span]);
+}
+
+/// What the replay did not reproduce is reported: a frame or a request the journal holds that
+/// differs from the one asked for in its place (the first frame still unmatched on its epoch,
+/// the first request under its tag), one in whose place nothing alike was asked for, and what
+/// was asked for that the journal never holds: a frame passed over by a later frame of its
+/// epoch, and one still unmatched when its epoch ends.
+#[test]
+fn exact_replay_reports_what_it_did_not_reproduce() {
+    let log = Log::default();
+    let (mut replay, _control) = querying_replay(&log);
+    let mut records = opened_and_armed();
+    records.extend([
+        // The resync's request (tag 1), and two queries, of which only the second is written.
+        ctx(None, 12, &[]),
+        ctx(Some(2), 13, &[101]),
+        ctx(Some(3), 14, &[102]),
+        wrote(key(0), Some(3), &queried(3, "V-1")),
+        // A query written otherwise than the codec asked for it, and a request likewise.
+        ctx(Some(4), 15, &[103]),
+        wrote(key(0), Some(4), &queried(4, "V-9")),
+        asked_for(key(0), 1, "http://127.0.0.1:1/other?ts=12"),
+        // A request in whose place only a frame was asked for, which the epoch's end leaves
+        // unwritten.
+        ctx(Some(5), 16, &[104]),
+        asked_for(key(0), 9, "http://127.0.0.1:1/never"),
+        closed(key(0)),
+    ]);
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    assert_eq!((matched, unwritten, excluded), (3, 2, 0));
+    let zero = MonoNs(0);
+    assert_eq!(
+        report.differences,
+        [
+            OutboundDiff {
+                journaled: wrote(key(0), Some(4), &queried(4, "V-9")),
+                replayed: Some(wrote_at(zero, key(0), Some(4), &queried(4, "V-1"))),
+            },
+            OutboundDiff {
+                journaled: asked_for(key(0), 1, "http://127.0.0.1:1/other?ts=12"),
+                replayed: Some(asked_at(zero, key(0), 1, "http://127.0.0.1:1/resync?ts=12")),
+            },
+            OutboundDiff {
+                journaled: asked_for(key(0), 9, "http://127.0.0.1:1/never"),
+                replayed: None,
+            },
+        ]
+    );
+}
+
+/// A request is matched wherever it lies on its epoch: the resync's request, asked for after two
+/// queries and journaled between their frames, as a request that starts while a write waits is,
+/// is matched with both frames, and nothing is unwritten.
+#[test]
+fn exact_replay_matches_a_request_journaled_ahead_of_a_frame_asked_before_it() {
+    let log = Log::default();
+    let (mut replay, _control) = querying_replay(&log);
+    let mut records = opened_and_armed();
+    records.extend([
+        ctx(Some(2), 12, &[101]),
+        ctx(Some(3), 13, &[102]),
+        ctx(None, 14, &[]),
+        wrote(key(0), Some(2), &queried(2, "V-1")),
+        asked_for(key(0), 1, "http://127.0.0.1:1/resync?ts=14"),
+        wrote(key(0), Some(3), &queried(3, "V-1")),
+    ]);
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    // The authentication, the arm, the two queries and the resync's request.
+    assert_eq!(
+        report,
+        ExactReport {
+            matched: 5,
+            ..ExactReport::default()
+        }
+    );
+    assert!(report.is_exact());
+}
+
+/// A difference names what was asked for in its place without taking it. A frame journaled
+/// ahead of the queries' frames, that nothing was asked for, is one difference, and the frames
+/// after it are still matched. A query written otherwise than asked is one difference, and the
+/// frame asked for in its place, passed over by the next query's, is not counted unwritten.
+#[test]
+fn a_difference_leaves_what_it_was_paired_with_to_match() {
+    let log = Log::default();
+    let (mut replay, _control) = querying_replay(&log);
+    let mut records = opened_and_armed();
+    records.extend([
+        ctx(Some(2), 12, &[101]),
+        ctx(Some(3), 13, &[102]),
+        wrote(key(0), None, "extra"),
+        wrote(key(0), Some(2), &queried(2, "V-1")),
+        wrote(key(0), Some(3), &queried(3, "V-1")),
+        ctx(Some(4), 14, &[103]),
+        ctx(Some(5), 15, &[104]),
+        wrote(key(0), Some(4), &queried(4, "V-9")),
+        wrote(key(0), Some(5), &queried(5, "V-1")),
+        closed(key(0)),
+    ]);
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    // The authentication, the arm and queries 2, 3 and 5.
+    assert_eq!((matched, unwritten, excluded), (5, 0, 0), "{report:?}");
+    let zero = MonoNs(0);
+    assert_eq!(
+        report.differences,
+        [
+            OutboundDiff {
+                journaled: wrote(key(0), None, "extra"),
+                replayed: Some(wrote_at(zero, key(0), Some(2), &queried(2, "V-1"))),
+            },
+            OutboundDiff {
+                journaled: wrote(key(0), Some(4), &queried(4, "V-9")),
+                replayed: Some(wrote_at(zero, key(0), Some(4), &queried(4, "V-1"))),
+            },
+        ]
+    );
+}
+
+/// A frame the codec asks for on a stream whose connection is not open is unwritten: here the
+/// second endpoint's ping, its timer fired on the order connection after that endpoint closed.
+/// The second endpoint's authentication, written on its own epoch, is matched there.
+#[test]
+fn a_frame_for_a_stream_with_no_connection_open_is_unwritten() {
+    let leg = ConnKey {
+        conn: CONN + 1,
+        epoch: 0,
+    };
+    let log = Log::default();
+    let config = ExecReplayConfig {
+        venue: OddVenue::leak(Odd::TwoEndpoints),
+        compare_outbound: true,
+        ..replay_config(toy_cfg("ws://127.0.0.1:1/replayed", "http://127.0.0.1:1"))
+    };
+    let (mut replay, _control) = ExecReplay::new(config, log.clone()).unwrap();
+    let records = vec![
+        opened(key(0)),
+        ctx(None, 10, &[]),
+        opened(leg),
+        ctx(None, 11, &[]),
+        authenticated_with(leg, 11, "toy-session-token"),
+        closed(leg),
+        timer(2, key(0), exec_toy::ping_tag(StreamId(2)).0),
+        ctx(None, 12, &[]),
+    ];
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    // The order connection's authentication, never written, and the ping.
+    let report = replay.exact().unwrap();
+    assert_eq!((report.matched, report.unwritten), (1, 2), "{report:?}");
+    assert!(report.differences.is_empty());
+    // Nothing differs, yet the replay is not exact: it asked for what was never written.
+    assert!(!report.is_exact());
+}
+
+/// A frame one endpoint's call asks for on another endpoint's stream, which the session writes
+/// once that call's own effects have run, can follow on that stream a frame the stream's own call
+/// asked for later (0115 item 4): the order connection's timer asks for the second endpoint's
+/// ping, then that endpoint's own timer asks for another, which the journal holds first. The
+/// replay finds the first ping unwritten where the second is matched, and its record a
+/// difference (FBC-mtnt places it where the session wrote it).
+#[test]
+fn a_routed_frame_written_after_its_streams_later_frame_reads_as_a_difference() {
+    let leg = ConnKey {
+        conn: CONN + 1,
+        epoch: 0,
+    };
+    let log = Log::default();
+    let config = ExecReplayConfig {
+        venue: OddVenue::leak(Odd::TwoEndpoints),
+        compare_outbound: true,
+        ..replay_config(toy_cfg("ws://127.0.0.1:1/replayed", "http://127.0.0.1:1"))
+    };
+    let (mut replay, _control) = ExecReplay::new(config, log.clone()).unwrap();
+    let ping = exec_toy::ping_tag(StreamId(2)).0;
+    let records = vec![
+        opened(key(0)),
+        ctx(None, 10, &[]),
+        authenticated_with(key(0), 10, "toy-session-token"),
+        opened(leg),
+        ctx(None, 11, &[]),
+        authenticated_with(leg, 11, "toy-session-token"),
+        timer(2, key(0), ping),
+        ctx(None, 12, &[]),
+        timer(3, leg, ping),
+        ctx(None, 13, &[]),
+        wrote(leg, None, "ping|ts=13"),
+        wrote(leg, None, "ping|ts=12"),
+    ];
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    // Both authentications and the later ping; the routed ping, passed over by it.
+    assert_eq!((matched, unwritten, excluded), (3, 1, 0), "{report:?}");
+    assert_eq!(
+        report.differences,
+        [OutboundDiff {
+            journaled: wrote(leg, None, "ping|ts=12"),
+            replayed: None,
+        }]
+    );
+}
+
+/// A `Degraded` span excludes what it may explain, counted: a difference journaled in it, kept
+/// from the reserve while the gap was open (numbered at or past the first record dropped), and
+/// what was asked for before its marker and is then found unwritten or still unmatched. A
+/// difference before the span and what is asked for after its marker are reported as ever.
+#[test]
+fn exact_replay_excludes_what_a_degraded_span_covers() {
+    let log = Log::default();
+    let (mut replay, _control) = querying_replay(&log);
+    // Numbered as the sink numbered them: the marker takes no number and moves the count past
+    // the three it dropped.
+    let mut records = opened_and_armed(); // 0 to 5
+    records.extend([
+        wrote(key(0), None, "bogus"),      // 6: a difference before the span
+        ctx(None, 12, &[]),                // 7: the resync's request, never journaled
+        wrote(key(0), None, "in the gap"), // 8: a difference in the span
+        ctx(Some(2), 13, &[101]),          // 9: asked for before the marker, never written
+        Record::Marker(Marker::Degraded {
+            from_seq: 8,
+            dropped: 3,
+        }),
+        ctx(Some(3), 14, &[102]),                   // 13
+        wrote(key(0), Some(3), &queried(3, "V-1")), // 14: passes over request 2's frame
+        wrote(key(0), None, "after the gap"),       // 15: a difference after the span
+        ctx(Some(5), 16, &[104]),                   // 16: passed over by 18, unwritten
+        ctx(Some(6), 17, &[105]),                   // 17
+        wrote(key(0), Some(6), &queried(6, "V-1")), // 18
+        ctx(None, 18, &[]),                         // 19: a request still unmatched
+    ]);
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    // Matched: the authentication, the arm, requests 3 and 6. Excluded: the difference in the
+    // span, request 2's frame and the first resync's request. Unwritten: request 5's frame and
+    // the second resync's request.
+    assert_eq!((matched, unwritten, excluded), (4, 2, 3), "{report:?}");
+    let journaled: Vec<&Record> = report.differences.iter().map(|d| &d.journaled).collect();
+    let bogus = wrote(key(0), None, "bogus");
+    let after = wrote(key(0), None, "after the gap");
+    assert_eq!(journaled, [&bogus, &after]);
+    assert!(report.differences.iter().all(|d| d.replayed.is_none()));
+    assert_eq!(replay.counters().gaps, 1);
+}
+
+/// Records numbered across two `Degraded` markers: each marker moves the count past the records
+/// it says were dropped, so the second marker's span covers exactly what the sink kept from its
+/// reserve at or past its first dropped record. Below it, a difference and a frame found unwritten
+/// at its epoch's end are reported; in it, a difference and a request found unwritten at a
+/// `Closed` the sink kept are excluded.
+#[test]
+fn exact_replay_numbers_records_past_every_degraded_span() {
+    let log = Log::default();
+    let (mut replay, _control) = querying_replay(&log);
+    let mut records = opened_and_armed(); // 0 to 5
+    records.extend([
+        // 6 to 9 dropped.
+        Record::Marker(Marker::Degraded {
+            from_seq: 6,
+            dropped: 4,
+        }),
+        ctx(Some(2), 12, &[101]), // 10: request 2's query, never written
+        closed(key(0)),           // 11: request 2's frame found unwritten here
+        opened(key(1)),           // 12
+        ctx(None, 13, &[]),       // 13: the second epoch's authentication
+        ctx(None, 14, &[]),       // 14: its resync's request, never journaled
+        wrote(key(1), None, "below the gap"), // 15: a difference just below the second span
+        wrote(key(1), None, "kept in the gap"), // 16: kept from the reserve, in it
+        closed(key(1)),           // 17: kept too; the resync's request found unwritten here
+        // 16 on, two dropped besides the two kept.
+        Record::Marker(Marker::Degraded {
+            from_seq: 16,
+            dropped: 2,
+        }),
+    ]);
+    replay.run(records.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    // Matched: the first epoch's authentication and arm. Unwritten: request 2's frame. Excluded:
+    // the difference kept in the second gap and the resync's request.
+    assert_eq!((matched, unwritten, excluded), (2, 1, 2), "{report:?}");
+    let journaled: Vec<&Record> = report.differences.iter().map(|d| &d.journaled).collect();
+    assert_eq!(journaled, [&wrote(key(1), None, "below the gap")]);
+    // In its place the codec asked for the second epoch's authentication.
+    let replayed = report.differences[0].replayed.as_ref().unwrap();
+    assert!(matches!(replayed, Record::Outbound { conn, .. } if *conn == key(1)));
+    assert_eq!(replay.counters().gaps, 2);
+}
+
+/// Exact replay numbers records as the journal's own sink numbered them. Journaled through a
+/// journal queue whose writer has not started, the sink drops Normal records at its soft limit
+/// and keeps a Safety one from its reserve; once the writer drains the queue, the next record
+/// closes the gap behind the `Degraded` marker the sink writes. The difference the sink kept in
+/// the gap is excluded, and the ones before the gap and closing it are reported.
+#[test]
+fn exact_replay_places_a_gap_as_the_journals_sink_marked_it() {
+    let root = fresh_dir("exec_replay_exact_sink");
+    let config = SinkConfig {
+        budget_bytes: 4096,
+        soft_limit_pct: 50,
+    };
+    let (mut sink, drain) = journal_queue(config, redaction_key()).unwrap();
+    let writer = JournalWriter::create(&root, SHARD, redaction_key()).unwrap();
+    // What became of each record offered, in the order offered: its place is its number.
+    let mut offered: Vec<Recorded> = Vec::new();
+    fn offer(
+        (sink, offered): (&mut QueueSink, &mut Vec<Recorded>),
+        class: TrafficClass,
+        record: &Record,
+    ) -> Recorded {
+        let recorded = sink.record(class, WallNs(1_000), record);
+        offered.push(recorded);
+        recorded
+    }
+    let (safety, normal) = (TrafficClass::Safety, TrafficClass::Normal);
+    for record in opened_and_armed() {
+        assert_eq!(
+            offer((&mut sink, &mut offered), safety, &record),
+            Recorded::Ok
+        );
+    }
+    let before = wrote(key(0), None, "before the gap");
+    assert_eq!(
+        offer((&mut sink, &mut offered), safety, &before),
+        Recorded::Ok
+    );
+    // Normal records the replay passes over, up to the soft limit and one past it.
+    let filler = Record::Marker(Marker::Recovered);
+    while offer((&mut sink, &mut offered), normal, &filler) == Recorded::Ok {}
+    let from_seq = offered.len() as u64 - 1;
+    assert_eq!(sink.open_gap(), Some(from_seq));
+    let kept = wrote(key(0), None, "kept in the gap");
+    assert_eq!(
+        offer((&mut sink, &mut offered), safety, &kept),
+        Recorded::Ok
+    );
+    let refused = offer((&mut sink, &mut offered), normal, &filler);
+    assert_eq!(refused, Recorded::DroppedCounted);
+    assert_eq!(sink.open_gap(), Some(from_seq));
+    let writer = drain.spawn(writer).unwrap();
+    for _ in 0..10_000 {
+        if sink.queued_bytes() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(sink.queued_bytes(), 0);
+    let after = wrote(key(0), None, "after the gap");
+    assert_eq!(
+        offer((&mut sink, &mut offered), normal, &after),
+        Recorded::Ok
+    );
+    assert_eq!(sink.open_gap(), None);
+    drop(sink);
+    writer.close().unwrap();
+    let dropped = offered
+        .iter()
+        .filter(|r| **r == Recorded::DroppedCounted)
+        .count() as u64;
+    assert_eq!(dropped, 2);
+
+    // The journal holds the marker the sink wrote, after the record it kept and before the one
+    // that closed the gap.
+    let journal: Vec<Record> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let degraded = Record::Marker(Marker::Degraded { from_seq, dropped });
+    let at = |record: &Record| journal.iter().position(|r| r == record).unwrap();
+    assert_eq!(journal.len() as u64, offered.len() as u64 - dropped + 1);
+    assert_eq!(at(&degraded), at(&kept) + 1);
+    assert_eq!(at(&after), at(&degraded) + 1);
+
+    let log = Log::default();
+    let (mut replay, _control) = comparing_replay(&log);
+    replay.run(journal.into_iter().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let diff = |journaled| OutboundDiff {
+        journaled,
+        replayed: None,
+    };
+    assert_eq!(
+        report,
+        ExactReport {
+            matched: 2,
+            unwritten: 0,
+            excluded: 1,
+            differences: vec![diff(before), diff(after)],
+        }
+    );
+}
+
+/// The resync's request, as the journal holds it, of tag `tag` at wall time `wall`, with
+/// [`HEADERS`]'s values `values`.
+fn headed(tag: u64, wall: i64, values: [&str; 3]) -> Record {
+    let url = format!("http://127.0.0.1:1/resync?ts={wall}");
+    let mut record = asked_for(key(0), tag, &url);
+    if let Record::HttpRequest { req, .. } = &mut record {
+        req.headers = HEADERS
+            .iter()
+            .zip(values)
+            .map(|(&(name, _, redact), value)| {
+                let header = Header {
+                    name,
+                    value: value.to_owned(),
+                    redact,
+                };
+                fbc_journal::HeaderRec::from(&header)
+            })
+            .collect();
+    }
+    record
+}
+
+/// A request's secret headers are compared as the reader returns them, blank at their length.
+/// The journal, written and read back, never holds the credential by its name or the one the
+/// codec marked, and the replayed codec, given other credentials, puts other bytes there: at
+/// the same length they match. A plain header that differs is a difference, and so is a
+/// credential of another length.
+#[test]
+fn exact_replay_compares_a_requests_secret_headers_by_their_length() {
+    let root = fresh_dir("exec_replay_exact_headers");
+    let other = |value: &str| "z".repeat(value.len());
+    let (auth, mark, trace) = (HEADERS[0].1, HEADERS[1].1, HEADERS[2].1);
+    let mut records = opened_and_armed();
+    records.extend([
+        ctx(None, 12, &[]),
+        headed(1, 12, [&other(auth), &other(mark), trace]),
+        ctx(None, 13, &[]),
+        headed(2, 13, [&other(auth), &other(mark), "trace-2"]),
+        ctx(None, 14, &[]),
+        headed(3, 14, ["Bearer short", &other(mark), trace]),
+    ]);
+    let mut writer = JournalWriter::create(&root, SHARD, redaction_key()).unwrap();
+    for record in &records {
+        writer.append(WallNs(1_000), record).unwrap();
+    }
+    writer.flush().unwrap();
+    let journal: Vec<Record> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    // The reader blanks both credentials at their length, and keeps the plain header.
+    let Record::HttpRequest { req, .. } = &journal[7] else {
+        panic!("not the first resync's request: {:?}", journal[7]);
+    };
+    let values: Vec<&str> = req.headers.iter().map(|h| h.value.as_str()).collect();
+    let blank = |value: &str| "2".repeat(value.len());
+    assert_eq!(values, [blank(auth).as_str(), blank(mark).as_str(), trace]);
+
+    let log = Log::default();
+    let config = ExecReplayConfig {
+        venue: OddVenue::leak(Odd::Headed),
+        compare_outbound: true,
+        ..replay_config(toy_cfg("ws://127.0.0.1:1/replayed", "http://127.0.0.1:1"))
+    };
+    let (mut replay, _control) = ExecReplay::new(config, log.clone()).unwrap();
+    replay.run(journal.iter().cloned().map(Ok)).unwrap();
+    let report = replay.exact().unwrap();
+    let (matched, unwritten, excluded) = (report.matched, report.unwritten, report.excluded);
+    assert_eq!((matched, unwritten, excluded), (3, 0, 0), "{report:?}");
+    let journaled: Vec<&Record> = report.differences.iter().map(|d| &d.journaled).collect();
+    assert_eq!(journaled, [&journal[9], &journal[11]]);
+    let tag = |record: Option<&Record>| match record {
+        Some(Record::HttpRequest { tag, .. }) => Some(tag.0),
+        _ => None,
+    };
+    let replayed: Vec<Option<u64>> = report
+        .differences
+        .iter()
+        .map(|d| tag(d.replayed.as_ref()))
+        .collect();
+    assert_eq!(replayed, [Some(2), Some(3)]);
 }
