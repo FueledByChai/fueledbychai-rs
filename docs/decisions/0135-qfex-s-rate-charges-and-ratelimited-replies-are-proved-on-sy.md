@@ -39,14 +39,15 @@ The synthetic half is in pieces:
 - Three landed tickets hold the limiter side. FBC-bg3p declares QFEX's two private buckets,
   FBC-e5bd shares them across a user's accounts, and FBC-ywjb classifies a refusal and holds
   the shared bucket.
-- Three open tickets plan the codec's own tests: FBC-zeb0, FBC-blcw and FBC-jxau.
+- The codec's own tests are FBC-zeb0's and FBC-blcw's, both landed, and FBC-jxau's, still
+  open.
 - None of them runs the codec inside an `ExecSession`. FBC-ywjb's tests run its classifier,
   the limiter and the session core, and its done line says "End-to-end private codec wiring
   remains in FBC-lqa8". FBC-e5bd's and FBC-bg3p's run limiters alone. FBC-zeb0's and
   FBC-jxau's construct the codec and read its effects, and FBC-blcw's encode commands.
-- Only FBC-blcw's done line names a charge: each place's. None names the charge of a cancel,
-  a `get_order`, the cancel-on-disconnect arm, an authentication or subscription frame, or a
-  page.
+- Only FBC-blcw's tests charge commands: each place, `cancel_order` (the cancel bucket) and
+  `get_order`. None charges the cancel-on-disconnect arm, an authentication or subscription
+  frame, or a page.
 
 lqa8 lands no commit of its own (item 4), so its "end-to-end" clause and these charges need a
 carrier. Item 2 names one.
@@ -131,15 +132,14 @@ The owner's words leave two points open, and the items that settle them say so:
      - the safety reserve still applies, and another user's budget stays apart;
      - a `RateLimited` reply reaches every account's counters.
    - **FBC-ywjb** (landed):
-     - in `crates/venues/fbc-venue-qfex/src/rate.rs`, only an exact echoed operation selects
-       its bucket, with the retry hint kept; malformed envelopes and hints fail closed; and,
-       in `synthetic_primary_and_subaccount_faults_share_general_and_cancel_holds`, a general
-       or cancel fault seen by one account holds that bucket for every account of the user,
-       for its hint, and leaves the other bucket free;
-     - in the same file, `echoed_credentials_are_whole_frame_redacted_without_diagnostics`.
-       Under 0134 it proves only the frames 0134 item 2 still keeps whole: an echo of
-       authentication, a frame with a JSON escape, and a malformed frame. FBC-zeb0's tests
-       prove the kept-envelope form;
+     - in `crates/venues/fbc-venue-qfex/src/rate.rs`,
+       `each_mapped_type_has_its_bucket_and_nothing_else_does`,
+       `only_the_two_documented_forms_give_a_hint` and
+       `an_echo_is_found_literally_or_behind_ascii_escapes`: only an exact echoed operation
+       selects its bucket, a retry hint is read only in its two documented forms, and an echo
+       is found literally or behind ASCII escapes. Its cross-account hold and whole-frame
+       redaction tests in that file were replaced when FBC-zeb0 landed: FBC-zeb0's tests below
+       carry both;
      - in `crates/fbc-runtime/src/ratelimit.rs`,
        `qfex_provider_refusal_holds_the_shared_bucket_without_spending_cancel_reserve` and
        `unknown_provider_echo_holds_frames_even_without_a_matching_bucket`: a refusal holds
@@ -148,14 +148,24 @@ The owner's words leave two points open, and the items that settle them say so:
      - in `crates/fbc-runtime/src/session_core.rs`,
        `provider_rate_effect_updates_the_shared_budget_without_writing_or_answering`: the
        session executes `Effect::RateLimited` as a hold alone, writing and answering nothing.
-   - **FBC-zeb0**'s done line, `crates/venues/fbc-venue-qfex/tests/private_codec.rs`:
-     - a rate-limit frame in either documented envelope, and a `RATE_LIMITED` order status,
-       each give `Effect::RateLimited` with the documented retry hint and no settlement or
+   - **FBC-zeb0** (landed), `crates/venues/fbc-venue-qfex/tests/private_codec.rs`:
+     - `every_documented_rate_refusal_holds_the_budget_and_settles_or_reconnects_nothing`: a
+       rate-limit frame in either documented envelope, and a `RATE_LIMITED` order status, each
+       give `Effect::RateLimited` with the documented retry hint and no settlement or
        reconnect;
+     - `a_hold_reaches_the_budget_the_primary_and_its_subaccounts_share`: a hold one account
+       meets reaches every account of the provider user;
+     - `a_frame_kept_whole_answers_live_as_its_blanked_bytes_answer_in_replay` and
+       `an_auth_failure_a_missing_auth_reply_and_a_malformed_frame_each_end_their_own_epoch_only`:
+       the frames 0134 item 2 keeps whole (an echo of authentication, a frame with a JSON
+       escape, a malformed frame) answer live as their blanked bytes answer in replay;
      - its spans fall where 0134 items 3 and 4 place them, and replaying the redacted journal
        gives the same effects (0134's Consequences).
-   - **FBC-blcw**'s done line, `crates/venues/fbc-venue-qfex/tests/private_orders.rs`: each
-     supported place (GTC, ALO, IOC) is encoded with its charge.
+   - **FBC-blcw** (landed), `crates/venues/fbc-venue-qfex/tests/private_orders.rs`:
+     `each_supported_place_encodes_the_documented_add_order_frame_for_the_selected_account_with_its_charge`
+     (each supported place, GTC, ALO and IOC, with its charge),
+     `cancel_and_get_order_by_venue_uuid_encode_exactly` (`cancel_order` charged to the cancel
+     bucket, `get_order` as a query) and `the_charges_reach_the_provider_users_shared_buckets`.
    - **FBC-jxau**'s done line, `crates/venues/fbc-venue-qfex/tests/probe_resync.rs` and
      `crates/venues/fbc-venue-qfex/tests/probe_settle.rs`: an `err` echoing the arm gives
      `RateLimited` with no settlement, with its kept hint (0134 item 7).
@@ -279,7 +289,7 @@ The owner's words leave two points open, and the items that settle them say so:
   exist, so lqa8 would never close.
 - **Take the slices' tests alone as the end-to-end proof:** rejected. None runs the codec in a
   session on a shared limiter, FBC-ywjb's done line leaves that wiring to lqa8, and lqa8 lands
-  nothing. Only a place's charge would be proved.
+  nothing. Only the charges of places, `cancel_order` and `get_order` would be proved.
 - **Widen FBC-jxau's or FBC-blcw's done line instead of filing the carrier:** not taken. The
   charges span four slices, and the sessions need the probe mode, the encoder and the resync
   together. One ticket after FBC-jxau holds them all, and FBC-cnyh waits on FBC-jxau anyway.
