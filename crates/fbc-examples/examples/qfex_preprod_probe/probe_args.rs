@@ -9,6 +9,7 @@ use fbc_venue_qfex::exec::AUTH_DEADLINE;
 use fbc_venue_qfex::probe::{PREPROD_MDS, PREPROD_REST, PREPROD_TRADE};
 
 use crate::auth_qfex::{Armed, PUBLIC_VAR, SECRET_VAR, SUB_ID_VAR, SUB_PUBLIC_VAR, SUB_SECRET_VAR};
+use crate::ledger::{self, Bounds, MAX_AGE_S, MAX_ENTRIES, MAX_SPAN_S};
 
 /// The help text `--help` prints.
 pub fn usage() -> String {
@@ -21,13 +22,16 @@ sends no command but each session's arm and the probe's own reads.
 
 Before anything connects it refuses any origin but QFEX's pre-production ones (or, for a test
 stub, all of them loopback addresses), an account decision 0122 refuses, missing or empty
-credentials, and a SOCKS5 proxy with loopback origins. Then it reads GET /user/subaccounts, and
-before each session the primary account and every listed subaccount (GET /user/positions, and
+credentials, a SOCKS5 proxy with loopback origins, and a missing or unaccepted --registry-span,
+--ledger-max-age or --ledger-max-entries: fill-ledger bounds that cannot outlast a registry's
+sessions and fills (decision 0132 item 5). Then it reads GET /user/subaccounts, and before each
+session the primary account and every listed subaccount (GET /user/positions, and
 get_user_orders on a trade socket that never arms): a session starts only when every account
 holds no open order (none on the page, none counted by REST) and a flat position. Each session
-arms once; at the arm's answer, its deadline or the connection's end the program stops it, with
-no second connection attempt. The sessions run one after the other, so no two arms are ever in
-flight across the user.
+arms once; at the arm's answer, its deadline, the connection's end, --session-wait or its
+registry's span bound the program stops it, through its stop control, with no second
+connection attempt. The sessions run one after the other, so no two arms are ever in flight
+across the user.
 
 Usage: cargo run -p fbc-examples --example qfex_preprod_probe -- [OPTIONS]
 
@@ -46,6 +50,17 @@ Options:
                            (default 120); longer than --connect-wait-ms, QFEX's 60 s
                            authentication deadline and --rpc-timeout-ms together, so the
                            program never stops a session while its arm is in flight
+  --registry-span <S>      required, no default: the longest from a registry's first session's
+                           start to its last session's end, 1 to {MAX_SPAN_S}; a session that
+                           reaches it is stopped. Longer than --connect-wait-ms, QFEX's 60 s
+                           authentication deadline and --rpc-timeout-ms together, as
+                           --session-wait is. Stage one gives each session its own registry
+  --ledger-max-age <S>     required, no default: how long each registry's fill ledger keeps a
+                           fill, 1 to {MAX_AGE_S}; longer than --registry-span (decision 0132
+                           item 5)
+  --ledger-max-entries <N> required, no default: the most fills it keeps, 1 to {MAX_ENTRIES};
+                           above the fill ceiling, every order a registry's sessions may place
+                           at its largest size in size steps (stage one places nothing: 0)
   --trade-url <URL>        default {PREPROD_TRADE}
   --rest-url <URL>         default {PREPROD_REST}
   --mds-url <URL>          default {PREPROD_MDS}
@@ -79,6 +94,9 @@ pub struct Options {
     pub read_wait: Duration,
     pub connect_wait: Duration,
     pub session_wait: Duration,
+    /// Each registry's fill-ledger bounds and the span bound they outlast (decision 0132 item
+    /// 5), accepted against stage one's fill ceiling.
+    pub ledger: Bounds,
 }
 
 /// What the command line asked for.
@@ -92,19 +110,18 @@ pub enum Parsed {
 pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut evidence_dir = None;
     let mut arms = Vec::new();
-    let mut opts = Options {
-        evidence_dir: PathBuf::new(),
-        arms: Vec::new(),
-        trade_url: PREPROD_TRADE.to_owned(),
-        rest_url: PREPROD_REST.to_owned(),
-        mds_url: PREPROD_MDS.to_owned(),
-        proxy: ProxyConfig::Direct,
-        rpc_timeout_ms: 10_000,
-        page_size: 1000,
-        read_wait: Duration::from_millis(10_000),
-        connect_wait: Duration::from_millis(10_000),
-        session_wait: Duration::from_secs(120),
-    };
+    let (mut trade_url, mut rest_url, mut mds_url) = (
+        PREPROD_TRADE.to_owned(),
+        PREPROD_REST.to_owned(),
+        PREPROD_MDS.to_owned(),
+    );
+    let mut proxy = ProxyConfig::Direct;
+    let (mut rpc_timeout_ms, mut page_size) = (10_000, 1000);
+    let mut read_wait = Duration::from_millis(10_000);
+    let mut connect_wait = Duration::from_millis(10_000);
+    let mut session_wait = Duration::from_secs(120);
+    // The fill ledger's bounds and the span bound: required, with no defaults.
+    let (mut span, mut max_age, mut max_entries) = (None, None, None);
     let mut argv = argv.into_iter();
     while let Some(arg) = argv.next() {
         let mut value = || {
@@ -117,30 +134,33 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--evidence-dir" => evidence_dir = Some(absolute(&value()?)?),
             "--arm" => arms.push(armed(&value()?, &arms)?),
-            "--rpc-timeout-ms" => opts.rpc_timeout_ms = number(&arg, &value()?, 501, 60_000)?,
-            "--page-size" => opts.page_size = number(&arg, &value()?, 1, 1000)? as u16,
-            "--read-wait-ms" => opts.read_wait = millis(&arg, &value()?)?,
-            "--connect-wait-ms" => opts.connect_wait = millis(&arg, &value()?)?,
-            "--session-wait" => {
-                opts.session_wait = Duration::from_secs(number(&arg, &value()?, 1, 3600)?);
+            "--rpc-timeout-ms" => rpc_timeout_ms = number(&arg, &value()?, 501, 60_000)?,
+            "--page-size" => page_size = number(&arg, &value()?, 1, 1000)? as u16,
+            "--read-wait-ms" => read_wait = millis(&arg, &value()?)?,
+            "--connect-wait-ms" => connect_wait = millis(&arg, &value()?)?,
+            "--session-wait" => session_wait = secs(&arg, &value()?, 3600)?,
+            "--registry-span" => span = Some(secs(&arg, &value()?, MAX_SPAN_S)?),
+            "--ledger-max-age" => max_age = Some(secs(&arg, &value()?, MAX_AGE_S)?),
+            "--ledger-max-entries" => {
+                max_entries = Some(number(&arg, &value()?, 1, MAX_ENTRIES)? as usize);
             }
-            "--trade-url" => opts.trade_url = value()?,
-            "--rest-url" => opts.rest_url = value()?,
-            "--mds-url" => opts.mds_url = value()?,
-            "--socks5" => opts.proxy = socks5(&value()?)?,
+            "--trade-url" => trade_url = value()?,
+            "--rest-url" => rest_url = value()?,
+            "--mds-url" => mds_url = value()?,
+            "--socks5" => proxy = socks5(&value()?)?,
             _ => return Err("an unknown argument (not shown); --help lists the flags".to_owned()),
         }
     }
-    opts.evidence_dir = evidence_dir.ok_or("--evidence-dir is required")?;
+    let evidence_dir = evidence_dir.ok_or("--evidence-dir is required")?;
     if arms.is_empty() {
         return Err("--arm is required: primary, subaccount, or both".to_owned());
     }
-    opts.arms = arms;
     // A session opens, authenticates within QFEX's deadline, then arms and waits out the arm's:
     // a --session-wait no longer than all three could stop it with its arm in flight, spending
-    // that account's capture with no outcome.
-    let arm = Duration::from_millis(opts.rpc_timeout_ms);
-    if opts.session_wait <= opts.connect_wait + AUTH_DEADLINE + arm {
+    // that account's capture with no outcome. The span bound stops a session too, so it must
+    // outlast the same three.
+    let to_arm = connect_wait + AUTH_DEADLINE + Duration::from_millis(rpc_timeout_ms);
+    if session_wait <= to_arm {
         return Err(format!(
             "--session-wait must be longer than --connect-wait-ms, QFEX's {} s authentication \
              deadline and --rpc-timeout-ms together, or a session could be stopped with its arm \
@@ -148,7 +168,32 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             AUTH_DEADLINE.as_secs()
         ));
     }
-    Ok(Parsed::Run(Box::new(opts)))
+    let span = span.ok_or("--registry-span is required: it has no default")?;
+    let max_age = max_age.ok_or("--ledger-max-age is required: it has no default")?;
+    let max_entries = max_entries.ok_or("--ledger-max-entries is required: it has no default")?;
+    if span <= to_arm {
+        return Err(format!(
+            "--registry-span must be longer than --connect-wait-ms, QFEX's {} s authentication \
+             deadline and --rpc-timeout-ms together, or the span bound could stop a session \
+             with its arm in flight (the values are not shown)",
+            AUTH_DEADLINE.as_secs()
+        ));
+    }
+    let ledger = Bounds::new(max_age, max_entries, span, &ledger::stage_one())?;
+    Ok(Parsed::Run(Box::new(Options {
+        evidence_dir,
+        arms,
+        trade_url,
+        rest_url,
+        mds_url,
+        proxy,
+        rpc_timeout_ms,
+        page_size,
+        read_wait,
+        connect_wait,
+        session_wait,
+        ledger,
+    })))
 }
 
 /// An absolute path; refused, never shown, otherwise.
@@ -181,6 +226,11 @@ fn number(flag: &str, value: &str, lo: u64, hi: u64) -> Result<u64, String> {
             "{flag}: not a whole number from {lo} to {hi} (not shown)"
         )),
     }
+}
+
+/// Whole seconds from 1 to `hi`.
+fn secs(flag: &str, value: &str, hi: u64) -> Result<Duration, String> {
+    number(flag, value, 1, hi).map(Duration::from_secs)
 }
 
 /// Whole milliseconds from 1 to 120000.

@@ -43,6 +43,7 @@ use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value, json};
 
 use crate::evidence::privacy_hits;
+use crate::ledger::{self, RegistryRun};
 
 /// What one account's reads showed before a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -264,6 +265,9 @@ pub struct Evidence {
     pub listed: Option<usize>,
     pub reads: Vec<AccountRead>,
     pub sessions: Vec<SessionRun>,
+    /// Each registry's fill ledger: its bounds, and its horizon and replay counts at each of its
+    /// sessions' ends (decision 0132 item 5).
+    pub registries: Vec<RegistryRun>,
     /// Why the probe stopped before its sessions ended.
     pub stopped: Option<String>,
     pub fixtures: Vec<String>,
@@ -286,10 +290,11 @@ pub struct Evidence {
 
 impl Evidence {
     /// Whether the run did all stage one asks: every session armed with its capture whole,
-    /// the journal's sink dropped nothing and its writer wrote everything, and every file
-    /// written.
+    /// the journal's sink dropped nothing and its writer wrote everything, every registry's
+    /// ledger bounds held, and every file written.
     pub fn ok(&self) -> bool {
         self.stopped.is_none()
+            && self.registries.iter().all(RegistryRun::held)
             && self.withheld.is_empty()
             && self.errors.is_empty()
             && self.dropped == [0, 0]
@@ -894,6 +899,7 @@ pub fn markdown(ev: &Evidence) -> String {
         }
         let _ = writeln!(s);
     }
+    ledger::markdown(&mut s, &ev.registries);
     let _ = writeln!(
         s,
         "## Files\n\n\
@@ -945,7 +951,8 @@ pub fn to_json(ev: &Evidence) -> Value {
         "journal_dropped": {"normal": normal, "safety": safety},
         "journal_writer_failed": ev.writer_failed,
         "stopped": ev.stopped, "subaccounts_listed": ev.listed, "reads": reads,
-        "sessions": sessions, "fixtures": ev.fixtures, "kept_string_members": ev.strings,
+        "sessions": sessions, "registries": ledger::to_json(&ev.registries),
+        "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
 }
 
