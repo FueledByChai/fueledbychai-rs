@@ -20,12 +20,12 @@ probe, `hibachi_cod_probe` in `crates/fbc-examples`.
 This record states how its sessions run. It is the narrow record two owner answers ask for:
 
 - **2026-10-20 (FBC-xvtr's notes).** The question was: "The cancel-on-disconnect probe places
-  real orders on a venue decision 0058 refuses. How should it run?" He chose "Through fbc-oms
+  real orders on a venue decision 0058 refuses. How should it run?" The owner chose "Through fbc-oms
   (Recommended)": "The probe uses fbc-oms and fbc-runtime like every other order: caps, a
   single-use authorization per command, Stop. A narrow record lets the probe's session start
   despite 0058, for this probe only."
 - **2026-10-21 (FBC-jw1b's notes).** The question was how the probe's registry can be
-  seeded on mainnet. He chose option B, a probe-only record:
+  seeded on mainnet. The owner chose option B, a probe-only record:
   - Only the supervised probe, on the separate Rust-only account, arms its fbc-oms registry,
     and it arms on a seed of nothing.
   - It does so after REST shows no open order on any market and no position in the probe's
