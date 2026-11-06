@@ -42,13 +42,22 @@ A check that reads recorded data reads it from a subdirectory named after the ch
 - `continuity/`, `no_exch_ts_synthesized/` and `book_channels/`: market-data case files, one per
   book channel the suite drives (`<channel>.frames`, in the format
   `crates/fbc-conformance/src/suite/book_cases.rs` documents), written by hand in the toy's own
-  protocol (`crates/fbc-conformance/src/toy/md.rs`), each frame tagged with what the fixture
-  knows of it: the toy's `book` channel with its sequence breaks marked `gap=<symbol>`
+  protocol (`crates/fbc-conformance/src/toy/md.rs`), each line tagged with what the fixture
+  knows of it. The toy's `book` channel: its sequence breaks marked `gap=<symbol>`
   (`continuity/book`), its frames carrying a timestamp marked `ts`
   (`no_exch_ts_synthesized/book`), and its frames marked with the order channels whose
-  liquidity they show, public only (`book_channels/book`). The toy's `rpi_book` is anchored on
-  REST, which the suite does not drive yet (FBC-fhk4), so it has no case; the toy's market
-  data is text, so `continuity` has no `longer_block/` sub-case here.
+  liquidity they show, public only (`book_channels/book`). The toy's `rpi_book`, anchored on
+  REST (FBC-fhk4): its snapshots are the anchors' answers, `anchor|sym|seq|<levels>` bodies in
+  `http` lines answering the requests the toy asks for under the setup's anchor base
+  (`crates/fbc-conformance/tests/toy_setup/mod.rs`, `ANCHOR_URL`, never opened), TOYA-PERP's
+  as request tag 1 and TOYB-PERP's as tag 2 when subscribed, each later one under the next
+  tag; its breaks marked `gap=<symbol>`, with a delta held without a second gap while its
+  re-anchor is awaited, a break of one instrument while the other's re-anchor is awaited, and
+  an anchor that mends nothing (`continuity/rpi_book`), its frames and answers carrying a
+  timestamp marked `ts` (`no_exch_ts_synthesized/rpi_book`), and its frames and answers marked
+  with the order channels whose liquidity they show, public and RPI, as the toy declares
+  (`book_channels/rpi_book`). The toy's market data is text, so `continuity` has no
+  `longer_block/` sub-case here. Nothing in them is key- or address-shaped.
 - `reject_coverage/table.txt`: the toy's own made-up reject codes (its `REJECT_CODES`, in
   `crates/fbc-conformance/src/toy/decode.rs`), each followed by the `RejectKind` it maps to as
   the kind's `Debug` spells it, and one code the toy does not know, which maps to `Other`
@@ -56,7 +65,8 @@ A check that reads recorded data reads it from a subdirectory named after the ch
 
 `caps_truthful`, `commands_selfcontained`, `encode_deterministic`, `price_grid` and
 `subscriptions_idempotent` read no file: they need only the toy's factory and the setup the
-suite's test gives (the toy's spec table, an empty configuration and no credentials). Nor do
+suite's test gives (the toy's spec table, a configuration naming only the anchored channel's
+REST base, and no credentials). Nor do
 `amend_ack`, `mixed_batch`, `unknown_on_timeout`, `resync_after_reconnect` and `two_phase_ack`:
 they run the order-entry session against the stub server, which answers as the setup's
 order-entry stub states (`crates/fbc-conformance/tests/toy_setup/mod.rs`, decisions 0083 and

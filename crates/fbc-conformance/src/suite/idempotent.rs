@@ -9,14 +9,15 @@
 //! from the factory (one per epoch, as the runtime builds them) is opened, and the reconciler's
 //! call for the set is handed to its [`subscribe`](fbc_core::MdCodec::subscribe), which must
 //! take it. After the reconnect it must ask, opening and subscribing, for exactly the effects it
-//! asked for on the first connection: an [`MdCodec`] is deterministic given its inputs and prior state, and a fresh one
-//! has none, so anything else is state carried over (a codec that remembers the last
-//! connection's subscriptions sends them twice). Within each epoch, opening and subscribing
-//! together send at least one subscribe request (an [`Effect::Send`] charged
+//! asked for on the first connection (the HTTP requests a channel anchored on REST asks for its
+//! anchors among them, FBC-fhk4): an [`MdCodec`] is deterministic given its inputs and prior
+//! state, and a fresh one has none, so anything else is state carried over (a codec that
+//! remembers the last connection's subscriptions sends them twice). Within each epoch, opening
+//! and subscribing together send at least one subscribe request (an [`Effect::Send`] charged
 //! [`OpKind::Subscribe`]: a set taken and never sent is no subscription, Codex r4218744576),
-//! and each frame once: one sent from both would subscribe twice (Codex
-//! r4218492650). Then the same set is desired again, and any call the reconciler yields is a
-//! breach. It reads no fixture file.
+//! and each frame once: one sent from both would subscribe twice (Codex r4218492650). Then the
+//! same set is desired again, and any call the reconciler yields is a breach. It reads no
+//! fixture file.
 
 use std::collections::BTreeSet;
 

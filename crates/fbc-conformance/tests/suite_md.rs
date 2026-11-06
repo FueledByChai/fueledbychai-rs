@@ -2,14 +2,21 @@
 //! sequence break, naming every break it missed. Around it, every other way the four
 //! market-data checks fail or are skipped: a toy that reports a gap in sequence, stamps a
 //! timestamp its frame lacks, puts a book's frames on another book or declares channels its
-//! frames do not show, refuses a subscription; caps that declare no book, only anchored or
-//! unchained ones, or binary market data and its longer-block sub-case; and fixture
+//! frames do not show, refuses a subscription; caps that declare no book, or only unchained
+//! ones, or binary market data and its longer-block sub-case; and fixture
 //! directories missing a directory or a case, holding a stray case, a malformed line, a refused
 //! frame or a case that states nothing.
 //!
 //! FBC-n35m (decision 0124): `continuity` holds a prune or a clear of one side of a broken book as
 //! it holds a level, and counts either as the codec taking the sequence; `book_channels` requires
 //! both on the channel's own book, and reads neither as showing liquidity.
+//!
+//! FBC-fhk4's done line, its second half: the toy's `rpi_book`, anchored on REST, is driven from
+//! case files whose `http` lines answer its anchors, and `continuity` fails a toy variant that
+//! ignores that channel's sequence breaks. Around it: the twists hold what the toy pushes from an
+//! anchor's answer as from a frame; an answer is no frame for a case's sequence taken or a
+//! longer block; an `http` line with no request to answer is a breach of its case; and
+//! `book_channels` names the lines showing a channel `rpi_book` is declared without.
 
 mod toy_setup;
 
@@ -49,6 +56,9 @@ const CHECKS: [(&str, Check); 4] = [
 enum Twist {
     /// It drops every gap it would report: a sequence break is ignored.
     IgnoresBreaks,
+    /// It drops every gap it would report on the anchored book (`rpi_book`), and only there:
+    /// that channel's sequence breaks are ignored (FBC-fhk4).
+    IgnoresAnchoredBreaks,
     /// Every frame it decodes also reports a gap on the book.
     GapsAlways,
     /// Every event without the venue's timestamp gets one of the codec's own.
@@ -218,7 +228,8 @@ impl VenueFactory for Variant {
     }
 }
 
-/// The toy's market-data codec, twisted.
+/// The toy's market-data codec, twisted: what it pushes from a frame or an anchor's HTTP answer
+/// alike, except where a twist names frames.
 struct Twisted {
     inner: Box<dyn MdCodec>,
     twist: Twist,
@@ -279,18 +290,28 @@ fn stray_window(inst: InstrumentId, book: BookId) -> MdEvent {
 }
 
 impl Twisted {
-    /// [`Twist::KeepsApplying`]'s frame, and its kin's: the toy's events, a `stray` event of the
-    /// book before each gap on it, and one of every book still broken from an earlier frame.
+    /// The event [`Twist::KeepsApplying`] and its kin push of a broken book.
+    fn stray(&self) -> Option<fn(InstrumentId, BookId) -> MdEvent> {
+        match self.twist {
+            Twist::KeepsApplying => Some(stray_level),
+            Twist::KeepsPruning => Some(stray_prune),
+            Twist::KeepsClearing => Some(stray_clear),
+            Twist::KeepsWindowing => Some(stray_window),
+            _ => None,
+        }
+    }
+
+    /// [`Twist::KeepsApplying`]'s frame or HTTP answer, and its kin's: the events the toy pushes
+    /// as `decode` hands it the input, a `stray` event of the book before each gap on it, and one
+    /// of every book still broken from an earlier input.
     fn keep_applying(
         &mut self,
-        f: RawFrame<'_>,
-        (scope, specs): (&DecodeScope<'_>, &SpecTable),
         sink: &mut dyn MdSink,
-        fx: &mut Effects,
         stray: fn(InstrumentId, BookId) -> MdEvent,
+        decode: impl FnOnce(&mut dyn MdCodec, &mut dyn MdSink) -> Result<(), DecodeError>,
     ) -> Result<(), DecodeError> {
         let mut toy = Collect(Vec::new());
-        let outcome = self.inner.on_frame(f, scope, specs, &mut toy, fx);
+        let outcome = decode(&mut *self.inner, &mut toy);
         let before = self.broken.clone();
         for (meta, ev) in toy.0 {
             match ev {
@@ -387,6 +408,14 @@ impl MdSink for Rewrite<'_> {
                 Twist::IgnoresBreaks,
                 MdEvent::Health {
                     h: FeedHealth::Gap, ..
+                },
+            ) => return,
+            (
+                Twist::IgnoresAnchoredBreaks,
+                MdEvent::Health {
+                    feed: Feed::Book(ANCHORED_BOOK),
+                    h: FeedHealth::Gap,
+                    ..
                 },
             ) => return,
             (Twist::StampsTime, _) if meta.exch_ts.is_none() => meta.exch_ts = Some(ExchNs(7)),
@@ -556,15 +585,10 @@ impl MdCodec for Twisted {
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
         let twist = self.twist;
-        let stray: Option<fn(InstrumentId, BookId) -> MdEvent> = match twist {
-            Twist::KeepsApplying => Some(stray_level),
-            Twist::KeepsPruning => Some(stray_prune),
-            Twist::KeepsClearing => Some(stray_clear),
-            Twist::KeepsWindowing => Some(stray_window),
-            _ => None,
-        };
-        if let Some(stray) = stray {
-            return self.keep_applying(f, (scope, specs), sink, fx, stray);
+        if let Some(stray) = self.stray() {
+            return self.keep_applying(sink, stray, |toy, sink| {
+                toy.on_frame(f, scope, specs, sink, fx)
+            });
         }
         let text;
         let f = match (twist, f) {
@@ -598,7 +622,17 @@ impl MdCodec for Twisted {
         sink: &mut dyn MdSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        self.inner.on_http(tag, resp, scope, specs, sink, fx)
+        // What the toy pushes from an anchor's answer is twisted as from a frame (FBC-fhk4).
+        if let Some(stray) = self.stray() {
+            return self.keep_applying(sink, stray, |toy, sink| {
+                toy.on_http(tag, resp, scope, specs, sink, fx)
+            });
+        }
+        let rewrite = &mut Rewrite {
+            sink,
+            twist: self.twist,
+        };
+        self.inner.on_http(tag, resp, scope, specs, rewrite, fx)
     }
 
     fn on_timer(
@@ -718,6 +752,12 @@ fn probed(outcome: Result<Verdict, Failure>) -> Vec<String> {
 
 const PLUS_ONE: &str = "BookCaps.continuity is PlusOne";
 
+/// A `continuity` case of the toy's anchored `rpi_book` on TOYA alone, as a connection carrying
+/// one instrument sees it: its one anchor answered, a delta in sequence, then a break.
+const RPI_TOYA_ONLY: &str = "http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n\
+                             text delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=\n\
+                             gap=TOYA-PERP text delta|sym=TOYA-PERP|book=1|seq=13|bid=100:4|ask=\n";
+
 // ---------------------------------------------------------------------------------------------
 // The done line.
 // ---------------------------------------------------------------------------------------------
@@ -726,7 +766,8 @@ const PLUS_ONE: &str = "BookCaps.continuity is PlusOne";
 fn continuity_fails_a_toy_variant_that_ignores_a_sequence_break_naming_every_break() {
     let failure = failed(Variant::twisted(Twist::IgnoresBreaks).run(suite::continuity));
     assert_eq!(failure.check, "continuity");
-    assert_eq!(named(&failure), [PLUS_ONE; 3]);
+    // The anchored rpi_book's breaks too (FBC-fhk4).
+    assert_eq!(named(&failure), [PLUS_ONE; 6]);
     assert_eq!(
         said(&failure, PLUS_ONE),
         [
@@ -736,8 +777,40 @@ fn continuity_fails_a_toy_variant_that_ignores_a_sequence_break_naming_every_bre
              reported for it",
             "continuity/book.frames line 17 breaks TOYB-PERP's sequence, yet no gap on book was \
              reported for it",
+            "continuity/rpi_book.frames line 14 breaks TOYA-PERP's sequence, yet no gap on \
+             rpi_book was reported for it",
+            "continuity/rpi_book.frames line 23 breaks TOYA-PERP's sequence, yet no gap on \
+             rpi_book was reported for it",
+            "continuity/rpi_book.frames line 24 breaks TOYB-PERP's sequence, yet no gap on \
+             rpi_book was reported for it",
         ]
     );
+}
+
+/// FBC-fhk4's done line, its second half: `continuity` drives the toy's anchored `rpi_book` from
+/// its case's frames and anchors' HTTP answers, and fails a toy variant that ignores that
+/// channel's sequence breaks, naming each break on `rpi_book` and nothing on `book`.
+#[test]
+fn continuity_fails_the_anchored_rpi_book_of_a_toy_variant_that_ignores_its_sequence_break() {
+    let failure = failed(Variant::twisted(Twist::IgnoresAnchoredBreaks).run(suite::continuity));
+    assert_eq!(failure.check, "continuity");
+    assert_eq!(named(&failure), [PLUS_ONE; 3]);
+    let missed = |line: u32, sym: &str| {
+        format!(
+            "continuity/rpi_book.frames line {line} breaks {sym}'s sequence, yet no gap on \
+             rpi_book was reported for it"
+        )
+    };
+    assert_eq!(
+        said(&failure, PLUS_ONE),
+        [
+            missed(14, "TOYA-PERP"),
+            missed(23, "TOYA-PERP"),
+            missed(24, "TOYB-PERP"),
+        ]
+    );
+    // The toy itself passes it.
+    probed(Variant::declaring(|_| {}).run(suite::continuity));
 }
 
 #[test]
@@ -758,12 +831,31 @@ fn the_suite_test_for_continuity_panics_naming_the_declared_continuity() {
 #[test]
 fn continuity_fails_a_toy_that_reports_a_gap_in_sequence() {
     let failure = failed(Variant::twisted(Twist::GapsAlways).run(suite::continuity));
-    // Every frame not marked (eleven frames, three of them breaks), and TOYB's break, which
-    // also reports a gap on TOYA.
-    assert_eq!(named(&failure), [PLUS_ONE; 9]);
+    // On book, every frame not marked (eleven frames, three of them breaks), and TOYB's break,
+    // which also reports a gap on TOYA. On rpi_book (FBC-fhk4), every frame not marked (eight
+    // frames, three of them breaks; its HTTP answers are no frames), and each break, which also
+    // reports a gap on TOYA's book.
+    assert_eq!(named(&failure), [PLUS_ONE; 17]);
+    let said = said(&failure, PLUS_ONE);
     assert_eq!(
-        said(&failure, PLUS_ONE)[0],
+        said[0],
         "continuity/book.frames line 3 is in sequence, yet a gap was reported"
+    );
+    assert_eq!(
+        said[9..],
+        [
+            "continuity/rpi_book.frames line 7 is in sequence, yet a gap was reported",
+            "continuity/rpi_book.frames line 11 is in sequence, yet a gap was reported",
+            "continuity/rpi_book.frames line 12 is in sequence, yet a gap was reported",
+            "continuity/rpi_book.frames line 14 breaks TOYA-PERP's sequence, yet a gap was \
+             reported on TOYA-PERP's Book(BookId(0))",
+            "continuity/rpi_book.frames line 16 is in sequence, yet a gap was reported",
+            "continuity/rpi_book.frames line 21 is in sequence, yet a gap was reported",
+            "continuity/rpi_book.frames line 23 breaks TOYA-PERP's sequence, yet a gap was \
+             reported on TOYA-PERP's Book(BookId(0))",
+            "continuity/rpi_book.frames line 24 breaks TOYB-PERP's sequence, yet a gap was \
+             reported on TOYA-PERP's Book(BookId(0))",
+        ]
     );
 }
 
@@ -771,12 +863,21 @@ fn continuity_fails_a_toy_that_reports_a_gap_in_sequence() {
 fn no_exch_ts_synthesized_fails_a_toy_that_stamps_a_time_its_frame_lacks() {
     let failure = failed(Variant::twisted(Twist::StampsTime).run(suite::no_exch_ts_synthesized));
     assert_eq!(failure.check, "no_exch_ts_synthesized");
-    assert_eq!(named(&failure), ["VenueMeta.exch_ts"; 6]);
+    // Six events on book, and six on rpi_book, four of them from an anchor's HTTP answer
+    // (FBC-fhk4).
+    assert_eq!(named(&failure), ["VenueMeta.exch_ts"; 12]);
+    let said = said(&failure, "VenueMeta.exch_ts");
     assert_eq!(
-        said(&failure, "VenueMeta.exch_ts")[0],
+        said[0],
         "no_exch_ts_synthesized/book.frames line 4: the frame carries no timestamp, yet an \
          event carries exch_ts 7"
     );
+    assert_eq!(
+        said[7],
+        "no_exch_ts_synthesized/rpi_book.frames line 6: the HTTP answer carries no timestamp, \
+         yet an event carries exch_ts 7"
+    );
+    assert_eq!(said[7..11], [said[7]; 4]);
 }
 
 #[test]
@@ -812,6 +913,41 @@ fn book_channels_fails_a_declared_channel_no_frame_shows_and_a_shown_one_not_dec
     assert_eq!(
         said(&failure, "BookCaps.includes_channels lacks Rpi"),
         ["book_channels/book.frames line 1 shows Rpi liquidity"]
+    );
+}
+
+/// FBC-fhk4: the toy's anchored `rpi_book` declares public and RPI liquidity
+/// (`md.books[1].includes_channels`), and its case shows each, in its anchors' HTTP answers and
+/// its deltas: declared without either, `book_channels` names every line that shows it.
+#[test]
+fn book_channels_fails_the_anchored_rpi_book_declared_without_public_or_rpi() {
+    let public_only = Variant::declaring(|caps| {
+        caps.md.books[usize::from(ANCHORED_BOOK.0)].includes_channels =
+            TagSet::of(&[Channel::Public]);
+    });
+    let failure = failed(public_only.run(suite::book_channels));
+    assert_eq!(named(&failure), ["BookCaps.includes_channels lacks Rpi"; 2]);
+    assert_eq!(
+        said(&failure, "BookCaps.includes_channels lacks Rpi"),
+        [
+            "book_channels/rpi_book.frames line 4 shows Rpi liquidity",
+            "book_channels/rpi_book.frames line 6 shows Rpi liquidity",
+        ]
+    );
+    let rpi_only = Variant::declaring(|caps| {
+        caps.md.books[usize::from(ANCHORED_BOOK.0)].includes_channels = TagSet::of(&[Channel::Rpi]);
+    });
+    let failure = failed(rpi_only.run(suite::book_channels));
+    assert_eq!(
+        named(&failure),
+        ["BookCaps.includes_channels lacks Public"; 2]
+    );
+    assert_eq!(
+        said(&failure, "BookCaps.includes_channels lacks Public"),
+        [
+            "book_channels/rpi_book.frames line 4 shows Public liquidity",
+            "book_channels/rpi_book.frames line 5 shows Public liquidity",
+        ]
     );
 }
 
@@ -861,12 +997,15 @@ fn subscriptions_idempotent_fails_a_codec_that_refuses_the_set() {
     let failure = failed(variant.run(suite::subscriptions_idempotent));
     assert_eq!(failure.check, "subscriptions_idempotent");
     let refused = said(&failure, "MdCodec::subscribe");
-    assert_eq!(refused.len(), 1);
-    assert!(
-        refused[0].starts_with("refused book on every instrument in epoch 0: "),
-        "{}",
-        refused[0]
-    );
+    assert_eq!(refused.len(), 2);
+    for (refused, channel) in refused.iter().zip(["book", "rpi_book"]) {
+        assert!(
+            refused.starts_with(&format!(
+                "refused {channel} on every instrument in epoch 0: "
+            )),
+            "{refused}"
+        );
+    }
     // The checks that read cases fail on the refusal before any frame.
     for (name, check) in [CHECKS[0], CHECKS[2], CHECKS[3]] {
         let failure = failed(variant.run(check));
@@ -880,7 +1019,17 @@ fn continuity_fails_a_toy_that_reports_a_break_on_the_wrong_instrument() {
     // Codex r4217682431: a gap must name the instrument whose sequence broke.
     let failure = failed(Variant::twisted(Twist::WrongInstrument).run(suite::continuity));
     let said = said(&failure, PLUS_ONE);
-    assert_eq!(said.len(), 6, "{said:#?}");
+    // Six on book and six on rpi_book (FBC-fhk4).
+    assert_eq!(said.len(), 12, "{said:#?}");
+    assert_eq!(
+        said[6..8],
+        [
+            "continuity/rpi_book.frames line 14 breaks TOYA-PERP's sequence, yet no gap on \
+             rpi_book was reported for it",
+            "continuity/rpi_book.frames line 14 breaks TOYA-PERP's sequence, yet a gap was \
+             reported on TOYB-PERP",
+        ]
+    );
     assert_eq!(
         said[..2],
         [
@@ -897,7 +1046,13 @@ fn continuity_fails_a_toy_that_reports_a_break_on_another_feed_too() {
     // Codex r4217839174: the instrument's trades are not broken by its book's gap.
     let failure = failed(Variant::twisted(Twist::GapsTradesToo).run(suite::continuity));
     let said = said(&failure, PLUS_ONE);
-    assert_eq!(said.len(), 3, "{said:#?}");
+    // Each break on book and on rpi_book (FBC-fhk4).
+    assert_eq!(said.len(), 6, "{said:#?}");
+    assert_eq!(
+        said[3],
+        "continuity/rpi_book.frames line 14 breaks TOYA-PERP's sequence, yet a gap was reported \
+         on TOYA-PERP's Trades"
+    );
     assert_eq!(
         said[0],
         "continuity/book.frames line 10 breaks TOYA-PERP's sequence, yet a gap was reported on \
@@ -911,21 +1066,29 @@ fn continuity_fails_a_toy_that_keeps_a_broken_book_live_until_its_snapshot() {
     // gap) or from any later frame before its next snapshot begins, is applied by a consumer
     // that trusts it.
     let failure = failed(Variant::twisted(Twist::KeepsApplying).run(suite::continuity));
-    assert_eq!(named(&failure), [PLUS_ONE; 5]);
-    let broken = |line: u32, sym: &str| {
+    assert_eq!(named(&failure), [PLUS_ONE; 11]);
+    let broken = |file: &str, line: u32, sym: &str| {
         format!(
-            "continuity/book.frames line {line} pushes a level of {sym}'s book while its \
+            "continuity/{file}.frames line {line} pushes a level of {sym}'s book while its \
              sequence is broken: a broken book takes nothing until its next snapshot"
         )
     };
     assert_eq!(
         said(&failure, PLUS_ONE),
         [
-            broken(10, "TOYA-PERP"),
-            broken(12, "TOYA-PERP"),
-            broken(16, "TOYA-PERP"),
-            broken(17, "TOYB-PERP"),
-            broken(17, "TOYA-PERP"),
+            broken("book", 10, "TOYA-PERP"),
+            broken("book", 12, "TOYA-PERP"),
+            broken("book", 16, "TOYA-PERP"),
+            broken("book", 17, "TOYB-PERP"),
+            broken("book", 17, "TOYA-PERP"),
+            // FBC-fhk4: on rpi_book, line 18 is an anchor's answer that mends nothing, held to
+            // the broken book as a frame is; line 20's anchor begins its snapshot.
+            broken("rpi_book", 14, "TOYA-PERP"),
+            broken("rpi_book", 16, "TOYA-PERP"),
+            broken("rpi_book", 18, "TOYA-PERP"),
+            broken("rpi_book", 23, "TOYA-PERP"),
+            broken("rpi_book", 24, "TOYB-PERP"),
+            broken("rpi_book", 24, "TOYA-PERP"),
         ]
     );
 }
@@ -941,21 +1104,27 @@ fn continuity_fails_a_toy_that_prunes_clears_or_windows_a_broken_book_until_its_
         (Twist::KeepsWindowing, "window"),
     ] {
         let failure = failed(Variant::twisted(twist).run(suite::continuity));
-        assert_eq!(named(&failure), [PLUS_ONE; 5], "{twist:?}");
-        let broken = |line: u32, sym: &str| {
+        assert_eq!(named(&failure), [PLUS_ONE; 11], "{twist:?}");
+        let broken = |file: &str, line: u32, sym: &str| {
             format!(
-                "continuity/book.frames line {line} pushes a {kind} of {sym}'s book while its \
+                "continuity/{file}.frames line {line} pushes a {kind} of {sym}'s book while its \
                  sequence is broken: a broken book takes nothing until its next snapshot"
             )
         };
         assert_eq!(
             said(&failure, PLUS_ONE),
             [
-                broken(10, "TOYA-PERP"),
-                broken(12, "TOYA-PERP"),
-                broken(16, "TOYA-PERP"),
-                broken(17, "TOYB-PERP"),
-                broken(17, "TOYA-PERP"),
+                broken("book", 10, "TOYA-PERP"),
+                broken("book", 12, "TOYA-PERP"),
+                broken("book", 16, "TOYA-PERP"),
+                broken("book", 17, "TOYB-PERP"),
+                broken("book", 17, "TOYA-PERP"),
+                broken("rpi_book", 14, "TOYA-PERP"),
+                broken("rpi_book", 16, "TOYA-PERP"),
+                broken("rpi_book", 18, "TOYA-PERP"),
+                broken("rpi_book", 23, "TOYA-PERP"),
+                broken("rpi_book", 24, "TOYB-PERP"),
+                broken("rpi_book", 24, "TOYA-PERP"),
             ],
             "{twist:?}"
         );
@@ -972,20 +1141,28 @@ fn continuity_counts_a_side_prune_or_clear_as_the_codec_taking_the_sequence() {
         "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
          gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
     );
+    scratch.write("continuity/rpi_book.frames", RPI_TOYA_ONLY);
     let only_gaps = Variant::twisted(Twist::OnlyGaps);
     let failure = failed(only_gaps.run_in(suite::continuity, &scratch.0));
-    assert_eq!(
-        said(&failure, "continuity/book.frames"),
-        [
-            "no frame in sequence pushes an event of book: a case must show the codec taking \
-             the sequence, not only breaking it"
-        ]
-    );
+    for channel in ["book", "rpi_book"] {
+        assert_eq!(
+            said(&failure, &format!("continuity/{channel}.frames")),
+            [format!(
+                "no frame in sequence pushes an event of {channel}: a case must show the codec \
+                 taking the sequence, not only breaking it"
+            )]
+        );
+    }
     for twist in [Twist::OnlyGapsAndClears, Twist::OnlyGapsAndPrunes] {
         let read = probed(Variant::twisted(twist).run_in(suite::continuity, &scratch.0));
-        assert!(
-            read.contains(&"continuity/book.frames: 1 of 2 frames break the sequence".to_owned()),
-            "{twist:?}: {read:#?}"
+        assert_eq!(
+            read[..2],
+            [
+                "continuity/book.frames: 1 of 2 frames break the sequence",
+                "continuity/rpi_book.frames: 1 of 3 lines (2 frames, 1 HTTP answer) break the \
+                 sequence",
+            ],
+            "{twist:?}"
         );
     }
 }
@@ -1020,11 +1197,21 @@ fn book_channels_reads_a_side_prune_or_clear_as_showing_no_liquidity() {
         "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3,98:5|ask=101:2\n\
          text delta|sym=TOYA-PERP|book=0|seq=11|bid=100:4|ask=\n",
     );
+    // The anchored channel's snapshot, from its anchor's HTTP answer, alike (FBC-fhk4).
+    scratch.write(
+        "book_channels/rpi_book.frames",
+        "http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3,98:5|ask=101:2\n\
+         text delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=\n",
+    );
     for twist in [Twist::OnlyGapsAndClears, Twist::OnlyGapsAndPrunes] {
         let failure = failed(Variant::twisted(twist).run_in(suite::book_channels, &scratch.0));
         assert_eq!(
             named(&failure),
-            ["BookCaps.includes_channels has Public"],
+            [
+                "BookCaps.includes_channels has Public",
+                "BookCaps.includes_channels has Public",
+                "BookCaps.includes_channels has Rpi",
+            ],
             "{twist:?}: {failure}"
         );
     }
@@ -1035,19 +1222,25 @@ fn continuity_fails_a_toy_that_reports_a_broken_book_live_before_its_snapshot_en
     // Codex r4218492690: Live says no gap since the last snapshot, so a broken book is Live only
     // once its next snapshot is complete.
     let failure = failed(Variant::twisted(Twist::LiveTooSoon).run(suite::continuity));
-    let live = |line: u32, sym: &str| {
+    let live = |file: &str, line: u32, sym: &str| {
         format!(
-            "continuity/book.frames line {line} reports {sym}'s book Live while its sequence is \
-             broken: it is Live again only once its next snapshot ends"
+            "continuity/{file}.frames line {line} reports {sym}'s book Live while its sequence \
+             is broken: it is Live again only once its next snapshot ends"
         )
     };
     assert_eq!(
         said(&failure, PLUS_ONE),
         [
-            live(10, "TOYA-PERP"),
-            live(13, "TOYA-PERP"),
-            live(16, "TOYA-PERP"),
-            live(17, "TOYB-PERP"),
+            live("book", 10, "TOYA-PERP"),
+            live("book", 13, "TOYA-PERP"),
+            live("book", 16, "TOYA-PERP"),
+            live("book", 17, "TOYB-PERP"),
+            // FBC-fhk4: line 20 is the anchor's HTTP answer whose snapshot mends the book, Live
+            // as soon as it begins; lines 8 and 10 anchor books never broken.
+            live("rpi_book", 14, "TOYA-PERP"),
+            live("rpi_book", 20, "TOYA-PERP"),
+            live("rpi_book", 23, "TOYA-PERP"),
+            live("rpi_book", 24, "TOYB-PERP"),
         ]
     );
 }
@@ -1091,7 +1284,9 @@ fn continuity_reads_the_longer_blocks_of_a_binary_venues_unchained_books() {
     let unsequenced = || Variant {
         caps: |caps| {
             caps.md.encoding = Encoding::Sbe;
-            caps.md.books[0].continuity = Continuity::Unsequenced;
+            for book in &mut caps.md.books {
+                book.continuity = Continuity::Unsequenced;
+            }
         },
         ..Variant::twisted(Twist::BinaryText)
     };
@@ -1099,14 +1294,23 @@ fn continuity_reads_the_longer_blocks_of_a_binary_venues_unchained_books() {
     let file = "continuity/longer_block/book.frames";
     let snap = "snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2";
     scratch.write(file, &hex(snap));
+    // The anchored channel's longer blocks, after its anchor's answer (FBC-fhk4).
+    scratch.write(
+        "continuity/longer_block/rpi_book.frames",
+        &format!(
+            "http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n{}",
+            hex("delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=")
+        ),
+    );
     let read = probed(unsequenced().run_in(suite::continuity, &scratch.0));
     assert_eq!(
         read,
         [
             "book: skipped: BookCaps.continuity is Unsequenced: nothing chains its frames",
-            "rpi_book: skipped: BookCaps.rest_anchor is true: its snapshot comes in an HTTP \
-             answer, which the suite does not carry yet (FBC-fhk4)",
+            "rpi_book: skipped: BookCaps.continuity is Unsequenced: nothing chains its frames",
             "continuity/longer_block/book.frames: 1 frames, 0 breaking the sequence",
+            "continuity/longer_block/rpi_book.frames: 1 frames, 0 breaking the sequence, 1 HTTP \
+             answer",
         ]
     );
     // A breach in it is reported, not discarded.
@@ -1123,27 +1327,33 @@ fn continuity_holds_a_book_broken_after_a_snapshot_began_in_the_same_frame() {
     // Codex r4218744557: a gap discards the snapshot begun before it, so only a snapshot begun
     // after the gap mends the book.
     let failure = failed(Variant::twisted(Twist::SnapshotBeforeGap).run(suite::continuity));
-    let level = |line: u32, sym: &str| {
+    let level = |file: &str, line: u32, sym: &str| {
         format!(
-            "continuity/book.frames line {line} pushes a level of {sym}'s book while its \
+            "continuity/{file}.frames line {line} pushes a level of {sym}'s book while its \
              sequence is broken: a broken book takes nothing until its next snapshot"
         )
     };
-    let live = |line: u32, sym: &str| {
+    let live = |file: &str, line: u32, sym: &str| {
         format!(
-            "continuity/book.frames line {line} reports {sym}'s book Live while its sequence is \
-             broken: it is Live again only once its next snapshot ends"
+            "continuity/{file}.frames line {line} reports {sym}'s book Live while its sequence \
+             is broken: it is Live again only once its next snapshot ends"
         )
     };
     assert_eq!(
         said(&failure, PLUS_ONE),
         [
-            level(10, "TOYA-PERP"),
-            live(10, "TOYA-PERP"),
-            level(16, "TOYA-PERP"),
-            live(16, "TOYA-PERP"),
-            level(17, "TOYB-PERP"),
-            live(17, "TOYB-PERP"),
+            level("book", 10, "TOYA-PERP"),
+            live("book", 10, "TOYA-PERP"),
+            level("book", 16, "TOYA-PERP"),
+            live("book", 16, "TOYA-PERP"),
+            level("book", 17, "TOYB-PERP"),
+            live("book", 17, "TOYB-PERP"),
+            level("rpi_book", 14, "TOYA-PERP"),
+            live("rpi_book", 14, "TOYA-PERP"),
+            level("rpi_book", 23, "TOYA-PERP"),
+            live("rpi_book", 23, "TOYA-PERP"),
+            level("rpi_book", 24, "TOYB-PERP"),
+            live("rpi_book", 24, "TOYB-PERP"),
         ]
     );
 }
@@ -1187,6 +1397,10 @@ fn subscriptions_idempotent_fails_a_codec_that_sends_no_subscribe_request() {
              opening or subscribing",
             "book: epoch 1 sends no subscribe request (a Send charged OpKind::Subscribe), \
              opening or subscribing",
+            "rpi_book: epoch 0 sends no subscribe request (a Send charged OpKind::Subscribe), \
+             opening or subscribing",
+            "rpi_book: epoch 1 sends no subscribe request (a Send charged OpKind::Subscribe), \
+             opening or subscribing",
         ]
     );
 }
@@ -1206,9 +1420,19 @@ fn the_checks_drive_one_connection_as_the_topology_allows() {
         "text snap|sym=TOYA-PERP|book=0|seq=10|bid=100:3|ask=101:2\n\
          gap=TOYA-PERP text delta|sym=TOYA-PERP|book=0|seq=12|bid=100:4|ask=\n",
     );
-    probed(per_instrument().run_in(suite::continuity, &scratch.0));
+    // The anchored channel too: one anchor asked for, on its one instrument (FBC-fhk4).
+    scratch.write("continuity/rpi_book.frames", RPI_TOYA_ONLY);
+    let read = probed(per_instrument().run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        read[1],
+        "continuity/rpi_book.frames: 1 of 3 lines (2 frames, 1 HTTP answer) break the sequence"
+    );
     let sent = probed(per_instrument().run(suite::subscriptions_idempotent));
-    assert!(sent[1].starts_with("book: 1 subscriptions"), "{sent:?}");
+    assert!(sent[0].starts_with("book: 1 subscriptions"), "{sent:?}");
+    assert!(
+        sent[1].starts_with("rpi_book: 1 subscriptions sent once in each of 2 epochs ([2, 2]"),
+        "{sent:?}"
+    );
     // A capped shared connection takes as many as its cap.
     let capped = Variant::declaring(|caps| {
         caps.md.topology = ConnTopology::Shared {
@@ -1216,7 +1440,8 @@ fn the_checks_drive_one_connection_as_the_topology_allows() {
         };
     });
     let sent = probed(capped.run(suite::subscriptions_idempotent));
-    assert!(sent[1].starts_with("book: 1 subscriptions"), "{sent:?}");
+    assert!(sent[0].starts_with("book: 1 subscriptions"), "{sent:?}");
+    assert!(sent[1].starts_with("rpi_book: 1 subscriptions"), "{sent:?}");
     // The toy, its two instruments on one connection, fails a codec that takes one only.
     let failure = failed(Variant::twisted(Twist::OneInstrument).run(suite::continuity));
     assert!(said(&failure, "MdCodec::subscribe")[0].starts_with("refused book"));
@@ -1228,7 +1453,10 @@ fn subscriptions_idempotent_fails_a_codec_whose_reconnect_opens_differently() {
     let failure = failed(Variant::twisted(Twist::OpenDrifts).run(suite::subscriptions_idempotent));
     assert_eq!(
         said(&failure, "MdCodec::on_open"),
-        ["book: the reconnect's on_open asked for other effects than the first epoch's"]
+        [
+            "book: the reconnect's on_open asked for other effects than the first epoch's",
+            "rpi_book: the reconnect's on_open asked for other effects than the first epoch's",
+        ]
     );
 }
 
@@ -1238,6 +1466,7 @@ fn a_case_on_an_instrument_its_connection_did_not_subscribe_fails() {
     let mut per_instrument = Variant::declaring(|_| {});
     per_instrument.caps = |caps| caps.md.topology = ConnTopology::PerInstrument;
     let scratch = Scratch::toy("unsubscribed");
+    scratch.write("continuity/rpi_book.frames", RPI_TOYA_ONLY);
     // A tag naming the instrument the connection did not subscribe.
     scratch.write(
         "continuity/book.frames",
@@ -1302,12 +1531,16 @@ fn subscriptions_idempotent_fails_a_codec_whose_reconnect_sends_other_subscripti
 fn subscriptions_idempotent_fails_a_codec_that_sends_the_last_connections_subscriptions_again() {
     let failure = failed(Variant::twisted(Twist::PilesUp).run(suite::subscriptions_idempotent));
     // Its reconnect differs from the first epoch, and sends its frame twice within the epoch
-    // (Codex r4218492650).
+    // (Codex r4218492650). rpi_book's codecs are the third and fourth it builds, so each of its
+    // epochs sends its frame more than once (FBC-fhk4).
     assert_eq!(
         said(&failure, "MdCodec::subscribe"),
         [
             "book: the reconnect's subscribe asked for other effects than the first epoch's",
             "book: epoch 1 sends the same frame twice, opening and subscribing",
+            "rpi_book: epoch 0 sends the same frame twice, opening and subscribing",
+            "rpi_book: the reconnect's subscribe asked for other effects than the first epoch's",
+            "rpi_book: epoch 1 sends the same frame twice, opening and subscribing",
         ]
     );
 }
@@ -1317,34 +1550,112 @@ fn subscriptions_idempotent_fails_a_codec_that_sends_the_last_connections_subscr
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn every_check_is_skipped_for_a_venue_with_no_book_channel_or_only_anchored_ones() {
+fn every_check_is_skipped_for_a_venue_with_no_book_channel_and_drives_every_anchored_one() {
     let none = Variant::declaring(|caps| caps.md.books.clear());
-    let anchored = Variant::declaring(|caps| caps.md.books[0].rest_anchor = true);
-    for variant in [none, anchored] {
-        for (name, check) in CHECKS {
-            match variant.run(check) {
-                Ok(Verdict::Skipped { check, why }) => {
-                    assert_eq!(check, name);
-                    assert!(why.contains("BookCaps.rest_anchor"), "{why}");
-                }
-                other => panic!("{name}: {other:?}"),
+    for (name, check) in CHECKS {
+        match none.run(check) {
+            Ok(Verdict::Skipped { check, why }) => {
+                assert_eq!(check, name);
+                assert!(why.starts_with("the caps declare no book channel"), "{why}");
             }
+            other => panic!("{name}: {other:?}"),
         }
     }
+    // FBC-fhk4: a channel anchored on REST is driven, never skipped by name. Every book the toy
+    // declares anchored, each check drives both.
+    let anchored = Variant::declaring(|caps| caps.md.books[0].rest_anchor = true);
+    for (name, check) in CHECKS {
+        let probed = probed(anchored.run(check));
+        assert!(
+            probed.iter().all(|p| !p.contains("skipped: BookCaps")),
+            "{name}: {probed:#?}"
+        );
+        assert!(
+            probed
+                .iter()
+                .any(|p| p.starts_with("rpi_book") || p.contains("/rpi_book.frames")),
+            "{name}: {probed:#?}"
+        );
+    }
+}
+
+/// FBC-fhk4: an `http` line answers a request the codec asked for and no line answered; one
+/// with none to answer is a breach of its case, which is judged no further, while the other
+/// channels' cases are still judged.
+#[test]
+fn an_http_line_with_no_request_to_answer_is_a_breach_of_its_case_and_others_are_judged() {
+    let scratch = Scratch::toy("unasked");
+    // A tag the toy never gave a request.
+    scratch.write(
+        "continuity/rpi_book.frames",
+        "http tag=9 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n\
+         gap=TOYA-PERP text delta|sym=TOYA-PERP|book=1|seq=12|bid=100:4|ask=\n",
+    );
+    let failure =
+        failed(Variant::twisted(Twist::IgnoresBreaks).run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, "continuity/rpi_book.frames"),
+        ["line 1 answers HTTP request 9, which the codec has not asked for or a line has answered"]
+    );
+    // book's breaks are still reported; rpi_book's case is judged no further.
+    assert_eq!(said(&failure, PLUS_ONE).len(), 3, "{failure}");
+    assert!(
+        said(&failure, PLUS_ONE)
+            .iter()
+            .all(|b| b.starts_with("continuity/book.frames"))
+    );
+
+    // One more answer than requests: the toy asked for two anchors.
+    scratch.write(
+        "continuity/rpi_book.frames",
+        "http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n\
+         http 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1\n\
+         http 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1\n",
+    );
+    let failure = failed(scratch.run(suite::continuity));
+    assert_eq!(
+        said(&failure, "continuity/rpi_book.frames"),
+        ["line 3 answers an HTTP request, but the codec has asked for none it still waits on"]
+    );
+
+    // A request answered twice by its tag.
+    scratch.write(
+        "continuity/rpi_book.frames",
+        "http tag=1 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n\
+         http tag=1 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n",
+    );
+    let failure = failed(scratch.run(suite::continuity));
+    assert_eq!(
+        said(&failure, "continuity/rpi_book.frames"),
+        ["line 2 answers HTTP request 1, which the codec has not asked for or a line has answered"]
+    );
+
+    // An answer the codec refuses is a refused line, as a frame is.
+    scratch.write(
+        "no_exch_ts_synthesized/rpi_book.frames",
+        "http 200 text nonsense\n\
+         http 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1\n",
+    );
+    let failure = failed(scratch.run(suite::no_exch_ts_synthesized));
+    let refused = said(&failure, "no_exch_ts_synthesized/rpi_book.frames");
+    assert_eq!(refused.len(), 1, "{failure}");
+    assert!(refused[0].starts_with("line 1 refused: "), "{failure}");
 }
 
 #[test]
 fn continuity_skips_a_channel_whose_frames_nothing_chains() {
     let windowed = Variant::declaring(|caps| {
-        caps.md.books[0].continuity = Continuity::Windowed;
+        for book in &mut caps.md.books {
+            book.continuity = Continuity::Windowed;
+        }
     });
     match windowed.run_in(suite::continuity, &Scratch::empty("windowed").0) {
         Ok(Verdict::Skipped { why, .. }) => assert!(why.contains("Windowed or Unsequenced")),
         other => panic!("{other:?}"),
     }
-    // The other checks still drive it.
+    // The other checks still drive them.
     let driven = probed(windowed.run(suite::book_channels));
-    assert_eq!(driven[1], "book_channels/book.frames: shows [Public]");
+    assert_eq!(driven[0], "book_channels/book.frames: shows [Public]");
 
     // With a second, chained channel, the unchained one is named.
     let mixed = Variant::declaring(|caps| {
@@ -1355,7 +1666,7 @@ fn continuity_skips_a_channel_whose_frames_nothing_chains() {
     });
     let named = probed(mixed.run(suite::continuity));
     assert_eq!(
-        named[1],
+        named[0],
         "flat: skipped: BookCaps.continuity is Unsequenced: nothing chains its frames"
     );
 }
@@ -1387,11 +1698,31 @@ fn continuity_reads_a_binary_venues_longer_blocks() {
     let empty_delta = "delta|sym=TOYA-PERP|book=0|seq=11|bid=|ask=";
     let file = "continuity/longer_block/book.frames";
     scratch.write(file, &(hex(snap) + &hex(delta)));
+    // FBC-fhk4: the anchored channel's longer blocks follow its anchors' HTTP answers, which are
+    // its REST bodies, no binary block: text, and one (a refusal it asks again after) pushing
+    // nothing.
+    let rpi = "continuity/longer_block/rpi_book.frames";
+    let anchors = "http tag=2 503 text busy\n\
+                   http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3|ask=101:2\n";
+    let rpi_delta = hex("delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=");
+    scratch.write(rpi, &format!("{anchors}{rpi_delta}"));
     let read = probed(binary().run_in(suite::continuity, &scratch.0));
     assert_eq!(
         read[2..],
-        ["continuity/longer_block/book.frames: 2 frames, 0 breaking the sequence"]
+        [
+            "continuity/longer_block/book.frames: 2 frames, 0 breaking the sequence",
+            "continuity/longer_block/rpi_book.frames: 1 frames, 0 breaking the sequence, 2 HTTP \
+             answers",
+        ]
     );
+    // Answers alone hand the codec no frame.
+    scratch.write(rpi, anchors);
+    let failure = failed(binary().run_in(suite::continuity, &scratch.0));
+    assert_eq!(
+        said(&failure, rpi),
+        ["hands the codec no frame: a case that decodes nothing proves nothing"]
+    );
+    scratch.write(rpi, &format!("{anchors}{rpi_delta}"));
 
     // Codex r4217839165: an empty longer-block case fails.
     scratch.write(file, "# nothing\n");
@@ -1454,17 +1785,20 @@ fn a_check_fails_a_missing_case_a_malformed_one_and_a_case_it_never_reads() {
     let scratch = Scratch::toy("stray");
     fs::remove_file(scratch.at("book_channels/book.frames")).unwrap();
     scratch.write(
-        "book_channels/rpi_book.frames",
-        "# anchored: never driven\n",
+        "book_channels/flat_book.frames",
+        "# no such channel: never driven\n",
     );
     let failure = failed(scratch.run(suite::book_channels));
     assert_eq!(
         named(&failure),
-        ["book_channels/book.frames", "book_channels/rpi_book.frames"]
+        [
+            "book_channels/book.frames",
+            "book_channels/flat_book.frames"
+        ]
     );
     assert!(said(&failure, "book_channels/book.frames")[0].starts_with("cannot read"));
     assert_eq!(
-        said(&failure, "book_channels/rpi_book.frames"),
+        said(&failure, "book_channels/flat_book.frames"),
         ["book_channels drives no book channel of that name, so it is never checked"]
     );
 

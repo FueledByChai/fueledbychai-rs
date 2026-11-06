@@ -1,0 +1,24 @@
+# The toy's `rpi_book` channel (ANCHORED_BOOK), anchored on REST (BookCaps.rest_anchor) and
+# sequenced plus one per instrument (BookCaps.continuity PlusOne). Subscribed, the toy asks for
+# TOYA-PERP's anchor (request tag 1), then TOYB-PERP's (tag 2); an `http` line answers the one
+# its `tag=` names, or the earliest the toy still waits on. Each `gap=<symbol>` frame breaks
+# that instrument's sequence, and only those do.
+# A delta before its book's anchor is held until the anchor comes.
+text delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=
+http tag=2 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1
+# TOYA-PERP's anchor at 10: the held 11 follows it.
+http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3,98:5|ask=101:2
+text delta|sym=TOYA-PERP|book=1|seq=12|bid=|ask=101:0
+text delta|sym=TOYB-PERP|book=1|seq=501|bid=41:2|ask=
+# 13 never came: the toy asks for TOYA-PERP's anchor again (tag 3), holding 14.
+gap=TOYA-PERP text delta|sym=TOYA-PERP|book=1|seq=14|bid=99:1|ask=
+# Held, with no second gap.
+text delta|sym=TOYA-PERP|book=1|seq=15|bid=99:2|ask=
+# An anchor before a delta already missed mends nothing: asked for again (tag 4).
+http 200 text anchor|sym=TOYA-PERP|seq=11|bid=100:1|ask=101:1
+# The anchor at 14: the held 15 follows it.
+http 200 text anchor|sym=TOYA-PERP|seq=14|bid=100:1|ask=101:1
+text delta|sym=TOYA-PERP|book=1|seq=16|bid=100:2|ask=
+# A repeat breaks it too, and so does a sequence gone back.
+gap=TOYA-PERP text delta|sym=TOYA-PERP|book=1|seq=16|bid=100:3|ask=
+gap=TOYB-PERP text delta|sym=TOYB-PERP|book=1|seq=499|bid=41:0|ask=

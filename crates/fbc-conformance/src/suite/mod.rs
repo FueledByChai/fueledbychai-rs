@@ -50,9 +50,10 @@
 //!   `RejectKind` it maps to as the kind's `Debug` spells it ([`reject_coverage`]).
 //! - `continuity/`, `no_exch_ts_synthesized/` and `book_channels/`: one market-data case per
 //!   book channel the suite drives, `<channel>.frames`, its frames tagged with what the fixture
-//!   knows of them (the format is [`book_cases`]'s); and, for a venue whose market data is
-//!   binary, `continuity/longer_block/<channel>.frames`, frames whose binary block is longer
-//!   than expected.
+//!   knows of them, and for a channel anchored on REST its anchors' answers in `http` lines (the
+//!   format is [`book_cases`]'s); and, for a venue whose market data is binary,
+//!   `continuity/longer_block/<channel>.frames`, frames whose binary block is longer than
+//!   expected.
 //!
 //! [`caps_truthful`], [`commands_selfcontained`], [`encode_deterministic`], [`price_grid`] and
 //! [`subscriptions_idempotent`] read no file: they need only the factory and the [`Setup`] the
@@ -188,8 +189,9 @@
 //! - [`reject_coverage`]: every code in the fixture's reject table maps to the `RejectKind` the
 //!   table gives it, `Other` only where the table says so (design §6 step 9).
 //!
-//! The four market-data checks skip by name a book channel anchored on REST (FBC-fhk4), and a
-//! check's sub-case skipped (a text venue's longer blocks) is listed by name among what it
+//! The four market-data checks drive every book channel the caps declare, one anchored on REST
+//! among them, its anchors' answers handed to the codec from its cases' `http` lines (FBC-fhk4);
+//! a check's sub-case skipped (a text venue's longer blocks) is listed by name among what it
 //! probed.
 
 pub mod book_cases;

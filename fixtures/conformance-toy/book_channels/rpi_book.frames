@@ -1,0 +1,8 @@
+# The toy's `rpi_book` channel (ANCHORED_BOOK) shows public and RPI liquidity
+# (BookCaps.includes_channels): every frame or anchor's HTTP answer that pushes a level says
+# which. TOYB-PERP's anchor (request tag 2) is answered before TOYA-PERP's (tag 1).
+public rpi http tag=2 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1
+public http 200 text anchor|sym=TOYA-PERP|seq=10|bid=100:3,98:5|ask=101:2
+rpi text delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=
+# A delta setting no level shows nothing.
+text delta|sym=TOYB-PERP|book=1|seq=501|bid=|ask=

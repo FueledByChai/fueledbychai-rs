@@ -114,6 +114,14 @@ pub(crate) fn parse(text: &str) -> Result<Case, String> {
 
 /// The `http` line `n` whose text after `http ` is `response`, or why it is not one.
 fn http(response: &str, n: usize) -> Result<Line, String> {
+    let (status, body) = self::response(response, n)?;
+    Ok(Line::Http { status, body })
+}
+
+/// The status and body of the response line `n` spells after `http `, `<status> text <body>`
+/// or `<status> hex <bytes>`, or why it spells none; a market-data case's `http` line reads
+/// its response the same way ([`super::book_cases`]).
+pub(crate) fn response(response: &str, n: usize) -> Result<(u16, Vec<u8>), String> {
     let shape = || {
         format!(
             "line {n}: not `http <status> text <body>` or `http <status> hex <bytes>`, <status> \
@@ -133,7 +141,7 @@ fn http(response: &str, n: usize) -> Result<Line, String> {
     } else {
         return Err(shape());
     };
-    Ok(Line::Http { status, body })
+    Ok((status, body))
 }
 
 /// The bytes `hex` spells, spaces between them allowed; `None` when it spells none, has an odd

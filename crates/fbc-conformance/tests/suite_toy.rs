@@ -10,6 +10,10 @@
 //! with replies computed from them (`toy_setup::order_entry`); `continuity`'s longer-block sub-case reports
 //! itself skipped by name for the toy's text protocol. The checks are run directly too, to show what they probed: a
 //! pass that probed nothing would prove nothing.
+//!
+//! FBC-fhk4's done line, its first half: the four market-data checks drive the toy's `rpi_book`
+//! (`ANCHORED_BOOK`, anchored on REST, showing public and RPI liquidity) through the suite macro
+//! from case files whose `http` lines carry its anchors' answers, rather than skip it by name.
 
 mod toy_setup;
 
@@ -238,50 +242,56 @@ fn price_grid_quantizes_and_sends_every_boundary_price_on_both_of_the_toys_instr
     }
 }
 
-/// Why the toy's `rpi_book` is skipped by every market-data check.
-const ANCHORED: &str = "rpi_book: skipped: BookCaps.rest_anchor is true: its snapshot comes in \
-                        an HTTP answer, which the suite does not carry yet (FBC-fhk4)";
-
+/// FBC-fhk4: the toy's `rpi_book`, anchored on REST, is driven from a case whose `http` lines
+/// answer its anchors, by tag and earliest first; nothing skips it by name.
 #[test]
-fn continuity_detects_every_marked_break_and_skips_the_longer_block_sub_case_by_name() {
+fn continuity_detects_every_marked_break_on_both_toy_books_and_skips_the_longer_block_by_name() {
     assert_eq!(
         probed(suite::continuity),
         [
-            ANCHORED,
             "continuity/book.frames: 3 of 11 frames break the sequence",
+            "continuity/rpi_book.frames: 3 of 12 lines (8 frames, 4 HTTP answers) break the \
+             sequence",
             "longer_block: skipped: MdCaps.encoding is Text: its frames carry no binary block",
         ]
     );
 }
 
 #[test]
-fn subscriptions_idempotent_sends_the_toys_book_once_per_epoch() {
+fn subscriptions_idempotent_sends_the_toys_books_once_per_epoch_and_the_anchors_with_rpi_book() {
     assert_eq!(
         probed(suite::subscriptions_idempotent),
         [
-            ANCHORED,
             "book: 2 subscriptions sent once in each of 2 epochs ([1, 1] effects), nothing for \
              the same set again",
+            // FBC-fhk4: one subscribe frame and an anchor's request per instrument.
+            "rpi_book: 2 subscriptions sent once in each of 2 epochs ([3, 3] effects), nothing \
+             for the same set again",
         ]
     );
 }
 
 #[test]
-fn no_exch_ts_synthesized_judges_every_event_of_a_frame_without_a_timestamp_on_the_toy() {
+fn no_exch_ts_synthesized_judges_every_event_of_a_frame_or_answer_without_a_timestamp_on_the_toy() {
     assert_eq!(
         probed(suite::no_exch_ts_synthesized),
         [
-            ANCHORED,
             "no_exch_ts_synthesized/book.frames: 6 events from frames without a timestamp",
+            "no_exch_ts_synthesized/rpi_book.frames: 6 events from frames and HTTP answers \
+             without a timestamp",
         ]
     );
 }
 
 #[test]
-fn book_channels_holds_the_toys_book_to_public_liquidity() {
+fn book_channels_holds_the_toys_book_to_public_and_its_rpi_book_to_public_and_rpi_liquidity() {
     assert_eq!(
         probed(suite::book_channels),
-        [ANCHORED, "book_channels/book.frames: shows [Public]"]
+        [
+            "book_channels/book.frames: shows [Public]",
+            // FBC-fhk4: md.books[1].includes_channels, Public and Rpi, each shown by a line.
+            "book_channels/rpi_book.frames: shows [Public, Rpi]",
+        ]
     );
 }
 

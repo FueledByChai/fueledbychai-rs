@@ -1,5 +1,6 @@
 //! What the conformance toy's fixtures (`fixtures/conformance-toy`) assume, shared by the suite's
-//! tests on the toy: its two instruments, no configuration, no credentials, the golden
+//! tests on the toy: its two instruments, a configuration naming only its anchored book
+//! channel's REST base ([`ANCHOR_URL`], FBC-fhk4), no credentials, the golden
 //! commands whose encodings `signing_golden/` holds, its order-entry stream, which the case
 //! files' frames are handed on, how its order entry answers over the stub server
 //! ([`order_entry`]), no bootstrap: the toy's codec encodes as built, and venue order ids as
@@ -27,6 +28,11 @@ pub const FIXTURES: &str = concat!(
     "/../../fixtures/conformance-toy"
 );
 
+/// The REST base the toy's anchored book channel (`rpi_book`) asks its anchors under, never
+/// opened: the market-data checks hand the codec each anchor's answer from their case files'
+/// `http` lines (FBC-fhk4). It holds no credential.
+pub const ANCHOR_URL: &str = "https://conformance.invalid/anchor";
+
 /// The wall time the goldens are signed at.
 const WALL: i64 = 1_759_363_200_000_000_000;
 
@@ -34,7 +40,7 @@ const WALL: i64 = 1_759_363_200_000_000_000;
 pub fn assumed() -> Setup {
     Setup {
         specs: toy::specs(),
-        cfg: VenueConfig::new(),
+        cfg: config(),
         creds: Secrets::new(),
         goldens: goldens(),
         exec_stream: toy::EXEC_STREAM,
@@ -42,6 +48,14 @@ pub fn assumed() -> Setup {
         bootstrap: None,
         venue_order_ids,
     }
+}
+
+/// The toy's configuration: its anchored book channel's REST base, so its market-data codec
+/// subscribes that channel rather than refuse it for want of one.
+pub fn config() -> VenueConfig {
+    let mut cfg = VenueConfig::new();
+    cfg.insert(toy::ANCHOR_URL_KEY, ANCHOR_URL);
+    cfg
 }
 
 /// Order `i`'s venue id as the stub's answers spell them; the toy takes any.

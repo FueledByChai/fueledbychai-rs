@@ -19,6 +19,12 @@
 //! channel declared [`Continuity::Windowed`] or [`Continuity::Unsequenced`] has nothing to
 //! chain and is skipped by name.
 //!
+//! A channel anchored on REST ([`BookCaps::rest_anchor`]) is driven like any other (FBC-fhk4):
+//! its case's `http` lines hand the codec its anchors' answers, and an answer is held to the
+//! gaps it marks and to the books broken before it as a frame is, its snapshot mending one. An
+//! answer is no frame, though: it never shows the codec taking the sequence, which only a frame
+//! of the channel does.
+//!
 //! # The longer-block sub-case
 //!
 //! A venue whose market data is binary ([`Encoding::Sbe`] or [`Encoding::Protobuf`]) also
@@ -28,9 +34,11 @@
 //! every one binary (Codex r4217991970), and the codec must decode every one, each pushing
 //! something (Codex r4217682441, r4217839165), and report a gap exactly where the case marks
 //! one, if anywhere: a longer block is read by its declared length, never taken for a break,
-//! refused or dropped. A text venue ([`Encoding::Json`] or [`Encoding::Text`]) has no binary
-//! block: the sub-case is skipped by name, and a `longer_block/` directory in its fixtures
-//! fails, as a case never read.
+//! refused or dropped. An anchored channel's sub-case may answer its anchors in `http` lines,
+//! whose bodies are the venue's REST answers, not its binary blocks: an answer need be neither
+//! binary nor push anything, and is no frame the case must hold (FBC-fhk4). A text venue
+//! ([`Encoding::Json`] or [`Encoding::Text`]) has no binary block: the sub-case is skipped by
+//! name, and a `longer_block/` directory in its fixtures fails, as a case never read.
 
 use std::collections::BTreeSet;
 
@@ -38,7 +46,7 @@ use fbc_core::{
     BookCaps, Continuity, Encoding, Feed, FeedHealth, InstrumentId, MdEvent, SpecTable,
 };
 
-use super::book_cases::{self, Book, NO_BOOK, PerBook, Step};
+use super::book_cases::{self, Book, Kind, NO_BOOK, PerBook, Step};
 use super::harness::Harness;
 use super::{Breach, Failure, Subject, Verdict};
 
@@ -47,9 +55,8 @@ const CHECK: &str = "continuity";
 const LONGER: &str = "longer_block";
 
 /// Why the check is skipped for a venue it drives no channel of.
-const NOTHING_CHAINED: &str = "the caps declare no book channel the suite drives whose \
-     continuity chains its frames: none, each anchored on REST (BookCaps.rest_anchor, FBC-fhk4), \
-     or each Windowed or Unsequenced (BookCaps.continuity)";
+const NOTHING_CHAINED: &str = "the caps declare no book channel whose continuity chains its \
+     frames: none, or each Windowed or Unsequenced (BookCaps.continuity)";
 
 /// Runs `continuity` against `subject`.
 pub fn continuity(subject: &Subject<'_>) -> Result<Verdict, Failure> {
@@ -163,7 +170,9 @@ fn judge(
                 _ => None,
             })
             .collect();
-        if !breaks && !step.binary {
+        // An anchor's HTTP answer is no frame (FBC-fhk4).
+        let frame = step.kind != Kind::Http;
+        if !breaks && step.kind == Kind::Text {
             // Codex r4217991970: a longer block is a binary frame's.
             let what = format!("line {line} is a text frame: a longer block is binary");
             breaches.push(Breach::new(file, what));
@@ -173,14 +182,14 @@ fn judge(
                 let what = format!("{file} line {line} is in sequence, yet a gap was reported");
                 breaches.push(Breach::new(&capability, what));
             }
-            if !breaks && step.events.is_empty() {
+            if !breaks && frame && step.events.is_empty() {
                 let what = format!(
                     "line {line} decodes to no event: a longer block must be read, not dropped"
                 );
                 breaches.push(Breach::new(file, what));
             }
             // Codex r4218744571: a frame in sequence that the codec takes.
-            in_sequence |= step.events.iter().any(|(_, ev)| on_book(ev, book));
+            in_sequence |= frame && step.events.iter().any(|(_, ev)| on_book(ev, book));
             let held = Held { book, broke: &[] };
             kept_live(
                 &mut broken,
@@ -245,14 +254,19 @@ fn judge(
             breaches,
         );
     }
-    let frames = steps.len();
+    let answers = steps.iter().filter(|s| s.kind == Kind::Http).count();
+    let frames = steps.len() - answers;
     if !breaks {
         if frames == 0 {
             // Codex r4217839165.
             let what = "hands the codec no frame: a case that decodes nothing proves nothing";
             breaches.push(Breach::new(file, what));
         }
-        return format!("{file}: {frames} frames, {marked} breaking the sequence");
+        let answered = match answers {
+            0 => String::new(),
+            n => format!(", {}", http_answers(n)),
+        };
+        return format!("{file}: {frames} frames, {marked} breaking the sequence{answered}");
     }
     if marked == 0 {
         let what = "marks no frame `gap=<symbol>`: a case that breaks no sequence proves nothing";
@@ -265,7 +279,22 @@ fn judge(
         );
         breaches.push(Breach::new(file, what));
     }
-    format!("{file}: {marked} of {frames} frames break the sequence")
+    match answers {
+        0 => format!("{file}: {marked} of {frames} frames break the sequence"),
+        n => format!(
+            "{file}: {marked} of {} lines ({frames} frames, {}) break the sequence",
+            steps.len(),
+            http_answers(n)
+        ),
+    }
+}
+
+/// `n` HTTP answers, in words.
+fn http_answers(n: usize) -> String {
+    match n {
+        1 => "1 HTTP answer".to_owned(),
+        n => format!("{n} HTTP answers"),
+    }
 }
 
 /// The instruments whose book is broken: `held` until a snapshot of it begins, `healing` until
@@ -411,7 +440,7 @@ mod tests {
         }
         Step {
             line,
-            binary: false,
+            kind: Kind::Text,
             tags,
             result: Ok(()),
             events: events.into_iter().map(|ev| (VenueMeta::NONE, ev)).collect(),

@@ -4,12 +4,13 @@
 //! figures and a replay's ordering rest on a time the venue never sent.
 //!
 //! For every book channel the suite drives ([`book_cases`](super::book_cases)),
-//! `no_exch_ts_synthesized/<channel>.frames` marks with the `ts` tag each frame that carries the
-//! venue's timestamp. Every event pushed from a frame not marked must carry none. A case none of
-//! whose unmarked frames pushes an event proves nothing and fails. Market data only: the
-//! order-entry events are not held to this check yet.
+//! `no_exch_ts_synthesized/<channel>.frames` marks with the `ts` tag each frame, or HTTP answer
+//! (an anchored channel's snapshot, FBC-fhk4), that carries the venue's timestamp. Every event
+//! pushed from a line not marked must carry none. A case none of whose unmarked lines pushes an
+//! event proves nothing and fails. Market data only: the order-entry events are not held to
+//! this check yet.
 
-use super::book_cases::{self, NO_BOOK, PerBook};
+use super::book_cases::{self, Kind, NO_BOOK, PerBook};
 use super::harness::Harness;
 use super::{Breach, Failure, Subject, Verdict};
 
@@ -25,11 +26,15 @@ pub fn no_exch_ts_synthesized(subject: &Subject<'_>) -> Result<Verdict, Failure>
         judge: &|_, file, steps, _, breaches| {
             let mut judged = 0usize;
             for step in steps.iter().filter(|s| !s.tags.ts) {
+                let line = match step.kind {
+                    Kind::Http => "HTTP answer",
+                    Kind::Text | Kind::Binary => "frame",
+                };
                 for (meta, _) in &step.events {
                     judged += 1;
                     if let Some(ts) = meta.exch_ts {
                         let what = format!(
-                            "{file} line {}: the frame carries no timestamp, yet an event \
+                            "{file} line {}: the {line} carries no timestamp, yet an event \
                              carries exch_ts {}",
                             step.line, ts.0
                         );
@@ -38,11 +43,15 @@ pub fn no_exch_ts_synthesized(subject: &Subject<'_>) -> Result<Verdict, Failure>
                 }
             }
             if judged == 0 {
-                let what = "no event is decoded from a frame without a timestamp: a case that \
+                let what = "no event is decoded from a line without a timestamp: a case that \
                             states none proves nothing";
                 breaches.push(Breach::new(file, what));
             }
-            format!("{file}: {judged} events from frames without a timestamp")
+            let lines = match steps.iter().any(|s| s.kind == Kind::Http) {
+                true => "frames and HTTP answers",
+                false => "frames",
+            };
+            format!("{file}: {judged} events from {lines} without a timestamp")
         },
     };
     let outcome = per_book.run(&h, subject, &books, skipped);
