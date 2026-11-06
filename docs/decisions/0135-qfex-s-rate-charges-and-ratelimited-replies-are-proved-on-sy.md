@@ -131,15 +131,10 @@ The owner's words leave two points open, and the items that settle them say so:
        charge one general and one cancel budget, across threads;
      - the safety reserve still applies, and another user's budget stays apart;
      - a `RateLimited` reply reaches every account's counters.
-   - **FBC-ywjb** (landed):
-     - in `crates/venues/fbc-venue-qfex/src/rate.rs`,
-       `each_mapped_type_has_its_bucket_and_nothing_else_does`,
-       `only_the_two_documented_forms_give_a_hint` and
-       `an_echo_is_found_literally_or_behind_ascii_escapes`: only an exact echoed operation
-       selects its bucket, a retry hint is read only in its two documented forms, and an echo
-       is found literally or behind ASCII escapes. Its cross-account hold and whole-frame
-       redaction tests in that file were replaced when FBC-zeb0 landed: FBC-zeb0's tests below
-       carry both;
+   - **FBC-ywjb** (landed). Its classifier tests in
+     `crates/venues/fbc-venue-qfex/src/rate.rs` were replaced when FBC-zeb0 rewrote that file:
+     FBC-zeb0's bullet below cites what proves the classifier, the cross-account hold and the
+     whole-frame redaction now. Its own tests that stand are fbc-runtime's:
      - in `crates/fbc-runtime/src/ratelimit.rs`,
        `qfex_provider_refusal_holds_the_shared_bucket_without_spending_cancel_reserve` and
        `unknown_provider_echo_holds_frames_even_without_a_matching_bucket`: a refusal holds
@@ -148,7 +143,13 @@ The owner's words leave two points open, and the items that settle them say so:
      - in `crates/fbc-runtime/src/session_core.rs`,
        `provider_rate_effect_updates_the_shared_budget_without_writing_or_answering`: the
        session executes `Effect::RateLimited` as a hold alone, writing and answering nothing.
-   - **FBC-zeb0** (landed), `crates/venues/fbc-venue-qfex/tests/private_codec.rs`:
+   - **FBC-zeb0** (landed), in `crates/venues/fbc-venue-qfex/src/rate.rs` as it rewrote it,
+     `each_mapped_type_has_its_bucket_and_nothing_else_does`,
+     `only_the_two_documented_forms_give_a_hint` and
+     `an_echo_is_found_literally_or_behind_ascii_escapes` (only an exact echoed operation
+     selects its bucket, a retry hint is read only in its two documented forms, and an echo
+     is found literally or behind ASCII escapes), and in
+     `crates/venues/fbc-venue-qfex/tests/private_codec.rs`:
      - `every_documented_rate_refusal_holds_the_budget_and_settles_or_reconnects_nothing`: a
        rate-limit frame in either documented envelope, and a `RATE_LIMITED` order status, each
        give `Effect::RateLimited` with the documented retry hint and no settlement or
