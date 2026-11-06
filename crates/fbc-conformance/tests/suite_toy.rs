@@ -271,14 +271,17 @@ fn subscriptions_idempotent_sends_the_toys_books_once_per_epoch_and_the_anchors_
     );
 }
 
+/// Codex r4489870341: on `rpi_book`, the anchor answered without a timestamp after a stamped
+/// delta was held releases that delta's level carrying its own frame's timestamp, which the
+/// answer's `held=` names, while its snapshot and the unstamped held delta carry none.
 #[test]
 fn no_exch_ts_synthesized_judges_every_event_of_a_frame_or_answer_without_a_timestamp_on_the_toy() {
     assert_eq!(
         probed(suite::no_exch_ts_synthesized),
         [
             "no_exch_ts_synthesized/book.frames: 6 events from frames without a timestamp",
-            "no_exch_ts_synthesized/rpi_book.frames: 6 events from frames and HTTP answers \
-             without a timestamp",
+            "no_exch_ts_synthesized/rpi_book.frames: 12 events from frames and HTTP answers \
+             without a timestamp, 1 released from a held frame with its timestamp",
         ]
     );
 }

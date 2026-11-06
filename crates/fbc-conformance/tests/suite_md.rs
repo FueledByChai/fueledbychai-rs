@@ -17,6 +17,12 @@
 //! anchor's answer as from a frame; an answer is no frame for a case's sequence taken or a
 //! longer block; an `http` line with no request to answer is a breach of its case; and
 //! `book_channels` names the lines showing a channel `rpi_book` is declared without.
+//!
+//! Codex r4489870341: `no_exch_ts_synthesized` lets an anchor's answer without a timestamp
+//! release a stamped delta the toy held with its own frame's timestamp, which the answer names
+//! with `held=`, and fails a toy that dates the answer's snapshot, a health it reports or an
+//! unstamped held delta by it, a case naming a frame that held nothing or was released already,
+//! and a case whose only events judged are released ones.
 
 mod toy_setup;
 
@@ -63,6 +69,23 @@ enum Twist {
     GapsAlways,
     /// Every event without the venue's timestamp gets one of the codec's own.
     StampsTime,
+    /// Each book snapshot an anchor's HTTP answer pushes without the venue's timestamp is dated
+    /// by the last timestamp the answer's events carry, a stamped delta's it held and flushes
+    /// after the snapshot (Codex r4489870341).
+    DatesSnapshotByHeld,
+    /// After each anchor's HTTP answer pushing a snapshot, it reports the book live, dated by the
+    /// last timestamp the answer's events carry, a stamped delta's it held.
+    LiveByHeld,
+    /// Each event an anchor's HTTP answer pushes after its snapshot without the venue's
+    /// timestamp is dated by the last timestamp the answer's events carry: an unstamped delta it
+    /// held is flushed with a stamped one's.
+    DatesFlushedByHeld,
+    /// Each event an anchor's HTTP answer none of whose events carries the venue's timestamp
+    /// pushes after its snapshot is dated by the last timestamp the codec pushed before the
+    /// answer, from any frame or answer.
+    DatesFlushedByLast,
+    /// It pushes only the events that carry the venue's timestamp.
+    OnlyStamped,
     /// Every book event is put on the anchored book instead.
     OtherBook,
     /// It refuses every subscription.
@@ -203,6 +226,7 @@ impl VenueFactory for Variant {
                 twist,
                 built: self.builds.fetch_add(1, Ordering::Relaxed),
                 broken: BTreeSet::new(),
+                last_ts: None,
             }),
         }
     }
@@ -237,6 +261,8 @@ struct Twisted {
     built: u64,
     /// The books it reported a gap on and has had no snapshot of since ([`Twist::KeepsApplying`]).
     broken: BTreeSet<(InstrumentId, BookId)>,
+    /// The last timestamp an event it pushed carried ([`Twist::DatesFlushedByLast`]).
+    last_ts: Option<ExchNs>,
 }
 
 /// The events a twisted codec's toy pushed from one call.
@@ -353,6 +379,9 @@ impl MdSink for Rewrite<'_> {
             }
         );
         if self.twist == Twist::OnlyGaps && !gap {
+            return;
+        }
+        if self.twist == Twist::OnlyStamped && meta.exch_ts.is_none() {
             return;
         }
         if matches!(
@@ -590,6 +619,15 @@ impl MdCodec for Twisted {
                 toy.on_frame(f, scope, specs, sink, fx)
             });
         }
+        if twist == Twist::DatesFlushedByLast {
+            let mut toy = Collect(Vec::new());
+            let outcome = self.inner.on_frame(f, scope, specs, &mut toy, fx);
+            for (meta, ev) in toy.0 {
+                self.last_ts = meta.exch_ts.or(self.last_ts);
+                sink.push(meta, ev);
+            }
+            return outcome;
+        }
         let text;
         let f = match (twist, f) {
             (Twist::BinaryText, RawFrame::Binary(bytes)) => {
@@ -622,6 +660,56 @@ impl MdCodec for Twisted {
         sink: &mut dyn MdSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        let twist = self.twist;
+        if matches!(
+            twist,
+            Twist::DatesSnapshotByHeld
+                | Twist::LiveByHeld
+                | Twist::DatesFlushedByHeld
+                | Twist::DatesFlushedByLast
+        ) {
+            let mut toy = Collect(Vec::new());
+            let outcome = self.inner.on_http(tag, resp, scope, specs, &mut toy, fx);
+            // The last timestamp the answer's events carry, and the last one the codec pushed
+            // before the answer.
+            let held = toy.0.iter().rev().find_map(|(meta, _)| meta.exch_ts);
+            let before = self.last_ts;
+            let (mut in_snapshot, mut after_snapshot, mut snapshot) = (false, false, None);
+            for (mut meta, ev) in toy.0 {
+                let of_snapshot = match ev {
+                    MdEvent::BookSnapshotBegin { inst, book, .. } => {
+                        in_snapshot = true;
+                        snapshot = Some((inst, book));
+                        true
+                    }
+                    MdEvent::BookSnapshotEnd { .. } => {
+                        in_snapshot = false;
+                        after_snapshot = true;
+                        true
+                    }
+                    _ => in_snapshot,
+                };
+                let flushed = after_snapshot && !of_snapshot;
+                let date = match twist {
+                    Twist::DatesSnapshotByHeld if of_snapshot => held,
+                    Twist::DatesFlushedByHeld if flushed => held,
+                    Twist::DatesFlushedByLast if flushed && held.is_none() => before,
+                    _ => None,
+                };
+                meta.exch_ts = meta.exch_ts.or(date);
+                self.last_ts = meta.exch_ts.or(self.last_ts);
+                sink.push(meta, ev);
+            }
+            if let (Twist::LiveByHeld, Some((inst, book))) = (twist, snapshot) {
+                let meta = VenueMeta {
+                    exch_ts: held,
+                    ..VenueMeta::NONE
+                };
+                let (feed, h) = (Feed::Book(book), FeedHealth::Live);
+                sink.push(meta, MdEvent::Health { inst, feed, h });
+            }
+            return outcome;
+        }
         // What the toy pushes from an anchor's answer is twisted as from a frame (FBC-fhk4).
         if let Some(stray) = self.stray() {
             return self.keep_applying(sink, stray, |toy, sink| {
@@ -863,21 +951,227 @@ fn continuity_fails_a_toy_that_reports_a_gap_in_sequence() {
 fn no_exch_ts_synthesized_fails_a_toy_that_stamps_a_time_its_frame_lacks() {
     let failure = failed(Variant::twisted(Twist::StampsTime).run(suite::no_exch_ts_synthesized));
     assert_eq!(failure.check, "no_exch_ts_synthesized");
-    // Six events on book, and six on rpi_book, four of them from an anchor's HTTP answer
-    // (FBC-fhk4).
-    assert_eq!(named(&failure), ["VenueMeta.exch_ts"; 12]);
+    // Six events on book, and eleven on rpi_book, nine of them from an anchor's HTTP answer
+    // (FBC-fhk4): the last answer's snapshot and the unstamped delta it releases, but not the
+    // stamped one, which keeps its own frame's timestamp (Codex r4489870341).
+    assert_eq!(named(&failure), ["VenueMeta.exch_ts"; 17]);
     let said = said(&failure, "VenueMeta.exch_ts");
     assert_eq!(
         said[0],
-        "no_exch_ts_synthesized/book.frames line 4: the frame carries no timestamp, yet an \
-         event carries exch_ts 7"
+        "no_exch_ts_synthesized/book.frames line 4: the frame carries no timestamp, yet \
+         Level { inst: InstrumentId(7), book: BookId(0), side: Bid, px: Ticks(100), qty: \
+         Lots(4) } carries exch_ts 7"
+    );
+    for s in &said[7..11] {
+        assert!(
+            s.starts_with(
+                "no_exch_ts_synthesized/rpi_book.frames line 6: the HTTP answer carries no \
+                 timestamp, yet "
+            ) && s.ends_with(" carries exch_ts 7"),
+            "{s}"
+        );
+    }
+    for s in &said[12..] {
+        assert!(
+            s.starts_with(
+                "no_exch_ts_synthesized/rpi_book.frames line 16: the HTTP answer carries no \
+                 timestamp and releases no held frame stamped 7, yet "
+            ),
+            "{s}"
+        );
+    }
+    // The held delta the answer flushes, named.
+    assert_eq!(
+        said[16],
+        "no_exch_ts_synthesized/rpi_book.frames line 16: the HTTP answer carries no timestamp \
+         and releases no held frame stamped 7, yet Level { inst: InstrumentId(7), book: \
+         BookId(1), side: Bid, px: Ticks(99), qty: Lots(1) } carries exch_ts 7"
+    );
+}
+
+/// Codex r4489870341: an anchor's answer without a timestamp that releases a stamped delta the
+/// toy held may carry that delta's timestamp on the delta's events only: a toy that dates the
+/// answer's snapshot by it fails, naming each of the snapshot's events, and nothing else.
+#[test]
+fn no_exch_ts_synthesized_fails_a_toy_dating_an_anchors_snapshot_by_the_delta_it_held() {
+    let twisted = Variant::twisted(Twist::DatesSnapshotByHeld);
+    let failure = failed(twisted.run(suite::no_exch_ts_synthesized));
+    assert_eq!(failure.check, "no_exch_ts_synthesized");
+    assert_eq!(named(&failure), ["VenueMeta.exch_ts"; 4]);
+    let dated = |ev: &str| {
+        format!(
+            "no_exch_ts_synthesized/rpi_book.frames line 16: the HTTP answer carries no \
+             timestamp, yet {ev}, of a book snapshot it pushes, carries exch_ts \
+             1759363200000000900, line 12's: a snapshot is the line's own, never released from \
+             a held frame"
+        )
+    };
+    assert_eq!(
+        said(&failure, "VenueMeta.exch_ts"),
+        [
+            dated("BookSnapshotBegin { inst: InstrumentId(7), book: BookId(1), epoch: 2 }"),
+            dated(
+                "Level { inst: InstrumentId(7), book: BookId(1), side: Bid, px: Ticks(100), \
+                 qty: Lots(1) }"
+            ),
+            dated(
+                "Level { inst: InstrumentId(7), book: BookId(1), side: Ask, px: Ticks(101), \
+                 qty: Lots(1) }"
+            ),
+            dated("BookSnapshotEnd { inst: InstrumentId(7), book: BookId(1) }"),
+        ]
+    );
+}
+
+/// The toy's `rpi_book` case, by name.
+const RPI_TS: &str = "no_exch_ts_synthesized/rpi_book.frames";
+
+/// The toy's `rpi_book` case, with `more` after its last line, 16.
+fn rpi_ts_and(more: &str) -> String {
+    let toy = fs::read_to_string(Path::new(FIXTURES).join(RPI_TS)).unwrap();
+    assert_eq!(toy.lines().count(), 16);
+    format!("{toy}{more}")
+}
+
+/// Codex r4489870341, the skeptic's first P3: an anchor's answer without a timestamp that
+/// releases a stamped delta the toy held may carry that delta's timestamp on book deltas only: a
+/// toy that dates the health it reports after the answer by it fails, naming the health, where
+/// the rule before let it through.
+#[test]
+fn no_exch_ts_synthesized_fails_a_toy_dating_a_health_by_the_delta_it_held() {
+    let failure = failed(Variant::twisted(Twist::LiveByHeld).run(suite::no_exch_ts_synthesized));
+    assert_eq!(named(&failure), ["VenueMeta.exch_ts"]);
+    assert_eq!(
+        said(&failure, "VenueMeta.exch_ts"),
+        [
+            "no_exch_ts_synthesized/rpi_book.frames line 16: the HTTP answer carries no \
+             timestamp, yet Health { inst: InstrumentId(7), feed: Book(BookId(1)), h: Live }, no \
+             book delta, carries exch_ts 1759363200000000900, line 12's: only a book delta is \
+             released from a held frame"
+        ]
+    );
+}
+
+/// Codex r4489870341, the skeptic's second P3: the toy's case states with `held=<ns>:1` that
+/// one event of the answer carries the held delta's timestamp, so a toy that flushes the
+/// unstamped delta it held with it too fails, naming both, where the rule before let it
+/// through. Without the count, as before, the case cannot tell them apart.
+#[test]
+fn no_exch_ts_synthesized_fails_a_toy_flushing_an_unstamped_held_delta_with_a_stamped_ones_time() {
+    let twisted = Variant::twisted(Twist::DatesFlushedByHeld);
+    let failure = failed(twisted.run(suite::no_exch_ts_synthesized));
+    assert_eq!(named(&failure), ["VenueMeta.exch_ts"]);
+    assert_eq!(
+        said(&failure, "VenueMeta.exch_ts"),
+        [
+            "no_exch_ts_synthesized/rpi_book.frames line 16: the HTTP answer carries no \
+             timestamp and releases line 12's held frame with `held=1759363200000000900:1`, yet \
+             2 of its book deltas carry exch_ts 1759363200000000900: Level { inst: \
+             InstrumentId(7), book: BookId(1), side: Bid, px: Ticks(99), qty: Lots(1) }, Level \
+             { inst: InstrumentId(7), book: BookId(1), side: Bid, px: Ticks(99), qty: Lots(2) }"
+        ]
+    );
+
+    let scratch = Scratch::toy("held-uncounted");
+    let uncounted =
+        rpi_ts_and("").replace("held=1759363200000000900:1 ", "held=1759363200000000900 ");
+    scratch.write(RPI_TS, &uncounted);
+    probed(twisted.run_in(suite::no_exch_ts_synthesized, &scratch.0));
+}
+
+/// Codex r4489870341, the skeptic's third P3: a toy that dates the unstamped delta an answer
+/// flushes by the last timestamp it pushed passes only a case that lets the answer name that
+/// timestamp's frame with `held=`. A `held=` naming a frame that pushed its timestamp at once,
+/// so held nothing, or one an earlier answer released, is the case's error, and the dated delta
+/// breaches, where the rule before took both cases and passed the toy.
+#[test]
+fn no_exch_ts_synthesized_fails_a_case_releasing_a_frame_that_held_nothing_or_was_released() {
+    let twisted = Variant::twisted(Twist::DatesFlushedByLast);
+    // The toy's own case: the one answer it dates by an earlier time flushes nothing.
+    probed(twisted.run(suite::no_exch_ts_synthesized));
+    let scratch = Scratch::toy("held-twice");
+    let dated = |line: u32, px: u32, ns: &str| {
+        format!(
+            "no_exch_ts_synthesized/rpi_book.frames line {line}: the HTTP answer carries no \
+             timestamp and releases no held frame stamped {ns}, yet Level {{ inst: \
+             InstrumentId(7), book: BookId(1), side: Bid, px: Ticks({px}), qty: Lots(1) }} \
+             carries exch_ts {ns}"
+        )
+    };
+
+    // Line 17, stamped, is pushed at once; 18 breaks the sequence and is held; the answer at 19
+    // flushes it dated by 17's timestamp, and names 17's frame.
+    scratch.write(
+        RPI_TS,
+        &rpi_ts_and(
+            "ts=1759363200000001000 text \
+             delta|sym=TOYA-PERP|book=1|seq=15|ts=1759363200000001000|bid=98:2|ask=\n\
+             text delta|sym=TOYA-PERP|book=1|seq=17|bid=97:1|ask=\n\
+             held=1759363200000001000 http 200 text \
+             anchor|sym=TOYA-PERP|seq=16|bid=100:1|ask=101:1\n",
+        ),
+    );
+    let failure = failed(twisted.run_in(suite::no_exch_ts_synthesized, &scratch.0));
+    assert_eq!(named(&failure), [RPI_TS, "VenueMeta.exch_ts"]);
+    assert_eq!(
+        said(&failure, RPI_TS),
+        [
+            "line 19: `held=1759363200000001000` names line 17's frame, which pushed an event \
+             carrying exch_ts 1759363200000001000 at once: it held none stamped so"
+        ]
     );
     assert_eq!(
-        said[7],
-        "no_exch_ts_synthesized/rpi_book.frames line 6: the HTTP answer carries no timestamp, \
-         yet an event carries exch_ts 7"
+        said(&failure, "VenueMeta.exch_ts"),
+        [dated(19, 97, "1759363200000001000")]
     );
-    assert_eq!(said[7..11], [said[7]; 4]);
+
+    // Line 17 breaks the sequence and is held; the answer at 18 flushes it dated by line 12's
+    // timestamp, and names line 12's frame, which line 16 released.
+    scratch.write(
+        RPI_TS,
+        &rpi_ts_and(
+            "text delta|sym=TOYA-PERP|book=1|seq=16|bid=98:1|ask=\n\
+             held=1759363200000000900 http 200 text \
+             anchor|sym=TOYA-PERP|seq=15|bid=100:1|ask=101:1\n",
+        ),
+    );
+    let failure = failed(twisted.run_in(suite::no_exch_ts_synthesized, &scratch.0));
+    assert_eq!(named(&failure), [RPI_TS, "VenueMeta.exch_ts"]);
+    assert_eq!(
+        said(&failure, RPI_TS),
+        [
+            "line 18: `held=1759363200000000900` names line 12's frame, which line 16 released: \
+             a held frame is released once"
+        ]
+    );
+    assert_eq!(
+        said(&failure, "VenueMeta.exch_ts"),
+        [dated(18, 98, "1759363200000000900")]
+    );
+}
+
+/// Codex r4489870341, the skeptic's fifth P3: a toy that pushes only the events carrying the
+/// venue's timestamp leaves `rpi_book`'s case judging only the delta its last answer releases
+/// with its held frame's timestamp, which proves nothing, where the rule before counted it.
+#[test]
+fn no_exch_ts_synthesized_fails_a_case_whose_only_events_judged_are_released() {
+    let failure = failed(Variant::twisted(Twist::OnlyStamped).run(suite::no_exch_ts_synthesized));
+    let book = "no_exch_ts_synthesized/book.frames";
+    assert_eq!(named(&failure), [book, RPI_TS]);
+    assert_eq!(
+        said(&failure, book),
+        [
+            "no event is decoded from a line without a timestamp: a case that states none proves \
+             nothing"
+        ]
+    );
+    assert_eq!(
+        said(&failure, RPI_TS),
+        [
+            "every event decoded from a line without a timestamp is released from a held frame \
+             with its timestamp: a case that states none of its own proves nothing"
+        ]
+    );
 }
 
 #[test]
@@ -1806,7 +2100,10 @@ fn a_check_fails_a_missing_case_a_malformed_one_and_a_case_it_never_reads() {
     let failure = failed(scratch.run(suite::no_exch_ts_synthesized));
     assert_eq!(
         said(&failure, "no_exch_ts_synthesized/book.frames"),
-        ["line 1: `tz` is neither a frame nor a tag (gap=<symbol>, ts, public, rpi)"]
+        [
+            "line 1: `tz` is neither a frame nor a tag (gap=<symbol>, ts, ts=<ns>, \
+             held=<ns>[:<count>], public, rpi)"
+        ]
     );
 }
 

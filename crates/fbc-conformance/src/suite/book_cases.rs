@@ -38,6 +38,15 @@
 //!   instruments may carry one such tag for each whose sequence it breaks;
 //! - `ts`: the line carries the venue's timestamp
 //!   ([`no_exch_ts_synthesized`](super::no_exch_ts_synthesized));
+//! - `ts=<ns>`: as `ts`, stating the timestamp, the [`ExchNs`](fbc_core::ExchNs) the codec
+//!   reports for it, in nanoseconds; a line carrying several may carry one such tag for each;
+//! - `held=<ns>[:<count>]`: the line releases book deltas the codec held from an earlier line
+//!   whose `ts=<ns>` states that timestamp, as an anchor's answer releases the deltas held until
+//!   it came, each such frame once, and, with `:<count>` (1 or more), at most that many of its
+//!   book deltas carry the timestamp; without it, any number may
+//!   ([`no_exch_ts_synthesized`](super::no_exch_ts_synthesized)); a line releasing several held
+//!   frames may carry one such tag for each. A held book snapshot cannot be stated: the
+//!   snapshot an `http` or frame line pushes is that line's own;
 //! - `public`, `rpi`: the order channels whose liquidity the line shows
 //!   ([`book_channels`](super::book_channels)).
 //!
@@ -86,15 +95,60 @@ pub(crate) struct Tags {
     pub gaps: BTreeSet<String>,
     /// It carries the venue's timestamp.
     pub ts: bool,
+    /// The venue's timestamps it carries that the fixture states (`ts=<ns>`), as the codec
+    /// reports them ([`ExchNs`](fbc_core::ExchNs)'s nanoseconds).
+    pub stamps: BTreeSet<i64>,
+    /// The earlier frames whose events, held by the codec, it releases (`held=<ns>[:<count>]`),
+    /// in the order it names them.
+    pub held: Vec<Held>,
     /// The order channels whose liquidity it shows.
     pub shows: BTreeSet<Channel>,
 }
+
+/// A held frame a line releases (`held=<ns>[:<count>]`).
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) struct Held {
+    /// The timestamp the frame's line states (`ts=<ns>`), as the codec reports it.
+    pub ns: i64,
+    /// How many of the line's events may carry it, at most; `None` when the line does not say.
+    pub count: Option<usize>,
+}
+
+impl Held {
+    /// The `held=` tag whose text after `held=` is `word`; `None` when it is none.
+    fn parse(word: &str) -> Option<Held> {
+        let (ns, count) = match word.split_once(':') {
+            None => (word, None),
+            Some((ns, count)) => (ns, Some(count.parse().ok().filter(|&c| c > 0)?)),
+        };
+        Some(Held {
+            ns: ns.parse().ok()?,
+            count,
+        })
+    }
+}
+
+/// The tags a line may carry, as an error names them.
+const TAG_LIST: &str = "gap=<symbol>, ts, ts=<ns>, held=<ns>[:<count>], public, rpi";
 
 impl Tags {
     /// Adds the tag `word`; `false` when it is none.
     fn add(&mut self, word: &str) -> bool {
         if let Some(symbol) = word.strip_prefix("gap=").filter(|s| !s.is_empty()) {
             self.gaps.insert(symbol.to_owned());
+            return true;
+        }
+        if let Some(ns) = word.strip_prefix("ts=") {
+            let Ok(ns) = ns.parse() else { return false };
+            self.ts = true;
+            self.stamps.insert(ns);
+            return true;
+        }
+        if let Some(held) = word.strip_prefix("held=") {
+            let Some(held) = Held::parse(held) else {
+                return false;
+            };
+            self.held.push(held);
             return true;
         }
         match word {
@@ -179,9 +233,8 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Line>, String> {
                 ));
             };
             if !tags.add(word) {
-                let tags = "gap=<symbol>, ts, public, rpi";
                 return Err(format!(
-                    "line {n}: `{word}` is neither a frame nor a tag ({tags})"
+                    "line {n}: `{word}` is neither a frame nor a tag ({TAG_LIST})"
                 ));
             }
             rest = after.trim_start();
@@ -557,6 +610,41 @@ mod tests {
         );
     }
 
+    /// Codex r4489870341: `ts=<ns>` marks a line carrying the venue's timestamp as `ts` does,
+    /// stating it, and `held=<ns>[:<count>]` the timestamps of the held frames a line releases,
+    /// in order, each with how many of the line's events may carry it if the line says; either
+    /// may repeat, and a bare `ts` still reads as before.
+    #[test]
+    fn a_line_states_its_timestamps_and_those_of_the_held_frames_it_releases() {
+        let case = parse(
+            "ts=5 ts=-2 text a\n\
+             held=7 held=5:2 http 200 text b\n\
+             ts held=-5:1 held=5 text c\n",
+        )
+        .unwrap();
+        let tags: Vec<&Tags> = case.iter().map(|l| &l.tags).collect();
+        let held = |ns, count| Held { ns, count };
+        assert_eq!(
+            tags,
+            [
+                &Tags {
+                    ts: true,
+                    stamps: [5, -2].into(),
+                    ..Tags::default()
+                },
+                &Tags {
+                    held: vec![held(7, None), held(5, Some(2))],
+                    ..Tags::default()
+                },
+                &Tags {
+                    ts: true,
+                    held: vec![held(-5, Some(1)), held(5, None)],
+                    ..Tags::default()
+                },
+            ]
+        );
+    }
+
     /// FBC-fhk4: an `http` line, after its tags, answers the request its `tag=` names or the
     /// earliest, with a text or hex body read as an order-entry case reads one.
     #[test]
@@ -707,11 +795,27 @@ mod tests {
             parse("ts http").unwrap_err(),
             "line 1: holds no `text ` or `hex ` frame and no `http ` answer"
         );
-        for bad in ["late", "gap", "gap="] {
+        for bad in [
+            "late",
+            "gap",
+            "gap=",
+            "ts=",
+            "ts=x",
+            "held",
+            "held=",
+            "held=1.5",
+            "held=5:",
+            "held=5:0",
+            "held=5:-1",
+            "held=5:x",
+            "held=:1",
+            "held=5:1:1",
+        ] {
             assert_eq!(
                 parse(&format!("{bad} text a")).unwrap_err(),
                 format!(
-                    "line 1: `{bad}` is neither a frame nor a tag (gap=<symbol>, ts, public, rpi)"
+                    "line 1: `{bad}` is neither a frame nor a tag (gap=<symbol>, ts, ts=<ns>, \
+                     held=<ns>[:<count>], public, rpi)"
                 )
             );
         }

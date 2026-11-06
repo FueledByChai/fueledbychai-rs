@@ -168,7 +168,8 @@
 //! - [`subscriptions_idempotent`]: subscribing the same set twice through the runtime's
 //!   reconciler sends nothing the second time, before and after a reconnect (decision 0002).
 //! - [`no_exch_ts_synthesized`]: a market-data event carries the venue's timestamp only when
-//!   its frame does.
+//!   its frame does, or, for a book delta, the frame it was held from until a later line
+//!   released it, which that line names (`held=`), once; a book snapshot is never released so.
 //! - [`book_channels`]: a book's frames show the order channels its `BookCaps.includes_channels`
 //!   declares, and decode onto that book.
 //! - [`amend_ack`]: an accepted amend surfaces as an `OrderUpdate` in state `Amended`, from the
