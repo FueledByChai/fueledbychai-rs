@@ -41,6 +41,16 @@
 //!   to the minimum notional at the mark price. Its credentials come from mainnet-only variables
 //!   (`src/auth_mainnet.rs`, a review path). It Starts only after a trustworthy resync seeded the
 //!   market (Paradex's snapshot source is trustworthy, decision 0094).
+//! - `qfex_preprod_probe` (`examples/qfex_preprod_probe/`, FBC-l931): QFEX PRE-PRODUCTION only,
+//!   stage one of decision 0132 item 7's probe. Before anything connects it refuses any origin
+//!   but QFEX's pre-production ones (or, for a stub, all loopback), an account decision 0122
+//!   refuses, missing credentials and a proxied loopback origin. It reads every account of the
+//!   provider user through the adapter's `account_reads` and starts a session only when each
+//!   holds no open order and a flat position; then one `ExecSession` per account, one after the
+//!   other, arms cancel-on-disconnect once and is stopped at the arm's outcome with no second
+//!   attempt. It places nothing. It writes a report, its evidence, its journal and a scrubbed
+//!   fixture slice of what answered the arm. Its credentials come from the environment through
+//!   `src/auth_qfex.rs` (a review path), which also hands each signed read to the connector.
 //!
 //! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
 //! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the

@@ -12,6 +12,7 @@ program's flags.
 | `testnet_quote` | A plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). Paradex TESTNET, or with `--mainnet` a supervised short session on Paradex MAINNET (FBC-tyft). See below. |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 | `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of `--order-usd`, the operator's own size, well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It Starts only after a trustworthy resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094) and the account is flat. See below. |
+| `qfex_preprod_probe` | QFEX PRE-PRODUCTION only: stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing. See below. |
 
 ## md_watch
 
@@ -275,6 +276,106 @@ Read the market's `price_tick_size`, `order_size_increment` and `min_notional` f
 `GET https://api.prod.paradex.trade/v1/markets`; the caps, the size, the offsets and the duration
 are yours, within the limits above (the caps have none but being positive). `--help` lists every
 flag and output line.
+
+## qfex_preprod_probe
+
+Stage one of decision 0132 item 7's QFEX probe (FBC-l931): an owner-assisted run (decision 0067)
+on QFEX's PRE-PRODUCTION environment, with the credentials QFEX supplied for it. It arms
+cancel-on-disconnect once per account and records what answers the arm. It places nothing, and
+it sends no command but each session's arm and its own reads. FBC-9sk2's place stages build on
+it once FBC-jxau has landed.
+
+Before anything connects, it refuses:
+
+- any origin but QFEX's pre-production ones (the defaults: `wss://trade.qfex.io`,
+  `https://api.qfex.io`, `wss://mds.qfex.io`), or, for a test stub, all three loopback addresses;
+  any `qfex.com` host, and any mix of the two (decision 0132 item 6's guard, in the adapter);
+- an account decision 0122 item 1 refuses: `QFEX_SUBACCOUNT_ID` must be a lowercase subaccount
+  UUID, as QFEX writes one;
+- a missing or empty credential, and a subaccount credential with one half set;
+- `--socks5` with loopback origins: the proxy would reach its own host's loopback;
+- an `--evidence-dir` that is not empty.
+
+A refusal names the setting or the variable, never its value. Then:
+
+1. It reads `GET /user/subaccounts` with the primary credential. The subaccount armed on must be
+   listed.
+2. Before each session, for the primary account and every listed subaccount, it reads
+   `GET /user/positions` (a subaccount selected by `x-qfex-requested-account-id`) and one
+   `get_user_orders` page, on a trade socket of that account's own that sends only its
+   authentication and that read, and never arms. A subaccount is read with its own credential
+   when it is the one `QFEX_SUBACCOUNT_ID` names and that credential is set, and with the
+   primary credential otherwise. A session starts only when every account can be read and holds
+   no open order, no TWAP and only flat positions; otherwise the run stops there and writes its
+   report. Decision 0132 item 7 asks only an empty page and flat positions. The run also refuses
+   an account whose REST positions count any `open_orders` while its page lists none: an order
+   the page does not list (no page says whether stop orders are) could be cancelled by the arm,
+   and its report would confound the capture. Every read, write and close on a read socket waits
+   at most `--read-wait-ms`.
+3. It runs one session per `--arm`, in the order given, one after the other, so no two arms are
+   ever in flight across the user. Each is fbc-runtime's `ExecSession`, unchanged, with the
+   `AccountWideCodAuthority` for the account it arms on (decision 0121). The session sends the
+   arm itself once QFEX has authenticated the stream and confirmed its three subscriptions.
+   The program stops the session at the arm's outcome (its answer, or `Unknown` at
+   `--rpc-timeout-ms`), at the connection's end, or at `--session-wait`, whichever comes
+   first. `--session-wait` must be longer than `--connect-wait-ms`, QFEX's 60 s authentication
+   deadline and `--rpc-timeout-ms` together, so it never stops a session with its arm in flight.
+   Its reconnect pacing allows one attempt a day, so no second attempt starts meanwhile.
+   Until FBC-jxau decodes an answer, every arm ends `Unknown` at its deadline (decision 0132
+   item 1).
+
+Every request takes its origin from the guarded configuration, through the adapter's
+`account_reads`, and is charged first to the one rate limiter the sessions share for the
+provider user (decision 0123). A read the limiter has no room for is not sent.
+
+Prerequisites, which the run cannot check (decision 0132 item 2, asserted by the
+`AccountWideCodAuthority` it gives): nothing else is connected to or trades on any account of the
+user. No QFEX web session, no other program, no other API client. The accounts must also be flat
+with no open order; the run checks that.
+
+```text
+export QFEX_PUBLIC_KEY=...             # the primary credential QFEX supplied for pre-production
+export QFEX_SECRET_KEY=...
+export QFEX_SUBACCOUNT_ID=...          # the subaccount to arm on, lowercase
+export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # only if QFEX scoped a credential to that subaccount
+export QFEX_SUBACCOUNT_SECRET_KEY=...  # (both or neither)
+cargo run -p fbc-examples --example qfex_preprod_probe -- \
+    --evidence-dir "$HOME/fbc-qfex-probe/$(date -u +%Y%m%dT%H%M%SZ)" \
+    --arm primary --arm subaccount
+```
+
+`--help` lists every flag. The evidence directory holds:
+
+- `report.md`: the accounts as each check read them (counts only, never an id or an amount),
+  and for each session whether the stream authenticated, whether the arm was written, its
+  outcome, every frame QFEX sent placed against the arm (before it, in its window, after it),
+  and what that shows under decision 0132 item 1. An ack echoing the arm is the shape 0132 reads
+  as its Final acceptance, which FBC-jxau then decodes. Frames in the window that echo nothing
+  of the arm are listed by kind, and an echo of the arm after the window is named late; neither,
+  nor an empty window, is read as the arm's answer: a new record decides what answers the arm.
+  It also names every member whose string value a fixture keeps.
+- `evidence.json`: the same, machine-readable.
+- `journal/`: the sessions' journal. Credentials and account ids appear in it only as keyed
+  hashes under a key the run draws and never writes. Keep it local.
+- `fixtures/`: every frame QFEX sent on a session's socket, read back from the journal with
+  its spans blanked, and a README. A frame that is not a top-level `ack` or `err` envelope
+  echoing a request has its numbers zeroed, so no amount of the account is published. Each file
+  passed the privacy check's patterns before it was written, and the run then ran
+  `scripts/privacy-check.sh` over the directory, removing it when the check fails. Those
+  patterns know credential and address shapes only, and string values are kept as QFEX sent
+  them (but the codec's spans). So before committing, read every file for an identifying string
+  (an email, a user name, a wallet address in another form, a name), starting from the members
+  `report.md` names as keeping a string value; remove or blank any you find. Then commit the
+  directory as `fixtures/qfex/exec-recorded/arm/`, with `report.md`, in the PR that records the
+  capture, and run the check again after copying.
+
+If QFEX does not confirm a subscription in the shape the adapter reads, the stream is never
+reported authenticated and no arm is sent. The report then says so, and the fixtures hold the
+confirmations as QFEX sent them (FBC-bsou's note on FBC-l931).
+
+The exit status is 0 only when every session authenticated, wrote its arm, saw its outcome with
+one connection attempt, and every file was written. Agents never run this program against QFEX;
+its test (`tests/qfex_preprod_probe.rs`) runs it against a QFEX-shaped conformance stub.
 
 ## paradex_testnet_acceptance
 

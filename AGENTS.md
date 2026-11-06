@@ -639,7 +639,22 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `--mainnet` (FBC-tyft) a supervised Paradex MAINNET session behind `--mainnet` and
     `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, the operator's own
     positive caps (required, no defaults, no ceiling: FBC-thks), offsets of at least 20 bps,
-    `--duration` of at most an hour, never seeded by hand. The samples that trade share
+    `--duration` of at most an hour, never seeded by hand.
+    And `examples/qfex_preprod_probe/` (FBC-l931): stage one of decision 0132 item 7's QFEX
+    probe, an owner-assisted run (0067) on QFEX PRE-PRODUCTION only, arming cancel-on-disconnect
+    once per account and placing nothing: before anything connects it refuses any origin the
+    adapter's probe guard refuses, an account 0122 item 1 refuses, missing credentials and a
+    proxied loopback origin; it reads `GET /user/subaccounts` and, before each session, every
+    account's REST positions and one `get_user_orders` page on a socket that never arms (the
+    adapter's `account_reads`), starting a session only when each is flat with no open order
+    on the page and none counted by REST;
+    one unchanged `ExecSession` per `--arm`, one after the other, with the
+    `AccountWideCodAuthority` (0121), stopped at its arm's outcome or the connection's end, its
+    pacing allowing no second attempt; it writes a report, evidence, its journal and a scrubbed
+    fixture slice for `fixtures/qfex/exec-recorded/arm/` (`tests/qfex_preprod_probe.rs`, against
+    a QFEX-shaped conformance stub). Its credentials come from the environment through
+    `src/auth_qfex.rs`, a review path, which also hands each signed read to the connector; it
+    reuses `paradex_testnet_acceptance`'s privacy patterns by path. The samples that trade share
     `src/link.rs` (the glue) and `src/testnet.rs` (guard and wiring), and the mainnet ones
     `src/mainnet.rs` (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
