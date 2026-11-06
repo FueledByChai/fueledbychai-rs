@@ -623,9 +623,16 @@ impl Entries {
     /// generation advanced, when a trip came since the last time, leaving Exit as it is
     /// (decision 0139).
     pub(crate) fn apply_trips(&mut self) {
-        if !self.trips.take() {
-            return;
+        if self.trips.take() {
+            self.cancel_only_quoting();
         }
+    }
+
+    /// Moves every market held in Quoting to Cancel-only and advances its generation. It does
+    /// not go through `set`, which compares with `state`: a trip that comes after `take` makes
+    /// `state` read Cancel-only already, so `set` would move the market without advancing its
+    /// generation, and a command built in Quoting before would pass its check at submit.
+    fn cancel_only_quoting(&mut self) {
         let mut moved: Vec<InstrumentId> = self
             .states
             .iter()
@@ -634,8 +641,8 @@ impl Entries {
             .collect();
         moved.sort();
         for market in moved {
-            let armed = self.armed(market);
-            self.set(market, EntryState::CancelOnly, armed);
+            self.states.insert(market, EntryState::CancelOnly);
+            self.generations.advance(market);
         }
     }
 
@@ -964,5 +971,43 @@ impl Registry {
             EntryState::Killed => self.entries.set(market, EntryState::CancelOnly, armed),
             _ => self.entries.entry(market),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_trip_after_the_take_still_advances_the_generation_of_each_market_moved() {
+        let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
+        let mut entries = Entries::default();
+        entries.states.insert(btc, EntryState::Quoting);
+        entries
+            .states
+            .insert(eth, EntryState::Exit(ExitKind::Flatten));
+        let (btc_before, eth_before) = (entries.generation(btc), entries.generation(eth));
+        let trip = entries.trip_handle();
+
+        trip.trip();
+        assert!(entries.trips.take());
+        // Another thread trips between the take and the move: `state` reads Cancel-only now.
+        trip.trip();
+        assert_eq!(entries.state(btc), EntryState::CancelOnly);
+        entries.cancel_only_quoting();
+
+        assert_eq!(entries.states.get(&btc), Some(&EntryState::CancelOnly));
+        assert!(entries.generation(btc) > btc_before);
+        assert_eq!(
+            entries.states.get(&eth),
+            Some(&EntryState::Exit(ExitKind::Flatten))
+        );
+        assert_eq!(entries.generation(eth), eth_before);
+
+        // The trip that came during the move moves nothing more.
+        let moved = entries.generation(btc);
+        entries.apply_trips();
+        assert_eq!(entries.generation(btc), moved);
+        assert!(!entries.trips.pending());
     }
 }
