@@ -1,0 +1,7 @@
+{
+  "$schema": "https://schemas.example/ListSubaccountsResponseBody.json",
+  "account_ids": [
+    "5a5a5a5a-0000-4000-8000-00000000c0de",
+    "5a5a5a5a-0000-4000-8000-00000000beef"
+  ]
+}

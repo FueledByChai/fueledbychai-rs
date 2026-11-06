@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schemas.example/PositionsBalanceResponseBody.json",
+  "balance": {
+    "deposit": 1000.25,
+    "realised_pnl": -3.5,
+    "order_margin": 27.08,
+    "position_margin": 10.75,
+    "unrealised_pnl": 0.5,
+    "net_funding": -0.125,
+    "available_balance": 963.42,
+    "builder_rewards": 0.0,
+    "isolated_equity": 12.5
+  },
+  "positions": [
+    {
+      "symbol": "AAPL-USD",
+      "position": 1e-12,
+      "realised_pnl": 0.0,
+      "unrealised_pnl": 0.0,
+      "net_funding": 0.0,
+      "open_orders": 2,
+      "open_quantity": 2.708,
+      "leverage": 20.0,
+      "margin": 10.0,
+      "maintenance_margin": 0.03333333333333333,
+      "average_price": 200.0
+    },
+    {
+      "symbol": "NVDA-USD",
+      "position": -1234567890.1234567890,
+      "realised_pnl": 0.0,
+      "unrealised_pnl": 0.5,
+      "net_funding": 0.0,
+      "open_orders": 0,
+      "open_quantity": 0,
+      "leverage": 10.0,
+      "margin": 0.75,
+      "maintenance_margin": 0.05,
+      "average_price": 120.0,
+      "isolated_available": 0.0,
+      "isolated_collateral": 0.0,
+      "margin_mode": "CROSS"
+    }
+  ]
+}

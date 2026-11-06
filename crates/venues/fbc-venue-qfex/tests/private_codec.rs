@@ -1596,7 +1596,10 @@ fn every_source_file_is_in_the_module_tree() {
         let text = fs::read_to_string(&parent).unwrap();
         let declared = text.lines().any(|line| {
             let line = line.trim();
-            let line = line.strip_prefix("pub ").unwrap_or(line);
+            let line = line
+                .strip_prefix("pub ")
+                .or_else(|| line.strip_prefix("pub(crate) "))
+                .unwrap_or(line);
             line == format!("mod {module};")
         });
         assert!(declared, "{rel:?} is not declared in {parent:?}");
