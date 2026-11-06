@@ -13,9 +13,9 @@
 //! name those instruments only: an event on another instrument, or a `gap=` tag naming one, is
 //! a breach (Codex r4217991939). So is a trading status ([`MdEvent::Status`]) from a venue whose
 //! [`MdCaps::status`](fbc_core::MdCaps) declares it reports none, `FeedSource::None`
-//! (decision 0130). A channel whose
-//! [`BookCaps::rest_anchor`] is true is skipped by name, saying why: its snapshot comes in an
-//! HTTP answer, which these case files do not carry (FBC-fhk4).
+//! (decision 0130). A channel whose [`BookCaps::rest_anchor`] is true is driven like any other
+//! (FBC-fhk4): its snapshot comes in an HTTP answer to a request the codec asks for, which its
+//! case hands the codec in an `http` line.
 //!
 //! # A market-data case file
 //!
@@ -23,45 +23,63 @@
 //! [`BookCaps::channel`] spells it: what one fresh codec is handed, in order, after it is
 //! opened ([`on_open`](fbc_core::MdCodec::on_open)) and subscribed to the channel
 //! ([`subscribe`](fbc_core::MdCodec::subscribe), one call). A line is a frame, as in an
-//! order-entry case ([`super::frames`]), after the tags that state what the fixture
-//! knows of it:
+//! order-entry case ([`super::frames`]), or an HTTP answer, after the tags that state what the
+//! fixture knows of it:
 //!
 //! ```text
 //! [<tag> ...] text <frame>
 //! [<tag> ...] hex <bytes>
+//! [<tag> ...] http [tag=<n>] <status> text <body>
+//! [<tag> ...] http [tag=<n>] <status> hex <bytes>
 //! ```
 //!
-//! - `gap=<symbol>`: the frame breaks the sequence of the instrument whose venue symbol is
+//! - `gap=<symbol>`: the line breaks the sequence of the instrument whose venue symbol is
 //!   `<symbol>` on its book ([`continuity`](super::continuity)); a frame batching several
 //!   instruments may carry one such tag for each whose sequence it breaks;
-//! - `ts`: the frame carries the venue's timestamp
+//! - `ts`: the line carries the venue's timestamp
 //!   ([`no_exch_ts_synthesized`](super::no_exch_ts_synthesized));
-//! - `public`, `rpi`: the order channels whose liquidity the frame shows
+//! - `public`, `rpi`: the order channels whose liquidity the line shows
 //!   ([`book_channels`](super::book_channels)).
 //!
+//! An `http` line (FBC-fhk4) is the response, with status `<status>` (100 to 599), no header and
+//! the body everything after `text ` up to the end of the line or the bytes `hex ` spells, to an
+//! HTTP request ([`Effect::Http`]) the codec asked for, opening, subscribing or on an earlier
+//! line, that no `http` line has answered yet: the one whose tag ([`HttpTag`]) is `<n>`, or,
+//! without `tag=`, the earliest. It is handed to [`on_http`](fbc_core::MdCodec::on_http) under
+//! that request's tag, as the runtime hands a codec the answer to the request it asked for
+//! (decision 0027): a channel anchored on REST is given its snapshot this way. An `http` line
+//! with no such request to answer is a breach naming the case and line, and the rest of that
+//! case is not judged: the case is wrong, not the codec. A request's failure
+//! ([`HttpFailure`](fbc_core::HttpFailure)), its headers and the timers the codec asks for (a
+//! retry) are not modelled.
+//!
+//! The suite cannot tell a request the codec has given up on from one it still waits on: a
+//! request stays outstanding until a line answers it, and an answer is never matched against
+//! the request's URL. Once a codec asks again in place of an earlier request (the toy does,
+//! holding more deltas than [`MAX_HELD`](crate::toy::MAX_HELD) while it waits for an anchor),
+//! a line answering the newer request must name it with `tag=`: without one it answers the
+//! earliest, the request given up on.
+//!
 //! A blank line or one starting with `#` is a comment. Frames are handed to
-//! [`on_frame`](fbc_core::MdCodec::on_frame) in the decode scope the core lends a market-data
-//! session ([`dispatch_market_data`](fbc_core::dispatch_market_data)); a frame the codec
-//! refuses is a breach, and so is a case missing, unreadable or malformed, and a case file no
-//! driven channel reads. What a check reports of a frame is its file and line, never its bytes.
+//! [`on_frame`](fbc_core::MdCodec::on_frame), and answers to `on_http`, in the decode scope the
+//! core lends a market-data session ([`dispatch_market_data`](fbc_core::dispatch_market_data));
+//! a line the codec refuses is a breach, and so is a case missing, unreadable or malformed, and
+//! a case file no driven channel reads. What a check reports of a line is its file and number,
+//! never its bytes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 
 use fbc_core::{
-    BookCaps, BookId, Channel, DecodeError, Effects, FeedSource, InstrumentId, MdEvent, MdSink,
-    RawFrame, SpecTable, VenueMeta,
+    BookCaps, BookId, Channel, DecodeError, Effect, Effects, FeedSource, HttpResponse, HttpTag,
+    InstrumentId, MdEvent, MdSink, RawFrame, SpecTable, VenueMeta,
 };
 
 use super::frames::{self, EXT, unhex};
 use super::harness::Harness;
 use super::{Breach, Failure, Subject, Verdict};
 
-/// Why a channel anchored on REST is skipped.
-pub(crate) const ANCHORED: &str = "BookCaps.rest_anchor is true: its snapshot comes in an HTTP \
-                                   answer, which the suite does not carry yet (FBC-fhk4)";
-
-/// What the fixture states of one frame.
+/// What the fixture states of one line.
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub(crate) struct Tags {
     /// It breaks the sequences of the instruments these venue symbols name.
@@ -89,19 +107,47 @@ impl Tags {
     }
 }
 
-/// One frame of a case.
+/// What one line of a case hands the codec.
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub(crate) enum Frame {
+pub(crate) enum Input {
     Text(String),
     Binary(Vec<u8>),
+    /// The response to the request whose tag is `tag`, or, for `None`, to the earliest the
+    /// codec asked for that no line answered.
+    Http {
+        tag: Option<HttpTag>,
+        status: u16,
+        body: Vec<u8>,
+    },
 }
 
-/// One line of a case: its number, what the fixture states of its frame, and the frame.
+/// What kind of input a line hands the codec.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Kind {
+    /// A text frame.
+    Text,
+    /// A binary frame.
+    Binary,
+    /// The answer to an HTTP request: no frame.
+    Http,
+}
+
+impl Input {
+    fn kind(&self) -> Kind {
+        match self {
+            Input::Text(_) => Kind::Text,
+            Input::Binary(_) => Kind::Binary,
+            Input::Http { .. } => Kind::Http,
+        }
+    }
+}
+
+/// One line of a case: its number, what the fixture states of it, and what it hands the codec.
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub(crate) struct Line {
     pub line: usize,
     pub tags: Tags,
-    pub frame: Frame,
+    pub input: Input,
 }
 
 /// The case `text` holds, or why it is not one.
@@ -115,17 +161,22 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Line>, String> {
         }
         let mut tags = Tags::default();
         let mut rest = raw.trim_start();
-        let frame = loop {
+        let input = loop {
             if let Some(frame) = rest.strip_prefix("text ") {
-                break Frame::Text(frame.to_owned());
+                break Input::Text(frame.to_owned());
             }
             if let Some(bytes) = rest.strip_prefix("hex ") {
                 let bytes =
                     unhex(bytes).ok_or_else(|| format!("line {n}: not hexadecimal bytes"))?;
-                break Frame::Binary(bytes);
+                break Input::Binary(bytes);
+            }
+            if let Some(answer) = rest.strip_prefix("http ") {
+                break http(answer, n)?;
             }
             let Some((word, after)) = rest.split_once(' ') else {
-                return Err(format!("line {n}: holds no `text ` or `hex ` frame"));
+                return Err(format!(
+                    "line {n}: holds no `text ` or `hex ` frame and no `http ` answer"
+                ));
             };
             if !tags.add(word) {
                 let tags = "gap=<symbol>, ts, public, rpi";
@@ -138,10 +189,27 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Line>, String> {
         case.push(Line {
             line: n,
             tags,
-            frame,
+            input,
         });
     }
     Ok(case)
+}
+
+/// The `http` line `n` whose text after `http ` is `answer`: `tag=<n>` naming the request it
+/// answers, if it names one, then the response as an order-entry case spells it.
+fn http(answer: &str, n: usize) -> Result<Input, String> {
+    let (tag, response) = match answer.strip_prefix("tag=") {
+        None => (None, answer),
+        Some(rest) => {
+            let (tag, response) = rest.split_once(' ').unwrap_or((rest, ""));
+            let tag = tag.parse().map_err(|_| {
+                format!("line {n}: `tag={tag}` names no request: a request's tag is a number")
+            })?;
+            (Some(HttpTag(tag)), response)
+        }
+    };
+    let (status, body) = frames::response(response, n)?;
+    Ok(Input::Http { tag, status, body })
 }
 
 /// The case in `file`, or why it cannot be read.
@@ -158,8 +226,8 @@ pub(crate) struct Book {
 }
 
 /// The book channels the caps declare, split into those a check drives and, for the rest, a
-/// line naming each and why it is skipped: `skip` says why a channel the suite could drive is
-/// skipped by this check, if it is; one anchored on REST is skipped by every check.
+/// line naming each and why it is skipped: `skip` says why a channel is skipped by this check,
+/// if it is.
 pub(crate) fn books(
     h: &Harness<'_>,
     skip: impl Fn(&BookCaps) -> Option<String>,
@@ -167,11 +235,7 @@ pub(crate) fn books(
     let mut driven = Vec::new();
     let mut skipped = Vec::new();
     for (i, caps) in h.caps.md.books.iter().enumerate() {
-        let why = match caps.rest_anchor {
-            true => Some(ANCHORED.to_owned()),
-            false => skip(caps),
-        };
-        match why {
+        match skip(caps) {
             Some(why) => skipped.push(format!("{}: skipped: {why}", caps.channel)),
             None => driven.push(Book {
                 id: BookId(u8::try_from(i).expect("at most 256 book channels")),
@@ -186,8 +250,8 @@ pub(crate) fn books(
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Step {
     pub line: usize,
-    /// The frame was binary.
-    pub binary: bool,
+    /// What the line handed the codec.
+    pub kind: Kind,
     pub tags: Tags,
     pub result: Result<(), DecodeError>,
     pub events: Vec<(VenueMeta, MdEvent)>,
@@ -202,9 +266,50 @@ impl MdSink for Collect {
     }
 }
 
-/// `case` handed, line by line, to a market-data codec built fresh from the factory, opened and
-/// subscribed to `book` on every instrument; a subscription the codec refuses fails the check.
-pub(crate) fn decode(h: &Harness<'_>, book: &Book, case: &[Line]) -> Result<Vec<Step>, Failure> {
+/// The HTTP requests `fx` asks for, their tags appended to `asked` in order. The rest is
+/// dropped: the suite opens no connection and runs no timer.
+fn note(fx: &mut Effects, asked: &mut VecDeque<HttpTag>) {
+    for effect in fx.take() {
+        if let Effect::Http { tag, .. } = effect {
+            asked.push_back(tag);
+        }
+    }
+}
+
+/// The request an `http` line answers, taken from `asked`: the one `tag` names, or the earliest;
+/// what is wrong with the line `n` when there is none.
+fn answered(
+    asked: &mut VecDeque<HttpTag>,
+    tag: Option<HttpTag>,
+    n: usize,
+) -> Result<HttpTag, String> {
+    match tag {
+        None => asked.pop_front().ok_or_else(|| {
+            format!(
+                "line {n} answers an HTTP request, but the codec has asked for none it still \
+                 waits on"
+            )
+        }),
+        Some(tag) => match asked.iter().position(|t| *t == tag) {
+            Some(at) => Ok(asked.remove(at).expect("a position held")),
+            None => Err(format!(
+                "line {n} answers HTTP request {}, which the codec has not asked for or a line \
+                 has answered",
+                tag.0
+            )),
+        },
+    }
+}
+
+/// `case` handed line by line to a market-data codec built fresh from the factory, opened and
+/// subscribed to `book` on every instrument: a frame to `on_frame`, an answer to `on_http` under
+/// the tag of the request it answers. A subscription the codec refuses fails the check; an
+/// `http` line with no request to answer is what is wrong with the case (`Ok(Err(_))`).
+pub(crate) fn decode(
+    h: &Harness<'_>,
+    book: &Book,
+    case: &[Line],
+) -> Result<Result<Vec<Step>, String>, Failure> {
     let subs = h.book_subs(book.id);
     let mut codec = h.md_codec(subs.clone());
     let mut fx = Effects::new();
@@ -213,25 +318,41 @@ pub(crate) fn decode(h: &Harness<'_>, book: &Book, case: &[Line]) -> Result<Vec<
         let what = format!("refused {} on every instrument: {e}", book.caps.channel);
         return Err(h.fail("MdCodec::subscribe", what));
     }
+    // The tags of the HTTP requests asked for and not yet answered, earliest first.
+    let mut asked = VecDeque::new();
+    note(&mut fx, &mut asked);
     let specs = h.specs();
     Ok(h.md_scope(|scope| {
         let mut steps = Vec::with_capacity(case.len());
         for line in case {
             let mut sink = Collect(Vec::new());
-            let frame = match &line.frame {
-                Frame::Text(text) => RawFrame::Text(text),
-                Frame::Binary(bytes) => RawFrame::Binary(bytes),
+            let result = match &line.input {
+                Input::Text(text) => {
+                    codec.on_frame(RawFrame::Text(text), scope, specs, &mut sink, &mut fx)
+                }
+                Input::Binary(bytes) => {
+                    codec.on_frame(RawFrame::Binary(bytes), scope, specs, &mut sink, &mut fx)
+                }
+                Input::Http { tag, status, body } => {
+                    let tag = answered(&mut asked, *tag, line.line)?;
+                    let resp = HttpResponse {
+                        status: *status,
+                        headers: &[],
+                        body,
+                    };
+                    codec.on_http(tag, Ok(resp), scope, specs, &mut sink, &mut fx)
+                }
             };
-            let result = codec.on_frame(frame, scope, specs, &mut sink, &mut fx);
+            note(&mut fx, &mut asked);
             steps.push(Step {
                 line: line.line,
-                binary: matches!(line.frame, Frame::Binary(_)),
+                kind: line.input.kind(),
                 tags: line.tags.clone(),
                 result,
                 events: sink.0,
             });
         }
-        steps
+        Ok(steps)
     }))
 }
 
@@ -292,8 +413,9 @@ pub(crate) struct PerBook<'a> {
 
 impl PerBook<'_> {
     /// Reads and decodes each driven channel's case and judges it: a directory or case missing
-    /// or unreadable, a frame the codec refuses and a case file no driven channel reads are
-    /// breaches too. The skipped channels are listed among what was probed.
+    /// or unreadable, an `http` line with no request to answer (the case not judged further), a
+    /// line the codec refuses and a case file no driven channel reads are breaches too. The
+    /// skipped channels are listed among what was probed.
     pub(crate) fn run(
         &self,
         h: &Harness<'_>,
@@ -322,7 +444,13 @@ impl PerBook<'_> {
                     continue;
                 }
             };
-            let steps = decode(h, book, &case)?;
+            let steps = match decode(h, book, &case)? {
+                Ok(steps) => steps,
+                Err(what) => {
+                    breaches.push(Breach::new(&file, what));
+                    continue;
+                }
+            };
             let subscribed: BTreeSet<InstrumentId> =
                 h.book_subs(book.id).iter().map(|s| s.inst).collect();
             let specs = h.specs();
@@ -388,10 +516,8 @@ pub(crate) fn verdict(
     }
 }
 
-/// Why a check that drives every channel not anchored on REST is skipped when it drives none.
-pub(crate) const NO_BOOK: &str = "the caps declare no book channel the suite drives: none, or \
-                                  each anchored on REST (BookCaps.rest_anchor), whose snapshot \
-                                  comes in an HTTP answer the suite does not carry yet (FBC-fhk4)";
+/// Why a check that drives every book channel is skipped when it drives none.
+pub(crate) const NO_BOOK: &str = "the caps declare no book channel";
 
 #[cfg(test)]
 mod tests {
@@ -411,7 +537,7 @@ mod tests {
                 Line {
                     line: 3,
                     tags: Tags::default(),
-                    frame: Frame::Text("a|b=1".to_owned())
+                    input: Input::Text("a|b=1".to_owned())
                 },
                 Line {
                     line: 4,
@@ -420,14 +546,119 @@ mod tests {
                         ts: true,
                         ..Tags::default()
                     },
-                    frame: Frame::Text(" c d".to_owned())
+                    input: Input::Text(" c d".to_owned())
                 },
                 Line {
                     line: 5,
                     tags: rpi,
-                    frame: Frame::Binary(vec![0x0a, 0xff])
+                    input: Input::Binary(vec![0x0a, 0xff])
                 },
             ]
+        );
+    }
+
+    /// FBC-fhk4: an `http` line, after its tags, answers the request its `tag=` names or the
+    /// earliest, with a text or hex body read as an order-entry case reads one.
+    #[test]
+    fn an_http_line_reads_its_tags_the_request_it_names_its_status_and_body() {
+        let case = parse(
+            "public rpi http tag=2 200 text anchor|sym=A|seq=1\n\
+             http 503 hex 6f 6b\n\
+             ts http tag=7 204 text \n",
+        )
+        .unwrap();
+        let http = |tag: Option<u64>, status, body: &[u8]| Input::Http {
+            tag: tag.map(HttpTag),
+            status,
+            body: body.to_vec(),
+        };
+        let shows = Tags {
+            shows: [Channel::Public, Channel::Rpi].into(),
+            ..Tags::default()
+        };
+        let ts = Tags {
+            ts: true,
+            ..Tags::default()
+        };
+        assert_eq!(
+            case,
+            [
+                Line {
+                    line: 1,
+                    tags: shows,
+                    input: http(Some(2), 200, b"anchor|sym=A|seq=1"),
+                },
+                Line {
+                    line: 2,
+                    tags: Tags::default(),
+                    input: http(None, 503, b"ok"),
+                },
+                Line {
+                    line: 3,
+                    tags: ts,
+                    input: http(Some(7), 204, b""),
+                },
+            ]
+        );
+        assert_eq!(
+            case.iter().map(|l| l.input.kind()).collect::<Vec<_>>(),
+            [Kind::Http; 3]
+        );
+    }
+
+    #[test]
+    fn an_http_line_naming_no_request_or_spelling_no_response_is_refused_by_number() {
+        for bad in [
+            "http tag=x 200 text a",
+            "http tag= 200 text a",
+            "http tag=-1 200 text a",
+        ] {
+            let tag = bad.split(' ').nth(1).unwrap();
+            assert_eq!(
+                parse(bad).unwrap_err(),
+                format!("line 1: `{tag}` names no request: a request's tag is a number"),
+                "{bad}"
+            );
+        }
+        let shape = "line 1: not `http <status> text <body>` or `http <status> hex <bytes>`, \
+                     <status> from 100 to 599";
+        for bad in [
+            "http tag=1",
+            "http tag=1 200",
+            "http 99 text a",
+            "http 200 body a",
+        ] {
+            assert_eq!(parse(bad).unwrap_err(), shape, "{bad}");
+        }
+        assert_eq!(
+            parse("http 200 hex 0").unwrap_err(),
+            "line 1: not hexadecimal bytes"
+        );
+    }
+
+    /// FBC-fhk4: an answer goes to the request its tag names, or to the earliest one asked for
+    /// and not yet answered; a line with none to answer is the case's error.
+    #[test]
+    fn an_answer_takes_the_request_its_tag_names_or_the_earliest_and_none_twice() {
+        let mut asked: VecDeque<HttpTag> = [1, 2, 3].map(HttpTag).into();
+        assert_eq!(answered(&mut asked, Some(HttpTag(2)), 4), Ok(HttpTag(2)));
+        assert_eq!(answered(&mut asked, None, 5), Ok(HttpTag(1)));
+        assert_eq!(
+            answered(&mut asked, Some(HttpTag(2)), 6),
+            Err(
+                "line 6 answers HTTP request 2, which the codec has not asked for or a line has \
+                 answered"
+                    .to_owned()
+            )
+        );
+        assert_eq!(answered(&mut asked, None, 7), Ok(HttpTag(3)));
+        assert_eq!(
+            answered(&mut asked, None, 8),
+            Err(
+                "line 8 answers an HTTP request, but the codec has asked for none it still waits \
+                 on"
+                .to_owned()
+            )
         );
     }
 
@@ -448,7 +679,7 @@ mod tests {
         };
         let step = Step {
             line: 4,
-            binary: false,
+            kind: Kind::Text,
             tags: Tags::default(),
             result: Ok(()),
             events: vec![(VenueMeta::NONE, health), (VenueMeta::NONE, status)],
@@ -470,7 +701,11 @@ mod tests {
     fn a_line_of_no_frame_an_unknown_tag_or_bad_hex_is_refused_by_number() {
         assert_eq!(
             parse("text a\ngap=X").unwrap_err(),
-            "line 2: holds no `text ` or `hex ` frame"
+            "line 2: holds no `text ` or `hex ` frame and no `http ` answer"
+        );
+        assert_eq!(
+            parse("ts http").unwrap_err(),
+            "line 1: holds no `text ` or `hex ` frame and no `http ` answer"
         );
         for bad in ["late", "gap", "gap="] {
             assert_eq!(

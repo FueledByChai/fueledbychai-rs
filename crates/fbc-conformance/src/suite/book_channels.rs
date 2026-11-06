@@ -5,13 +5,15 @@
 //! hides the levels a strategy thinks it sees.
 //!
 //! For every book channel the suite drives ([`book_cases`](super::book_cases)),
-//! `book_channels/<channel>.frames` marks each frame with the order channels whose liquidity it
-//! shows (`public`, `rpi`), as the venue documents or a recording shows. The check holds:
+//! `book_channels/<channel>.frames` marks each frame, and each HTTP answer (an anchored
+//! channel's snapshot, FBC-fhk4), with the order channels whose liquidity it shows (`public`,
+//! `rpi`), as the venue documents or a recording shows. The check holds, a line being a frame
+//! or an answer:
 //!
-//! - every channel a frame shows is one the book declares;
-//! - every channel the book declares is shown by some frame of the case;
-//! - every frame that pushes a level states its channels, and only such a frame states any;
-//! - every book event a frame pushes (snapshot, level, window, a prune or a clear of one side,
+//! - every channel a line shows is one the book declares;
+//! - every channel the book declares is shown by some line of the case;
+//! - every line that pushes a level states its channels, and only such a line states any;
+//! - every book event a line pushes (snapshot, level, window, a prune or a clear of one side,
 //!   and the book's health) is on the channel's own [`BookId`](fbc_core::BookId): the runtime
 //!   routes each by its book (Codex r4218492678, decision 0124). Only a level shows liquidity.
 

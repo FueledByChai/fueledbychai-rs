@@ -1,0 +1,9 @@
+# The toy's `rpi_book` channel (ANCHORED_BOOK), its snapshots in the anchors' HTTP answers: the
+# lines tagged `ts`, frames and answers alike, carry the venue's timestamp (`ts=`); the events of
+# the others must carry none.
+ts http 200 text anchor|sym=TOYA-PERP|seq=10|ts=1759363200000000000|bid=100:3|ask=101:2
+text delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=
+http 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1
+ts text delta|sym=TOYB-PERP|book=1|seq=501|ts=1759363200000000500|bid=41:2|ask=
+# A gap reported from a frame without a timestamp carries none either.
+text delta|sym=TOYA-PERP|book=1|seq=13|bid=99:1|ask=
