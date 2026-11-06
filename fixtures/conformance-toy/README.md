@@ -54,10 +54,13 @@ A check that reads recorded data reads it from a subdirectory named after the ch
   tag; its breaks marked `gap=<symbol>`, with a delta held without a second gap while its
   re-anchor is awaited, a break of one instrument while the other's re-anchor is awaited, and
   an anchor that mends nothing (`continuity/rpi_book`), its frames and answers carrying a
-  timestamp marked `ts` (`no_exch_ts_synthesized/rpi_book`), and its frames and answers marked
-  with the order channels whose liquidity they show, public and RPI, as the toy declares
-  (`book_channels/rpi_book`). The toy's market data is text, so `continuity` has no
-  `longer_block/` sub-case here. Nothing in them is key- or address-shaped.
+  timestamp marked `ts`, and a delta held while an anchor is awaited marked `ts=<ns>` with the
+  timestamp it carries, which the anchor's answer, carrying none, releases and names with
+  `held=<ns>:1`, its one level the one event carrying it (`no_exch_ts_synthesized/rpi_book`,
+  Codex r4489870341), and its frames and answers marked with the order channels whose
+  liquidity they show, public and RPI, as the toy declares (`book_channels/rpi_book`). The
+  toy's market data is text, so `continuity` has no `longer_block/` sub-case here. Nothing in
+  them is key- or address-shaped.
 - `reject_coverage/table.txt`: the toy's own made-up reject codes (its `REJECT_CODES`, in
   `crates/fbc-conformance/src/toy/decode.rs`), each followed by the `RejectKind` it maps to as
   the kind's `Debug` spells it, and one code the toy does not know, which maps to `Other`

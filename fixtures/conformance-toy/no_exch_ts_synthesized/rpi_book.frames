@@ -1,9 +1,16 @@
 # The toy's `rpi_book` channel (ANCHORED_BOOK), its snapshots in the anchors' HTTP answers: the
 # lines tagged `ts`, frames and answers alike, carry the venue's timestamp (`ts=`); the events of
-# the others must carry none.
+# the others carry none, but for a held delta's that an answer names releasing with `held=`.
 ts http 200 text anchor|sym=TOYA-PERP|seq=10|ts=1759363200000000000|bid=100:3|ask=101:2
 text delta|sym=TOYA-PERP|book=1|seq=11|bid=100:4|ask=
 http 200 text anchor|sym=TOYB-PERP|seq=500|bid=40:1|ask=42:1
 ts text delta|sym=TOYB-PERP|book=1|seq=501|ts=1759363200000000500|bid=41:2|ask=
 # A gap reported from a frame without a timestamp carries none either.
 text delta|sym=TOYA-PERP|book=1|seq=13|bid=99:1|ask=
+# TOYA-PERP's anchor is asked for again (tag 3), holding 13. A delta the venue stamped, its
+# timestamp stated with `ts=`, is held too: it pushes nothing.
+ts=1759363200000000900 text delta|sym=TOYA-PERP|book=1|seq=14|ts=1759363200000000900|bid=99:2|ask=
+# The anchor at 12 carries no timestamp: its snapshot carries none, nor does the held 13; the
+# held 14 is released carrying its own frame's timestamp, the one `held=` names, on its one
+# level, which `:1` counts (Codex r4489870341).
+held=1759363200000000900:1 http 200 text anchor|sym=TOYA-PERP|seq=12|bid=100:1|ask=101:1
