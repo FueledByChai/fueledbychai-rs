@@ -1,0 +1,53 @@
+{
+  "balance": {
+    "deposit": 1000.25,
+    "realised_pnl": -3.5,
+    "order_margin": 0.0,
+    "position_margin": 0.0,
+    "unrealised_pnl": 0.0,
+    "net_funding": -0.125,
+    "available_balance": 996.625,
+    "builder_rewards": 0.0
+  },
+  "positions": [
+    {
+      "symbol": "AAPL-USD",
+      "position": 0,
+      "realised_pnl": 0.0,
+      "unrealised_pnl": 0.0,
+      "net_funding": 0.0,
+      "open_orders": 0,
+      "open_quantity": 0,
+      "leverage": 20.0,
+      "margin": 0.0,
+      "maintenance_margin": 0.0,
+      "average_price": 0.0
+    },
+    {
+      "symbol": "NVDA-USD",
+      "position": 0.0,
+      "realised_pnl": 0.0,
+      "unrealised_pnl": 0.0,
+      "net_funding": 0.0,
+      "open_orders": 1.0,
+      "open_quantity": 0,
+      "leverage": 10.0,
+      "margin": 0.0,
+      "maintenance_margin": 0.0,
+      "average_price": 0.0
+    },
+    {
+      "symbol": "MSFT-USD",
+      "position": -0.0,
+      "realised_pnl": 0.0,
+      "unrealised_pnl": 0.0,
+      "net_funding": 0.0,
+      "open_orders": 0,
+      "open_quantity": 0,
+      "leverage": 10.0,
+      "margin": 0.0,
+      "maintenance_margin": 0.0,
+      "average_price": 0.0
+    }
+  ]
+}

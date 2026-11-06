@@ -9,11 +9,15 @@
 //! whose guard admits only QFEX's pre-production origins or loopback stubs, the factory declares
 //! the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade socket and builds the
 //! codec in its probe mode. Readiness stays `Record` in both, and production stays `exec: None`.
+//! Under the mode alone, [`account_reads`] builds and decodes the probe's own reads of every
+//! account of the provider user (decision 0132 item 7): the account listing, each account's
+//! positions, and its open orders on a trade socket of its own.
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
 //! corresponding MDS channel pages; [`QfexMd`] says what each becomes.
 
+pub mod account_reads;
 pub mod auth;
 mod caps;
 pub mod discover;

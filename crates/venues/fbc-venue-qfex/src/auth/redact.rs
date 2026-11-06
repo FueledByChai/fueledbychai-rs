@@ -32,8 +32,14 @@ pub(super) struct Marks<'a> {
 /// - `account_id`, `public_key`, `signature`, `jwt`: what an authentication sends, which an
 ///   echo can return;
 /// - `api_key`, `secret_key`: credential names no QFEX reply is documented to carry, kept out
-///   all the same.
-pub(super) const SENSITIVE: [&str; 8] = [
+///   all the same;
+/// - `account_ids`: the provider user's subaccounts, which
+///   [`GET /user/subaccounts`](https://docs.qfex.com/api-reference/rest/user/list-subaccounts)
+///   lists (FBC-h3z1, decision 0122 item 3);
+/// - `balance`: every value of the account's balance, which
+///   [`GET /user/positions`](https://docs.qfex.com/api-reference/rest/user/user-positions)
+///   answers beside the positions (FBC-h3z1, decision 0009).
+pub(super) const SENSITIVE: [&str; 10] = [
     "user_id",
     "id",
     "account_id",
@@ -42,6 +48,8 @@ pub(super) const SENSITIVE: [&str; 8] = [
     "jwt",
     "api_key",
     "secret_key",
+    "account_ids",
+    "balance",
 ];
 
 /// The deepest nesting walked, past serde_json's own limit of 128, so whatever serde_json
@@ -410,6 +418,12 @@ mod tests {
         // Duplicates are each redacted, as written.
         let input = r#"{"user_id":"a","user_id":"b"}"#;
         assert_eq!(redacted(input), r#"{"user_id":"2","user_id":"2"}"#);
+        // The private REST reads' listed account ids and balance values (FBC-h3z1).
+        let input = r#"{"account_ids":["ab",null],"balance":{"deposit":1.5,"x":true}}"#;
+        assert_eq!(
+            redacted(input),
+            r#"{"account_ids":["22",null],"balance":{"deposit":222,"x":true}}"#
+        );
     }
 
     #[test]

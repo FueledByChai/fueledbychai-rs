@@ -1,14 +1,26 @@
-Synthetic private trade-socket frames (decision 0009). Nothing in this directory was received
-from QFEX or belongs to an account.
+Synthetic private trade-socket frames and REST answers (decision 0009). Nothing in this
+directory was received from QFEX or belongs to an account.
 
-- Each file is one frame, hand-built with the member names QFEX's trade AsyncAPI
-  (https://docs.qfex.com/websocket/trade.yaml) gives OrderResponse, AllOrdersResponse (its
-  orders and twaps rows), FillResponse, PositionPayload, BalancePayload and StopOrder, in the
-  envelopes its channel pages show (order_response is the order responses page's example,
-  https://docs.qfex.com/websocket/channels/trade/order, with its values replaced).
+- Each JSON file but the three REST answers below is one frame, hand-built with the member
+  names QFEX's trade AsyncAPI (https://docs.qfex.com/websocket/trade.yaml) gives OrderResponse,
+  AllOrdersResponse (its orders and twaps rows), FillResponse, PositionPayload, BalancePayload
+  and StopOrder, in the envelopes its channel pages show (order_response is the order responses
+  page's example, https://docs.qfex.com/websocket/channels/trade/order, with its values
+  replaced).
 - Every value is made up: the UUIDs are repeated digits, the user_id and id values name no user
   or account, and the symbols, prices, quantities, times and enum values (execution_type,
   direction, stop_order_type, a TWAP's status) are invented, not taken from a capture or
-  checked against QFEX. They prove which bytes the redaction names, not how a codec decodes.
+  checked against QFEX. They prove which bytes the redaction names, and, for
+  all_orders_response.json, how the probe's page decoder reads the documented shape
+  (crates/venues/fbc-venue-qfex/tests/account_reads.rs), not what QFEX sends.
+- subaccounts.json, positions.json and positions_flat.json (FBC-h3z1) are hand-built REST
+  answers in the shapes QFEX's REST reference gives ListSubaccountsResponseBody
+  (https://docs.qfex.com/api-reference/rest/user/list-subaccounts) and
+  PositionsBalanceResponseBody with its BalancePublic and PositionPublic
+  (https://docs.qfex.com/api-reference/rest/user/user-positions), read 2026-11-05. Neither page
+  shows an example answer. The account ids are repeated digits naming no account, the $schema
+  URLs are on a reserved example domain, and every balance, position, margin and count is
+  invented; the positions are chosen to pin exact decoding (1e-12, a twenty-digit position, and
+  0, 0.0 and -0.0 as flat), not taken from a capture.
 
 This marker covers fixtures/qfex/private/ only. A recorded frame never goes here.

@@ -201,7 +201,12 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   under `qfex.exec.mode` `preprod_probe` alone, a host-guarded pre-production probe's order
   entry (`src/probe.rs`; its caps in `src/exec/caps.rs`, account-wide cancel-on-disconnect
   offering no disarm, which `caps_truthful` holds it to in `tests/conformance.rs`, 0141; its
-  REST reads' headers from `src/auth`, `TradeAuth::rest_headers`; 0132 item 6),
+  REST reads' headers from `src/auth`, `TradeAuth::rest_headers`; 0132 item 6) and the probe's
+  own reads of every account of the provider user (`src/account_reads.rs`:
+  `GET /user/subaccounts`, `GET /user/positions` and a `get_user_orders` page after that
+  account's authentication, each built only under the guard and signed by `src/auth`'s
+  `ReadAuth` for an account and credentials the caller names, and decoded exactly; 0132 item 7,
+  FBC-h3z1),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -827,6 +832,11 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   `fixtures/hibachi/signing/` (marked `SYNTHETIC`) holds the Java oracle
   (`HibachiSignOracle.java`, `run-oracle.sh`) and the vectors it wrote on a synthetic key, its
   README saying how it was run and which buffers Hibachi's docs print.
+  `fixtures/qfex/private/` (marked `SYNTHETIC`) holds hand-built QFEX trade-socket frames in the
+  shapes its trade AsyncAPI gives (an order, a fill, a page of open orders, a position, a
+  balance and a stop order) and answers to `GET /user/subaccounts` and `GET /user/positions` in
+  its REST reference's shapes, every id, `user_id` and value made up, its `SYNTHETIC` file
+  citing each shape.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs

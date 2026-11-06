@@ -81,9 +81,9 @@
 //! `order.rs` says.
 
 mod caps;
-mod echo;
+pub(crate) mod echo;
 mod ids;
-mod json;
+pub(crate) mod json;
 mod order;
 mod private;
 
@@ -106,6 +106,7 @@ use crate::rate;
 pub use self::caps::{RISK_REJECT_WINDOW, probe_exec_caps};
 pub use self::echo::{ARM, ErrCode};
 pub use self::ids::{CLIENT_ID_FORMAT, is_venue_order_id};
+pub(crate) use self::private::exact;
 pub use self::private::{OrderStatus, PrivateState};
 
 /// The trade WebSocket, the codec's one stream.
@@ -257,20 +258,11 @@ impl QfexExec {
     /// epoch's arm was sent, and the account's (`TradeAuth::inbound_spans`) for the rest.
     fn spans(&self, frame: RawFrame<'_>) -> Vec<Range<u32>> {
         let account = self.auth.inbound_spans(Inbound::Frame(frame));
-        if !rate::can_echo(frame.bytes()) {
-            return account.body().to_vec();
-        }
-        match frame {
-            RawFrame::Text(text) => match self.armed {
-                Some(arm) => echo::armed_spans(text, account.body(), self.in_flight == [arm]),
-                None => echo::spans(text, account.body()),
-            },
-            RawFrame::Binary(bytes) => {
-                let end = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-                std::iter::once(0..end)
-                    .filter(|span| !span.is_empty())
-                    .collect()
+        match (self.armed, frame) {
+            (Some(arm), RawFrame::Text(text)) if rate::can_echo(frame.bytes()) => {
+                echo::armed_spans(text, account.body(), self.in_flight == [arm])
             }
+            _ => frame_spans(account.body(), frame),
         }
     }
 
@@ -333,13 +325,7 @@ impl QfexExec {
     }
 
     fn on_auth_reply(&mut self, top: &[Member<'_>], fx: &mut Effects) {
-        let text = |name: &str| json::get(top, name).and_then(Node::str);
-        let documented = text("type") == Some("auth")
-            && text("result") == Some("success")
-            && json::get(top, "err").is_none();
-        let observed = matches!(top, [(name, value)]
-            if name == "authenticated" && matches!(value.kind, Kind::Literal("true")));
-        if !(documented || observed) {
+        if !auth_success(top) {
             return self.end(fx, "QFEX did not authenticate the stream");
         }
         // Not yet reported: that waits for the last confirmation.
@@ -434,6 +420,39 @@ impl QfexExec {
         self.last = Some(state);
         Ok(())
     }
+}
+
+/// The journal's spans of a frame off a trade socket with no arm sent on it: decision 0134's
+/// for one that can echo a request (one span, whole, for a binary one), and `account`, the
+/// spans the socket's authentication names (`TradeAuth::inbound_spans`, or the probe's account
+/// reads', FBC-h3z1), for the rest.
+pub(crate) fn frame_spans(account: &[Range<u32>], frame: RawFrame<'_>) -> Vec<Range<u32>> {
+    if !rate::can_echo(frame.bytes()) {
+        return account.to_vec();
+    }
+    match frame {
+        RawFrame::Text(text) => echo::spans(text, account),
+        RawFrame::Binary(bytes) => {
+            let end = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+            std::iter::once(0..end)
+                .filter(|span| !span.is_empty())
+                .collect()
+        }
+    }
+}
+
+/// Whether `top`, the members of a frame in none of the err and ack envelopes, is QFEX's reply
+/// that the stream is authenticated: the authenticate page's `{"type":"auth","result":"success"}`
+/// (with no `err` beside it) or the AsyncAPI's `{"authenticated":true}`, its one member. The
+/// codec and the probe's account reads (FBC-h3z1) take nothing else as success.
+pub(crate) fn auth_success(top: &[Member<'_>]) -> bool {
+    let text = |name: &str| json::get(top, name).and_then(Node::str);
+    let documented = text("type") == Some("auth")
+        && text("result") == Some("success")
+        && json::get(top, "err").is_none();
+    let observed = matches!(top, [(name, value)]
+        if name == "authenticated" && matches!(value.kind, Kind::Literal("true")));
+    documented || observed
 }
 
 impl ExecCodec for QfexExec {
