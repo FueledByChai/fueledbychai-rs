@@ -38,6 +38,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -45,6 +46,11 @@ use auth_qfex::{Armed, PUBLIC_VAR, SECRET_VAR, SUB_ID_VAR, SUB_PUBLIC_VAR, SUB_S
 use capture::{Arrived, Evidence, SessionRun, When};
 use fbc_conformance::{
     Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
+};
+use fbc_core::{ConnKey, MonoNs, RawFrame, RpcId, Stamp, TrafficClass, WallNs, WireSlice};
+use fbc_journal::{
+    ControlEvent, JournalError, JournalSink, JournalWriter, Opcode, QueueSink, Record, Recorded,
+    RedactionKey, SinkConfig, WriterThread, journal_queue,
 };
 use fbc_runtime::ProxyConfig;
 use fbc_runtime::http::Method;
@@ -470,6 +476,9 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     assert!(read("README.md").contains("error_code; result; subscribed; symbol; type"));
     assert!(ev.withheld.is_empty() && ev.errors.is_empty(), "{ev:#?}");
     assert_eq!(ev.fixtures.len(), 7 + 4 + 1);
+    // The journal kept every record: its sink dropped none, and no capture is partial.
+    assert_eq!(ev.dropped, [0, 0]);
+    assert!(ev.sessions.iter().all(|run| run.partial.is_empty()));
 
     // The files: the report and the evidence say what answered each arm, the fixtures pass
     // the repository's privacy check, and nothing holds a credential or an account id.
@@ -478,10 +487,17 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     assert!(report.contains("An ack echoing the arm arrived in its window"));
     assert!(report.contains("Nothing arrived in the arm's window"));
     assert!(report.contains("read every fixture for an identifying string"));
+    assert!(report.contains(
+        "Records the journal's sink dropped: 0 Normal, 0 Safety. Sessions whose capture is \
+         partial: none."
+    ));
     let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
     assert_eq!(evidence["ok"], true);
     assert_eq!(evidence["kept_string_members"][0], "error_code");
     assert_eq!(evidence["sessions"][1]["arm_outcome"], "Unknown");
+    assert_eq!(evidence["journal_dropped"]["normal"], 0);
+    assert_eq!(evidence["journal_dropped"]["safety"], 0);
+    assert_eq!(evidence["sessions"][1]["capture"], "whole");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
     evidence::privacy_check(&script, &fixtures).unwrap();
     assert_no_secret(&opts.evidence_dir);
@@ -1026,6 +1042,658 @@ fn what_the_capture_shows_of_the_arm() {
     run.arm_sent = false;
     assert!(run.answer().starts_with("No arm was sent"));
     assert!(!run.ok());
+}
+
+// ----- Journal gaps (decision 0006) -----
+
+/// What a test offers the journal's sink: a record under its class, or one withheld (`omit`),
+/// which the sink drops and counts as it does a record it has no room for.
+enum Offer {
+    Keep(Record),
+    Drop,
+}
+
+const WALL: WallNs = WallNs(1_762_000_000_000_000_000);
+/// A time in the hour after `WALL`'s: its first record makes the writer roll its segment.
+const NEXT_HOUR: WallNs = WallNs(WALL.0 + 3_600 * 1_000_000_000);
+/// The UTC day `WALL` falls on, the journal's directory for it, and the first segment the
+/// writer opens there.
+const DAY_DIR: &str = "20251101";
+const SEGMENT: &str = "0-000000.fbcj";
+
+fn conn(n: u16) -> ConnKey {
+    ConnKey { conn: n, epoch: 1 }
+}
+
+fn stamp(n: u16) -> Stamp {
+    Stamp {
+        ingest_seq: 0,
+        kernel_rx: None,
+        recv_mono: MonoNs(0),
+        recv_wall: WALL,
+        conn: conn(n),
+    }
+}
+
+/// A session's records on connection `n`, as the runtime journals them: opened, the
+/// authentication reply, the arm, `in_window`, the arm's deadline, closed.
+fn session_records(n: u16, in_window: Vec<Offer>) -> Vec<Offer> {
+    let mut offers = vec![
+        Offer::Keep(Record::Control {
+            at: MonoNs(0),
+            ev: ControlEvent::Opened(conn(n)),
+        }),
+        Offer::Keep(Record::inbound(stamp(n), RawFrame::Text(AUTH_OK))),
+        Offer::Keep(Record::Outbound {
+            at: MonoNs(0),
+            conn: conn(n),
+            rpc: Some(RpcId(1)),
+            opcode: Opcode::Text,
+            frame: WireSlice::plain(ARM.as_bytes().to_vec()),
+        }),
+    ];
+    offers.extend(in_window);
+    offers.push(Offer::Keep(Record::RpcTimeout {
+        stamp: stamp(n),
+        rpc: RpcId(1),
+    }));
+    offers.push(Offer::Keep(Record::Control {
+        at: MonoNs(0),
+        ev: ControlEvent::Closed(conn(n)),
+    }));
+    offers
+}
+
+fn ack(n: u16) -> Offer {
+    Offer::Keep(Record::inbound(stamp(n), RawFrame::Text(ARM_ACK)))
+}
+
+/// The probe's own sink and writer thread, as the run makes them, journaling under `dir`.
+fn queue(dir: &Path) -> (QueueSink, WriterThread) {
+    let key = Arc::new(RedactionKey::new(&[9; 32]).unwrap());
+    let config = SinkConfig {
+        budget_bytes: 16 << 20,
+        soft_limit_pct: 90,
+    };
+    let (sink, drain) = journal_queue(config, Arc::clone(&key)).unwrap();
+    let writer = JournalWriter::create(dir.join("journal"), 0, key).unwrap();
+    (sink, drain.spawn(writer).unwrap())
+}
+
+/// Journals `offers` under `WALL` through the probe's own sink and writer thread under `dir`;
+/// the sink is handed back with its writer closed.
+fn journal(dir: &Path, offers: Vec<Offer>) -> QueueSink {
+    let (mut sink, writing) = queue(dir);
+    for offer in offers {
+        let (recorded, kept) = match offer {
+            Offer::Keep(record) => (sink.record(TrafficClass::Normal, WALL, &record), true),
+            Offer::Drop => (sink.omit(TrafficClass::Normal, WALL), false),
+        };
+        assert_eq!(recorded == Recorded::Ok, kept);
+    }
+    writing.close().unwrap();
+    sink
+}
+
+/// Journals `offers`, each under its wall time, as [`journal`] does, but with the writer's
+/// first roll into a later hour failing: the name it compresses the closed segment into is
+/// taken by a directory, so the writer thread stops there, as it does at any write error, and
+/// every record the sink accepted after the last one written stays unwritten. The sink is
+/// handed back with what closing the writer returned.
+fn journal_until_the_roll_fails(
+    dir: &Path,
+    offers: Vec<(WallNs, Offer)>,
+) -> (QueueSink, Result<(), JournalError>) {
+    let day = dir.join("journal").join(DAY_DIR);
+    fs::create_dir_all(day.join(format!("{SEGMENT}.zst.tmp"))).unwrap();
+    let (mut sink, writing) = queue(dir);
+    for (wall, offer) in offers {
+        let _ = match offer {
+            Offer::Keep(record) => sink.record(TrafficClass::Normal, wall, &record),
+            Offer::Drop => sink.omit(TrafficClass::Normal, wall),
+        };
+    }
+    let closed = writing.close();
+    // The first hour's records were written, in the segment the failed roll left uncompressed.
+    assert!(day.join(SEGMENT).is_file());
+    (sink, closed)
+}
+
+/// Cuts the journal under `dir` inside its entry `n` (from 0, a marker counting as one), as a
+/// write that failed part way leaves a segment: its length and two bytes of its body stay.
+fn cut_inside(dir: &Path, n: usize) {
+    let segment = dir.join("journal").join(DAY_DIR).join(SEGMENT);
+    let bytes = fs::read(&segment).unwrap();
+    // After the segment's header: its magic and its format version.
+    let mut at = 6;
+    for _ in 0..n {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        at += 4 + usize::try_from(len).unwrap();
+    }
+    fs::write(&segment, &bytes[..at + 4 + 2]).unwrap();
+}
+
+/// Two sessions, primary then subaccount, each as the probe reports one that armed once and
+/// had its arm's outcome: what the journal shows is the slice's to add.
+fn reported() -> Vec<SessionRun> {
+    ["primary", "subaccount"]
+        .map(|account| SessionRun {
+            account,
+            authenticated: true,
+            arm: Some("Unknown".to_owned()),
+            ended_by: "the arm's outcome",
+            attempts: 1,
+            ..SessionRun::default()
+        })
+        .to_vec()
+}
+
+/// The evidence of a run whose sessions were `sessions`, its sink having dropped `dropped`.
+fn run_of(sessions: Vec<SessionRun>, dropped: [u64; 2]) -> Evidence {
+    Evidence {
+        started: "2026-11-06 00:00:00Z".to_owned(),
+        target: "a loopback test stub",
+        sessions,
+        dropped,
+        ..Evidence::default()
+    }
+}
+
+/// The evidence of a run whose sessions were [`reported`] and whose journal is under `dir`, as
+/// the run makes it: `sink`'s writer having closed as `closed` says (`stage::journal_closed`),
+/// then the slice of the journal, which it hands back.
+fn sliced(
+    dir: &Path,
+    sink: &QueueSink,
+    closed: Result<(), JournalError>,
+) -> (Evidence, Result<Vec<(String, String)>, String>) {
+    let mut ev = run_of(reported(), [0, 0]);
+    stage::journal_closed(&mut ev, closed, sink);
+    let files = capture::slice(&dir.join("journal"), 0, &mut ev);
+    (ev, files)
+}
+
+#[test]
+fn a_degraded_marker_in_a_sessions_window_makes_its_capture_partial_and_the_run_incomplete() {
+    let (dir, _removed) = temp_dir("gap-in-window");
+    // The primary account's arm is acked; in the subaccount's window the sink drops a frame
+    // (record 9), and the arm's deadline after it closes the gap behind a Degraded marker.
+    let mut offers = session_records(0, vec![ack(0)]);
+    offers.extend(session_records(1, vec![Offer::Drop]));
+    let sink = journal(&dir, offers);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    files.unwrap();
+
+    // The gap could hold only the subaccount's records: the primary account's capture is whole.
+    let [primary, sub] = [&ev.sessions[0], &ev.sessions[1]];
+    assert!(primary.partial.is_empty() && primary.ok(), "{primary:?}");
+    assert!(primary.answer().starts_with("An ack echoing the arm"));
+    assert_eq!(
+        sub.partial,
+        [
+            "a journal gap, 1 dropped from its record 9 on (a Degraded marker, decision 0006), \
+          could hold this session's records"
+        ]
+    );
+    assert!(sub.arm_sent && !sub.ok(), "{sub:?}");
+    // Its window looks empty, but nothing is concluded from it.
+    assert!(sub.frames.iter().all(|f| f.when == When::BeforeArm));
+    let answer = sub.answer();
+    assert!(answer.starts_with("The capture is partial"), "{answer}");
+    assert!(!answer.contains("Nothing arrived"), "{answer}");
+    assert!(
+        answer.contains("Echoes of the arm it kept: none."),
+        "{answer}"
+    );
+
+    // The run, whose sink's counts agree, is incomplete, and its report and evidence name the
+    // partial session and why.
+    assert_eq!(ev.dropped, [1, 0]);
+    assert!(!ev.ok());
+    // Even counts the sink never reported could not make it complete.
+    assert!(!run_of(ev.sessions.clone(), [0, 0]).ok());
+    let report = capture::markdown(&ev);
+    assert!(report.contains("Result: INCOMPLETE."), "{report}");
+    assert!(report.contains("**The journal is incomplete** (decision 0006)"));
+    assert!(report.contains("1 Normal, 0 Safety. Sessions whose capture is partial: subaccount."));
+    assert!(report.contains("- Capture: PARTIAL: a journal gap, 1 dropped from its record 9 on"));
+    assert!(!report.contains("Nothing arrived"), "{report}");
+    let readme = capture::readme(&ev);
+    assert!(
+        readme.contains(
+            "**This capture is partial** (decision 0006): the capture of subaccount is partial \
+             (the run's report says why; the journal's sink dropped 1 Normal and 0 Safety \
+             records)."
+        ),
+        "{readme}"
+    );
+    let evidence = capture::to_json(&ev);
+    assert_eq!(evidence["ok"], false);
+    assert_eq!(evidence["journal_dropped"]["normal"], 1);
+    assert_eq!(evidence["journal_writer_failed"], Value::Null);
+    assert_eq!(evidence["sessions"][0]["capture"], "whole");
+    assert_eq!(evidence["sessions"][1]["capture"], "partial");
+    assert_eq!(evidence["sessions"][1]["ok"], false);
+    assert!(
+        evidence["sessions"][1]["partial_because"][0]
+            .as_str()
+            .unwrap()
+            .contains("from its record 9")
+    );
+}
+
+#[test]
+fn a_gap_is_placed_on_every_session_whose_records_it_could_hold() {
+    // A gap opened in the primary account's window and closed only by the subaccount's first
+    // record could hold either's: both are partial.
+    let (dir, _removed) = temp_dir("gap-across");
+    let mut offers = session_records(0, vec![Offer::Drop]);
+    // Its deadline and close dropped too, so the gap is still open when the next session opens.
+    let closing = offers.split_off(offers.len() - 2);
+    offers.extend(closing.into_iter().map(|_| Offer::Drop));
+    offers.extend(session_records(1, vec![ack(1)]));
+    let sink = journal(&dir, offers);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    files.unwrap();
+    for run in &ev.sessions {
+        assert_eq!(run.partial.len(), 1, "{run:?}");
+        assert!(run.partial[0].contains("3 dropped from its record 3 on"));
+    }
+    // A kept echo of the arm is named, with no position against the arm and no conclusion.
+    let answer = ev.sessions[1].answer();
+    assert!(answer.starts_with("The capture is partial"), "{answer}");
+    assert!(
+        answer.contains(
+            "Echoes of the arm it kept: ack echoing the arm (position unverified, \
+             subaccount-002-partial.json)."
+        ),
+        "{answer}"
+    );
+    assert!(!answer.contains("Final acceptance"), "{answer}");
+
+    // A gap still open when the sink closes is marked last, by the writer: it could hold the
+    // records of every session from the one it opened in to the last.
+    let (dir, _removed) = temp_dir("gap-at-close");
+    let mut offers = session_records(0, vec![ack(0)]);
+    let mut sub = session_records(1, Vec::new());
+    sub.truncate(3);
+    sub.push(Offer::Drop);
+    offers.extend(sub);
+    let sink = journal(&dir, offers);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    files.unwrap();
+    assert!(ev.sessions[0].partial.is_empty(), "{:?}", ev.sessions[0]);
+    assert_eq!(ev.sessions[1].partial.len(), 1, "{:?}", ev.sessions[1]);
+    assert!(ev.sessions[1].partial[0].contains("1 dropped from its record 9 on"));
+}
+
+#[test]
+fn a_drop_the_journal_holds_no_marker_for_leaves_no_session_shown_whole() {
+    // The clean case: every record kept, both sessions whole, the run complete.
+    let (dir, _removed) = temp_dir("dropped-unmarked");
+    let mut offers = session_records(0, vec![ack(0)]);
+    offers.extend(session_records(1, vec![ack(1)]));
+    let mut sink = journal(&dir, offers);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    files.unwrap();
+    assert!(
+        ev.sessions
+            .iter()
+            .all(|run| run.partial.is_empty() && run.ok())
+    );
+    assert_eq!(ev.dropped, [0, 0]);
+    assert!(ev.ok(), "{ev:#?}");
+    let report = capture::markdown(&ev);
+    assert!(report.contains("Result: complete."), "{report}");
+    assert!(
+        report.contains("dropped: 0 Normal, 0 Safety. Sessions whose capture is partial: none.")
+    );
+    assert!(!report.contains("The journal is incomplete"));
+    assert_eq!(report.matches("- Capture: whole").count(), 2);
+    assert!(!capture::readme(&ev).contains("partial"));
+
+    // A record offered once the sink closed is dropped and counted, and no marker reaches the
+    // journal for it. The slice reads no gap, but the markers it read account for fewer drops
+    // than the sink counted: a drop no marker shows could be any session's, so each is partial.
+    assert_eq!(
+        sink.omit(TrafficClass::Safety, WALL),
+        Recorded::DroppedCounted
+    );
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    files.unwrap();
+    assert_eq!(ev.dropped, [0, 1]);
+    for run in &ev.sessions {
+        assert_eq!(
+            run.partial,
+            [
+                "records dropped: 1 by the journal's sink's count, 0 by its Degraded markers \
+                 (decision 0006), so a drop no marker shows could hold this session's records"
+            ],
+            "{run:?}"
+        );
+        assert!(run.answer().starts_with("The capture is partial"));
+    }
+    assert!(!ev.ok());
+    let report = capture::markdown(&ev);
+    assert!(report.contains("Result: INCOMPLETE."), "{report}");
+    assert!(report.contains("**The journal is incomplete** (decision 0006)"));
+    assert!(report.contains(
+        "dropped: 0 Normal, 1 Safety. Sessions whose capture is partial: primary; subaccount."
+    ));
+    assert!(!report.contains("partial: none"), "{report}");
+    assert!(!report.contains("- Capture: whole"), "{report}");
+    assert!(
+        !report.contains("An ack echoing the arm arrived"),
+        "{report}"
+    );
+    assert_eq!(capture::to_json(&ev)["journal_dropped"]["safety"], 1);
+    assert!(capture::readme(&ev).contains("**This capture is partial**"));
+}
+
+#[test]
+fn a_writer_stopped_by_a_failed_roll_leaves_the_sessions_it_could_hold_partial() {
+    let (dir, _removed) = temp_dir("writer-stops");
+    // The primary account's session, then the subaccount's opening, authentication and arm, in
+    // this hour; QFEX's ack of that arm, its deadline and its close in the next, which the
+    // writer stops at before writing any. The sink accepted every record: it drops none.
+    let mut offers: Vec<(WallNs, Offer)> = session_records(0, vec![ack(0)])
+        .into_iter()
+        .map(|offer| (WALL, offer))
+        .collect();
+    let mut sub = session_records(1, vec![ack(1)]);
+    let later = sub.split_off(3);
+    offers.extend(sub.into_iter().map(|offer| (WALL, offer)));
+    offers.extend(later.into_iter().map(|offer| (NEXT_HOUR, offer)));
+    let (sink, closed) = journal_until_the_roll_fails(&dir, offers);
+    assert!(closed.is_err());
+    let mut ev = run_of(reported(), [0, 0]);
+    stage::journal_closed(&mut ev, closed, &sink);
+    assert_eq!(ev.dropped, [0, 0]);
+    assert!(ev.writer_failed.is_some(), "{ev:?}");
+    assert!(ev.errors[0].starts_with("the journal's writer: "), "{ev:?}");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    stage::write_slice(&dir, &mut ev, &script).unwrap();
+    let (report, evidence) = capture::outputs(&mut ev);
+
+    // Every record written precedes the subaccount's arm, so whatever the writer did not write
+    // came after it: the primary account's capture is whole and its ack stands.
+    let [primary, sub] = [&ev.sessions[0], &ev.sessions[1]];
+    assert!(primary.partial.is_empty(), "{primary:?}");
+    assert!(primary.answer().starts_with("An ack echoing the arm"));
+    // The subaccount's arm was written, and what answered it is in no file: its capture is
+    // partial, and nothing is concluded from its empty window.
+    assert!(sub.arm_sent, "{sub:?}");
+    assert_eq!(
+        sub.partial,
+        [
+            "the journal's writer stopped at an error, so the records the sink accepted after \
+             the last one it wrote are in no file, neither counted nor marked as dropped \
+             (decision 0006), and could be this session's"
+        ]
+    );
+    let answer = sub.answer();
+    assert!(answer.starts_with("The capture is partial"), "{answer}");
+    assert!(!answer.contains("Nothing arrived"), "{answer}");
+    assert!(sub.frames.iter().all(|f| f.file.ends_with("-partial.json")));
+
+    assert!(report.contains("Result: INCOMPLETE."), "{report}");
+    assert!(report.contains("**The journal is incomplete** (decision 0006)"));
+    assert!(report.contains("0 Normal, 0 Safety. Sessions whose capture is partial: subaccount."));
+    assert_eq!(report.matches("- Capture: whole").count(), 1, "{report}");
+    assert!(report.contains("- Capture: PARTIAL: the journal's writer stopped at an error"));
+    assert!(!report.contains("Nothing arrived"), "{report}");
+    let evidence = json(&evidence);
+    assert_eq!(evidence["sessions"][0]["capture"], "whole");
+    assert_eq!(evidence["sessions"][1]["capture"], "partial");
+    assert!(evidence["journal_writer_failed"].is_string());
+    let readme = fs::read_to_string(dir.join("fixtures/README.md")).unwrap();
+    assert!(
+        readme.contains("**This capture is partial** (decision 0006): the capture of subaccount"),
+        "{readme}"
+    );
+    assert!(
+        !readme.contains("so whatever answered the arm is here"),
+        "{readme}"
+    );
+    assert!(dir.join("fixtures/subaccount-001-partial.json").is_file());
+    assert!(dir.join("fixtures/primary-002-in-window.json").is_file());
+}
+
+#[test]
+fn drops_after_the_writer_stopped_reach_no_marker_and_no_session_is_shown_whole() {
+    let (dir, _removed) = temp_dir("writer-stops-drops");
+    let mut offers: Vec<(WallNs, Offer)> = session_records(0, vec![ack(0)])
+        .into_iter()
+        .map(|offer| (WALL, offer))
+        .collect();
+    let mut sub = session_records(1, Vec::new());
+    let later = sub.split_off(3);
+    offers.extend(sub.into_iter().map(|offer| (WALL, offer)));
+    // In the next hour the writer stops at its first record. The queue, which nothing drains
+    // now, fills with frames of the subaccount's window, more than the soft limit holds: the
+    // sink drops what has no room, counted, and no marker of it reaches the journal.
+    let pad = format!("{{\"pad\":\"{}\"}}", "x".repeat(1 << 20));
+    for _ in 0..16 {
+        let frame = Record::inbound(stamp(1), RawFrame::Text(&pad));
+        offers.push((NEXT_HOUR, Offer::Keep(frame)));
+    }
+    offers.push((NEXT_HOUR, ack(1)));
+    offers.extend(later.into_iter().map(|offer| (NEXT_HOUR, offer)));
+    let (sink, closed) = journal_until_the_roll_fails(&dir, offers);
+    let (ev, files) = sliced(&dir, &sink, closed);
+    files.unwrap();
+    assert!(ev.dropped[0] > 0, "{:?}", ev.dropped);
+    assert!(ev.writer_failed.is_some());
+
+    // The markers read account for none of the drops, which could then be any session's, the
+    // primary account's included; and the writer stopped in the subaccount's.
+    let unmarked = format!(
+        "records dropped: {} by the journal's sink's count, 0 by its Degraded markers",
+        ev.dropped[0]
+    );
+    let [primary, sub] = [&ev.sessions[0], &ev.sessions[1]];
+    assert_eq!(primary.partial.len(), 1, "{primary:?}");
+    assert!(primary.partial[0].starts_with(&unmarked), "{primary:?}");
+    assert_eq!(sub.partial.len(), 2, "{sub:?}");
+    assert!(sub.partial[0].starts_with("the journal's writer stopped at an error"));
+    assert!(sub.partial[1].starts_with(&unmarked));
+    for run in &ev.sessions {
+        assert!(
+            run.answer().starts_with("The capture is partial"),
+            "{run:?}"
+        );
+    }
+    let report = capture::markdown(&ev);
+    assert!(report.contains("**The journal is incomplete** (decision 0006)"));
+    assert!(
+        report.contains("Sessions whose capture is partial: primary; subaccount."),
+        "{report}"
+    );
+    assert!(!report.contains("partial: none"), "{report}");
+    assert!(!report.contains("- Capture: whole"), "{report}");
+    assert!(!report.contains("Nothing arrived"), "{report}");
+    assert!(
+        !report.contains("An ack echoing the arm arrived"),
+        "{report}"
+    );
+    let readme = capture::readme(&ev);
+    assert!(
+        readme.contains("the capture of primary; subaccount is partial"),
+        "{readme}"
+    );
+}
+
+#[test]
+fn a_journal_cut_inside_a_record_leaves_every_session_from_the_cut_on_partial() {
+    // A gap in the subaccount's window, its marker written before the arm's deadline, and the
+    // journal cut inside that deadline (entry 10: nine records, then the marker). The slice
+    // stops at the cut with the gap it read still open.
+    let (dir, _removed) = temp_dir("cut-after-marker");
+    let mut offers = session_records(0, vec![ack(0)]);
+    offers.extend(session_records(1, vec![Offer::Drop]));
+    let sink = journal(&dir, offers);
+    cut_inside(&dir, 10);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    let err = files.unwrap_err();
+    assert!(err.starts_with("the journal: "), "{err}");
+    let [primary, sub] = [&ev.sessions[0], &ev.sessions[1]];
+    assert!(primary.partial.is_empty() && primary.ok(), "{primary:?}");
+    assert_eq!(sub.partial.len(), 2, "{sub:?}");
+    assert!(sub.partial[0].starts_with("a journal gap, 1 dropped from its record 9 on"));
+    assert!(
+        sub.partial[1].starts_with("the journal could not be read to its end (the journal: "),
+        "{sub:?}"
+    );
+    assert!(sub.answer().starts_with("The capture is partial"));
+    let report = capture::markdown(&ev);
+    assert!(report.contains("Sessions whose capture is partial: subaccount."));
+    assert!(!report.contains("Nothing arrived"), "{report}");
+
+    // A clean journal cut inside the subaccount's authentication reply (entry 7): its arm is
+    // never read, and the session is partial, never one whose arm was not sent.
+    let (dir, _removed) = temp_dir("cut-before-arm");
+    let mut offers = session_records(0, vec![ack(0)]);
+    offers.extend(session_records(1, vec![ack(1)]));
+    let sink = journal(&dir, offers);
+    cut_inside(&dir, 7);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    assert!(files.is_err());
+    let [primary, sub] = [&ev.sessions[0], &ev.sessions[1]];
+    assert!(primary.partial.is_empty() && primary.ok(), "{primary:?}");
+    assert!(!sub.arm_sent && sub.frames.is_empty(), "{sub:?}");
+    assert_eq!(sub.partial.len(), 1, "{sub:?}");
+    assert!(sub.partial[0].starts_with("the journal could not be read to its end"));
+    let answer = sub.answer();
+    assert!(answer.starts_with("The capture is partial"), "{answer}");
+    assert!(!answer.contains("No arm was sent"), "{answer}");
+    let report = capture::markdown(&ev);
+    assert!(report.contains("Sessions whose capture is partial: subaccount."));
+    assert!(report.contains("- Arm written: not shown (the capture is partial)"));
+    assert!(!report.contains("No arm was sent"), "{report}");
+    assert_eq!(
+        capture::to_json(&ev)["sessions"][1]["arm_sent"],
+        Value::Null
+    );
+    assert_eq!(capture::to_json(&ev)["sessions"][0]["arm_sent"], true);
+}
+
+#[test]
+fn a_partial_sessions_frames_are_named_and_listed_with_no_position_against_its_arm() {
+    // The subaccount's arm deadline is dropped, and QFEX's ack after it closes the gap: read
+    // back, the ack falls in a window nothing ended. The gap could hold that deadline, so no
+    // position is stated: not in its file's name, its listing, the evidence or the answer.
+    let (dir, _removed) = temp_dir("no-position");
+    let mut offers = session_records(0, vec![ack(0)]);
+    let mut sub = session_records(1, Vec::new());
+    let closed = sub.pop().unwrap();
+    let deadline = sub.pop().unwrap();
+    assert!(matches!(deadline, Offer::Keep(Record::RpcTimeout { .. })));
+    sub.extend([Offer::Drop, ack(1), closed]);
+    offers.extend(sub);
+    let sink = journal(&dir, offers);
+    let (mut ev, files) = sliced(&dir, &sink, Ok(()));
+    let files = files.unwrap();
+    let names: Vec<&str> = files.iter().map(|(file, _)| file.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "primary-001-before-arm.json",
+            "primary-002-in-window.json",
+            "subaccount-001-partial.json",
+            "subaccount-002-partial.json",
+        ]
+    );
+    let sub = &ev.sessions[1];
+    assert_eq!(sub.partial.len(), 1, "{sub:?}");
+    // As read, the ack falls in the window: the position the capture does not state.
+    assert_eq!(sub.frames[1].when, When::InWindow);
+    let answer = sub.answer();
+    assert!(
+        answer.contains(
+            "Echoes of the arm it kept: ack echoing the arm (position unverified, \
+             subaccount-002-partial.json)."
+        ),
+        "{answer}"
+    );
+    assert!(!answer.contains("in-window"), "{answer}");
+    let report = capture::markdown(&ev);
+    assert!(
+        report.contains(
+            "| 2 | position unverified | ack echoing the arm | subaccount-002-partial.json |"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("| 2 | in-window | ack echoing the arm | primary-002-in-window.json |")
+    );
+    assert!(!report.contains("subaccount-002-in-window"), "{report}");
+    let evidence = capture::to_json(&ev);
+    assert_eq!(evidence["sessions"][0]["frames"][1]["when"], "in-window");
+    assert_eq!(
+        evidence["sessions"][1]["frames"][1]["when"],
+        "position unverified"
+    );
+    capture::write_fixtures(&dir.join("fixtures"), files, &mut ev).unwrap();
+    let readme = fs::read_to_string(dir.join("fixtures/README.md")).unwrap();
+    assert!(
+        readme.contains("Each of their files is named `<account>-<n>-partial.json`"),
+        "{readme}"
+    );
+    assert!(dir.join("fixtures/subaccount-002-partial.json").is_file());
+}
+
+#[test]
+fn a_gap_placed_on_no_session_is_never_shown_beside_a_whole_capture() {
+    // The slice places what it finds of every gap, so only a run with no session, or one whose
+    // journal was never sliced, has a gap on no session. Its report never says, beside the
+    // gap, that no capture is partial.
+    let ev = run_of(Vec::new(), [2, 0]);
+    let report = capture::markdown(&ev);
+    assert!(
+        report.contains("**The journal is incomplete** (decision 0006)"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "Sessions whose capture is partial: the drops could not be placed on a session; no \
+             session's capture is shown whole."
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("partial: none"), "{report}");
+    let readme = capture::readme(&ev);
+    assert!(
+        readme.contains(
+            "dropped 2 Normal and 0 Safety records, and the drops could not be placed on a \
+             session; no session's capture is shown whole."
+        ),
+        "{readme}"
+    );
+    // Sessions it was never placed on are each shown partial for it, with no conclusion and no
+    // position.
+    let mut sessions = reported();
+    sessions[0].arm_sent = true;
+    sessions[0].frames.push(Arrived {
+        kind: "ack echoing the arm".to_owned(),
+        when: When::InWindow,
+        file: "primary-001-in-window.json".to_owned(),
+    });
+    let ev = run_of(sessions, [0, 1]);
+    let report = capture::markdown(&ev);
+    assert!(
+        report.contains("Sessions whose capture is partial: primary; subaccount."),
+        "{report}"
+    );
+    assert!(!report.contains("- Capture: whole"), "{report}");
+    assert!(
+        !report.contains("An ack echoing the arm arrived"),
+        "{report}"
+    );
+    assert!(report.contains("| 1 | position unverified | ack echoing the arm |"));
+    let evidence = capture::to_json(&ev);
+    assert_eq!(evidence["sessions"][0]["capture"], "partial");
+    assert_eq!(evidence["sessions"][0]["arm_sent"], true);
+    assert_eq!(evidence["sessions"][1]["arm_sent"], Value::Null);
 }
 
 #[test]
