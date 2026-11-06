@@ -79,6 +79,11 @@ pub struct Registry {
     /// client ids live events showed while the registry did not hold them (0005's I7,
     /// decision 0108; [`Registry::cancel_orphans`]).
     pub(crate) orphans: Orphans,
+    /// A trip the next admission of a place or batch item makes right after it, once: the unit
+    /// tests' stand-in for another thread tripping the registry between an admission and its
+    /// registration (decision 0139).
+    #[cfg(test)]
+    trip_after_admission: Option<crate::CancelOnlyTrip>,
 }
 
 /// One registry among every registry the process built: drawn fresh for each.
@@ -483,10 +488,15 @@ impl Registry {
     /// freeing what it counted, so a held place is never stranded (decision 0084).
     pub fn place(&mut self, order: NewOrder) -> Result<PermittedCommand, OmsError> {
         self.reap_dropped();
-        self.admit_placement(&order)?;
-        self.insert(order.clone())?;
-        self.held(order.cid);
+        // The market's generation, watched before the order is admitted, with no trip applied
+        // until the place is built: a trip applied later moves it, so a place admitted in
+        // Quoting before a trip is refused at submit (decision 0139).
         let guard = self.state_guard(order.inst);
+        self.admit_placement(&order)?;
+        #[cfg(test)]
+        self.after_admission();
+        self.register(order.clone())?;
+        self.held(order.cid);
         Ok(PermittedCommand::holding(
             VenueCommand::Place(order),
             guard,
@@ -516,14 +526,17 @@ impl Registry {
         {
             return Err(OmsError::MixedMarkets);
         }
+        // Watched before any item is admitted, as a place's is ([`Registry::place`]).
+        let guard = orders.first().map(|first| self.state_guard(first.inst));
         let mut plan = PlacePlan::default();
         let mut admitted = Vec::new();
         for order in orders {
             let cid = order.cid;
-            match self
-                .admit_placement(&order)
-                .and_then(|()| self.insert(order.clone()).map(|_| ()))
-            {
+            match self.admit_placement(&order).and_then(|()| {
+                #[cfg(test)]
+                self.after_admission();
+                self.register(order.clone()).map(|_| ())
+            }) {
                 Ok(()) => {
                     self.held(cid);
                     admitted.push(order);
@@ -531,8 +544,9 @@ impl Registry {
                 Err(refusal) => plan.refused.push((cid, refusal)),
             }
         }
-        if let Some(first) = admitted.first() {
-            let guard = self.state_guard(first.inst);
+        if let Some(guard) = guard
+            && !admitted.is_empty()
+        {
             plan.command = Some(PermittedCommand::holding(
                 VenueCommand::PlaceBatch(admitted),
                 guard,
@@ -625,6 +639,14 @@ impl Registry {
     /// [`Registry::place_batch`], under the pre-trade caps.
     pub fn insert(&mut self, placed: NewOrder) -> Result<&OrderRecord, OmsError> {
         self.reap_dropped();
+        self.register(placed)
+    }
+
+    /// Registers `placed` PendingNew, as [`Registry::insert`] does, without reaping first: a
+    /// place or batch item is registered after its admission with no trip applied between, so
+    /// the generation its build watched before the admission is the one a trip moves (decision
+    /// 0139).
+    fn register(&mut self, placed: NewOrder) -> Result<&OrderRecord, OmsError> {
         let cid = placed.cid;
         match self.orders.entry(cid) {
             std::collections::hash_map::Entry::Occupied(_) => Err(OmsError::DuplicateCid(cid)),
@@ -1352,4 +1374,116 @@ fn judge_place(
         .judge(exposure, marked, adds.exposure)
         .map_err(OmsError::State)?;
     exposure.admit(adds, reduce_only).map_err(OmsError::Capped)
+}
+
+#[cfg(test)]
+impl Registry {
+    /// Trips `trip` right after the next admission of a place or batch item, once.
+    fn trip_after_next_admission(&mut self, trip: crate::CancelOnlyTrip) {
+        self.trip_after_admission = Some(trip);
+    }
+
+    /// What [`Registry::place`] and [`Registry::place_batch`] call right after each admission.
+    fn after_admission(&mut self) {
+        if let Some(trip) = self.trip_after_admission.take() {
+            trip.trip();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fbc_core::{MarketLease, NonceScope};
+
+    use super::*;
+    use crate::common::{cid, lease_dir, lots, order_caps, placement, symbol};
+    use crate::{
+        Authorization, EntryState, LeaseKeys, Leases, MarketCapsConfig, StaleAuthorization,
+        StateGeneration,
+    };
+
+    const INST: InstrumentId = InstrumentId::new(1);
+    const ACCT: AccountKey = AccountKey::new(1);
+
+    /// A registry with `INST` flat, armed and Quoting: seeded by hand in a declared testnet run,
+    /// under lease names of its own whose nonces are not per account, so Start takes the
+    /// market's lease alone.
+    fn quoting() -> Registry {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let account = format!("registry-unit-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+        let wire = symbol("SYN-1-PERP");
+        let caps = OrderCaps {
+            nonce_scope: NonceScope::Random,
+            ..order_caps()
+        };
+        let keys = LeaseKeys::new("synthetic", &account, &caps).with_market(INST, wire.clone());
+        let limits = MarketCapsConfig {
+            inventory: Some(lots(1_000)),
+            resting: Some(lots(1_000)),
+        };
+        let mut reg = Registry::with_caps(PreTradeCaps::new().with_market(INST, limits).unwrap())
+            .with_lease_keys(keys)
+            .for_testnet_run(TestnetRun::owner_assisted());
+        reg.seed_position(INST, SignedLots(0)).unwrap();
+        let lease = MarketLease::acquire(&lease_dir(), "synthetic", &account, &wire).unwrap();
+        reg.start(INST, Leases::market(lease)).unwrap();
+        assert_eq!(reg.entry(INST).state(), EntryState::Quoting);
+        reg
+    }
+
+    /// Authorizes `cmd`, built while `INST` was Quoting at generation `quoting` and a trip
+    /// landed right after its admission, and checks it at submit: the authorization applied the
+    /// trip, which moved the market to Cancel-only and its generation past `quoting`, so the
+    /// command is refused as a change of state.
+    fn checked_after_trip(
+        reg: &mut Registry,
+        quoting: StateGeneration,
+        cmd: PermittedCommand,
+    ) -> Authorization {
+        let auth = reg.authorize(ACCT, cmd).unwrap();
+        let now = reg.entry(INST);
+        assert_eq!(now.state(), EntryState::CancelOnly);
+        assert_eq!(
+            auth.check_at_submit(),
+            Err(StaleAuthorization::StateChanged {
+                market: INST,
+                built: quoting,
+                now: now.generation(),
+            })
+        );
+        assert_eq!(now.generation().get(), quoting.get() + 1);
+        auth
+    }
+
+    #[test]
+    fn a_place_admitted_in_quoting_and_tripped_before_its_registration_is_refused_at_submit() {
+        let mut reg = quoting();
+        let built = reg.entry(INST).generation();
+        let trip = reg.cancel_only_trip();
+        reg.trip_after_next_admission(trip.clone());
+        let place = reg.place(placement(cid(), 100, 1)).unwrap();
+        assert_eq!(trip.trips(), 1);
+        drop(checked_after_trip(&mut reg, built, place));
+    }
+
+    #[test]
+    fn a_batch_with_an_item_admitted_in_quoting_and_tripped_before_its_registration_is_refused_at_submit()
+     {
+        let mut reg = quoting();
+        let built = reg.entry(INST).generation();
+        let trip = reg.cancel_only_trip();
+        reg.trip_after_next_admission(trip.clone());
+        let (first, second) = (placement(cid(), 100, 1), placement(cid(), 99, 1));
+        let plan = reg
+            .place_batch(vec![first.clone(), second.clone()])
+            .unwrap();
+        assert_eq!(trip.trips(), 1);
+        // The second item is admitted after the trip: Cancel-only, never built.
+        assert_eq!(
+            plan.refused,
+            vec![(second.cid, OmsError::State(StateRefusal::CancelOnly(INST)))]
+        );
+        let auth = checked_after_trip(&mut reg, built, plan.command.unwrap());
+        assert_eq!(auth.command(), &VenueCommand::PlaceBatch(vec![first]));
+    }
 }
