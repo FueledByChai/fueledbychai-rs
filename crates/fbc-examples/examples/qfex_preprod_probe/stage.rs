@@ -31,7 +31,10 @@
 //!   the arm's window is kept as decision 0132 item 3 says. The sessions run one after the
 //!   other: no two arms are in flight across the user.
 //! - **The files** ([`crate::capture`]): the report, the evidence, the journal and the scrubbed
-//!   fixture slice, which scripts/privacy-check.sh must pass.
+//!   fixture slice, which scripts/privacy-check.sh must pass. A record the journal dropped,
+//!   marked in it or only counted by its sink, one its writer never wrote, and a journal that
+//!   cannot be read to its end each make the run incomplete and the capture of every session
+//!   that could have lost a record partial (decision 0006).
 
 use std::cell::RefCell;
 use std::fmt;
@@ -47,7 +50,9 @@ use fbc_core::{
     Namespace, NonceBlock, NonceSource, RateCharge, RawFrame, SpecTable, TrafficClass, VenueCaps,
     VenueConfig, VenueFactory, Via, WallNs, dispatch,
 };
-use fbc_journal::{JournalWriter, NonceSourceId, RedactionKey, SinkConfig, journal_queue};
+use fbc_journal::{
+    JournalError, JournalWriter, NonceSourceId, QueueSink, RedactionKey, SinkConfig, journal_queue,
+};
 use fbc_runtime::ws::{Message, WebSocket};
 use fbc_runtime::{
     AccountWideCodAuthority, Connector, ExecControl, ExecHandler, ExecSession, ExecSessionConfig,
@@ -182,6 +187,8 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
     };
     let (sink, drain) =
         journal_queue(sink, Arc::clone(&key)).map_err(|e| format!("the journal: {e}"))?;
+    // Kept to read its drop counts once the writer has closed.
+    let sink = Rc::new(RefCell::new(sink));
     let writer = JournalWriter::create(dir.join("journal"), SHARD, key);
     let writer = writer.map_err(|e| format!("the journal: {e}"))?;
     let writing = drain
@@ -201,7 +208,7 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
         limiter,
         nonces,
         clock: IngestClock::new(),
-        journal: Journal::new(Rc::new(RefCell::new(sink))),
+        journal: Journal::new(Rc::clone(&sink)),
         origin: Instant::now(),
         ev: Evidence {
             started: evidence::utc(wall_secs()),
@@ -224,14 +231,13 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
         ..
     } = run;
     // Every session has dropped its handle on the journal; this one goes too, and the writer
-    // thread writes what is queued and closes its segment.
+    // thread writes what is queued, the marker of a gap still open, and closes its segment.
+    // Then the sink's drop counts, every class's, which nothing offers to now: a drop the
+    // journal holds no marker for counts as much as one it does (decision 0006).
     drop(journal);
-    ev.errors.extend(
-        writing
-            .close()
-            .err()
-            .map(|e| format!("the journal's writer: {e}")),
-    );
+    let closed = writing.close();
+    journal_closed(&mut ev, closed, &sink.borrow());
+    drop(sink);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
     let failed = write_slice(dir, &mut ev, &script).err();
     ev.errors.extend(failed);
@@ -283,10 +289,27 @@ fn wall_secs() -> i64 {
     now.map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
+/// The records `sink` dropped since it was made, Normal then Safety ([`Evidence::dropped`]).
+pub fn journal_dropped(sink: &QueueSink) -> [u64; 2] {
+    [TrafficClass::Normal, TrafficClass::Safety].map(|class| sink.dropped(class))
+}
+
+/// What the run knows of its journal once the writer thread has closed (`closed`, what
+/// `WriterThread::close` returned), which the slice holds the journal it reads to (decision
+/// 0006): the error that stopped the writer, if one did ([`Evidence::writer_failed`], and among
+/// the errors), and `sink`'s drop counts ([`Evidence::dropped`]), which nothing offers to now.
+pub fn journal_closed(ev: &mut Evidence, closed: Result<(), JournalError>, sink: &QueueSink) {
+    if let Err(e) = closed {
+        ev.errors.push(format!("the journal's writer: {e}"));
+        ev.writer_failed = Some(e.to_string());
+    }
+    ev.dropped = journal_dropped(sink);
+}
+
 /// Writes the fixture slice of the journal under `dir` into `dir/fixtures`, then runs the
 /// privacy check `script` over it: fixtures it refuses are removed, never left to copy.
 pub fn write_slice(dir: &Path, ev: &mut Evidence, script: &Path) -> Result<(), String> {
-    let files = capture::slice(&dir.join("journal"), SHARD, &mut ev.sessions)?;
+    let files = capture::slice(&dir.join("journal"), SHARD, ev)?;
     let fixtures = dir.join("fixtures");
     capture::write_fixtures(&fixtures, files, ev)?;
     let checked = evidence::privacy_check(script, &fixtures);

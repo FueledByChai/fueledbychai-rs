@@ -373,9 +373,18 @@ If QFEX does not confirm a subscription in the shape the adapter reads, the stre
 reported authenticated and no arm is sent. The report then says so, and the fixtures hold the
 confirmations as QFEX sent them (FBC-bsou's note on FBC-l931).
 
+The journal's sink never blocks, so a record it has no room for is dropped (decision 0006). A
+session's capture is whole only when no loss the run found could hold its records: no gap a
+`Degraded` marker shows, no drop the markers leave unaccounted, no record a stopped writer left
+unwritten, and no end of the journal left unread. The report marks partial every session that
+could have lost a record, and says why. A partial session's report concludes
+nothing of what answered its arm and places none of its frames against the arm, and its fixture
+files are named `<account>-<n>-partial.json`.
+
 The exit status is 0 only when every session authenticated, wrote its arm, saw its outcome with
-one connection attempt, and every file was written. Agents never run this program against QFEX;
-its test (`tests/qfex_preprod_probe.rs`) runs it against a QFEX-shaped conformance stub.
+one connection attempt and kept a whole capture, and every file was written. Agents never run
+this program against QFEX; its test (`tests/qfex_preprod_probe.rs`) runs it against a
+QFEX-shaped conformance stub.
 
 ## paradex_testnet_acceptance
 

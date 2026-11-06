@@ -13,6 +13,18 @@
 //! margin, a balance) is published (decision 0009); its member names, strings and nesting are as
 //! received. No frame we wrote is kept.
 //!
+//! **Gaps.** The journal's sink never blocks: a record it has no room for is dropped and counted,
+//! and the gap is marked `Degraded` once space returns or at its close (decision 0006). This
+//! program is the evidence, so a gap is never assumed away. A session's capture is whole only
+//! when no loss the run found could hold its records: no gap a `Degraded` marker shows, no drop
+//! the markers leave unaccounted ([`Evidence::dropped`]), no record a stopped writer left
+//! unwritten ([`Evidence::writer_failed`]), and no end of the journal the slice could not read.
+//! The slice marks partial every session whose records a loss could hold ([`Gaps`]): from the
+//! point a writer error or an unreadable end could start, and every session for drops the
+//! markers leave unaccounted.
+//! Any of them makes the run incomplete, and a partial session's capture concludes nothing of
+//! what did or did not answer its arm, nor states where any frame of it fell against the arm.
+//!
 //! **Privacy.** Every fixture file, the report and the evidence pass the privacy check's patterns
 //! (`evidence::privacy_hits`, paradex_testnet_acceptance's, reused by path) before they are
 //! written: a fixture they find something in is withheld and named, and a report or evidence
@@ -26,7 +38,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use fbc_journal::{ControlEvent, JournalReader, Record};
+use fbc_journal::{ControlEvent, JournalReader, Marker, Record};
 use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value, json};
 
@@ -98,10 +110,16 @@ impl When {
 pub struct Arrived {
     /// What it is ([`kind`]).
     pub kind: String,
+    /// Where the records read place it against the arm; stated only for a whole capture
+    /// ([`SessionRun::position`]).
     pub when: When,
     /// Its fixture file's name.
     pub file: String,
 }
+
+/// A partial capture's frame's position against the arm: a gap could hold the arm's write, its
+/// deadline or its connection's close, so where the records read place a frame is not stated.
+pub const UNVERIFIED: &str = "position unverified";
 
 /// One session: what the session reported, and what its journal shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -125,6 +143,9 @@ pub struct SessionRun {
     pub error: Option<String>,
     /// Every frame QFEX sent on it, in order.
     pub frames: Vec<Arrived>,
+    /// Why its capture is partial: each way the journal could be missing its records ([`Gaps`]).
+    /// Empty when the journal was written and read whole and kept every record it could hold.
+    pub partial: Vec<String>,
 }
 
 /// What the capture shows of the arm (decision 0132 item 1).
@@ -145,26 +166,54 @@ const NOTHING: &str = "Nothing arrived in the arm's window: no reply came before
 const LATE: &str = "The arm was echoed only after its deadline: a capture with a longer \
      --rpc-timeout-ms, or a new record, decides whether that reply answers the arm (decision \
      0132 item 1).";
+const PARTIAL: &str = "The capture is partial: the journal may be missing records of this \
+     session's (decision 0006), so it cannot show what did or did not answer the arm, whether \
+     the arm was written included, and nothing is concluded from it. A run whose journal drops \
+     nothing decides (decision 0132 item 1).";
 
 impl SessionRun {
     /// Whether the session did what stage one asks: the stream authenticated, the arm was
-    /// written and its outcome reported, once, with no second connection attempt.
+    /// written and its outcome reported, once, with no second connection attempt, and the
+    /// journal kept every record of it.
     pub fn ok(&self) -> bool {
         self.authenticated
             && self.arm_sent
             && self.arm.is_some()
             && self.attempts == 1
             && self.error.is_none()
+            && self.partial.is_empty()
     }
 
-    /// What the capture shows of the arm: an echo of it in its window; else the kinds of what
-    /// arrived there, which echo nothing of the arm; else that nothing arrived; and, in either
-    /// of the last two, any echo of the arm that arrived after the window, late.
+    /// Where `frame`, one of its frames, arrived against the arm, as the capture can state it:
+    /// its window position ([`When::slug`]) when the capture is whole, [`UNVERIFIED`] when it is
+    /// partial.
+    pub fn position(&self, frame: &Arrived) -> &'static str {
+        match self.partial.is_empty() {
+            true => frame.when.slug(),
+            false => UNVERIFIED,
+        }
+    }
+
+    /// What the capture shows of the arm: for a partial capture, only that it is partial and
+    /// the echoes of the arm it kept, with no position; else an echo of it in its window; else
+    /// the kinds of what arrived there, which echo nothing of the arm; else that nothing
+    /// arrived; and, in either of the last two, any echo of the arm that arrived after the
+    /// window, late.
     pub fn answer(&self) -> String {
         let at = |when: When| self.frames.iter().filter(move |f| f.when == when);
         let echo = |f: &&Arrived| {
             f.kind.starts_with("ack echoing the arm") || f.kind.starts_with("err echoing the arm")
         };
+        if !self.partial.is_empty() {
+            let kept: Vec<String> = (self.frames.iter().filter(echo))
+                .map(|f| format!("{} ({}, {})", f.kind, self.position(f), f.file))
+                .collect();
+            return format!(
+                "{PARTIAL} Why: {}. Echoes of the arm it kept: {}.",
+                self.partial.join("; "),
+                list(&kept)
+            );
+        }
         if !self.arm_sent {
             return NOT_SENT.to_owned();
         }
@@ -225,14 +274,26 @@ pub struct Evidence {
     pub withheld: Vec<String>,
     /// What was not written, or not checked.
     pub errors: Vec<String>,
+    /// The records the journal's sink dropped, Normal then Safety, read once its writer closed
+    /// (`stage::journal_closed`): a drop no `Degraded` marker reached the journal for (one
+    /// offered once the writer had stopped, or once the sink closed) is counted here too.
+    pub dropped: [u64; 2],
+    /// The write error that stopped the journal's writer thread, when one did
+    /// (`stage::journal_closed`): every record the sink accepted after the last one written is
+    /// then in no file, and neither counted nor marked as dropped.
+    pub writer_failed: Option<String>,
 }
 
 impl Evidence {
-    /// Whether the run did all stage one asks: every session armed, and every file written.
+    /// Whether the run did all stage one asks: every session armed with its capture whole,
+    /// the journal's sink dropped nothing and its writer wrote everything, and every file
+    /// written.
     pub fn ok(&self) -> bool {
         self.stopped.is_none()
             && self.withheld.is_empty()
             && self.errors.is_empty()
+            && self.dropped == [0, 0]
+            && self.writer_failed.is_none()
             && !self.sessions.is_empty()
             && self.sessions.iter().all(SessionRun::ok)
     }
@@ -345,6 +406,152 @@ pub fn kept_strings(text: &str) -> BTreeSet<String> {
     found
 }
 
+/// The connection a record names, when it names one.
+fn conn_of(record: &Record) -> Option<u16> {
+    match record {
+        Record::Inbound { stamp, .. }
+        | Record::InboundControl { stamp, .. }
+        | Record::HttpResult { stamp, .. }
+        | Record::Timer { stamp, .. }
+        | Record::RpcTimeout { stamp, .. } => Some(stamp.conn.conn),
+        Record::Outbound { conn, .. }
+        | Record::WriteResult { conn, .. }
+        | Record::HttpRequest { conn, .. }
+        | Record::Control {
+            ev: ControlEvent::Opened(conn) | ControlEvent::Closed(conn),
+            ..
+        }
+        | Record::Control {
+            ev: ControlEvent::Subscribe { conn, .. },
+            ..
+        } => Some(conn.conn),
+        _ => None,
+    }
+}
+
+/// The journal's gaps, each placed on every session whose records it could hold (decision
+/// 0006).
+///
+/// The sink numbers every record offered to it from 0, except the `Degraded` markers it writes
+/// itself (this program journals none of its own), and keeps one gap open at a time: from the
+/// first record it drops to the record that closes it, its marker written just before that
+/// record, or as the journal's last record when the sink closes with the gap open. So `seq`,
+/// the records read plus the drops the markers read so far count, is a record's number for every
+/// record offered before the first drop of a gap not yet marked, and no less than that gap's
+/// `from_seq` for any record after (one the Safety reserve kept while the gap was open). A gap's
+/// records were offered after the last record numbered below its `from_seq` and before the
+/// record after its marker. The sessions run one after the other, session `n` on connection
+/// `n`, so the gap could hold the records of every session from the one the last record before
+/// it named (0 when none did) to the one the first record after it names (the last when none
+/// does). Every session it could hold is marked partial; none is passed over.
+///
+/// What no marker shows is placed at the journal's end ([`Gaps::end`]), through the last
+/// session: the records after a cut the slice could not read past; those the writer accepted
+/// and never wrote, when a write error stopped it, which all follow the last record written;
+/// and drops the sink counted that the markers read do not account for, which all follow the
+/// record after the last marker read (a drop before it is that marker's or an earlier one's),
+/// but may precede records the Safety reserve kept after them, so they are placed from the
+/// session the last record before that marker named (from the first session when no marker
+/// was read).
+#[derive(Default)]
+struct Gaps {
+    seq: u64,
+    /// The number and session of each record read that names a session's connection.
+    named: Vec<(u64, usize)>,
+    /// Gaps read whose last session no record has named yet: why, and their first session.
+    open: Vec<(String, usize)>,
+    /// The drops the `Degraded` markers read count, all told.
+    marked: u64,
+    /// The session the last record named before the last `Degraded` marker read (0 when none
+    /// did, or no marker was read): the first a drop no marker read shows could be in.
+    unmarked_from: usize,
+}
+
+impl Gaps {
+    /// The session the last record read that names one named, or the first.
+    fn last_named(&self) -> usize {
+        self.named.last().map_or(0, |&(_, n)| n)
+    }
+
+    fn read(&mut self, record: &Record, sessions: &mut [SessionRun]) {
+        if let Record::Marker(Marker::Degraded { from_seq, dropped }) = *record {
+            let before = self.named.iter().rev().find(|(seq, _)| *seq < from_seq);
+            let why = format!(
+                "a journal gap, {dropped} dropped from its record {from_seq} on (a Degraded \
+                 marker, decision 0006), could hold this session's records"
+            );
+            self.open.push((why, before.map_or(0, |&(_, n)| n)));
+            self.seq += dropped;
+            self.marked = self.marked.saturating_add(dropped);
+            self.unmarked_from = self.last_named();
+            return;
+        }
+        // Every other record took a number, other markers included, and none is a gap:
+        // `SessionStart` and `Recovered` mark none, and `CancelOnly` (decision 0139), which the
+        // runtime journals only for a journal given a registry's trip (this program gives it
+        // none), follows a drop without marking it. That drop is marked by the `Degraded`
+        // marker closing its gap or ending the journal, or else counted in the sink's drop
+        // counts and no marker's ([`Gaps::end`]), either of which fails the run.
+        let named = conn_of(record).map(usize::from);
+        if let Some(n) = named.filter(|n| *n < sessions.len()) {
+            self.named.push((self.seq, n));
+            for (why, first) in std::mem::take(&mut self.open) {
+                mark(sessions, first, n, &why);
+            }
+        }
+        self.seq += 1;
+    }
+
+    /// Marks partial, through the last session, every session whose records the journal's end
+    /// leaves in doubt: each gap still open, from its first session; with `cut`, why the
+    /// journal could not be read on, from the session the last record read named; with
+    /// `writer_failed`, from that session too; and when the sink counted `dropped` records and
+    /// the markers read account for another number, from [`Gaps::unmarked_from`].
+    fn end(
+        self,
+        sessions: &mut [SessionRun],
+        cut: Option<&str>,
+        writer_failed: bool,
+        dropped: u64,
+    ) {
+        let last = sessions.len().saturating_sub(1);
+        let read_to = self.last_named();
+        for (why, first) in self.open {
+            mark(sessions, first, last, &why);
+        }
+        if let Some(cut) = cut {
+            let why = format!(
+                "the journal could not be read to its end ({cut}), so the records after the \
+                 last one read could be this session's"
+            );
+            mark(sessions, read_to, last, &why);
+        }
+        if writer_failed {
+            let why = "the journal's writer stopped at an error, so the records the sink \
+                       accepted after the last one it wrote are in no file, neither counted nor \
+                       marked as dropped (decision 0006), and could be this session's";
+            mark(sessions, read_to, last, why);
+        }
+        if self.marked != dropped {
+            let why = format!(
+                "records dropped: {dropped} by the journal's sink's count, {} by its Degraded \
+                 markers (decision 0006), so a drop no marker shows could hold this session's \
+                 records",
+                self.marked
+            );
+            mark(sessions, self.unmarked_from, last, &why);
+        }
+    }
+}
+
+/// Marks sessions `a` to `b` partial, `why`, whichever way round the two are.
+fn mark(sessions: &mut [SessionRun], a: usize, b: usize, why: &str) {
+    let (from, to) = (a.min(b), a.max(b));
+    for run in sessions.iter_mut().take(to + 1).skip(from) {
+        run.partial.push(why.to_owned());
+    }
+}
+
 /// Ends the arm's window of connection `conn`, if it is open.
 fn close(window: &mut [When], conn: u16) {
     if let Some(when) = window.get_mut(usize::from(conn))
@@ -354,56 +561,124 @@ fn close(window: &mut [When], conn: u16) {
     }
 }
 
-/// Reads shard `shard` of the journal under `journal`, where session `n` ran on connection `n`:
-/// marks each session whose arm was written, adds every frame QFEX sent it to its frames, and
-/// gives each frame's fixture file and text.
+/// Reads shard `shard` of the journal under `journal`, where session `n` of `ev` ran on
+/// connection `n`: marks each session whose arm was written, adds every frame QFEX sent it to
+/// its frames, marks partial each session whose records the journal could be missing ([`Gaps`],
+/// held to `ev`'s writer and drop counts), and gives each frame's fixture file and text. A
+/// partial session's files are named `<account>-<n>-partial.json`, with no position.
+///
+/// A journal that cannot be opened, or read to its end, is an error, returned only once every
+/// session from the one the last record read named through the last is marked partial: a
+/// session the read never reached is partial, never one whose arm was not sent.
 pub fn slice(
     journal: &Path,
     shard: u16,
-    sessions: &mut [SessionRun],
+    ev: &mut Evidence,
 ) -> Result<Vec<(String, String)>, String> {
-    let reader = JournalReader::open(journal, shard).map_err(|e| format!("the journal: {e}"))?;
+    let dropped = ev.dropped[0].saturating_add(ev.dropped[1]);
+    let writer_failed = ev.writer_failed.is_some();
+    let sessions = &mut ev.sessions[..];
     let mut window = vec![When::BeforeArm; sessions.len()];
-    let mut files = Vec::new();
-    for entry in reader.entries() {
-        match entry.map_err(|e| format!("the journal: {e}"))?.record {
-            Record::Outbound { conn, frame, .. } if frame.bytes() == ARM.as_bytes() => {
-                let at = usize::from(conn.conn);
-                if let Some(run) = sessions.get_mut(at) {
-                    run.arm_sent = true;
-                    window[at] = When::InWindow;
-                }
+    // Each frame's session, its place among that session's frames, and its scrubbed text,
+    // named once the journal's end has said which captures are partial.
+    let mut texts: Vec<(usize, usize, String)> = Vec::new();
+    let mut gaps = Gaps::default();
+    let mut cut = None;
+    match JournalReader::open(journal, shard) {
+        Err(e) => cut = Some(format!("the journal: {e}")),
+        Ok(reader) => {
+            for entry in reader.entries() {
+                let record = match entry {
+                    Ok(entry) => entry.record,
+                    Err(e) => {
+                        cut = Some(format!("the journal: {e}"));
+                        break;
+                    }
+                };
+                gaps.read(&record, sessions);
+                read(record, sessions, &mut window, &mut texts);
             }
-            // The arm is the only request a session sends: its deadline ends the window.
-            Record::RpcTimeout { stamp, .. } => close(&mut window, stamp.conn.conn),
-            Record::Control {
-                ev: ControlEvent::Closed(key),
-                ..
-            } => close(&mut window, key.conn),
-            Record::Inbound { stamp, bytes, .. } => {
-                let at = usize::from(stamp.conn.conn);
-                if let Some(run) = sessions.get_mut(at) {
-                    let text = String::from_utf8_lossy(&bytes.0).into_owned();
-                    let n = run.frames.len() + 1;
-                    let file = format!("{}-{n:03}-{}.json", run.account, window[at].slug());
-                    let kind = kind(&text);
-                    files.push((file.clone(), scrub(&text)));
-                    run.frames.push(Arrived {
-                        kind,
-                        when: window[at],
-                        file,
-                    });
-                }
-            }
-            _ => {}
         }
     }
-    Ok(files)
+    gaps.end(sessions, cut.as_deref(), writer_failed, dropped);
+    let files = texts.into_iter().map(|(at, i, text)| {
+        let run = &mut sessions[at];
+        let when = match run.partial.is_empty() {
+            true => run.frames[i].when.slug(),
+            false => "partial",
+        };
+        let file = format!("{}-{:03}-{when}.json", run.account, i + 1);
+        run.frames[i].file.clone_from(&file);
+        (file, text)
+    });
+    let files = files.collect();
+    cut.map_or(Ok(files), Err)
+}
+
+/// Adds what `record` shows of the sessions to them: an arm written, its window's end, a frame
+/// QFEX sent (to `texts` too, unnamed).
+fn read(
+    record: Record,
+    sessions: &mut [SessionRun],
+    window: &mut [When],
+    texts: &mut Vec<(usize, usize, String)>,
+) {
+    match record {
+        Record::Outbound { conn, frame, .. } if frame.bytes() == ARM.as_bytes() => {
+            let at = usize::from(conn.conn);
+            if let Some(run) = sessions.get_mut(at) {
+                run.arm_sent = true;
+                window[at] = When::InWindow;
+            }
+        }
+        // The arm is the only request a session sends: its deadline ends the window.
+        Record::RpcTimeout { stamp, .. } => close(window, stamp.conn.conn),
+        Record::Control {
+            ev: ControlEvent::Closed(key),
+            ..
+        } => close(window, key.conn),
+        Record::Inbound { stamp, bytes, .. } => {
+            let at = usize::from(stamp.conn.conn);
+            if let Some(run) = sessions.get_mut(at) {
+                let text = String::from_utf8_lossy(&bytes.0).into_owned();
+                texts.push((at, run.frames.len(), scrub(&text)));
+                run.frames.push(Arrived {
+                    kind: kind(&text),
+                    when: window[at],
+                    file: String::new(),
+                });
+            }
+        }
+        // A gap, and every record no session's frames need, [`Gaps`] has read.
+        _ => {}
+    }
 }
 
 /// The fixture directory's README.
 pub fn readme(ev: &Evidence) -> String {
     let accounts: Vec<&str> = ev.sessions.iter().map(|s| s.account).collect();
+    let [normal, safety] = ev.dropped;
+    let sessions = shown(ev);
+    let gap = match (
+        has_gap(ev),
+        sessions.iter().any(|run| !run.partial.is_empty()),
+    ) {
+        (false, _) => String::new(),
+        (true, false) => format!(
+            "\n**This capture is partial** (decision 0006): the journal's sink dropped {normal} \
+             Normal and {safety} Safety records, and {UNPLACED}. What answered an arm may be \
+             missing here, and nothing is concluded from its absence.\n"
+        ),
+        (true, true) => format!(
+            "\n**This capture is partial** (decision 0006): the capture of {} is partial (the \
+             run's report says why; the journal's sink dropped {normal} Normal and {safety} \
+             Safety records). Each of their files is named `<account>-<n>-partial.json` and \
+             states no position against the arm, since a gap could hold the arm's write, its \
+             deadline or its connection's close. What answered an arm may be missing here, and \
+             nothing is concluded from its absence.\n",
+            partial_accounts(&sessions)
+        ),
+    };
     format!(
         "# QFEX trade-socket frames: what answered the cancel-on-disconnect arm\n\n\
          Recorded {} from {} by the owner-run program `qfex_preprod_probe` (crates/fbc-examples, \
@@ -414,7 +689,8 @@ pub fn readme(ev: &Evidence) -> String {
          named `<account>-<n>-<when>.json`: `before-arm` (the authentication reply, the \
          subscription confirmations and whatever came before the arm was written), `in-window` \
          (from the arm's write to its deadline or the connection's end, what decision 0132 item \
-         3 keeps, so whatever answered the arm is here) and `after-window`.\n\n\
+         3 keeps: when the capture is whole, whatever answered the arm is here) and \
+         `after-window`.\n\n\
          Method: the sessions' journal (decision 0006), read back with every span the codec \
          named blanked to `2`s: the account's identifiers and credentials (decisions 0028 and \
          0122 item 3) and, in an echo, the spans decisions 0132 item 3 and 0134 keep in place of \
@@ -426,12 +702,59 @@ pub fn readme(ev: &Evidence) -> String {
          directory. Those patterns know credential and address shapes only, so the owner reads \
          every file for an identifying string (an email, a user name, an address in another \
          form) before committing this directory, starting from the members the run found \
-         keeping a string value: {}.\n",
+         keeping a string value: {}.\n{gap}",
         ev.started.get(..10).unwrap_or(""),
         ev.target,
         accounts.join(" then "),
         list(&ev.strings),
     )
+}
+
+/// Whether the journal has a gap: a record its sink dropped, a writer stopped at an error, or
+/// a session's capture the slice found partial.
+fn has_gap(ev: &Evidence) -> bool {
+    ev.dropped != [0, 0]
+        || ev.writer_failed.is_some()
+        || ev.sessions.iter().any(|run| !run.partial.is_empty())
+}
+
+/// What is said of a gap the slice placed on no session: only of a journal never sliced, or
+/// of a run with no session, since the slice places what it finds of every gap.
+const UNPLACED: &str =
+    "the drops could not be placed on a session; no session's capture is shown whole";
+
+/// The sessions as the report, the evidence and the README show them: as the slice left them,
+/// unless the journal has a gap the slice placed on none of them, when each is shown partial
+/// for it ([`UNPLACED`]).
+fn shown(ev: &Evidence) -> Vec<SessionRun> {
+    let unplaced = has_gap(ev) && ev.sessions.iter().all(|run| run.partial.is_empty());
+    let shown = |run: &SessionRun| match unplaced {
+        true => SessionRun {
+            partial: vec![UNPLACED.to_owned()],
+            ..run.clone()
+        },
+        false => run.clone(),
+    };
+    ev.sessions.iter().map(shown).collect()
+}
+
+/// The accounts of `sessions` whose capture is partial, or, when there is none, [`UNPLACED`]:
+/// said only of a journal with a gap.
+fn partial_accounts(sessions: &[SessionRun]) -> String {
+    let partial: Vec<&str> = (sessions.iter())
+        .filter(|run| !run.partial.is_empty())
+        .map(|run| run.account)
+        .collect();
+    match partial.is_empty() {
+        true => UNPLACED.to_owned(),
+        false => partial.join("; "),
+    }
+}
+
+/// Whether the arm was written, as the capture can say: yes when the journal shows it, no only
+/// when it shows none and the capture is whole, and `None`, not shown, when it is partial.
+fn arm_written(run: &SessionRun) -> Option<bool> {
+    (run.arm_sent || run.partial.is_empty()).then_some(run.arm_sent)
 }
 
 /// Writes `files` and the README into `dir`, each only when the privacy check's patterns find
@@ -482,6 +805,24 @@ pub fn markdown(ev: &Evidence) -> String {
             "**The probe stopped before its sessions ended:** {why}\n"
         );
     }
+    let sessions = shown(ev);
+    let (gap, partial) = match has_gap(ev) {
+        false => ("", "none".to_owned()),
+        true => (
+            "**The journal is incomplete** (decision 0006): the run is incomplete, and a partial \
+             capture concludes nothing of what answered its arm. ",
+            partial_accounts(&sessions),
+        ),
+    };
+    let [normal, safety] = ev.dropped;
+    let writer = (ev.writer_failed.as_ref())
+        .map(|e| format!(" The journal's writer stopped at an error: {e}."))
+        .unwrap_or_default();
+    let _ = writeln!(
+        s,
+        "{gap}Records the journal's sink dropped: {normal} Normal, {safety} Safety. Sessions \
+         whose capture is partial: {partial}.{writer}\n"
+    );
     let listed = ev
         .listed
         .map_or_else(|| "not read".to_owned(), |n| n.to_string());
@@ -510,8 +851,15 @@ pub fn markdown(ev: &Evidence) -> String {
         );
     }
     let _ = writeln!(s, "\n## The sessions\n");
-    for run in &ev.sessions {
+    for run in &sessions {
         let arm = run.arm.as_deref().unwrap_or("none reported");
+        let capture = match run.partial.is_empty() {
+            true => "whole: no loss the run found could hold this session's records (no gap \
+                     the journal's markers show, no drop they leave unaccounted, no record its \
+                     writer left unwritten, no end of the journal left unread)"
+                .to_owned(),
+            false => format!("PARTIAL: {}", run.partial.join("; ")),
+        };
         let _ = writeln!(
             s,
             "### {}\n\n\
@@ -519,12 +867,13 @@ pub fn markdown(ev: &Evidence) -> String {
              - Arm written: {}; its outcome as the session reported it: {arm}\n\
              - Ended by: {}; connection attempts {} (failed {}), arm failures {}, frames the \
                codec could not decode {}\n\
-             - Error: {}\n\n\
+             - Error: {}\n\
+             - Capture: {capture}\n\n\
              **What it shows:** {}\n\n\
              | n | when | what | file |\n| --- | --- | --- | --- |",
             run.account,
             yn(run.authenticated),
-            yn(run.arm_sent),
+            arm_written(run).map_or("not shown (the capture is partial)", yn),
             run.ended_by,
             run.attempts,
             run.failed_attempts,
@@ -538,7 +887,7 @@ pub fn markdown(ev: &Evidence) -> String {
                 s,
                 "| {} | {} | {} | {} |",
                 n + 1,
-                f.when.slug(),
+                run.position(f),
                 f.kind,
                 f.file
             );
@@ -574,23 +923,27 @@ pub fn to_json(ev: &Evidence) -> Value {
                 "page_orders": r.page_orders, "page_twaps": r.page_twaps, "page_full": r.page_full})
         })
         .collect();
-    let sessions: Vec<Value> = ev
-        .sessions
+    let sessions: Vec<Value> = shown(ev)
         .iter()
         .map(|run| {
             let frames: Vec<Value> = run
                 .frames
                 .iter()
-                .map(|f| json!({"when": f.when.slug(), "what": f.kind, "file": f.file}))
+                .map(|f| json!({"when": run.position(f), "what": f.kind, "file": f.file}))
                 .collect();
             json!({"account": run.account, "authenticated": run.authenticated,
-                "arm_sent": run.arm_sent, "arm_outcome": run.arm, "ended_by": run.ended_by,
+                "arm_sent": arm_written(run), "arm_outcome": run.arm, "ended_by": run.ended_by,
                 "attempts": run.attempts, "failed_attempts": run.failed_attempts,
                 "arm_failures": run.arm_failures, "decode_errors": run.decode_errors,
-                "error": run.error, "answer": run.answer(), "ok": run.ok(), "frames": frames})
+                "error": run.error, "answer": run.answer(), "ok": run.ok(),
+                "capture": if run.partial.is_empty() { "whole" } else { "partial" },
+                "partial_because": run.partial, "frames": frames})
         })
         .collect();
+    let [normal, safety] = ev.dropped;
     json!({"ticket": "FBC-l931", "started": ev.started, "target": ev.target, "ok": ev.ok(),
+        "journal_dropped": {"normal": normal, "safety": safety},
+        "journal_writer_failed": ev.writer_failed,
         "stopped": ev.stopped, "subaccounts_listed": ev.listed, "reads": reads,
         "sessions": sessions, "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
