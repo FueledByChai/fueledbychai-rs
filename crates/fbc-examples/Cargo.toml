@@ -30,7 +30,8 @@ futures-util = { workspace = true, features = ["sink", "std"] }
 log = { workspace = true, features = ["std"] }
 rust_decimal.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "signal", "net", "io-util"] }
+# test-util: qfex_preprod_probe's test reads a registry's times on a paused runtime clock.
+tokio = { workspace = true, features = ["rt", "macros", "time", "sync", "signal", "net", "io-util", "test-util"] }
 
 [[example]]
 name = "md_watch"

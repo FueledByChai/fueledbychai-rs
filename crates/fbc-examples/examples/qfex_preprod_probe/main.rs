@@ -11,13 +11,15 @@
 //! export QFEX_SECRET_KEY=...
 //! export QFEX_SUBACCOUNT_ID=...    # the subaccount to arm on
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- \
-//!     --evidence-dir /abs/new/dir --arm primary --arm subaccount
+//!     --evidence-dir /abs/new/dir --arm primary --arm subaccount \
+//!     --registry-span <S> --ledger-max-age <S> --ledger-max-entries <N>
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --help
 //! ```
 
 #[path = "../../src/auth_qfex.rs"]
 mod auth_qfex;
 mod capture;
+mod ledger;
 // paradex_testnet_acceptance's privacy patterns, privacy check and UTC clock, reused by path,
 // with the glue whose withholding of credential-shaped words they name a frame's text by.
 #[allow(dead_code)]

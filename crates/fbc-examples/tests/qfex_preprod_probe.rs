@@ -25,6 +25,8 @@ mod capture;
 #[allow(dead_code)]
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
+#[path = "../examples/qfex_preprod_probe/ledger.rs"]
+mod ledger;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
@@ -234,7 +236,15 @@ fn options(dir: &Path, server: &StubServer, arms: &[Armed]) -> Options {
         read_wait: Duration::from_secs(5),
         connect_wait: Duration::from_secs(5),
         session_wait: Duration::from_secs(30),
+        ledger: bounds(Duration::from_secs(60)),
     }
+}
+
+/// Stage one's ledger bounds under the span bound `span`: an age a second longer, and a count
+/// of one, above stage one's fill ceiling of zero.
+fn bounds(span: Duration) -> ledger::Bounds {
+    let age = span + Duration::from_secs(1);
+    ledger::Bounds::new(age, 1, span, &ledger::stage_one()).unwrap()
 }
 
 /// Runs the probe with `opts` and `env`: its outcome or refusal, and what it printed.
@@ -502,6 +512,55 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     evidence::privacy_check(&script, &fixtures).unwrap();
     assert_no_secret(&opts.evidence_dir);
     assert!(printed.contains("DONE ok"), "{printed}");
+
+    // Each session's own registry (each arms its own account), its ledger under the run's
+    // bounds, and at its session's end a full horizon and no replay (decision 0132 item 5), in
+    // the report and the evidence, which pass the privacy check.
+    let shown: Vec<(&str, usize)> = (ev.registries.iter())
+        .map(|r| (r.account, r.ends.len()))
+        .collect();
+    assert_eq!(shown, [("primary", 1), ("subaccount", 1)]);
+    for r in &ev.registries {
+        assert_eq!(r.bounds, opts.ledger);
+        let end = &r.ends[0];
+        assert_eq!(end.session, r.account);
+        assert!(end.after < opts.session_wait, "{end:?}");
+        assert_eq!((end.horizon, end.held), (fbc_oms::Horizon::Full, 0));
+        assert_eq!(end.replays, fbc_oms::ReplayCounts::default());
+        assert!(r.held());
+    }
+    for account in ["primary", "subaccount"] {
+        let row =
+            format!("| {account} | 61s | 1 | 60s | 0 | no order: its sessions place none | yes |");
+        assert!(report.contains(&row), "{report}");
+        let end = format!("| {account} | {account} | ");
+        assert!(report.contains(&end), "{report}");
+        assert!(
+            report.contains(" | no | full | 0 | 0 | 0 | 0 | 0 | 0 |"),
+            "{report}"
+        );
+    }
+    let registry = &evidence["registries"][1];
+    assert_eq!(registry["account"], "subaccount");
+    assert_eq!(
+        (
+            &registry["ledger_max_age_ms"],
+            &registry["ledger_max_entries"]
+        ),
+        (&json("61000"), &json("1"))
+    );
+    assert_eq!(registry["registry_span_ms"], 60_000);
+    assert_eq!(registry["fill_ceiling"], 0);
+    assert_eq!(registry["held"], true);
+    let end = &registry["session_ends"][0];
+    assert_eq!(
+        (&end["session"], &end["horizon"]),
+        (&json("\"subaccount\""), &json("\"full\""))
+    );
+    assert_eq!(end["replays"]["untimed"], 0);
+    assert_eq!(end["replays"]["duplicate"], 0);
+    assert_eq!(end["past_span_ms"], Value::Null);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
     assert!(!printed.contains(SUB) && !printed.contains(PUBLIC));
 }
 
@@ -1764,11 +1823,23 @@ fn fixtures_the_privacy_check_cannot_pass_are_removed() {
 
 // ----- The command line -----
 
+/// The ledger's three flags, which every run needs (decision 0132 item 5): a span bound just
+/// longer than the defaults' 10 + 60 + 10 s to the arm's deadline, an age a second longer.
+const LEDGER: [&str; 6] = [
+    "--registry-span",
+    "81",
+    "--ledger-max-age",
+    "82",
+    "--ledger-max-entries",
+    "1",
+];
+
 #[test]
 fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     let parse = |args: &[&str]| probe_args::parse(args.iter().map(|a| (*a).to_owned()));
     assert_eq!(parse(&["--help"]), Ok(Parsed::Help));
-    let Ok(Parsed::Run(opts)) = parse(&["--evidence-dir", "/abs/dir", "--arm", "primary"]) else {
+    let least = ["--evidence-dir", "/abs/dir", "--arm", "primary"];
+    let Ok(Parsed::Run(opts)) = parse(&[&least[..], &LEDGER[..]].concat()) else {
         panic!("not parsed");
     };
     assert_eq!(opts.arms, [Armed::Primary]);
@@ -1799,10 +1870,23 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         "ws://127.0.0.1:3",
         "--socks5",
         "[::1]:1080",
+        "--registry-span",
+        "61",
+        "--ledger-max-age",
+        "604800",
+        "--ledger-max-entries",
+        "1000000",
     ];
     let Ok(Parsed::Run(opts)) = parse(&all) else {
         panic!("not parsed");
     };
+    let largest = ledger::Bounds::new(
+        Duration::from_secs(604_800),
+        1_000_000,
+        Duration::from_secs(61),
+        &[],
+    );
+    assert_eq!(opts.ledger, largest.unwrap());
     assert_eq!(opts.arms, [Armed::Subaccount, Armed::Primary]);
     assert_eq!((opts.rpc_timeout_ms, opts.page_size), (501, 1));
     assert_eq!(opts.read_wait, Duration::from_millis(7));
@@ -1848,7 +1932,18 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     }
     // --session-wait must outlast the connection, QFEX's 60 s authentication deadline and the
     // arm's: 10 + 60 + 10 s at the defaults, 120 + 60 + 60 s at the largest.
-    let run = ["--evidence-dir", "/d", "--arm", "primary"];
+    let run = [
+        "--evidence-dir",
+        "/d",
+        "--arm",
+        "primary",
+        "--registry-span",
+        "300",
+        "--ledger-max-age",
+        "301",
+        "--ledger-max-entries",
+        "1",
+    ];
     let waits = [
         (vec!["--session-wait", "80"], false),
         (vec!["--session-wait", "81"], true),
@@ -1895,9 +1990,726 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         "--evidence-dir",
         "--arm",
         "--session-wait",
+        "--registry-span",
+        "--ledger-max-age",
+        "--ledger-max-entries",
         PUBLIC_VAR,
         SUB_SECRET_VAR,
     ] {
         assert!(usage.contains(flag), "{flag}");
     }
+    // Its opening says what is refused before anything connects, the ledger's bounds included,
+    // and every stop, the span bound's included.
+    let flat = usage.split_whitespace().collect::<Vec<_>>().join(" ");
+    for said in [
+        "a missing or unaccepted --registry-span, --ledger-max-age or --ledger-max-entries: \
+         fill-ledger bounds that cannot outlast a registry's sessions and fills",
+        "at the arm's answer, its deadline, the connection's end, --session-wait or its \
+         registry's span bound the program stops it, through its stop control",
+    ] {
+        assert!(flat.contains(said), "{said}");
+    }
+}
+
+// ----- The fill ledger's bounds (FBC-5hif, decision 0132 item 5) -----
+
+#[test]
+fn the_ledger_flags_are_required_and_a_bound_that_cannot_outlast_the_registry_is_refused_naming_its_flag()
+ {
+    let run = ["--evidence-dir", "/d", "--arm", "primary"];
+    let with = |extra: &[&str]| -> Vec<String> {
+        let mut args: Vec<&str> = run.to_vec();
+        args.extend_from_slice(extra);
+        args.into_iter().map(str::to_owned).collect()
+    };
+    let refused = |args: Vec<String>, expected: &str| {
+        let err = probe_args::parse(args.clone()).unwrap_err();
+        assert!(err.contains(expected), "{args:?}: {err}");
+        // No value typed is shown: the ledger values below are all distinctive.
+        for typed in ["777", "778", "4242", "x7", "-9"] {
+            assert!(!err.contains(typed), "{args:?}: {err}");
+        }
+    };
+    // Each flag missing, the others given: it has no default.
+    let span = ["--registry-span", "777"];
+    let age = ["--ledger-max-age", "778"];
+    let count = ["--ledger-max-entries", "4242"];
+    refused(
+        with(&[&age[..], &count[..]].concat()),
+        "--registry-span is required",
+    );
+    refused(
+        with(&[&span[..], &count[..]].concat()),
+        "--ledger-max-age is required",
+    );
+    refused(
+        with(&[&span[..], &age[..]].concat()),
+        "--ledger-max-entries is required",
+    );
+    // Each one zero, malformed or past its range, naming the flag.
+    for flag in [
+        "--registry-span",
+        "--ledger-max-age",
+        "--ledger-max-entries",
+    ] {
+        for value in ["0", "x7", "-9", "99999999999999999999"] {
+            refused(
+                with(&[flag, value]),
+                &format!("{flag}: not a whole number from 1 to"),
+            );
+        }
+    }
+    refused(with(&["--registry-span", "86401"]), "from 1 to 86400");
+    refused(with(&["--ledger-max-age", "604801"]), "from 1 to 604800");
+    refused(
+        with(&["--ledger-max-entries", "1000001"]),
+        "from 1 to 1000000",
+    );
+    // A flag given no value.
+    refused(
+        with(&["--ledger-max-age"]),
+        "--ledger-max-age needs a value",
+    );
+    // The age must be longer than the span bound: equal or shorter is refused.
+    for age in ["777", "100"] {
+        refused(
+            with(&[&span[..], &["--ledger-max-age", age], &count[..]].concat()),
+            "--ledger-max-age must be longer than --registry-span",
+        );
+    }
+    // The span bound stops a session, so it must outlast the arm as --session-wait does: 10 +
+    // 60 + 10 s at the defaults.
+    refused(
+        with(&[
+            "--registry-span",
+            "80",
+            "--ledger-max-age",
+            "778",
+            "--ledger-max-entries",
+            "1",
+        ]),
+        "--registry-span must be longer than --connect-wait-ms",
+    );
+    let Ok(Parsed::Run(opts)) = probe_args::parse(with(&[
+        "--registry-span",
+        "81",
+        "--ledger-max-age",
+        "82",
+        "--ledger-max-entries",
+        "1",
+    ])) else {
+        panic!("not parsed");
+    };
+    let taken = ledger::Bounds::new(Duration::from_secs(82), 1, Duration::from_secs(81), &[]);
+    assert_eq!(opts.ledger, taken.unwrap());
+    assert_eq!(opts.ledger.config().max_age, Duration::from_secs(82));
+    assert_eq!(opts.ledger.config().max_entries, 1);
+
+    // The count must be above the fill ceiling: stage one's is zero, so every count the flag
+    // takes is above it; over synthetic place limits whose ceiling is 7, a count of 7 is
+    // refused and 8 taken.
+    let places = [
+        ledger::MayPlace {
+            what: "far post-only GTC",
+            orders: 1,
+            largest_steps: 1,
+        },
+        ledger::MayPlace {
+            what: "taker IOC",
+            orders: 2,
+            largest_steps: 3,
+        },
+    ];
+    let secs = Duration::from_secs;
+    let err = ledger::Bounds::new(secs(82), 7, secs(81), &places).unwrap_err();
+    assert!(
+        err.contains("--ledger-max-entries must be above the fill ceiling, 7"),
+        "{err}"
+    );
+    assert!(ledger::Bounds::new(secs(82), 8, secs(81), &places).is_ok());
+    // What a test may build by hand is held to the same bounds: a zero or overlong span, a zero
+    // age or count, and an overflowing ceiling.
+    let one = [ledger::MayPlace {
+        what: "x",
+        orders: 1,
+        largest_steps: 1,
+    }];
+    for (age, count, span, places, expected) in [
+        (
+            secs(2),
+            1,
+            secs(0),
+            &[][..],
+            "--registry-span: not from 1 to 86400 s",
+        ),
+        (
+            secs(90_000),
+            1,
+            secs(86_401),
+            &[][..],
+            "--registry-span: not from 1 to 86400 s",
+        ),
+        (secs(0), 1, secs(1), &[][..], "--ledger-max-age: zero"),
+        (secs(2), 0, secs(1), &[][..], "--ledger-max-entries: zero"),
+        (
+            secs(1),
+            1,
+            secs(1),
+            &one[..],
+            "--ledger-max-age must be longer",
+        ),
+    ] {
+        let err = ledger::Bounds::new(age, count, span, places).unwrap_err();
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn the_fill_ceiling_is_the_sum_of_each_orders_largest_size_in_size_steps() {
+    let place = |orders, largest_steps| ledger::MayPlace {
+        what: "synthetic",
+        orders,
+        largest_steps,
+    };
+    // Stage one places nothing: its ceiling is zero.
+    assert!(ledger::stage_one().is_empty());
+    assert_eq!(ledger::fill_ceiling(&ledger::stage_one()), Ok(0));
+    // Each order counted at its largest size in steps, since every fill moves at least one.
+    assert_eq!(ledger::fill_ceiling(&[place(1, 1)]), Ok(1));
+    assert_eq!(
+        ledger::fill_ceiling(&[place(1, 1), place(3, 5), place(2, 0)]),
+        Ok(1 + 15)
+    );
+    assert_eq!(
+        ledger::fill_ceiling(&[place(1, 10), place(1, 20), place(1, 30)]),
+        Ok(60)
+    );
+    // A ceiling that overflows, by a product or a sum, is refused.
+    for places in [
+        vec![place(u64::MAX, 2)],
+        vec![place(1, u64::MAX), place(1, 1)],
+    ] {
+        let err = ledger::fill_ceiling(&places).unwrap_err();
+        assert!(err.contains("the fill ceiling overflows"), "{err}");
+        let err = ledger::Bounds::new(Duration::from_secs(2), 1, Duration::from_secs(1), &places)
+            .unwrap_err();
+        assert!(err.contains("overflows"), "{err}");
+    }
+}
+
+/// The probe mode's caps, whose scope decodes the test's fills as the codec would.
+fn probe_caps() -> fbc_core::VenueCaps {
+    use fbc_core::VenueFactory;
+    let mut cfg = fbc_core::VenueConfig::new();
+    cfg.insert(
+        fbc_venue_qfex::probe::KEY_EXEC_MODE,
+        fbc_venue_qfex::probe::PREPROD_PROBE,
+    );
+    cfg.insert(fbc_venue_qfex::auth::TRADE_URL, "ws://127.0.0.1:1");
+    cfg.insert(fbc_venue_qfex::KEY_REST_URL, "http://127.0.0.1:2");
+    cfg.insert(fbc_venue_qfex::KEY_MDS_URL, "ws://127.0.0.1:3");
+    cfg.insert(fbc_venue_qfex::probe::KEY_PAGE_SIZE, "1000");
+    cfg.insert(fbc_venue_qfex::probe::KEY_RESYNC_TIMEOUT, "30s");
+    cfg.insert(fbc_venue_qfex::probe::KEY_RPC_TIMEOUT, "600ms");
+    fbc_venue_qfex::Qfex.caps(&cfg).unwrap()
+}
+
+/// A client id of the probe's namespace, minted under a lease of its own.
+fn our_cid() -> fbc_core::ClientOrderId {
+    let (dir, _removed) = temp_dir("lease");
+    let lease = fbc_core::NamespaceLease::acquire(
+        &dir,
+        fbc_core::AccountKey::new(1),
+        fbc_core::Namespace::new(1),
+    )
+    .unwrap();
+    fbc_core::CidMint::new(lease, 0, 0, WallNs(0))
+        .mint()
+        .unwrap()
+}
+
+/// A buy of one size step of `cid`'s order, keyed by the made-up trade id `trade` as both QFEX
+/// reads key a fill (decision 0132 item 5): live, or a replay (`FillEvent::replay`) as a resync
+/// pushes one.
+fn qfex_fill(cid: fbc_core::ClientOrderId, trade: &str, replay: bool) -> fbc_core::FillEvent {
+    use fbc_core::{AssetSym, CidMatch, FillIdent, FillOrigin, InstrumentId, Liquidity3, Lots};
+    let caps = probe_caps();
+    fbc_core::dispatch(&caps, fbc_core::Namespace::new(1), |scope| {
+        fbc_core::FillEvent {
+            ident: FillIdent::Venue {
+                fill: scope.fill_id(trade).unwrap(),
+                vid: Some(
+                    scope
+                        .venue_order_id("5a5a5a5a-0000-4000-8000-0000000000a1")
+                        .unwrap(),
+                ),
+                cum_after: None,
+            },
+            origin: FillOrigin::Order {
+                cid: Some(CidMatch::Ours(cid)),
+                px: fbc_core::Ticks(1),
+            },
+            inst: InstrumentId::new(1),
+            side: fbc_core::Side::Buy,
+            qty: Lots::new(1).unwrap(),
+            liquidity: Liquidity3::Maker,
+            fee: scope.fee(0, AssetSym::new("USD").unwrap()).unwrap(),
+            realized_pnl: None,
+            realized_funding: None,
+            replay,
+        }
+    })
+}
+
+/// When a registry's first session opened: `at` on the monotonic clock, the watermark well
+/// before every fill time the tests give.
+fn opened(at: MonoNs) -> ledger::Opened {
+    ledger::Opened {
+        mono: at,
+        wall: WallNs(1_000),
+        at: tokio::time::Instant::now(),
+    }
+}
+
+/// A matching-engine time `exch`, aligned to the same wall-clock number.
+fn engine(exch: i64) -> Option<fbc_oms::FillTime> {
+    Some(fbc_oms::FillTime {
+        exch: fbc_core::ExchNs(exch),
+        kind: fbc_core::ExchTsKind::MatchingEngine,
+        aligned: WallNs(exch),
+    })
+}
+
+const T1: &str = "5a5a5a5a-0000-4000-8000-0000000000f1";
+const T2: &str = "5a5a5a5a-0000-4000-8000-0000000000f2";
+const T3: &str = "5a5a5a5a-0000-4000-8000-0000000000f3";
+
+#[tokio::test]
+async fn a_fill_heard_live_at_the_registrys_start_is_a_duplicate_when_replayed_at_its_span_bound() {
+    use fbc_oms::{FillRouted, Horizon, ReplayCounts};
+    use ledger::Judged;
+    let span = Duration::from_secs(600);
+    let start = MonoNs(5_000_000_000);
+    let cid = our_cid();
+    let live = qfex_fill(cid, T1, false);
+    let replay = qfex_fill(cid, T1, true);
+    assert_eq!(live.key(), replay.key());
+
+    // The accepted bounds: an age longer than the span bound, a count above stage one's fill
+    // ceiling.
+    let accepted = bounds(span);
+    let acct = fbc_core::AccountKey::new(1);
+    let mut registry = ledger::RegistryLedger::new("primary", acct, &accepted, opened(start));
+    assert!(registry.deadline() >= tokio::time::Instant::now() + span - Duration::from_secs(1));
+    // The first session: the fill heard live as it starts, with no venue time (QFEX's until
+    // FBC-jdj7), is applied, and counted for our namespace's order.
+    let judged = registry.admit(&live, None, start);
+    assert_eq!(judged, Judged::Applied(FillRouted::OursUntracked(cid)));
+    registry.session_ended("first", start + Duration::from_secs(100));
+    // The second session on the same registry: a resync reads the fill again, as a replay with
+    // no matching-engine time, at the end of the span bound. The ledger still holds it, so it
+    // is a duplicate, never refused Untimed, and its horizon is still full.
+    let judged = registry.admit(&replay, None, start + span);
+    assert_eq!(judged, Judged::Duplicate);
+    registry.session_ended("second", start + span);
+    let run = registry.run();
+    assert_eq!(run.account, "primary");
+    assert_eq!(run.bounds, accepted);
+    let ends: Vec<(&str, Duration, Horizon, usize)> = (run.ends.iter())
+        .map(|e| (e.session, e.after, e.horizon, e.held))
+        .collect();
+    assert_eq!(
+        ends,
+        [
+            ("first", Duration::from_secs(100), Horizon::Full, 1),
+            ("second", span, Horizon::Full, 1),
+        ]
+    );
+    assert_eq!(run.ends[0].replays, ReplayCounts::default());
+    let counts = ReplayCounts {
+        duplicate: 1,
+        ..ReplayCounts::default()
+    };
+    assert_eq!(run.ends[1].replays, counts);
+    assert!(run.held());
+
+    // With max_age equal to the span bound, which the program refuses, the same replay at the
+    // same instant finds the fill forgotten: refused Untimed, the horizon lost.
+    let refused = ledger::Bounds::new(span, 1, span, &ledger::stage_one()).unwrap_err();
+    assert!(refused.contains("--ledger-max-age must be longer than --registry-span"));
+    let config = fbc_oms::LedgerConfig {
+        max_age: span,
+        max_entries: 1,
+    };
+    let mut reg = fbc_oms::Registry::new();
+    let mut short = fbc_oms::FillLedger::new(config, WallNs(1_000)).unwrap();
+    let judged = ledger::judge(&mut reg, &mut short, &live, None, start);
+    assert_eq!(judged, Judged::Applied(FillRouted::OursUntracked(cid)));
+    let judged = ledger::judge(&mut reg, &mut short, &replay, None, start + span);
+    assert_eq!(judged, Judged::Untimed);
+    assert_eq!(short.horizon(), Horizon::Lost);
+    assert_eq!(short.replays().untimed, 1);
+}
+
+#[tokio::test]
+async fn every_judgement_of_the_ledger_and_the_registry_is_reported() {
+    use fbc_oms::{FillRouted, Horizon, OmsError};
+    use ledger::Judged;
+    let cid = our_cid();
+    let start = MonoNs(0);
+    // A count of one: a second fill applied forgets the first, whose matching-engine time then
+    // bounds the horizon (only the tests give a count this tight against two fills).
+    let tight = ledger::Bounds::new(
+        Duration::from_secs(10),
+        1,
+        Duration::from_secs(5),
+        &ledger::stage_one(),
+    )
+    .unwrap();
+    let acct = fbc_core::AccountKey::new(2);
+    let mut registry = ledger::RegistryLedger::new("subaccount", acct, &tight, opened(start));
+    let first = qfex_fill(cid, T1, false);
+    let second = qfex_fill(cid, T2, false);
+    let applied = Judged::Applied(FillRouted::OursUntracked(cid));
+    assert_eq!(registry.admit(&first, engine(2_000), start), applied);
+    assert_eq!(registry.admit(&second, engine(3_000), start), applied);
+    // A replay of the forgotten fill, at or before the horizon: refused, it may have been
+    // applied.
+    let again = qfex_fill(cid, T1, true);
+    assert_eq!(
+        registry.admit(&again, engine(2_000), start),
+        Judged::BeyondHorizon
+    );
+    // A replay executed before the watermark: the starting position holds it.
+    let old = qfex_fill(cid, T3, true);
+    assert_eq!(
+        registry.admit(&old, engine(500), start),
+        Judged::BeforeWatermark
+    );
+    registry.session_ended("subaccount", start + Duration::from_secs(1));
+    let run = registry.run();
+    let end = &run.ends[0];
+    assert_eq!(end.horizon, Horizon::At(fbc_core::ExchNs(2_000)));
+    assert_eq!(
+        (end.replays.beyond_horizon, end.replays.before_watermark),
+        (1, 1)
+    );
+    assert!(!run.held());
+    // A registry refuses a fill from a second ledger.
+    let mut reg = fbc_oms::Registry::new();
+    let config = tight.config();
+    let mut one = fbc_oms::FillLedger::new(config, WallNs(1_000)).unwrap();
+    let mut other = fbc_oms::FillLedger::new(config, WallNs(1_000)).unwrap();
+    assert_eq!(
+        ledger::judge(&mut reg, &mut one, &first, None, start),
+        applied
+    );
+    assert_eq!(
+        ledger::judge(&mut reg, &mut other, &second, None, start),
+        Judged::Refused(OmsError::OtherLedger)
+    );
+}
+
+#[tokio::test]
+async fn a_stage_one_session_at_its_span_bound_is_stopped_through_its_stop_control() {
+    let (dir, _removed) = temp_dir("span");
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    steps.extend(read_socket(2, EMPTY_PAGE));
+    // QFEX never answers the session's authentication, so nothing but the span bound, before
+    // --session-wait, ends it.
+    steps.extend([Step::Accept, Step::Read { conn: 3 }]);
+    let listing = ok(&fixture("subaccounts.json"));
+    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+        .await
+        .unwrap();
+    let mut opts = options(&dir, &server, &[Armed::Primary]);
+    let span = Duration::from_secs(1);
+    // An age bound well past the span, so the moment the stopped session takes to end stays
+    // within it however loaded the machine.
+    let age = span + Duration::from_secs(20);
+    opts.ledger = ledger::Bounds::new(age, 1, span, &ledger::stage_one()).unwrap();
+    assert!(opts.session_wait > span * 10);
+    let began = std::time::Instant::now();
+    let (ran, printed) = probe(&opts, &environment()).await;
+    let took = began.elapsed();
+    let outcome = ran.unwrap();
+    // It ended at the span bound, through its stop control, with no second attempt.
+    assert!(took >= span && took < opts.session_wait, "{took:?}");
+    let session = &outcome.evidence.sessions[0];
+    assert_eq!(session.ended_by, "--registry-span");
+    assert!(!session.authenticated && !session.arm_sent);
+    assert_eq!((session.attempts, session.failed_attempts), (1, 0));
+    assert!(session.error.is_none(), "{session:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.connections().len(), 4);
+    assert!(
+        !outcome.ok && printed.contains("ended by --registry-span"),
+        "{printed}"
+    );
+    // Its registry's ledger, recorded as it ended: the bounds, a full horizon, no replay.
+    let registries = &outcome.evidence.registries;
+    assert_eq!(registries.len(), 1);
+    let end = &registries[0].ends[0];
+    assert_eq!(end.session, "primary");
+    assert!(
+        end.after >= span && end.after < opts.session_wait,
+        "{end:?}"
+    );
+    // The bound is when the stop is issued; the session ends a moment later, and the evidence
+    // says by how much.
+    assert!(end.after < age, "{end:?}");
+    assert_eq!(end.past_span(span), end.after.checked_sub(span));
+    assert_eq!(end.horizon, fbc_oms::Horizon::Full);
+    assert!(registries[0].held());
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["sessions"][0]["ended_by"], "--registry-span");
+    let registry = &evidence["registries"][0];
+    assert_eq!(registry["registry_span_ms"], 1_000);
+    assert_eq!(registry["ledger_max_age_ms"], 21_000);
+    let at_end = &registry["session_ends"][0];
+    assert_eq!(at_end["horizon"], "full");
+    let after_ms = at_end["after_ms"].as_u64().unwrap();
+    assert_eq!(at_end["past_span_ms"].as_u64(), after_ms.checked_sub(1_000));
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+/// Copies `dir`'s report and evidence alone into a directory of their own and runs
+/// scripts/privacy-check.sh over it.
+fn assert_report_and_evidence_pass_the_privacy_check(dir: &Path) {
+    let (checked, _removed) = temp_dir("privacy");
+    for name in ["report.md", "evidence.json"] {
+        fs::copy(dir.join(name), checked.join(name)).unwrap();
+    }
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &checked).unwrap();
+}
+
+#[test]
+fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_counts() {
+    use fbc_oms::{Horizon, ReplayCounts};
+    let secs = Duration::from_secs;
+    let places = [ledger::MayPlace {
+        what: "far post-only GTC",
+        orders: 1,
+        largest_steps: 2,
+    }];
+    let held = ledger::RegistryRun {
+        account: "primary",
+        bounds: ledger::Bounds::new(secs(301), 10, secs(300), &places).unwrap(),
+        ends: vec![ledger::AtEnd {
+            session: "primary",
+            after: Duration::from_millis(1_250),
+            horizon: Horizon::Full,
+            held: 0,
+            replays: ReplayCounts::default(),
+        }],
+    };
+    let counts = ReplayCounts {
+        applied: 1,
+        duplicate: 2,
+        before_watermark: 3,
+        beyond_horizon: 4,
+        untimed: 5,
+    };
+    let forgot = ledger::RegistryRun {
+        account: "subaccount",
+        bounds: bounds(secs(60)),
+        ends: vec![
+            ledger::AtEnd {
+                session: "drop test 1",
+                after: secs(10),
+                horizon: Horizon::At(fbc_core::ExchNs(1_762_000_000_000_000_000)),
+                held: 6,
+                replays: counts,
+            },
+            ledger::AtEnd {
+                session: "drop test 2",
+                after: secs(20),
+                horizon: Horizon::Lost,
+                held: 7,
+                replays: counts,
+            },
+        ],
+    };
+    // Two sessions that did all stage one asks, the journal showing each arm written.
+    let sessions = (reported().into_iter())
+        .map(|run| SessionRun {
+            arm_sent: true,
+            ..run
+        })
+        .collect();
+    let mut ev = run_of(sessions, [0, 0]);
+    ev.registries = vec![held.clone()];
+    assert!(ev.ok(), "{ev:#?}");
+    let (report, evidence) = capture::outputs(&mut ev);
+    assert!(
+        report.contains("## The fill ledger of each registry"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "| primary | 301s | 10 | 300s | 2 | 1 far post-only GTC of at most 2 steps | yes |"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("| primary | primary | 1.25s | no | full | 0 | 0 | 0 | 0 | 0 | 0 |"),
+        "{report}"
+    );
+    let v = json(&evidence);
+    let r = &v["registries"][0];
+    assert_eq!(r["ledger_max_age_ms"], 301_000);
+    assert_eq!(r["ledger_max_entries"], 10);
+    assert_eq!(r["registry_span_ms"], 300_000);
+    assert_eq!(r["fill_ceiling"], 2);
+    assert_eq!(r["ceiling_counts"][0]["largest_steps"], 2);
+    assert_eq!(r["held"], true);
+    assert_eq!(r["session_ends"][0]["after_ms"], 1_250);
+    assert_eq!(r["session_ends"][0]["past_span_ms"], Value::Null);
+    // A registry whose ledger forgot a fill: its horizon moved, the bounds did not hold, and
+    // the run is incomplete.
+    ev.registries.push(forgot);
+    assert!(!ev.ok());
+    let (report, evidence) = capture::outputs(&mut ev);
+    assert!(report.contains("Result: INCOMPLETE"), "{report}");
+    assert!(
+        report.contains(
+            "| subaccount | 61s | 1 | 60s | 0 | no order: its sessions place none | NO |"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "| subaccount | drop test 1 | 10s | no | at 1762000000000000000 (venue ns) | 6 | 1 | 2 \
+             | 3 | 4 | 5 |"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("| subaccount | drop test 2 | 20s | no | lost | 7 |"),
+        "{report}"
+    );
+    let v = json(&evidence);
+    let r = &v["registries"][1];
+    assert_eq!(r["held"], false);
+    assert_eq!(r["session_ends"][1]["horizon"], "lost");
+    let replays = &r["session_ends"][0]["replays"];
+    for (field, n) in [
+        ("applied", 1),
+        ("duplicate", 2),
+        ("before_watermark", 3),
+        ("beyond_horizon", 4),
+        ("untimed", 5),
+    ] {
+        assert_eq!(replays[field], n, "{field}");
+    }
+    assert_eq!(v["ok"], false);
+    // Both pass the repository's privacy check.
+    let (dir, _removed) = temp_dir("ledger-report");
+    fs::write(dir.join("report.md"), report).unwrap();
+    fs::write(dir.join("evidence.json"), evidence).unwrap();
+    assert_report_and_evidence_pass_the_privacy_check(&dir);
+}
+
+#[tokio::test]
+async fn a_registry_whose_session_ends_at_its_age_bound_has_not_held_them_though_its_horizon_reads_full()
+ {
+    use fbc_oms::{FillRouted, Horizon};
+    use ledger::Judged;
+    let secs = Duration::from_secs;
+    let cid = our_cid();
+    let start = MonoNs(0);
+    let span = secs(5);
+    let bounds = ledger::Bounds::new(secs(10), 5, span, &ledger::stage_one()).unwrap();
+    let acct = fbc_core::AccountKey::new(1);
+    let mut registry = ledger::RegistryLedger::new("primary", acct, &bounds, opened(start));
+    let live = qfex_fill(cid, T1, false);
+    let applied = Judged::Applied(FillRouted::OursUntracked(cid));
+    assert_eq!(registry.admit(&live, None, start), applied);
+    // A session ending just within the age bound: the fill applied at the registry's start is
+    // still held, so the bounds held, though the session ran past the span bound.
+    let within = start + (secs(10) - Duration::from_nanos(1));
+    registry.session_ended("first", within);
+    assert!(registry.run().held());
+    let first = &registry.run().ends[0];
+    assert_eq!(
+        first.past_span(span),
+        Some(secs(5) - Duration::from_nanos(1))
+    );
+    // Two sessions that did all stage one asks: with this registry the run is whole.
+    let sessions: Vec<SessionRun> = (reported().into_iter())
+        .map(|run| SessionRun {
+            arm_sent: true,
+            ..run
+        })
+        .collect();
+    let mut ev = run_of(sessions, [0, 0]);
+    ev.registries = vec![registry.run().clone()];
+    assert!(ev.ok(), "{ev:#?}");
+    // One ending at the age bound: fbc-oms forgets an aged fill only as it is given one, so
+    // with no fill since, the horizon still reads full and the fill is still counted held...
+    registry.session_ended("second", start + secs(10));
+    let second = &registry.run().ends[1];
+    assert_eq!((second.horizon, second.held), (Horizon::Full, 1));
+    assert_eq!(second.past_span(span), Some(secs(5)));
+    // ... but the bounds did not hold: a replay of that fill now finds it gone, refused
+    // Untimed, which would stop the probe (decision 0132 item 7).
+    assert!(!registry.run().held());
+    let replay = qfex_fill(cid, T1, true);
+    assert_eq!(
+        registry.admit(&replay, None, start + secs(10)),
+        Judged::Untimed
+    );
+    // The run is incomplete, and the report and the evidence say so.
+    ev.registries = vec![registry.run().clone()];
+    assert!(!ev.ok());
+    let (report, evidence) = capture::outputs(&mut ev);
+    assert!(report.contains("Result: INCOMPLETE"), "{report}");
+    assert!(
+        report.contains("| primary | 10s | 5 | 5s | 0 | no order: its sessions place none | NO |"),
+        "{report}"
+    );
+    assert!(
+        report.contains("| primary | second | 10s | 5s | full | 1 | 0 | 0 | 0 | 0 | 0 |"),
+        "{report}"
+    );
+    let v = json(&evidence);
+    let r = &v["registries"][0];
+    assert_eq!(r["held"], false);
+    assert_eq!(r["session_ends"][0]["past_span_ms"], 4_999);
+    assert_eq!(r["session_ends"][1]["past_span_ms"], 5_000);
+    assert_eq!(r["session_ends"][1]["horizon"], "full");
+    let (dir, _removed) = temp_dir("aged-report");
+    fs::write(dir.join("report.md"), report).unwrap();
+    fs::write(dir.join("evidence.json"), evidence).unwrap();
+    assert_report_and_evidence_pass_the_privacy_check(&dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_registrys_times_are_read_on_the_runtimes_clock_as_the_sessions_stamps_are() {
+    let secs = Duration::from_secs;
+    // The run's origin, then three seconds on the paused runtime clock, which no real time
+    // passes on: the run's monotonic clock reads them, as the sessions' IngestClock does.
+    let origin = tokio::time::Instant::now();
+    tokio::time::advance(secs(3)).await;
+    assert_eq!(ledger::mono_since(origin), MonoNs(3_000_000_000));
+    let opened = ledger::Opened::now(origin, WallNs(1_000));
+    assert_eq!(opened.mono, MonoNs(3_000_000_000));
+    assert_eq!(opened.at, tokio::time::Instant::now());
+    let span = secs(600);
+    let acct = fbc_core::AccountKey::new(1);
+    let mut registry = ledger::RegistryLedger::new("primary", acct, &bounds(span), opened);
+    assert_eq!(registry.deadline(), opened.at + span);
+    // The span bound's timer and the registry's times move together: at the deadline its
+    // session has run the whole span and no more.
+    tokio::time::sleep_until(registry.deadline()).await;
+    registry.session_ended("primary", ledger::mono_since(origin));
+    let end = &registry.run().ends[0];
+    assert_eq!((end.after, end.past_span(span)), (span, None));
+    assert!(registry.run().held());
+    // An origin after now reads zero, never wrapping.
+    let later = tokio::time::Instant::now() + secs(1);
+    assert_eq!(ledger::mono_since(later), MonoNs(0));
 }

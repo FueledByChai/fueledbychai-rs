@@ -294,6 +294,10 @@ Before anything connects, it refuses:
   UUID, as QFEX writes one;
 - a missing or empty credential, and a subaccount credential with one half set;
 - `--socks5` with loopback origins: the proxy would reach its own host's loopback;
+- a missing, zero or malformed `--registry-span`, `--ledger-max-age` or `--ledger-max-entries`
+  (each required, with no default; below), a ledger age not longer than the span bound, a span
+  bound not longer than `--connect-wait-ms`, QFEX's 60 s authentication deadline and
+  `--rpc-timeout-ms` together, and a ledger count not above the fill ceiling;
 - an `--evidence-dir` that is not empty.
 
 A refusal names the setting or the variable, never its value. Then:
@@ -317,9 +321,11 @@ A refusal names the setting or the variable, never its value. Then:
    `AccountWideCodAuthority` for the account it arms on (decision 0121). The session sends the
    arm itself once QFEX has authenticated the stream and confirmed its three subscriptions.
    The program stops the session at the arm's outcome (its answer, or `Unknown` at
-   `--rpc-timeout-ms`), at the connection's end, or at `--session-wait`, whichever comes
-   first. `--session-wait` must be longer than `--connect-wait-ms`, QFEX's 60 s authentication
-   deadline and `--rpc-timeout-ms` together, so it never stops a session with its arm in flight.
+   `--rpc-timeout-ms`), at the connection's end, at `--session-wait`, or at its registry's span
+   bound (`--registry-span`), whichever comes first, always through the session's stop control.
+   `--session-wait` and `--registry-span` must each be longer than `--connect-wait-ms`, QFEX's
+   60 s authentication deadline and `--rpc-timeout-ms` together, so neither stops a session
+   with its arm in flight.
    Its reconnect pacing allows one attempt a day, so no second attempt starts meanwhile.
    Until FBC-jxau decodes an answer, every arm ends `Unknown` at its deadline (decision 0132
    item 1).
@@ -327,6 +333,32 @@ A refusal names the setting or the variable, never its value. Then:
 Every request takes its origin from the guarded configuration, through the adapter's
 `account_reads`, and is charged first to the one rate limiter the sessions share for the
 provider user (decision 0123). A read the limiter has no room for is not sent.
+
+**The fill ledger's bounds** (decision 0132 item 5, FBC-5hif). Each session runs on a registry
+of its own, built as decision 0132 item 7 says (each arms its own account, and a registry is
+for one account), with one fill ledger kept across every session the registry serves. A ledger
+forgets a fill older than its age bound or beyond its count bound, and a fill heard live that
+it forgot is refused `Untimed` when a resync reads it again, which stops the probe (0132
+item 7). So the three bounds are yours, with no defaults:
+
+- `--registry-span <S>`: the longest from a registry's first session's start to its last
+  session's end, 1 to 86400 seconds. A session that reaches it is stopped; stage one places
+  nothing, so its stop control alone ends it, a moment after the bound (the report shows by how
+  much).
+- `--ledger-max-age <S>`: how long the ledger keeps a fill, 1 to 604800 seconds. It must be
+  longer than `--registry-span`, so nothing a registry's sessions applied ages out before the
+  last of them ends.
+- `--ledger-max-entries <N>`: the most fills it keeps, 1 to 1000000. It must be above the fill
+  ceiling: every order a registry's sessions may place, each at its largest size in size steps,
+  since every fill moves at least one step. Stage one places nothing, so its ceiling is zero and
+  any count is above it; FBC-9sk2's place stages add their orders to it.
+
+The report and the evidence state each registry's bounds and, at each of its sessions' ends,
+how long after the registry's first session's start it ended, by how much past the span bound,
+and its ledger's horizon and replay counts. The bounds held when every horizon is still full
+and every session ended within the age bound of its registry's first session's start: the
+ledger forgot no fill, and none it applied could have aged out. A run where one did not is
+incomplete.
 
 Prerequisites, which the run cannot check (decision 0132 item 2, asserted by the
 `AccountWideCodAuthority` it gives): nothing else is connected to or trades on any account of the
@@ -341,7 +373,8 @@ export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # only if QFEX scoped a credential to tha
 export QFEX_SUBACCOUNT_SECRET_KEY=...  # (both or neither)
 cargo run -p fbc-examples --example qfex_preprod_probe -- \
     --evidence-dir "$HOME/fbc-qfex-probe/$(date -u +%Y%m%dT%H%M%SZ)" \
-    --arm primary --arm subaccount
+    --arm primary --arm subaccount \
+    --registry-span <SECONDS> --ledger-max-age <SECONDS> --ledger-max-entries <N>
 ```
 
 `--help` lists every flag. The evidence directory holds:
@@ -353,7 +386,9 @@ cargo run -p fbc-examples --example qfex_preprod_probe -- \
   as its Final acceptance, which FBC-jxau then decodes. Frames in the window that echo nothing
   of the arm are listed by kind, and an echo of the arm after the window is named late; neither,
   nor an empty window, is read as the arm's answer: a new record decides what answers the arm.
-  It also names every member whose string value a fixture keeps.
+  It also names every member whose string value a fixture keeps, and gives each registry's
+  fill-ledger bounds, its horizon and replay counts at each session's end, and whether the
+  bounds held.
 - `evidence.json`: the same, machine-readable.
 - `journal/`: the sessions' journal. Credentials and account ids appear in it only as keyed
   hashes under a key the run draws and never writes. Keep it local.
@@ -382,7 +417,8 @@ nothing of what answered its arm and places none of its frames against the arm, 
 files are named `<account>-<n>-partial.json`.
 
 The exit status is 0 only when every session authenticated, wrote its arm, saw its outcome with
-one connection attempt and kept a whole capture, and every file was written. Agents never run
+one connection attempt and kept a whole capture, every registry's ledger bounds held, and every
+file was written. Agents never run
 this program against QFEX; its test (`tests/qfex_preprod_probe.rs`) runs it against a
 QFEX-shaped conformance stub.
 

@@ -26,10 +26,15 @@
 //!   (decision 0058), and the probe codec's resync asks for nothing, so nothing places. The
 //!   handler stops the session through its control at the arm's outcome (its answer, or
 //!   `Unknown` at its deadline) or at the connection's end, whichever comes first, and the
-//!   program at `--session-wait`; the reconnect pacing allows one attempt a day, so no second
-//!   attempt starts meanwhile. The journal keeps every frame as the codec names its spans, so
+//!   program at `--session-wait` or at its registry's span bound (`--registry-span`), through
+//!   the same control; the reconnect pacing allows one attempt a day, so no second attempt
+//!   starts meanwhile. The journal keeps every frame as the codec names its spans, so
 //!   the arm's window is kept as decision 0132 item 3 says. The sessions run one after the
 //!   other: no two arms are in flight across the user.
+//! - **The registries** ([`crate::ledger`]): each session's own, since each arms its own account
+//!   (decision 0082), built as decision 0132 item 7 says as the session starts, with one fill
+//!   ledger under the owner's bounds (decision 0132 item 5). Its span bound runs from then, and
+//!   its ledger's horizon and replay counts are recorded as the session ends, for the report.
 //! - **The files** ([`crate::capture`]): the report, the evidence, the journal and the scrubbed
 //!   fixture slice, which scripts/privacy-check.sh must pass. A record the journal dropped,
 //!   marked in it or only counted by its sink, one its writer never wrote, and a journal that
@@ -43,7 +48,7 @@ use std::io::Write;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     AccountKey, ConnKey, ConnState, EncodeCtx, Envelope, ExecEvent, HttpResponse, MonoNs,
@@ -74,6 +79,7 @@ use futures_util::StreamExt;
 use crate::auth_qfex::{self, Armed, Lookup, SUB_ID_VAR};
 use crate::capture::{self, AccountRead, Evidence, SessionRun};
 use crate::evidence;
+use crate::ledger::{self, Opened, RegistryLedger};
 use crate::probe_args::Options;
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -198,6 +204,10 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
         Origins::PreProduction => "QFEX pre-production",
         Origins::Loopback => "a loopback test stub",
     };
+    // The sessions' clock, then the run's monotonic origin just after it, on the same runtime
+    // clock ([`ledger::mono_since`]).
+    let clock = IngestClock::new();
+    let origin = tokio::time::Instant::now();
     let mut run = Run {
         opts,
         lookup,
@@ -207,9 +217,9 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
         connector: Connector::new(opts.proxy.clone()),
         limiter,
         nonces,
-        clock: IngestClock::new(),
+        clock,
         journal: Journal::new(Rc::clone(&sink)),
-        origin: Instant::now(),
+        origin,
         ev: Evidence {
             started: evidence::utc(wall_secs()),
             target,
@@ -283,6 +293,12 @@ fn configured(
     Ok((cfg, creds))
 }
 
+/// Now on the local wall clock.
+fn wall_ns() -> WallNs {
+    let wall = SystemTime::now().duration_since(UNIX_EPOCH);
+    WallNs(wall.map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)))
+}
+
 /// The seconds since the epoch now.
 fn wall_secs() -> i64 {
     let now = SystemTime::now().duration_since(UNIX_EPOCH);
@@ -333,7 +349,8 @@ struct Run<'a> {
     nonces: Nonces,
     clock: IngestClock,
     journal: Journal,
-    origin: Instant,
+    /// The run's monotonic origin, on the runtime's clock, taken just after `clock`'s.
+    origin: tokio::time::Instant,
     ev: Evidence,
 }
 
@@ -359,20 +376,32 @@ impl Run<'_> {
             }
             self.check_accounts(&cfg, &subs, account, name(armed))
                 .await?;
-            let run = self.session(n, armed, cfg, creds).await?;
-            self.ev.sessions.push(run);
+            // Stage one's registries serve one session each: each arms its own account.
+            let opened = Opened::now(self.origin, wall_ns());
+            let label = name(armed);
+            let mut registry =
+                RegistryLedger::new(label, account_key(armed), &self.opts.ledger, opened);
+            let ran = self
+                .session(n, armed, cfg, creds, registry.deadline())
+                .await;
+            registry.session_ended(label, self.mono());
+            self.ev.registries.push(registry.run().clone());
+            self.ev.sessions.push(ran?);
         }
         Ok(())
     }
 
+    /// Now on the run's monotonic clock: the runtime's, from just after the sessions'
+    /// `IngestClock` started on it ([`ledger::mono_since`]).
+    fn mono(&self) -> MonoNs {
+        ledger::mono_since(self.origin)
+    }
+
     /// The context of one signed read: now, and two nonces from the run's source.
     fn ctx(&mut self) -> EncodeCtx {
-        let wall = SystemTime::now().duration_since(UNIX_EPOCH);
-        let wall = wall.map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
-        let mono = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
         EncodeCtx {
-            wall: WallNs(wall),
-            mono: MonoNs(mono),
+            wall: wall_ns(),
+            mono: self.mono(),
             nonces: self.nonces.reserve(ReadAuth::NONCES),
         }
     }
@@ -528,13 +557,15 @@ impl Run<'_> {
         page.map_err(|e| format!("get_user_orders: {e}"))
     }
 
-    /// One session on `armed`, connection `n` of the run: it arms once and places nothing.
+    /// One session on `armed`, connection `n` of the run: it arms once and places nothing, and
+    /// is stopped at `span_end` at the latest, its registry's span bound.
     async fn session(
         &mut self,
         n: usize,
         armed: Armed,
         cfg: VenueConfig,
         creds: fbc_core::Secrets,
+        span_end: tokio::time::Instant,
     ) -> Result<SessionRun, String> {
         let acct = account_key(armed);
         let seen = Rc::new(RefCell::new(Seen::default()));
@@ -581,6 +612,13 @@ impl Run<'_> {
                 ran = &mut run => ran,
                 () = tokio::time::sleep(self.opts.session_wait) => {
                     Watch::stop(&seen, &control, "--session-wait");
+                    run.await
+                }
+                // Stage one places nothing, so a session at its span bound has nothing to
+                // cancel: the stop control alone ends it, a moment later (the report's past the
+                // span bound).
+                () = tokio::time::sleep_until(span_end) => {
+                    Watch::stop(&seen, &control, "--registry-span");
                     run.await
                 }
             }
