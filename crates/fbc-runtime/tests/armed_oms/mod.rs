@@ -191,11 +191,13 @@ pub fn cid() -> ClientOrderId {
 }
 
 /// The registry, the client id of its resting order `V-1`, which a resync showed, and of its
-/// resting order `V-2`, which it placed itself and so may amend.
+/// resting order `V-2`, which it placed itself and so may amend, and where its client ids come
+/// from.
 pub struct Oms {
     pub reg: Registry,
     pub resting: ClientOrderId,
     pub amendable: ClientOrderId,
+    cids: Box<dyn FnMut() -> ClientOrderId + Send>,
 }
 
 impl Oms {
@@ -211,6 +213,13 @@ impl Oms {
     /// [`Oms::armed`], the resync having shown the market's position at `position` lots
     /// (positive long) rather than flat.
     pub fn armed_holding(position: i64) -> Oms {
+        Oms::minting(position, Box::new(cid))
+    }
+
+    /// [`Oms::armed_holding`], every client id it mints, `V-1`'s and `V-2`'s first, taken from
+    /// `cids`: a mint of the test's own makes the commands it builds the same on every run
+    /// (FBC-qwq's golden).
+    pub fn minting(position: i64, mut cids: Box<dyn FnMut() -> ClientOrderId + Send>) -> Oms {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let account = format!("acct-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         let caps = order_caps();
@@ -222,7 +231,7 @@ impl Oms {
         };
         let pre_trade = PreTradeCaps::new().with_market(INST_A, limits).unwrap();
         let mut reg = Registry::with_caps(pre_trade).with_lease_keys(keys);
-        let resting = cid();
+        let resting = cids();
         let vid = exec_toy::with_scope(|scope| scope.venue_order_id("V-1")).unwrap();
         let snap = ResyncSnapshot {
             watermark: WallNs(1_000),
@@ -258,7 +267,7 @@ impl Oms {
         let acct = AccountLease::acquire(&dir, "toy", &account).unwrap();
         let leases = Leases::market(market).with_account(acct);
         reg.start(INST_A, leases).unwrap();
-        let amendable = cid();
+        let amendable = cids();
         let order = NewOrder {
             cid: amendable,
             inst: INST_A,
@@ -287,13 +296,14 @@ impl Oms {
             reg,
             resting,
             amendable,
+            cids,
         }
     }
 
     /// A post-only buy of 25 lots, built and authorized.
     pub fn place(&mut self) -> Authorization {
         let order = NewOrder {
-            cid: cid(),
+            cid: (self.cids)(),
             inst: INST_A,
             side: Side::Buy,
             kind: OrderKind::Limit { px: Ticks(130_865) },
@@ -348,7 +358,7 @@ impl Oms {
     pub fn batch(&mut self, n: i64) -> Authorization {
         let orders = (0..n)
             .map(|i| NewOrder {
-                cid: cid(),
+                cid: (self.cids)(),
                 inst: INST_A,
                 side: Side::Buy,
                 kind: OrderKind::Limit {

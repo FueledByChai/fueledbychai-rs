@@ -317,7 +317,22 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     event handed on through the live session's own call, effects not executed, and a control the
     replayed handler drops where it dropped its session's, after which it is handed nothing; a
     journal it replays holds one order-entry session's records, since a context names no
-    connection (another's requests counted) (`tests/exec_replay.rs`);
+    connection (another's requests counted) (`tests/exec_replay.rs`); and its exact replay
+    (FBC-qwq, 0006, 0142), when its configuration asks for it (`ExecReplayConfig::compare_outbound`;
+    off, a decoder replay keeps nothing of it), compares every frame and HTTP request the codec
+    asks for with those the journal holds of the session, outside their redaction spans (their
+    places and lengths compared, a secret header's value blank at its length), signatures
+    included: each journaled one matched on its connection epoch, a frame in the order asked
+    for, a request wherever it lies, or reported a difference with what was asked for in its place
+    (a request's under its tag), which a later record may still match, what was asked for and
+    never journaled counted unwritten, and a difference or an unwritten one a `Degraded` span may
+    explain, the sink's own numbering placing it, excluded and counted (`ExecReplay::exact`,
+    `ExactReport`, exact when nothing differs and nothing is unwritten, `is_exact`; a difference
+    a gap explains found after its marker, and a
+    frame one endpoint asks for on another's stream, read as differences, as `ExactReport` says),
+    held to a conformance-toy session recorded afresh on every run and to the committed golden in
+    `fixtures/conformance-toy/exact_replay/` (`tests/exact_replay.rs`, a signature alone differing
+    included) and to hand-built and sink-written records (`tests/exec_replay.rs`);
     every connection reads through `Tcp`, which on Linux keeps the `SO_TIMESTAMPNS` kernel
     receive time beneath TLS and WebSocket (nix, Linux only), so a frame's stamp carries
     `kernel_rx`, and a session reports each Safety write attributed to such a frame, the
@@ -868,7 +883,14 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   layout, with three forbidden edges, that the dependency-direction check's self-test runs
   against. `fixtures/journal/` holds journals `fbc-journal` wrote in an older
   format version, from synthetic records, which later readers must still read; its README says
-  how each was written.
+  how each was written. `fixtures/conformance-toy/exact_replay/golden/` holds exact replay's
+  golden (FBC-qwq): a conformance-toy order-entry session's journal as `tests/exact_replay.rs`
+  in `fbc-runtime` recorded it against the test's local stubs, the configuration and request ids
+  its replay is given (`session.txt`, the REST credential blanked as the journal keeps it) and a
+  rendering of every frame and request the journal holds (`outbound.txt`); it holds no key- or
+  address-shaped value, so it is not marked `SYNTHETIC`, and it is rewritten only under
+  `FBC_REFRESH_GOLDENS=1`, which `scripts/check.sh --refresh-goldens` sets for that one test and
+  the check otherwise unsets (its README says how).
 - Docs: `docs/decisions/` (records, index in its `README.md`; cite by number, never restate one
   in a doc or a ticket), `docs/PRODUCT_BACKLOG.md` (stories), and the Beads queue in `.beads`
   (prefix `FBC`).
@@ -904,6 +926,8 @@ key- and address-shaped hex, PEM headers and master-key bytes, and, by path alon
 copies and environment files, which `.gitignore` ignores; 0009), then the external
 reviewer's offline proof (`scripts/deepseek-review-tests.py`, below), then, once `Cargo.toml`
 exists, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+the golden refresh's self-test (`scripts/golden-refresh.sh --self-test`, below), the golden
+refresh itself only with `--refresh-goldens`, then
 `cargo test --workspace`, `cargo build --workspace --release` and the credential placement
 check (a venue crate's source outside `src/sign*` and `src/auth*` that names a JWT, bearer
 token, API key, authorization header or private key fails; 0009), then the licence gate
@@ -921,7 +945,8 @@ fbc-runtime caps; 0079),
 then the coverage
 ratchet (`scripts/coverage.sh`, workspace line coverage from cargo-llvm-cov, against
 `coverage-floor.txt` with 0.2 points of slack; the workspace ticket records the first floor
-with `scripts/coverage-ratchet.sh --set`). `scripts/check.sh --fast` skips the ratchet. On the
+with `scripts/coverage-ratchet.sh --set`), and last the "golden unchanged" step (below).
+`scripts/check.sh --fast` skips the ratchet. On the
 empty repository it takes about four minutes, almost all of it the loop's
 self-tests. cargo-llvm-cov 0.9.1 is installed once by hand (`rustup component add
 llvm-tools-preview`, `cargo install cargo-llvm-cov --version 0.9.1 --locked`); CI installs the
@@ -929,9 +954,25 @@ same version itself, and moving it is a ticket, like the toolchain. cargo-deny i
 same way on every machine that runs the check, fast or full (0017): install it once by hand
 with `cargo install cargo-deny --version 0.20.2 --locked`; CI installs the same version, the
 licence step fails naming the install command when it is missing or another version, and
-moving it is a ticket. The one planned step still marked TODO in the script is the
-golden-refresh flag. It stays open now that `fbc-journal` exists: exact-replay goldens compare
-outbound bytes, which need the exec path (BT-402).
+moving it is a ticket. The golden-refresh flag, `scripts/check.sh --refresh-goldens` (it
+combines with `--fast`; FBC-qwq, 0006, 0142 item 12), rewrites exact replay's golden
+(`fixtures/conformance-toy/exact_replay/golden/`) through `scripts/golden-refresh.sh refresh`:
+before the tests it runs `fbc-runtime`'s `tests/exact_replay.rs` test that records the
+conformance toy's session afresh with `FBC_REFRESH_GOLDENS=1`, the one variable under which that
+test replaces the committed golden with the fresh one, set for that command alone, and fails
+unless every file of the golden was rewritten (a renamed test, which cargo runs as no test,
+included). The check unsets that variable first, so a shell that exported it rewrites nothing,
+and at its end, with or without the flag, the "golden unchanged" step
+(`scripts/golden-refresh.sh unchanged`, against the checksum `sum` took before the tests) fails
+when any step after the refresh changed the golden. Without the flag, the tests replay the
+committed golden as it stands. `scripts/golden-refresh.sh --self-test`, which every run of the
+check runs, proves on a golden of its own, the test stood in for by a script that writes only
+under that variable as its store gate does, that the refresh passes only when it rewrote every
+file, the variable set for its command alone, and fails on one file left, none rewritten, a
+failed command or an emptied golden, and that the checksum sees a changed byte and an added,
+removed or renamed file; it then fails when `tests/exact_replay.rs` no longer holds the refresh's
+test under its name. A `cargo test` run outside the check with `FBC_REFRESH_GOLDENS=1`
+rewrites the golden too, and the next check's tests replay what it wrote.
 
 ### External model review (Codex; 0127)
 

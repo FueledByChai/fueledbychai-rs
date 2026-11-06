@@ -1,0 +1,12 @@
+frame 6:0 rpc=- Text auth|ts=1794003455738194000|token=22222222222222222
+frame 6:0 rpc=1 Text cod|rpc=1|on=1
+http 6:0 tag=1 rpc=- Get http://127.0.0.1:51845/acct/2222222222222222222/resync?ts=1794003455738507000 headers=0 body=
+frame 6:0 rpc=2 Text place|rpc=2|cid=00SKqVcforMjJnTdQ13T8|sym=TOYA-PERP|side=B|px=130865|qty=25|tif=gtc|ch=public|po=1|ro=0|ts=1794003455739044000|nonce=101|sig=32350dd7361d693a
+frame 6:0 rpc=3 Text amend|rpc=3|vid=V-2|sym=TOYA-PERP|side=B|px=130855|qty=10|tif=gtc|ch=public|po=1|ro=0|ts=1794003455739252000|nonce=102|sig=8d75fe94cc1e7a0c
+frame 6:0 rpc=4 Text cancel|rpc=4|vid=V-1|sym=TOYA-PERP|side=B|ts=1794003455739419000|nonce=103|sig=0e6ccd4063e49859
+frame 6:0 rpc=5 Text query|rpc=5|vid=V-1|sym=TOYA-PERP
+frame 6:0 rpc=6 Text fees|rpc=6
+frame 6:0 rpc=- Text ping|ts=1794003455740035000
+frame 6:1 rpc=- Text auth|ts=1794003455740514000|token=22222222222222222
+frame 6:1 rpc=7 Text cod|rpc=7|on=1
+http 6:1 tag=2 rpc=- Get http://127.0.0.1:51845/acct/2222222222222222222/resync?ts=1794003455744143000 headers=0 body=
