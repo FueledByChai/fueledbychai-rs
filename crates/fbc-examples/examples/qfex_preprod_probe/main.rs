@@ -29,6 +29,7 @@ mod evidence;
 #[path = "../../src/link.rs"]
 mod link;
 mod probe_args;
+mod refusals;
 mod stage;
 
 use std::cell::RefCell;

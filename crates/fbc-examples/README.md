@@ -334,6 +334,27 @@ Every request takes its origin from the guarded configuration, through the adapt
 `account_reads`, and is charged first to the one rate limiter the sessions share for the
 provider user (decision 0123). A read the limiter has no room for is not sent.
 
+**Provider rate refusals** (decision 0135 item 2, FBC-m9rj). The probe provokes no rate limit
+(0135 item 1), but it reports every one it can count. For each read socket and each session, the
+report and the evidence state how much the shared limiter's `counts().rejected` rose while it
+ran, how many of its frames were an `err` whose `error_code` is `RateLimited`, how many an
+`order_response` whose `status` is `RATE_LIMITED`, and how many were unread: kept whole by
+decision 0134 item 2 (an echo of authentication, a JSON escape, a repeated member) or not JSON,
+so that no code can be read from what the journal keeps. A session's frames are those its
+journal kept. A read socket's, which are not journaled, are the two it reads (the
+authentication reply and the page), each read as a journal would keep it, and each unread one
+read once more in memory as it arrived, never written, for a refusal kept whole: the case
+0135's "What would show this was wrong" names, since such a frame holds no budget (0134 item
+6). A session's frames reach only its codec, so a refusal kept whole in one is not seen; its
+unread count says how many such frames it had. A `RateLimited` err answering a read socket's
+authentication or its page holds the shared budget, as a session's runtime does for its codec's
+(decision 0126), and stops the run as any refused read does. What one met is at least the larger
+of the limiter's count and the refusals its frames show: a lower bound, since each can miss one
+the other sees. The REST reads' answers are not read for refusals: a 429 or 418 stops the run,
+its status named where it stopped. A refusal does not fail a run by itself; a count above zero
+is named in the report as provider rate-limit evidence to record under FBC-s5ox, which records a
+session's refusal from its journal; a refusal met on a read socket has only its count.
+
 **The fill ledger's bounds** (decision 0132 item 5, FBC-5hif). Each session runs on a registry
 of its own, built as decision 0132 item 7 says (each arms its own account, and a registry is
 for one account), with one fill ledger kept across every session the registry serves. A ledger
@@ -386,9 +407,9 @@ cargo run -p fbc-examples --example qfex_preprod_probe -- \
   as its Final acceptance, which FBC-jxau then decodes. Frames in the window that echo nothing
   of the arm are listed by kind, and an echo of the arm after the window is named late; neither,
   nor an empty window, is read as the arm's answer: a new record decides what answers the arm.
-  It also names every member whose string value a fixture keeps, and gives each registry's
+  It also names every member whose string value a fixture keeps, gives each registry's
   fill-ledger bounds, its horizon and replay counts at each session's end, and whether the
-  bounds held.
+  bounds held, and states the provider rate refusals each read socket and session met, at least.
 - `evidence.json`: the same, machine-readable.
 - `journal/`: the sessions' journal. Credentials and account ids appear in it only as keyed
   hashes under a key the run draws and never writes. Keep it local.

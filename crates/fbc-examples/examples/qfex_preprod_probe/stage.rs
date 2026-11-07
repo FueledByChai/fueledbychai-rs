@@ -16,6 +16,9 @@
 //!   only its authentication and that read, and never arms. Every request takes its origin from
 //!   the guarded configuration, through the adapter's `account_reads`, and is charged to the
 //!   run's one provider-user rate limiter first (refused, not waited for, when it has no room).
+//!   A `RateLimited` err answering its authentication or its page holds that limiter's shared
+//!   budget, as the adapter asks of its caller (decision 0126), and stops the probe as any
+//!   refused read does.
 //!   An account that cannot be read, a listing that does not name the subaccount armed on, an
 //!   open order, a TWAP or a position that is not flat stops the probe before the session, and
 //!   so does a REST `open_orders` count above zero ([`AccountRead::refusal`]). Every read, write
@@ -35,6 +38,10 @@
 //!   (decision 0082), built as decision 0132 item 7 says as the session starts, with one fill
 //!   ledger under the owner's bounds (decision 0132 item 5). Its span bound runs from then, and
 //!   its ledger's horizon and replay counts are recorded as the session ends, for the report.
+//! - **The provider rate refusals** ([`crate::refusals`]): each read socket's and each session's,
+//!   counted as decision 0135 item 2 says, for the report: the limiter's count while it ran
+//!   ([`Run::rejected`]), and its frames that were refusals or unread, a read socket's two as it
+//!   reads them and a session's from its journal.
 //! - **The files** ([`crate::capture`]): the report, the evidence, the journal and the scrubbed
 //!   fixture slice, which scripts/privacy-check.sh must pass. A record the journal dropped,
 //!   marked in it or only counted by its sink, one its writer never wrote, and a journal that
@@ -51,7 +58,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
-    AccountKey, ConnKey, ConnState, EncodeCtx, Envelope, ExecEvent, HttpResponse, MonoNs,
+    AccountKey, ConnKey, ConnState, EncodeCtx, Envelope, ExecEvent, HttpResponse, Inbound, MonoNs,
     Namespace, NonceBlock, NonceSource, RateCharge, RawFrame, SpecTable, TrafficClass, VenueCaps,
     VenueConfig, VenueFactory, Via, WallNs, dispatch,
 };
@@ -61,12 +68,12 @@ use fbc_journal::{
 use fbc_runtime::ws::{Message, WebSocket};
 use fbc_runtime::{
     AccountWideCodAuthority, Connector, ExecControl, ExecHandler, ExecSession, ExecSessionConfig,
-    InFlight, IngestClock, Journal, ProxyConfig, RateLimiter, RateUserKey, ReconnectPacing,
-    ReservedBound, RpcIds, SafetyReserve, WriteStall,
+    InFlight, IngestClock, Journal, ProxyConfig, RateLimiter, ReconnectPacing, ReservedBound,
+    RpcIds, SafetyReserve, WriteStall,
 };
 use fbc_venue_qfex::Qfex;
 use fbc_venue_qfex::account_reads::{
-    self, OrdersPage, PageAsk, RestRead, SocketWrite, Subaccounts,
+    self, NotAPage, OrdersPage, PageAsk, RestRead, SocketWrite, Subaccounts,
 };
 use fbc_venue_qfex::auth::{ACCOUNT_KEY, AccountSelection, ReadAuth, TRADE_URL, account_selection};
 use fbc_venue_qfex::probe::{
@@ -81,6 +88,7 @@ use crate::capture::{self, AccountRead, Evidence, SessionRun};
 use crate::evidence;
 use crate::ledger::{self, Opened, RegistryLedger};
 use crate::probe_args::Options;
+use crate::refusals::{self, ReadSocket, Refusals};
 
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
@@ -96,10 +104,6 @@ const SHARD: u16 = 0;
 
 /// The probe codec's resync deadline, which nothing reads until FBC-jxau lands the resync.
 const RESYNC_TIMEOUT: &str = "30s";
-
-/// The provider user the run's rate limiter counts for: one user, its accounts sharing QFEX's
-/// buckets (decision 0123).
-const USER: RateUserKey = RateUserKey::new(1);
 
 /// The reconnect pacing's floor, ceiling and window: one connection attempt a day.
 const DAY: Duration = Duration::from_secs(86_400);
@@ -177,7 +181,7 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
     let caps = QFEX.caps(&cfg).map_err(|e| e.to_string())?;
     let limits = caps.exec_limits.clone().unwrap_or_default();
     let reserve = SafetyReserve::percent(10).expect("10% is a reserve");
-    let limiter = RateLimiter::for_user(USER, &limits, reserve);
+    let limiter = RateLimiter::for_user(opts.rate_user, &limits, reserve);
     let limiter = limiter.map_err(|e| format!("the rate limiter: {e:?}"))?;
     let mut nonces = Nonces(Arc::new(Mutex::new(QfexNonces::os())));
     let key: Vec<u8> = nonces
@@ -467,7 +471,16 @@ impl Run<'_> {
                 format!("subaccount {n}")
             };
             label.push_str(if account == armed { " (armed)" } else { "" });
-            let read = self.read_account(cfg, account).await;
+            let mut met = None;
+            let read = self.read_account(cfg, account, &mut met).await;
+            // A read socket's refusals are reported whether or not its read succeeded.
+            if let Some(refusals) = met {
+                self.ev.read_sockets.push(ReadSocket {
+                    before,
+                    label: label.clone(),
+                    refusals,
+                });
+            }
             let read = read.map_err(|e| format!("{label} could not be read: {e}"))?;
             let refusal = read.refusal();
             let shown = format!(
@@ -489,11 +502,13 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// One account's positions, and its open orders on a trade socket of its own.
+    /// One account's positions, and its open orders on a trade socket of its own; `met` is the
+    /// provider rate refusals that socket met, once it opened.
     async fn read_account(
         &mut self,
         cfg: &VenueConfig,
         account: AccountSelection<'_>,
+        met: &mut Option<Refusals>,
     ) -> Result<AccountRead, String> {
         let reader = auth_qfex::reader(self.lookup, account)?;
         let ctx = self.ctx();
@@ -510,7 +525,11 @@ impl Run<'_> {
         let positions = positions.map_err(|e| format!("GET /user/positions: {e}"))?;
         let url = account_reads::trade_url(cfg, &reader).map_err(|e| e.to_string())?;
         let mut ws = auth_qfex::open(&self.connector, &url, self.opts.connect_wait).await?;
-        let page = self.page(cfg, &reader, &mut ws).await;
+        let before = self.rejected();
+        let mut heard = Refusals::default();
+        let page = self.page(cfg, &reader, &mut ws, &mut heard).await;
+        heard.limiter = self.rejected().saturating_sub(before);
+        *met = Some(heard);
         let wait = self.opts.read_wait;
         let closed = tokio::time::timeout(wait, ws.close(None)).await;
         let page = page?;
@@ -533,28 +552,66 @@ impl Run<'_> {
         })
     }
 
-    /// The socket's authentication, its success, then one `get_user_orders` page from offset 0.
+    /// The socket's authentication, its success, then one `get_user_orders` page from offset 0;
+    /// each of the two frames it reads counted in `heard` ([`Run::heard`]), which holds the
+    /// shared budget for a `RateLimited` err in either.
     async fn page(
         &mut self,
         cfg: &VenueConfig,
         reader: &ReadAuth,
         ws: &mut WebSocket,
+        heard: &mut Refusals,
     ) -> Result<OrdersPage, String> {
         let ctx = self.ctx();
         let auth = account_reads::authentication(cfg, reader, &ctx).map_err(|e| e.to_string())?;
+        let ask = PageAsk::new(self.opts.page_size, 0).map_err(|e| e.to_string())?;
         self.write(ws, &auth).await?;
         let reply = next(ws, self.opts.read_wait).await?;
+        let _ = self.heard(heard, reader, &reply, ask);
         if !account_reads::authenticated(reader, reply.raw()) {
             return Err("QFEX did not authenticate the read socket".to_owned());
         }
-        let ask = PageAsk::new(self.opts.page_size, 0).map_err(|e| e.to_string())?;
         let ask_frame = account_reads::user_orders(cfg, ask).map_err(|e| e.to_string())?;
         self.write(ws, &ask_frame).await?;
         let reply = next(ws, self.opts.read_wait).await?;
-        let page = dispatch(&self.caps, NS, |scope| {
-            account_reads::orders_page(reader, reply.raw(), ask, scope)
-        });
+        let page = self.heard(heard, reader, &reply, ask);
         page.map_err(|e| format!("get_user_orders: {e}"))
+    }
+
+    /// Counts `frame`, off `reader`'s read socket, in `heard` ([`Refusals::hear`]): as a journal
+    /// would keep it, its spans the adapter's (`account_reads::redact_inbound`, blanked by
+    /// [`refusals::kept`]), and, when that is unread, as it arrived, in memory only. Then reads it
+    /// as the adapter reads a page, which reads an err before anything else: a `RateLimited` err,
+    /// whether it answers the authentication or the page, holds the shared budget, as a session's
+    /// runtime holds it for its codec's errs in every state (decision 0126); one the journal
+    /// would keep whole holds none, as the codec holds none for it (0134 item 6).
+    fn heard(
+        &self,
+        heard: &mut Refusals,
+        reader: &ReadAuth,
+        frame: &Data,
+        ask: PageAsk,
+    ) -> Result<OrdersPage, NotAPage> {
+        let raw = frame.raw();
+        let spans = account_reads::redact_inbound(reader, Inbound::Frame(raw));
+        heard.hear(
+            &refusals::kept(raw, &spans),
+            &String::from_utf8_lossy(raw.bytes()),
+        );
+        let page = dispatch(&self.caps, NS, |scope| {
+            account_reads::orders_page(reader, raw, ask, scope)
+        });
+        if let Err(NotAPage::RateLimited(hold)) = &page {
+            let now = tokio::time::Instant::now();
+            (self.limiter).provider_rejected(now, NO_CONN, hold.charge, hold.retry_after);
+        }
+        page
+    }
+
+    /// The run's limiter's count of provider refusals so far: its user count, every one it
+    /// counted, since its buckets are all user-scoped (decision 0123).
+    fn rejected(&self) -> u64 {
+        self.limiter.counts().rejected.user
     }
 
     /// One session on `armed`, connection `n` of the run: it arms once and places nothing, and
@@ -568,6 +625,7 @@ impl Run<'_> {
         span_end: tokio::time::Instant,
     ) -> Result<SessionRun, String> {
         let acct = account_key(armed);
+        let before = self.rejected();
         let seen = Rc::new(RefCell::new(Seen::default()));
         let control = Rc::new(RefCell::new(None));
         let watch = Watch {
@@ -641,6 +699,11 @@ impl Run<'_> {
             arm_failures: counters.arm_failures,
             decode_errors: counters.decode_errors,
             error: ran.err().map(|e| e.to_string()),
+            // The holds its runtime made while it ran; its frames' counts are the slice's.
+            refusals: Refusals {
+                limiter: self.rejected().saturating_sub(before),
+                ..Refusals::default()
+            },
             ..SessionRun::default()
         })
     }

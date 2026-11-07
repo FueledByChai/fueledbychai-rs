@@ -655,11 +655,17 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `AccountWideCodAuthority` (0121) and a registry of its own whose one fill ledger it keeps
     (`ledger.rs`), stopped at its arm's outcome, the connection's end or the span bound, its
     pacing allowing no second attempt; it writes a report, evidence (each registry's ledger
-    bounds, and its horizon and replay counts at each session's end), its journal and a scrubbed
-    fixture slice for `fixtures/qfex/exec-recorded/arm/` (`tests/qfex_preprod_probe.rs`, against
-    a QFEX-shaped conformance stub). Its credentials come from the environment through
-    `src/auth_qfex.rs`, a review path, which also hands each signed read to the connector; it
-    reuses `paradex_testnet_acceptance`'s privacy patterns by path. The samples that trade share
+    bounds, and its horizon and replay counts at each session's end; the provider rate refusals
+    each read socket and session met, at least, 0135 item 2, FBC-m9rj: the shared limiter's
+    `counts().rejected`, the `RateLimited` errs and `RATE_LIMITED` order responses among its
+    frames as a journal keeps them, and its frames unread (kept whole by 0134 item 2, or not
+    JSON), a read socket's read once more in memory for a refusal kept whole, a count above zero
+    named as evidence for FBC-s5ox; `refusals.rs`), its journal and
+    a scrubbed fixture slice for `fixtures/qfex/exec-recorded/arm/`
+    (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped conformance stub). Its credentials
+    come from the environment through `src/auth_qfex.rs`, a review path, which also hands each
+    signed read to the connector; it reuses `paradex_testnet_acceptance`'s privacy patterns by
+    path. The samples that trade share
     `src/link.rs` (the glue) and `src/testnet.rs` (guard and wiring), and the mainnet ones
     `src/mainnet.rs` (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a

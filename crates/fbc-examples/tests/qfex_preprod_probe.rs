@@ -32,6 +32,8 @@ mod ledger;
 mod link;
 #[path = "../examples/qfex_preprod_probe/probe_args.rs"]
 mod probe_args;
+#[path = "../examples/qfex_preprod_probe/refusals.rs"]
+mod refusals;
 #[path = "../examples/qfex_preprod_probe/stage.rs"]
 mod stage;
 
@@ -49,15 +51,18 @@ use capture::{Arrived, Evidence, SessionRun, When};
 use fbc_conformance::{
     Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
 };
-use fbc_core::{ConnKey, MonoNs, RawFrame, RpcId, Stamp, TrafficClass, WallNs, WireSlice};
+use fbc_core::{
+    ConnKey, InboundSpans, MonoNs, RawFrame, RpcId, Stamp, TrafficClass, WallNs, WireSlice,
+};
 use fbc_journal::{
     ControlEvent, JournalError, JournalSink, JournalWriter, Opcode, QueueSink, Record, Recorded,
     RedactionKey, SinkConfig, WriterThread, journal_queue,
 };
-use fbc_runtime::ProxyConfig;
 use fbc_runtime::http::Method;
+use fbc_runtime::{ProxyConfig, RateUserKey};
 use fbc_venue_qfex::exec::ARM;
 use probe_args::{Options, Parsed};
+use refusals::Refusals;
 use serde_json::Value;
 
 /// Made-up credentials, in the alphabet QFEX's examples show.
@@ -237,7 +242,16 @@ fn options(dir: &Path, server: &StubServer, arms: &[Armed]) -> Options {
         connect_wait: Duration::from_secs(5),
         session_wait: Duration::from_secs(30),
         ledger: bounds(Duration::from_secs(60)),
+        rate_user: user(),
     }
+}
+
+/// A provider user of the run's own. A user's rate budget is process-wide (decision 0123), and
+/// the tests run probes at once in one process: each counts its refusals, and holds its budget,
+/// for its own user alone.
+fn user() -> RateUserKey {
+    static NEXT: AtomicU64 = AtomicU64::new(1_000);
+    RateUserKey::new(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Stage one's ledger bounds under the span bound `span`: an age a second longer, and a count
@@ -560,6 +574,69 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     assert_eq!(end["replays"]["untimed"], 0);
     assert_eq!(end["replays"]["duplicate"], 0);
     assert_eq!(end["past_span_ms"], Value::Null);
+
+    // A clean run met no provider rate refusal (decision 0135 item 2): every read socket and
+    // both sessions count none, the in-window err of another request included, and the report
+    // and the evidence say so.
+    assert_eq!(ev.read_sockets.len(), 6);
+    let befores: Vec<&str> = ev.read_sockets.iter().map(|r| r.before).collect();
+    assert_eq!(
+        befores,
+        [
+            "primary",
+            "primary",
+            "primary",
+            "subaccount",
+            "subaccount",
+            "subaccount"
+        ]
+    );
+    assert!(
+        ev.read_sockets
+            .iter()
+            .all(|r| r.refusals == Refusals::default())
+    );
+    for run in &ev.sessions {
+        assert_eq!(run.refusals, Refusals::default(), "{run:?}");
+        assert!(run.refusal_frames.is_empty());
+    }
+    assert!(
+        report.contains("No provider rate refusal was counted."),
+        "{report}"
+    );
+    assert!(report.contains("Frames unread, kept whole or not JSON: 0."));
+    assert!(report.contains(
+        "Met by each session, at least, with the read sockets before it: primary 0; subaccount 0."
+    ));
+    assert!(report.contains(
+        "| subaccount | read socket: subaccount 1 (armed) | 0 | 0 | 0 | 0 | 0 | 0 | not journaled |"
+    ));
+    assert!(report.contains("| primary | the session | 0 | 0 | 0 | 0 | not seen | 0 | none |"));
+    assert!(!report.contains("Provider rate-limit evidence"), "{report}");
+    let rates = &evidence["provider_rate_refusals"];
+    assert_eq!(rates["met_at_least"], 0);
+    assert_eq!(rates["record_under"], Value::Null);
+    assert_eq!(rates["frames_unread"], 0);
+    assert_eq!(rates["read_sockets"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        rates["read_sockets"][0]["counts"],
+        json(
+            r#"{"limiter_rejected":0,"rate_limited_errs":0,"rate_limited_order_responses":0,"frames_unread":0,"rate_limited_in_frames_kept_whole":0,"met_at_least":0}"#
+        )
+    );
+    assert_eq!(
+        rates["by_session"],
+        json(
+            r#"[{"session":"primary","met_at_least":0,"session_ran":true},{"session":"subaccount","met_at_least":0,"session_ran":true}]"#
+        )
+    );
+    assert_eq!(rates["sessions"][1]["counts"]["met_at_least"], 0);
+    // A session's frames reach only its codec: a refusal kept whole in one is not seen.
+    assert_eq!(
+        rates["sessions"][1]["counts"]["rate_limited_in_frames_kept_whole"],
+        Value::Null
+    );
+    assert_eq!(rates["sessions"][1]["frames"], json("[]"));
     assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
     assert!(!printed.contains(SUB) && !printed.contains(PUBLIC));
 }
@@ -1317,6 +1394,11 @@ fn a_degraded_marker_in_a_sessions_window_makes_its_capture_partial_and_the_run_
     assert!(report.contains("1 Normal, 0 Safety. Sessions whose capture is partial: subaccount."));
     assert!(report.contains("- Capture: PARTIAL: a journal gap, 1 dropped from its record 9 on"));
     assert!(!report.contains("Nothing arrived"), "{report}");
+    // Its frames' counts of provider rate refusals may be short, and the report says so.
+    assert!(report.contains(
+        "| subaccount | the session (capture partial: its frames' counts may be short) | 0 | 0 | \
+         0 | 0 | not seen | 0 | none |"
+    ));
     let readme = capture::readme(&ev);
     assert!(
         readme.contains(
@@ -1844,6 +1926,8 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     };
     assert_eq!(opts.arms, [Armed::Primary]);
     assert_eq!(opts.trade_url, "wss://trade.qfex.io");
+    // One provider user per process, the program's own numbering (decision 0123).
+    assert_eq!(opts.rate_user, probe_args::USER);
     assert_eq!((opts.rpc_timeout_ms, opts.page_size), (10_000, 1000));
     let all = [
         "--evidence-dir",
@@ -2712,4 +2796,569 @@ async fn a_registrys_times_are_read_on_the_runtimes_clock_as_the_sessions_stamps
     // An origin after now reads zero, never wrapping.
     let later = tokio::time::Instant::now() + secs(1);
     assert_eq!(ledger::mono_since(later), MonoNs(0));
+}
+
+// ----- Provider rate refusals (decision 0135 item 2, FBC-m9rj) -----
+
+/// A RateLimited err answering a get_user_orders page, flat, with the rate page's seconds hint.
+const LIMITED_PAGE: &str = r#"{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 3 seconds","incoming_message":{"type":"get_user_orders","params":{"limit":1000,"offset":0}}}"#;
+/// A RateLimited err echoing the arm, flat, with a one-second hint: the arm's type names no
+/// bucket, so the codec holds every frame budget for it.
+const LIMITED_ARM: &str = r#"{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 1 seconds","incoming_message":{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true}}}"#;
+/// An order QFEX refused for its rate, in the AsyncAPI's `order_response`.
+const LIMITED_ORDER: &str = r#"{"order_response":{"symbol":"AAPL-USD","status":"RATE_LIMITED"}}"#;
+/// A RateLimited err echoing nothing, flat, with the rate page's seconds hint: no account
+/// material and no echo, so the journal keeps it in clear.
+const LIMITED: &str = r#"{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 3 seconds"}"#;
+
+/// A RateLimited err echoing a read socket's authentication with `public`'s key: decision 0134
+/// item 2 keeps it whole, so the journal would keep only `2`s of it.
+fn limited_auth(public: &str) -> String {
+    format!(
+        r#"{{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 3 seconds","incoming_message":{{"type":"auth","params":{{"hmac":{{"public_key":"{public}"}}}}}}}}"#
+    )
+}
+
+#[tokio::test]
+async fn a_read_answered_rate_limited_reports_one_provider_rate_refusal_for_its_session_to_record_under_fbc_s5ox()
+ {
+    let (dir, _removed) = temp_dir("rate-limited-read");
+    // The primary account's session, after reads answered in full; then, before the
+    // subaccount's, QFEX refuses the first read's page for its rate.
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    steps.extend(read_socket(2, EMPTY_PAGE));
+    steps.extend(session_socket(3, &[ARM_ACK]));
+    steps.extend(read_socket(4, LIMITED_PAGE));
+    let listing = ok(&fixture("subaccounts.json"));
+    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+        .await
+        .unwrap();
+    let opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
+    let (ran, printed) = probe(&opts, &environment()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    let ev = &outcome.evidence;
+
+    // The refused read stops the probe before the subaccount's session, as any refused read
+    // does, and nothing is sent after it: the probe has returned, and the script has played.
+    assert!(
+        !outcome.ok && printed.contains("DONE INCOMPLETE"),
+        "{printed}"
+    );
+    let stopped = ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.contains(
+            "primary could not be read: get_user_orders: QFEX refused the page read: RateLimited"
+        ),
+        "{stopped}"
+    );
+    assert_eq!(server.connections().len(), 5);
+    assert_eq!(ev.sessions.len(), 1);
+
+    // One provider rate refusal, for the subaccount's session: the read socket before it held
+    // the shared budget for its page once (the limiter's count), and that page was a
+    // RateLimited err. Every other read socket and the primary account's session met none.
+    let none = Refusals::default();
+    let one = Refusals {
+        limiter: 1,
+        errs: 1,
+        ..Refusals::default()
+    };
+    let met: Vec<(&str, &str, Refusals)> = (ev.read_sockets.iter())
+        .map(|r| (r.before, r.label.as_str(), r.refusals))
+        .collect();
+    assert_eq!(
+        met,
+        [
+            ("primary", "primary (armed)", none),
+            ("primary", "subaccount 1", none),
+            ("primary", "subaccount 2", none),
+            ("subaccount", "primary", one),
+        ]
+    );
+    assert_eq!(one.met(), 1);
+    assert_eq!(ev.sessions[0].refusals, none);
+    assert_eq!(refusals::total(&ev.read_sockets, &ev.sessions), 1);
+
+    // report.md names it as provider rate-limit evidence to record under FBC-s5ox, for the
+    // subaccount's session, with no fixture said to hold it: a read socket is not journaled.
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains(
+            "**Provider rate-limit evidence to record under FBC-s5ox** (decision 0135 item 2): \
+             provider rate refusals met, at least: 1."
+        ),
+        "{report}"
+    );
+    assert!(report.contains("**This is provider rate-limit evidence, to record under FBC-s5ox.**"));
+    assert!(report.contains(
+        "A refusal met on a read socket has no frame in the journal, since the probe's reads are \
+         not journaled: only its count is here."
+    ));
+    assert!(!report.contains("The fixtures that hold a session's refusal frames"));
+    assert!(
+        report.contains(
+            "Met by each session, at least, with the read sockets before it: primary 0; \
+             subaccount 1 (its session did not run)."
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "| subaccount | read socket: primary | 1 | 1 | 0 | 0 | 0 | 1 | not journaled |"
+        ),
+        "{report}"
+    );
+    assert!(report.contains("| primary | the session | 0 | 0 | 0 | 0 | not seen | 0 | none |"));
+    assert!(!report.contains("No provider rate refusal was counted"));
+
+    // evidence.json says the same.
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    let rates = &evidence["provider_rate_refusals"];
+    assert_eq!(rates["met_at_least"], 1);
+    assert_eq!(rates["record_under"], "FBC-s5ox");
+    assert_eq!(
+        rates["by_session"],
+        json(
+            r#"[{"session":"primary","met_at_least":0,"session_ran":true},{"session":"subaccount","met_at_least":1,"session_ran":false}]"#
+        )
+    );
+    assert_eq!(
+        rates["read_sockets"][3],
+        json(
+            r#"{"before":"subaccount","account":"primary","counts":{"limiter_rejected":1,"rate_limited_errs":1,"rate_limited_order_responses":0,"frames_unread":0,"rate_limited_in_frames_kept_whole":0,"met_at_least":1}}"#
+        )
+    );
+    assert_eq!(rates["read_sockets"][0]["counts"]["met_at_least"], 0);
+    assert_eq!(rates["sessions"][0]["counts"]["met_at_least"], 0);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+/// A probe arming on the primary account whose first read socket QFEX answers `answer` in
+/// reply to its authentication: the probe asks for no page and stops there, as at any account
+/// it cannot read. Its directory's guard, options, outcome and what it printed.
+async fn authentication_answered(
+    what: &str,
+    answer: &str,
+) -> (Removed, Options, stage::Outcome, String) {
+    let (dir, removed) = temp_dir(what);
+    let steps = vec![
+        Step::Accept,
+        Step::Respond {
+            conn: 0,
+            with: reply(&[answer]),
+        },
+    ];
+    let listing = ok(&fixture("subaccounts.json"));
+    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+        .await
+        .unwrap();
+    let opts = options(&dir, &server, &[Armed::Primary]);
+    let (ran, printed) = probe(&opts, &environment()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(
+        !outcome.ok && printed.contains("DONE INCOMPLETE"),
+        "{printed}"
+    );
+    let stopped = outcome.evidence.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.contains(
+            "primary (armed) could not be read: QFEX did not authenticate the read socket"
+        ),
+        "{stopped}"
+    );
+    assert_eq!(server.connections().len(), 1);
+    assert_eq!(received(&server, 0).len(), 1);
+    assert!(outcome.evidence.sessions.is_empty());
+    (removed, opts, outcome, printed)
+}
+
+#[tokio::test]
+async fn a_read_sockets_authentication_answered_rate_limited_holds_the_shared_budget_and_counts_one_refusal()
+ {
+    let (_removed, opts, outcome, _) = authentication_answered("rate-limited-auth", LIMITED).await;
+    let ev = &outcome.evidence;
+
+    // The err, which the journal would keep in clear, is counted; and the probe held the shared
+    // budget for it, as a session's runtime holds it for its codec's err in every state
+    // (decision 0126): the limiter's count. One refusal, met before the primary's session.
+    let one = Refusals {
+        limiter: 1,
+        errs: 1,
+        ..Refusals::default()
+    };
+    assert_eq!(ev.read_sockets.len(), 1);
+    assert_eq!(ev.read_sockets[0].refusals, one);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains(
+            "| primary | read socket: primary (armed) | 1 | 1 | 0 | 0 | 0 | 1 | not journaled |"
+        ),
+        "{report}"
+    );
+    assert!(report.contains("provider rate refusals met, at least: 1."));
+    assert!(report.contains(
+        "Met by each session, at least, with the read sockets before it: primary 1 (its session \
+         did not run)."
+    ));
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    let rates = &evidence["provider_rate_refusals"];
+    assert_eq!(
+        (&rates["met_at_least"], &rates["record_under"]),
+        (&json("1"), &json(r#""FBC-s5ox""#))
+    );
+    assert_eq!(
+        rates["read_sockets"][0]["counts"],
+        json(
+            r#"{"limiter_rejected":1,"rate_limited_errs":1,"rate_limited_order_responses":0,"frames_unread":0,"rate_limited_in_frames_kept_whole":0,"met_at_least":1}"#
+        )
+    );
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_rate_limited_err_echoing_the_authentication_is_kept_whole_and_still_reported_as_a_refusal()
+ {
+    let answer = limited_auth(PUBLIC);
+    let (_removed, opts, outcome, printed) =
+        authentication_answered("rate-limited-auth-echo", &answer).await;
+    let ev = &outcome.evidence;
+
+    // Decision 0134 item 2 keeps it whole: as a journal would keep it, it shows no code and holds
+    // no budget (0134 item 6), so neither the limiter nor the kept frame counts it, and it is
+    // unread. Read once more in memory as it arrived, it was a RateLimited err: one refusal,
+    // reported, never a clean zero.
+    let whole = Refusals {
+        unread: 1,
+        whole: 1,
+        ..Refusals::default()
+    };
+    assert_eq!(ev.read_sockets.len(), 1);
+    assert_eq!(ev.read_sockets[0].refusals, whole);
+    assert_eq!(whole.met(), 1);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains(
+            "**Provider rate-limit evidence to record under FBC-s5ox** (decision 0135 item 2): \
+             provider rate refusals met, at least: 1."
+        ),
+        "{report}"
+    );
+    assert!(report.contains(
+        "Of them, 1 arrived in a frame decision 0134 item 2 keeps whole, which holds no budget \
+         (0134 item 6), read only in memory as it arrived: the case decision 0135's \"What would \
+         show this was wrong\" names, for FBC-s5ox to judge against that record."
+    ));
+    assert!(report.contains("Frames unread, kept whole or not JSON: 1."));
+    assert!(
+        report.contains(
+            "| primary | read socket: primary (armed) | 0 | 0 | 0 | 1 | 1 | 1 | not journaled |"
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("No provider rate refusal was counted"));
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    let rates = &evidence["provider_rate_refusals"];
+    assert_eq!(
+        (&rates["met_at_least"], &rates["frames_unread"]),
+        (&json("1"), &json("1"))
+    );
+    assert_eq!(rates["record_under"], "FBC-s5ox");
+    assert_eq!(
+        rates["read_sockets"][0]["counts"],
+        json(
+            r#"{"limiter_rejected":0,"rate_limited_errs":0,"rate_limited_order_responses":0,"frames_unread":1,"rate_limited_in_frames_kept_whole":1,"met_at_least":1}"#
+        )
+    );
+    // The echo held the account's public key: read in memory, it is written nowhere.
+    assert!(!printed.contains(PUBLIC));
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_session_that_meets_rate_refusals_reports_each_from_its_limiter_and_its_journal() {
+    let (dir, _removed) = temp_dir("rate-limited-session");
+    // QFEX refuses for its rate in the arm's window: an err echoing the arm, and an order.
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    steps.extend(read_socket(2, EMPTY_PAGE));
+    steps.extend(session_socket(3, &[LIMITED_ARM, LIMITED_ORDER]));
+    let listing = ok(&fixture("subaccounts.json"));
+    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+        .await
+        .unwrap();
+    let opts = options(&dir, &server, &[Armed::Primary]);
+    let (ran, printed) = probe(&opts, &environment()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    let ev = &outcome.evidence;
+
+    // A refusal is evidence, not a failure: the session armed and its arm ended Unknown at its
+    // deadline, the refusal settling nothing (decision 0126).
+    assert!(outcome.ok, "{printed}\n{ev:#?}");
+    let run = &ev.sessions[0];
+    assert_eq!(run.arm.as_deref(), Some("Unknown"));
+    assert_eq!(run.attempts, 1);
+    // The runtime held the shared budget for each (the limiter's count), and the journal kept
+    // both frames: one RateLimited err and one RATE_LIMITED order response.
+    let two = Refusals {
+        limiter: 2,
+        errs: 1,
+        orders: 1,
+        ..Refusals::default()
+    };
+    assert_eq!(run.refusals, two);
+    assert_eq!(run.refusals.met(), 2);
+    assert!(
+        ev.read_sockets
+            .iter()
+            .all(|r| r.refusals == Refusals::default())
+    );
+    let kinds: Vec<&str> = (run.refusal_frames.iter())
+        .map(|&i| run.frames[i].kind.as_str())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["err echoing the arm (RateLimited)", "{order_response}"]
+    );
+    let files = ["primary-005-in-window.json", "primary-006-in-window.json"];
+    let fixtures = opts.evidence_dir.join("fixtures");
+    for file in files {
+        assert!(fixtures.join(file).is_file(), "{file}");
+    }
+
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.contains("Result: complete."), "{report}");
+    assert!(
+        report.contains("provider rate refusals met, at least: 2."),
+        "{report}"
+    );
+    assert!(report.contains(
+        "The fixtures that hold a session's refusal frames are named in the table below."
+    ));
+    assert!(!report.contains("A refusal met on a read socket"));
+    assert!(
+        report
+            .contains("Met by each session, at least, with the read sockets before it: primary 2.")
+    );
+    assert!(
+        report.contains(
+            "| primary | the session | 2 | 1 | 1 | 0 | not seen | 2 | \
+             primary-005-in-window.json; primary-006-in-window.json |"
+        ),
+        "{report}"
+    );
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    let rates = &evidence["provider_rate_refusals"];
+    assert_eq!(rates["met_at_least"], 2);
+    assert_eq!(rates["record_under"], "FBC-s5ox");
+    assert_eq!(
+        rates["sessions"][0],
+        json(
+            r#"{"session":"primary","capture_whole":true,"counts":{"limiter_rejected":2,"rate_limited_errs":1,"rate_limited_order_responses":1,"frames_unread":0,"rate_limited_in_frames_kept_whole":null,"met_at_least":2},"frames":["primary-005-in-window.json","primary-006-in-window.json"]}"#
+        )
+    );
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    evidence::privacy_check(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh"),
+        &fixtures,
+    )
+    .unwrap();
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[test]
+fn a_refusal_frames_fixture_is_named_as_written_withheld_or_not_written() {
+    let frame = |file: &str| Arrived {
+        kind: "{order_response}".to_owned(),
+        when: When::InWindow,
+        file: file.to_owned(),
+    };
+    let [written, withheld, removed] = [
+        "primary-001-in-window.json",
+        "primary-002-in-window.json",
+        "primary-003-in-window.json",
+    ];
+    let run = SessionRun {
+        refusals: Refusals {
+            limiter: 3,
+            orders: 3,
+            ..Refusals::default()
+        },
+        frames: vec![frame(written), frame(withheld), frame(removed)],
+        refusal_frames: vec![0, 1, 2],
+        ..reported()[0].clone()
+    };
+    let mut ev = run_of(vec![run], [0, 0]);
+    ev.fixtures = vec![written.to_owned()];
+    ev.withheld = vec![format!("{withheld}: a JWT")];
+
+    // Each refusal frame's file is named as the run left it, in the report and the evidence.
+    let report = capture::markdown(&ev);
+    assert!(
+        report.contains(
+            "| primary | the session | 3 | 0 | 3 | 0 | not seen | 3 | primary-001-in-window.json; \
+             primary-002-in-window.json (withheld); primary-003-in-window.json (not written) |"
+        ),
+        "{report}"
+    );
+    assert!(report.contains(
+        "The fixtures that hold a session's refusal frames are named in the table below."
+    ));
+    let evidence = capture::to_json(&ev);
+    assert_eq!(
+        evidence["provider_rate_refusals"]["sessions"][0]["frames"],
+        json(
+            r#"["primary-001-in-window.json","primary-002-in-window.json (withheld)","primary-003-in-window.json (not written)"]"#
+        )
+    );
+
+    // With no fixture written (the privacy check removed the directory), none is said to hold
+    // a refusal frame.
+    ev.fixtures.clear();
+    let report = capture::markdown(&ev);
+    assert!(!report.contains("The fixtures that hold"), "{report}");
+    assert!(report.contains("| 3 | primary-001-in-window.json (not written); "));
+}
+
+#[test]
+fn a_read_sockets_frame_is_read_as_the_journal_keeps_it() {
+    // What the journal's reader returns of a frame recorded with `spans`.
+    let journaled = |frame: RawFrame<'_>, spans: &InboundSpans| {
+        let record = Record::inbound_redacted(stamp(0), frame, spans).unwrap();
+        match record.blanked() {
+            Record::Inbound { bytes, .. } => String::from_utf8_lossy(&bytes.0).into_owned(),
+            other => panic!("{other:?}"),
+        }
+    };
+    let binary = br#"{"type":"Err","error_code":"RateLimited"}"#;
+    for (frame, spans) in [
+        (RawFrame::Text(OTHER_ERR), Vec::new()),
+        (RawFrame::Text(OTHER_ERR), vec![2..6, 40..52]),
+        (RawFrame::Binary(binary), vec![1..7, 9..13]),
+    ] {
+        let spans = InboundSpans::frame(spans);
+        assert_eq!(refusals::kept(frame, &spans), journaled(frame, &spans));
+    }
+    // Spans that do not fit the frame are a codec defect the journal refuses; the runtime then
+    // marks all of the frame, and so it is kept: unread.
+    let past = std::iter::once(0..u32::try_from(AUTH_OK.len() + 1).unwrap());
+    let past = InboundSpans::frame(past.collect());
+    let frame = RawFrame::Text(AUTH_OK);
+    assert!(Record::inbound_redacted(stamp(0), frame, &past).is_err());
+    let kept = refusals::kept(frame, &past);
+    assert_eq!(kept, "2".repeat(AUTH_OK.len()));
+    let mut heard = Refusals::default();
+    assert!(!heard.count(&kept));
+    assert_eq!(heard.unread, 1);
+}
+
+#[test]
+fn a_provider_rate_refusal_is_a_rate_limited_err_or_a_rate_limited_order_response() {
+    use refusals::Refusal;
+    let cases = [
+        (LIMITED_PAGE, Some(Refusal::Err)),
+        (LIMITED_ARM, Some(Refusal::Err)),
+        (LIMITED, Some(Refusal::Err)),
+        (
+            r#"{"err":{"error_code":"RateLimited","message":"Too many requests."}}"#,
+            Some(Refusal::Err),
+        ),
+        (OTHER_ERR, None),
+        // A code the journal spanned, or a frame it kept whole, shows none.
+        (
+            r#"{"type":"Err","error_code":"22222222222","incoming_message":"2222"}"#,
+            None,
+        ),
+        ("22222222222222222222", None),
+        (r#"{"ack":{"error_code":"RateLimited"}}"#, None),
+        (r#"{"ack":{},"err":{"error_code":"RateLimited"}}"#, None),
+        (LIMITED_ORDER, Some(Refusal::Order)),
+        (r#"{"order_response":{"status":"ACK"}}"#, None),
+        (
+            r#"{"order_response":{"status":"RATE_LIMITED"},"x":1}"#,
+            None,
+        ),
+        (r#"{"order_response":"RATE_LIMITED"}"#, None),
+        (r#"{"position_response":{"status":"RATE_LIMITED"}}"#, None),
+        ("[1]", None),
+    ];
+    for (text, refusal) in cases {
+        assert_eq!(refusals::refusal(text), refusal, "{text}");
+    }
+    // What one met, at least: the larger of the limiter's count and the frames' together.
+    let mut heard = Refusals::default();
+    assert!(heard.count(LIMITED_PAGE) && heard.count(LIMITED_ORDER) && !heard.count(OTHER_ERR));
+    assert_eq!(
+        heard,
+        Refusals {
+            errs: 1,
+            orders: 1,
+            ..Refusals::default()
+        }
+    );
+    assert_eq!(heard.met(), 2);
+    assert_eq!(
+        Refusals {
+            limiter: 3,
+            ..heard
+        }
+        .met(),
+        3
+    );
+    // A frame no JSON object is kept of, blanked whole or not JSON at all, is unread: no code
+    // can be read from it.
+    let mut heard = Refusals::default();
+    assert!(!heard.count("22222222") && !heard.count("not JSON") && !heard.count("[1]"));
+    assert_eq!(
+        heard,
+        Refusals {
+            unread: 3,
+            ..Refusals::default()
+        }
+    );
+    // On a read socket, an unread frame is read once more as it arrived, for a refusal kept
+    // whole; a frame read as kept is never read as it arrived, so none counts twice.
+    let mut heard = Refusals::default();
+    let arrived = limited_auth(PUBLIC);
+    heard.hear(&"2".repeat(arrived.len()), &arrived);
+    heard.hear("2222", ARM_ACK);
+    heard.hear(LIMITED_PAGE, LIMITED_PAGE);
+    heard.hear(AUTH_OK, LIMITED);
+    assert_eq!(
+        heard,
+        Refusals {
+            limiter: 0,
+            errs: 1,
+            orders: 0,
+            unread: 2,
+            whole: 1,
+        }
+    );
+    assert_eq!(heard.met(), 2);
+    assert_eq!(
+        Refusals {
+            limiter: 2,
+            ..heard
+        }
+        .met(),
+        2
+    );
+    // A probe stopped before any read socket opened met none, and the report says so.
+    let ev = run_of(Vec::new(), [0, 0]);
+    assert_eq!(refusals::total(&ev.read_sockets, &ev.sessions), 0);
+    let report = capture::markdown(&ev);
+    assert!(
+        report.contains(
+            "Met by each session, at least, with the read sockets before it: none (no read \
+             socket opened)."
+        ),
+        "{report}"
+    );
+    assert!(report.contains("No provider rate refusal was counted."));
 }
