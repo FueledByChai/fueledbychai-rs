@@ -4,12 +4,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use fbc_runtime::ProxyConfig;
+use fbc_runtime::{ProxyConfig, RateUserKey};
 use fbc_venue_qfex::exec::AUTH_DEADLINE;
 use fbc_venue_qfex::probe::{PREPROD_MDS, PREPROD_REST, PREPROD_TRADE};
 
 use crate::auth_qfex::{Armed, PUBLIC_VAR, SECRET_VAR, SUB_ID_VAR, SUB_PUBLIC_VAR, SUB_SECRET_VAR};
 use crate::ledger::{self, Bounds, MAX_AGE_S, MAX_ENTRIES, MAX_SPAN_S};
+
+/// The provider user a run's rate limiter counts for: one user, its accounts sharing QFEX's
+/// buckets (decision 0123). The program's own numbering: a process probes one user.
+pub const USER: RateUserKey = RateUserKey::new(1);
 
 /// The help text `--help` prints.
 pub fn usage() -> String {
@@ -97,6 +101,10 @@ pub struct Options {
     /// Each registry's fill-ledger bounds and the span bound they outlast (decision 0132 item
     /// 5), accepted against stage one's fill ceiling.
     pub ledger: Bounds,
+    /// The provider user the run's rate limiter counts for, and whose shared budget a refusal
+    /// holds (decision 0123): always [`USER`] from the command line. A test that runs several
+    /// probes at once in one process gives each its own, since a user's budget is process-wide.
+    pub rate_user: RateUserKey,
 }
 
 /// What the command line asked for.
@@ -193,6 +201,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         connect_wait,
         session_wait,
         ledger,
+        rate_user: USER,
     })))
 }
 

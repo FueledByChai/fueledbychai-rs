@@ -44,6 +44,7 @@ use serde_json::{Map, Value, json};
 
 use crate::evidence::privacy_hits;
 use crate::ledger::{self, RegistryRun};
+use crate::refusals::{self, ReadSocket, Refusals};
 
 /// What one account's reads showed before a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -144,6 +145,12 @@ pub struct SessionRun {
     pub error: Option<String>,
     /// Every frame QFEX sent on it, in order.
     pub frames: Vec<Arrived>,
+    /// The provider rate refusals it met (decision 0135 item 2): the limiter's count while it
+    /// ran (`stage.rs`), and its frames the journal kept that were refusals or unread
+    /// ([`slice`]).
+    pub refusals: Refusals,
+    /// Which of [`SessionRun::frames`] were provider rate refusals, by index.
+    pub refusal_frames: Vec<usize>,
     /// Why its capture is partial: each way the journal could be missing its records ([`Gaps`]).
     /// Empty when the journal was written and read whole and kept every record it could hold.
     pub partial: Vec<String>,
@@ -268,6 +275,9 @@ pub struct Evidence {
     /// Each registry's fill ledger: its bounds, and its horizon and replay counts at each of its
     /// sessions' ends (decision 0132 item 5).
     pub registries: Vec<RegistryRun>,
+    /// Every read socket the reads opened, and the provider rate refusals each met (decision 0135
+    /// item 2); a session's are its own ([`SessionRun::refusals`]).
+    pub read_sockets: Vec<ReadSocket>,
     /// Why the probe stopped before its sessions ended.
     pub stopped: Option<String>,
     pub fixtures: Vec<String>,
@@ -326,7 +336,7 @@ pub fn kind(text: &str) -> String {
 
 /// A frame's top-level `ack` or `err` envelope, nested (`{"ack": {...}}`, `{"err": {...}}`) or
 /// flat (`{"type": "Err", ...}`), and the object that holds its members.
-fn envelope(top: &Map<String, Value>) -> Option<(&'static str, &Map<String, Value>)> {
+pub fn envelope(top: &Map<String, Value>) -> Option<(&'static str, &Map<String, Value>)> {
     let flat = top.get("type").and_then(Value::as_str) == Some("Err");
     match (top.get("ack"), top.get("err"), flat) {
         (Some(Value::Object(ack)), None, false) => Some(("ack", ack)),
@@ -621,7 +631,8 @@ pub fn slice(
 }
 
 /// Adds what `record` shows of the sessions to them: an arm written, its window's end, a frame
-/// QFEX sent (to `texts` too, unnamed).
+/// QFEX sent (to `texts` too, unnamed), and among those the provider rate refusals and the frames
+/// no refusal can be read from, read from the bytes the journal kept ([`Refusals::count`]).
 fn read(
     record: Record,
     sessions: &mut [SessionRun],
@@ -646,6 +657,9 @@ fn read(
             let at = usize::from(stamp.conn.conn);
             if let Some(run) = sessions.get_mut(at) {
                 let text = String::from_utf8_lossy(&bytes.0).into_owned();
+                if run.refusals.count(&text) {
+                    run.refusal_frames.push(run.frames.len());
+                }
                 texts.push((at, run.frames.len(), scrub(&text)));
                 run.frames.push(Arrived {
                     kind: kind(&text),
@@ -804,13 +818,16 @@ pub fn markdown(ev: &Evidence) -> String {
          FBC-l931, decision 0132 items 1, 3 and 7. Started {} against {}. Result: {result}.\n",
         ev.started, ev.target
     );
+    let sessions = shown(ev);
+    if let Some(line) = refusals::headline(ev, &sessions) {
+        let _ = writeln!(s, "{line}");
+    }
     if let Some(why) = &ev.stopped {
         let _ = writeln!(
             s,
             "**The probe stopped before its sessions ended:** {why}\n"
         );
     }
-    let sessions = shown(ev);
     let (gap, partial) = match has_gap(ev) {
         false => ("", "none".to_owned()),
         true => (
@@ -899,6 +916,7 @@ pub fn markdown(ev: &Evidence) -> String {
         }
         let _ = writeln!(s);
     }
+    refusals::markdown(&mut s, ev, &sessions);
     ledger::markdown(&mut s, &ev.registries);
     let _ = writeln!(
         s,
@@ -929,7 +947,8 @@ pub fn to_json(ev: &Evidence) -> Value {
                 "page_orders": r.page_orders, "page_twaps": r.page_twaps, "page_full": r.page_full})
         })
         .collect();
-    let sessions: Vec<Value> = shown(ev)
+    let shown = shown(ev);
+    let sessions: Vec<Value> = shown
         .iter()
         .map(|run| {
             let frames: Vec<Value> = run
@@ -951,7 +970,9 @@ pub fn to_json(ev: &Evidence) -> Value {
         "journal_dropped": {"normal": normal, "safety": safety},
         "journal_writer_failed": ev.writer_failed,
         "stopped": ev.stopped, "subaccounts_listed": ev.listed, "reads": reads,
-        "sessions": sessions, "registries": ledger::to_json(&ev.registries),
+        "sessions": sessions,
+        "provider_rate_refusals": refusals::to_json(ev, &shown),
+        "registries": ledger::to_json(&ev.registries),
         "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
 }
