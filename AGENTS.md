@@ -968,11 +968,13 @@ when any step after the refresh changed the golden. Without the flag, the tests 
 committed golden as it stands. `scripts/golden-refresh.sh --self-test`, which every run of the
 check runs, proves on a golden of its own, the test stood in for by a script that writes only
 under that variable as its store gate does, that the refresh passes only when it rewrote every
-file, the variable set for its command alone, and fails on one file left, none rewritten, a
-failed command or an emptied golden, and that the checksum sees a changed byte and an added,
-removed or renamed file; it then fails when `tests/exact_replay.rs` no longer holds the refresh's
-test under its name. A `cargo test` run outside the check with `FBC_REFRESH_GOLDENS=1`
-rewrites the golden too, and the next check's tests replay what it wrote.
+file, which the stand-in does only when it sees the variable at 1, and that the self-test's own
+shell, which runs that refresh and not a subshell, holds no such variable once the refresh
+returns; that the refresh fails on one file left, none rewritten, a failed command or an
+emptied golden; and that the checksum sees a changed byte and an added, removed or renamed
+file; it then fails when `tests/exact_replay.rs` no longer holds the refresh's test under its
+name. A `cargo test` run outside the check with `FBC_REFRESH_GOLDENS=1` rewrites the golden
+too, and the next check's tests replay what it wrote.
 
 ### External model review (Codex; 0127)
 
