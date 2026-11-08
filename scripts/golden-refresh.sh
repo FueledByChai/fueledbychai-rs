@@ -12,7 +12,9 @@
 #   scripts/golden-refresh.sh unchanged SUM  fail unless the golden's checksum is still SUM
 #   scripts/golden-refresh.sh --self-test    prove the three on a golden of its own, the test
 #                                            stood in for by a script that writes as its store
-#                                            gate does, then check that the test refresh runs
+#                                            gate does, and that a refresh run in the
+#                                            self-test's own shell leaves FBC_REFRESH_GOLDENS
+#                                            unset there, then check that the test refresh runs
 #                                            is still in its file under its name
 #
 # A refresh judges a file rewritten by its modification time, against a mark taken a second
@@ -121,12 +123,17 @@ esac
 STANDIN
   chmod +x "$standin"
 
-  # Rewriting every file passes, the variable set for the refresh's command alone.
+  # Rewriting every file passes, which the stand-in does only when it sees the variable at 1, and
+  # the shell that ran the refresh holds no such variable once the refresh returns. The refresh
+  # runs in this shell, its output to a file, not in a $( ) subshell, which would hide whatever
+  # the refresh set.
   committed
   before="$(sum "$golden")"
   unset FBC_REFRESH_GOLDENS
-  out="$(refresh "$golden" "$standin" "$golden" all 2>&1)" || fail "a whole rewrite failed: $out"
-  [ -z "${FBC_REFRESH_GOLDENS+set}" ] || fail "the variable outlived the refresh's command"
+  refresh "$golden" "$standin" "$golden" all > "$tmp/out" 2>&1 ||
+    fail "a whole rewrite failed: $(cat "$tmp/out")"
+  [ -z "${FBC_REFRESH_GOLDENS+set}" ] ||
+    fail "the refresh left FBC_REFRESH_GOLDENS set in the shell that ran it"
   [ "$(sum "$golden")" != "$before" ] || fail "a whole rewrite left the golden as it was"
   [ -f "$golden/journal/20000102/4-000000.fbcj" ] && [ ! -e "$golden/journal/20000101" ] ||
     fail "a whole rewrite did not replace the journal"
