@@ -17,6 +17,11 @@
 //!   what 0134 item 3 keeps; every other echo as 0126 and 0134 say; and decoder replay of the
 //!   journal gives the same events and effects.
 //! - The private REST reads' headers come from `src/auth`, signed as QFEX's REST reference says.
+//! - FBC-3prm (decision 0143 item 2): `production_probe`'s guard admits exactly the three
+//!   production origins, with or without a trailing `/`, and an all-loopback set, and refuses a
+//!   pre-production origin, a mixed set and any other origin, each in every factory method and in
+//!   the probe's own connections, naming the key and never the value; it declares the same caps
+//!   and plan as `preprod_probe`, and `preprod_probe` still refuses every `qfex.com` host.
 //!
 //! Every key, account, id and frame here is synthetic: the frames are built from the shapes
 //! QFEX's pages show (each test names the page), or are `fixtures/qfex/private` (its
@@ -43,8 +48,9 @@ use fbc_journal::{JournalReader, JournalWriter, Record, RedactionKey};
 use fbc_venue_qfex::auth::{self, TradeAuth};
 use fbc_venue_qfex::exec::{ARM, CHANNELS, ErrCode, QfexExec, TRADE, probe_exec_caps};
 use fbc_venue_qfex::probe::{
-    self, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins, PREPROD_MDS,
-    PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, SPEED_BUMP,
+    self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
+    PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS, PRODUCTION_PROBE,
+    PRODUCTION_REST, PRODUCTION_TRADE, SPEED_BUMP,
 };
 use fbc_venue_qfex::sign::HmacKey;
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex};
@@ -107,14 +113,29 @@ fn loopback(account: &str) -> VenueConfig {
     )
 }
 
+/// The probe in its production mode on QFEX's production origins (decision 0143 item 2).
+fn production(account: &str) -> VenueConfig {
+    let cfg = on(account, PRODUCTION_TRADE, PRODUCTION_REST, PRODUCTION_MDS);
+    with(cfg, KEY_EXEC_MODE, PRODUCTION_PROBE)
+}
+
+/// The probe in its production mode on a loopback stub.
+fn production_loopback(account: &str) -> VenueConfig {
+    with(loopback(account), KEY_EXEC_MODE, PRODUCTION_PROBE)
+}
+
 fn with(mut cfg: VenueConfig, key: &str, value: &str) -> VenueConfig {
     cfg.insert(key, value);
     cfg
 }
 
-/// `cfg` without `key`: rebuilt from what it holds, since a configuration removes nothing.
+/// The pre-production probe without `key`.
 fn without(account: &str, key: &str) -> VenueConfig {
-    let full = preprod(account);
+    dropped(&preprod(account), key)
+}
+
+/// `full` without `key`: rebuilt from what it holds, since a configuration removes nothing.
+fn dropped(full: &VenueConfig, key: &str) -> VenueConfig {
     let mut cfg = VenueConfig::new();
     for name in [
         KEY_EXEC_MODE,
@@ -459,11 +480,23 @@ fn refused_everywhere(cfg: &VenueConfig, want: ConfigError, what: &str) {
     assert_eq!(probe::connections(cfg).err(), Some(want), "{what}");
 }
 
-/// Every factory method admits `cfg`, on the side of the guard `side`.
+/// Every factory method admits `cfg`, on the side of the guard `side`, in the environment its
+/// mode names.
 fn admitted(cfg: &VenueConfig, side: Origins, what: &str) {
     let probe = probe::mode(cfg).unwrap_or_else(|e| panic!("{what}: {e}"));
     let probe = probe.unwrap_or_else(|| panic!("{what}: no probe"));
     assert_eq!(probe.origins(), side, "{what}");
+    let environment = match cfg.get(KEY_EXEC_MODE) {
+        Some(PRODUCTION_PROBE) => Environment::Production,
+        _ => Environment::PreProduction,
+    };
+    assert_eq!(probe.environment(), environment, "{what}");
+    assert_eq!(probe.environment().mode(), cfg.get(KEY_EXEC_MODE).unwrap());
+    assert_eq!(
+        probe::connections(cfg).unwrap().environment,
+        environment,
+        "{what}"
+    );
     assert!(Qfex.caps(cfg).unwrap().exec.is_some(), "{what}");
     assert!(Qfex.exec_account_key(cfg).unwrap().is_some(), "{what}");
     assert_eq!(Qfex.plan_exec(cfg).unwrap().len(), 1, "{what}");
@@ -587,6 +620,7 @@ fn the_guard_refuses_each_other_configuration_before_anything_is_planned() {
         (auth::TRADE_URL, "wss://trade.qfex.com"),
         (auth::TRADE_URL, "wss://TRADE.QFEX.COM"),
         (auth::TRADE_URL, "wss://qfex.com"),
+        (auth::TRADE_URL, "wss://xn--trde-6na.qfex.com"),
         (KEY_REST_URL, "https://api.qfex.com"),
         (KEY_REST_URL, "https://api.qfex.com:443/"),
         (KEY_MDS_URL, "wss://mds.qfex.com"),
@@ -610,8 +644,9 @@ fn the_guard_refuses_each_other_configuration_before_anything_is_planned() {
         "every production origin",
     );
 
-    // Any other origin: a pre-production host written otherwise, another key's origin, another
-    // host, a host name for loopback, and an address that is not loopback.
+    // Any other origin: a pre-production host written otherwise (a trailing dot, any other case,
+    // a punycode or non-ASCII lookalike included), another key's origin, another host, a host
+    // name for loopback, and an address that is not loopback.
     for (key, value) in [
         (auth::TRADE_URL, "wss://trade.qfex.io:443"),
         (auth::TRADE_URL, "wss://trade.qfex.io/v1"),
@@ -619,6 +654,11 @@ fn the_guard_refuses_each_other_configuration_before_anything_is_planned() {
         (auth::TRADE_URL, "ws://trade.qfex.io"),
         (auth::TRADE_URL, "WSS://trade.qfex.io"),
         (auth::TRADE_URL, "wss://TRADE.qfex.io"),
+        (auth::TRADE_URL, "wss://TRADE.QFEX.IO"),
+        (auth::TRADE_URL, "wss://trade.qfex.io."),
+        (auth::TRADE_URL, "wss://trade.qfex.com."),
+        (auth::TRADE_URL, "wss://xn--trde-6na.qfex.io"),
+        (auth::TRADE_URL, "wss://tr\u{430}de.qfex.io"),
         (auth::TRADE_URL, "wss://user@trade.qfex.io"),
         (auth::TRADE_URL, "wss://trade.qfex.io.example.org"),
         (auth::TRADE_URL, PREPROD_MDS),
@@ -626,9 +666,11 @@ fn the_guard_refuses_each_other_configuration_before_anything_is_planned() {
         (auth::TRADE_URL, "wss://example.org"),
         (auth::TRADE_URL, " wss://trade.qfex.io"),
         (KEY_REST_URL, "http://api.qfex.io"),
+        (KEY_REST_URL, "https://api.qfex.io."),
         (KEY_REST_URL, "https://api.qfex.io/refdata"),
         (KEY_REST_URL, "wss://api.qfex.io"),
         (KEY_MDS_URL, "wss://mds.qfex.io?x=1"),
+        (KEY_MDS_URL, "wss://mds.qfex.io."),
         (KEY_MDS_URL, PREPROD_TRADE),
     ] {
         case(with(preprod(SUB), key, value), invalid(key, other), value);
@@ -649,8 +691,20 @@ fn the_guard_refuses_each_other_configuration_before_anything_is_planned() {
     }
 
     // An unknown mode.
-    for mode in ["probe", "PREPROD_PROBE", "preprod_probe ", "", "production"] {
-        let want = invalid(KEY_EXEC_MODE, "expected preprod_probe, or no value");
+    for mode in [
+        "probe",
+        "PREPROD_PROBE",
+        "preprod_probe ",
+        "",
+        "production",
+        "PRODUCTION_PROBE",
+        " production_probe",
+        "production-probe",
+    ] {
+        let want = invalid(
+            KEY_EXEC_MODE,
+            "expected preprod_probe, production_probe, or no value",
+        );
         case(with(preprod(SUB), KEY_EXEC_MODE, mode), want, mode);
     }
 
@@ -748,6 +802,270 @@ fn the_guard_refuses_each_other_configuration_before_anything_is_planned() {
     assert!(!err.contains("secret-host"), "{err}");
 }
 
+// ----- The production mode and its guard (decision 0143 item 2, FBC-3prm) -----
+
+#[test]
+fn production_probe_admits_exactly_the_three_production_origins_and_an_all_loopback_set() {
+    for account in ["primary", SUB] {
+        admitted(&production(account), Origins::Production, "production");
+        admitted(&production_loopback(account), Origins::Loopback, "loopback");
+    }
+    // A trailing `/` is ignored, on each origin or all of them.
+    let slashed = |key: &str, cfg: VenueConfig| {
+        let value = format!("{}/", cfg.get(key).unwrap());
+        with(cfg, key, &value)
+    };
+    for key in [auth::TRADE_URL, KEY_REST_URL, KEY_MDS_URL] {
+        admitted(&slashed(key, production(SUB)), Origins::Production, key);
+        let local = slashed(key, production_loopback(SUB));
+        admitted(&local, Origins::Loopback, key);
+    }
+    let all = slashed(
+        auth::TRADE_URL,
+        slashed(KEY_REST_URL, slashed(KEY_MDS_URL, production(SUB))),
+    );
+    admitted(&all, Origins::Production, "every origin slashed");
+    // Loopback is any 127.0.0.0/8 address or [::1], with or without a port, under either scheme
+    // each origin takes, as under preprod_probe.
+    for (trade, rest, mds) in [
+        ("wss://127.0.0.1", "https://127.0.0.1", "wss://127.0.0.1"),
+        ("ws://[::1]:9001", "http://[::1]:9002", "wss://[::1]"),
+    ] {
+        let cfg = with(on(SUB, trade, rest, mds), KEY_EXEC_MODE, PRODUCTION_PROBE);
+        admitted(&cfg, Origins::Loopback, trade);
+    }
+
+    // The probe's own connections: the production origins without the `/`, the trade socket as
+    // an order-entry session opens it, the account key 0122 binds, and the environment.
+    let c = probe::connections(&all).unwrap();
+    let url = format!("{PRODUCTION_TRADE}/?api_key={PUBLIC}");
+    let key_at = url.find(PUBLIC).unwrap() as u32;
+    assert_eq!(c.trade.as_str(), url);
+    let key_span = key_at..key_at + PUBLIC.len() as u32;
+    assert_eq!(c.trade.redactions(), std::slice::from_ref(&key_span));
+    assert_eq!((c.rest, c.mds), (PRODUCTION_REST, PRODUCTION_MDS));
+    assert_eq!(c.account, AccountKey::new(9));
+    assert_eq!(
+        (c.environment, c.origins),
+        (Environment::Production, Origins::Production)
+    );
+    let local = production_loopback("primary");
+    let local = probe::connections(&local).unwrap();
+    assert_eq!(
+        (local.environment, local.origins, local.account),
+        (
+            Environment::Production,
+            Origins::Loopback,
+            AccountKey::new(4)
+        )
+    );
+    // The same loopback set under preprod_probe names pre-production.
+    let local = loopback("primary");
+    let local = probe::connections(&local).unwrap();
+    assert_eq!(
+        (local.environment, local.origins),
+        (Environment::PreProduction, Origins::Loopback)
+    );
+
+    // The origins and the mode each environment names.
+    assert_eq!(
+        Environment::Production.origins(),
+        [PRODUCTION_TRADE, PRODUCTION_REST, PRODUCTION_MDS]
+    );
+    assert_eq!(
+        Environment::PreProduction.origins(),
+        [PREPROD_TRADE, PREPROD_REST, PREPROD_MDS]
+    );
+    assert_eq!(Environment::Production.mode(), PRODUCTION_PROBE);
+    assert_eq!(Environment::PreProduction.mode(), PREPROD_PROBE);
+    assert_eq!(
+        (PRODUCTION_TRADE, PRODUCTION_REST, PRODUCTION_MDS),
+        (
+            "wss://trade.qfex.com",
+            "https://api.qfex.com",
+            "wss://mds.qfex.com"
+        )
+    );
+    // The settings read as under preprod_probe.
+    let probe = settings(&production(SUB));
+    assert_eq!(
+        (
+            probe.page_size(),
+            probe.resync_timeout(),
+            probe.rpc_timeout()
+        ),
+        (1000, Duration::from_secs(30), RPC_TIMEOUT)
+    );
+}
+
+#[test]
+fn production_probe_refuses_a_preproduction_origin_a_mix_and_any_other_origin() {
+    let invalid = |key, reason| ConfigError::Invalid { key, reason };
+    let mixed = "mixes a loopback origin with a production one";
+    let preproduction = "a pre-production qfex.io host";
+    let other = "neither its production origin nor a loopback origin";
+    let mut cases: Vec<(VenueConfig, ConfigError, String)> = Vec::new();
+    let mut case = |cfg, want, what: &str| cases.push((cfg, want, what.to_owned()));
+
+    // A mixed set, whichever origin differs.
+    let local = loopback(SUB);
+    for key in [KEY_REST_URL, KEY_MDS_URL] {
+        let cfg = with(production(SUB), key, local.get(key).unwrap());
+        let what = format!("{key}: a loopback origin among production ones");
+        case(cfg, invalid(key, mixed), &what);
+    }
+    let cfg = with(production_loopback(SUB), KEY_MDS_URL, PRODUCTION_MDS);
+    case(
+        cfg,
+        invalid(KEY_MDS_URL, mixed),
+        "a production origin among loopback ones",
+    );
+    let cfg = with(production_loopback(SUB), auth::TRADE_URL, PRODUCTION_TRADE);
+    case(
+        cfg,
+        invalid(KEY_REST_URL, mixed),
+        "the trade origin alone production",
+    );
+
+    // Any qfex.io host: pre-production's own origins, alone or all three, however written.
+    for (key, value) in [
+        (auth::TRADE_URL, PREPROD_TRADE),
+        (auth::TRADE_URL, "wss://TRADE.QFEX.IO"),
+        (auth::TRADE_URL, "wss://qfex.io"),
+        (auth::TRADE_URL, "wss://trade.qfex.io:443/"),
+        (KEY_REST_URL, PREPROD_REST),
+        (KEY_REST_URL, "https://api.qfex.io/"),
+        (KEY_REST_URL, "http://api.qfex.io:8080"),
+        (KEY_MDS_URL, PREPROD_MDS),
+        (KEY_MDS_URL, "ws://mds.qfex.io:8080"),
+    ] {
+        case(
+            with(production(SUB), key, value),
+            invalid(key, preproduction),
+            value,
+        );
+    }
+    let cfg = with(preprod(SUB), KEY_EXEC_MODE, PRODUCTION_PROBE);
+    case(
+        cfg,
+        invalid(auth::TRADE_URL, preproduction),
+        "every pre-production origin",
+    );
+
+    // Any other origin: a production host written otherwise (a trailing dot, any other case, a
+    // punycode or non-ASCII lookalike included), another key's origin, another host, a host name
+    // for loopback, and an address that is not loopback, an IPv4-mapped loopback included.
+    for (key, value) in [
+        (auth::TRADE_URL, "wss://trade.qfex.com:443"),
+        (auth::TRADE_URL, "wss://trade.qfex.com/v1"),
+        (auth::TRADE_URL, "wss://trade.qfex.com//"),
+        (auth::TRADE_URL, "ws://trade.qfex.com"),
+        (auth::TRADE_URL, "WSS://trade.qfex.com"),
+        (auth::TRADE_URL, "wss://TRADE.qfex.com"),
+        (auth::TRADE_URL, "wss://TRADE.QFEX.COM"),
+        (auth::TRADE_URL, "wss://trade.qfex.com."),
+        (auth::TRADE_URL, "wss://xn--trde-6na.qfex.com"),
+        (auth::TRADE_URL, "wss://tr\u{430}de.qfex.com"),
+        (auth::TRADE_URL, "wss://user@trade.qfex.com"),
+        (auth::TRADE_URL, "wss://trade.qfex.com.example.org"),
+        (auth::TRADE_URL, "wss://qfex.com"),
+        (auth::TRADE_URL, PRODUCTION_MDS),
+        (auth::TRADE_URL, "https://api.qfex.com"),
+        (auth::TRADE_URL, "wss://example.org"),
+        (auth::TRADE_URL, " wss://trade.qfex.com"),
+        (KEY_REST_URL, "http://api.qfex.com"),
+        (KEY_REST_URL, "https://api.qfex.com/refdata"),
+        (KEY_REST_URL, "https://api.qfex.com:443"),
+        (KEY_REST_URL, "https://api.qfex.com."),
+        (KEY_REST_URL, "wss://api.qfex.com"),
+        (KEY_MDS_URL, "wss://mds.qfex.com?x=1"),
+        (KEY_MDS_URL, "wss://mds.qfex.com."),
+        (KEY_MDS_URL, PRODUCTION_TRADE),
+    ] {
+        case(
+            with(production(SUB), key, value),
+            invalid(key, other),
+            value,
+        );
+    }
+    for (key, value) in [
+        (auth::TRADE_URL, "ws://localhost:9001"),
+        (auth::TRADE_URL, "ws://10.0.0.1:9001"),
+        (auth::TRADE_URL, "ws://[::2]:9001"),
+        (auth::TRADE_URL, "ws://[::ffff:127.0.0.1]:9001"),
+        (auth::TRADE_URL, "ws://127.1:9001"),
+        (KEY_REST_URL, "http://0.0.0.0:9002"),
+        (KEY_MDS_URL, "ws://127.0.0.1:9003/path"),
+    ] {
+        let cfg = with(production_loopback(SUB), key, value);
+        case(cfg, invalid(key, other), value);
+    }
+
+    // A missing origin or setting, none with a default, and a setting out of range, as under
+    // preprod_probe.
+    for key in [
+        auth::TRADE_URL,
+        KEY_REST_URL,
+        KEY_MDS_URL,
+        KEY_PAGE_SIZE,
+        KEY_RESYNC_TIMEOUT,
+        KEY_RPC_TIMEOUT,
+    ] {
+        case(
+            dropped(&production(SUB), key),
+            ConfigError::Missing(key),
+            key,
+        );
+    }
+    let want = invalid(KEY_PAGE_SIZE, "expected a whole number from 1 to 1000");
+    case(with(production(SUB), KEY_PAGE_SIZE, "0"), want, "page 0");
+    let want = invalid(
+        KEY_RPC_TIMEOUT,
+        "must be longer than QFEX's 500 ms speed bump",
+    );
+    case(
+        with(production(SUB), KEY_RPC_TIMEOUT, "500ms"),
+        want,
+        "500ms",
+    );
+
+    for (cfg, want, what) in &cases {
+        refused_everywhere(cfg, *want, what);
+        // Each refusal of an origin names the key, never the value it refused.
+        let ConfigError::Invalid { key, .. } = want else {
+            continue;
+        };
+        if ![auth::TRADE_URL, KEY_REST_URL, KEY_MDS_URL].contains(key) {
+            continue;
+        }
+        let value = cfg.get(key).unwrap();
+        for err in [
+            probe::mode(cfg).unwrap_err().to_string(),
+            Qfex.caps(cfg).unwrap_err().to_string(),
+            probe::connections(cfg).unwrap_err().to_string(),
+        ] {
+            assert!(err.contains(key), "{what}: {err}");
+            assert!(!err.contains(value), "{what}: {err}");
+        }
+    }
+    assert!(cases.len() > 45, "{} cases", cases.len());
+
+    // And preprod_probe still refuses every qfex.com host: production's origins, alone or all
+    // three, and a production configuration under the pre-production mode.
+    let production_host = "a production qfex.com host";
+    for (key, value) in [
+        (auth::TRADE_URL, PRODUCTION_TRADE),
+        (KEY_REST_URL, PRODUCTION_REST),
+        (KEY_MDS_URL, PRODUCTION_MDS),
+    ] {
+        let cfg = with(preprod(SUB), key, value);
+        refused_everywhere(&cfg, invalid(key, production_host), value);
+    }
+    let cfg = with(production(SUB), KEY_EXEC_MODE, PREPROD_PROBE);
+    let want = invalid(auth::TRADE_URL, production_host);
+    refused_everywhere(&cfg, want, "every production origin under preprod_probe");
+}
+
 #[test]
 fn an_absent_mode_gives_market_data_only_and_no_codec() {
     // Production's origins, probe settings the mode would refuse, and no mode: as before the
@@ -790,7 +1108,13 @@ fn an_absent_mode_gives_market_data_only_and_no_codec() {
 
 #[test]
 fn under_the_mode_the_factory_declares_item_6s_exec_caps_and_one_order_entry_endpoint() {
-    for cfg in [preprod("primary"), loopback(SUB)] {
+    // Under either mode (decision 0143 item 2): the same caps and the same one endpoint.
+    for cfg in [
+        preprod("primary"),
+        loopback(SUB),
+        production("primary"),
+        production_loopback(SUB),
+    ] {
         let caps = Qfex.caps(&cfg).unwrap();
         let exec = caps.exec.clone().expect("the probe declares order entry");
         assert_eq!(exec, probe_exec_caps());

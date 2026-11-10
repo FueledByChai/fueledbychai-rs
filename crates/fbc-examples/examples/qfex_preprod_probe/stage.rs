@@ -1,15 +1,17 @@
-//! Stage one of the QFEX pre-production probe (decision 0132 items 1, 3, 6 and 7; FBC-l931):
-//! one session per account, each arming cancel-on-disconnect once, so the journal captures
-//! whatever answers the arm. It places nothing and sends no command but each session's arm and
-//! the probe's own reads.
+//! Stage one of the QFEX probe (decision 0132 items 1, 3, 6 and 7; FBC-l931), on pre-production,
+//! or with `--production` on production (decision 0143): one session per account, each arming
+//! cancel-on-disconnect once, so the journal captures whatever answers the arm. It places
+//! nothing and sends no command but each session's arm and the probe's own reads.
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
-//!   (`src/auth_qfex.rs`), and each session's configuration passes decision 0132 item 6's guard
-//!   and decision 0122 item 1's account check (the adapter's `probe::connections`): any QFEX
-//!   origin but the pre-production ones, a `qfex.com` host, a mix of loopback and other
-//!   origins, or an account id that is not `primary` or a lowercase subaccount UUID is refused,
-//!   naming the setting and never its value. Loopback origins with a SOCKS5 proxy are refused
-//!   too: the proxy would reach its own host's loopback.
+//!   (`src/auth_qfex.rs`), and each session's configuration, under the adapter's probe mode for
+//!   the run's environment (`preprod_probe`, or `production_probe` with `--production`), passes
+//!   that mode's guard and decision 0122 item 1's account check (the adapter's
+//!   `probe::connections`): any QFEX origin but the environment's own, a host of the other
+//!   environment's domain (`qfex.com` on pre-production, `qfex.io` on production), a mix of
+//!   loopback and other origins, or an account id that is not `primary` or a lowercase
+//!   subaccount UUID is refused, naming the setting and never its value. Loopback origins with
+//!   a SOCKS5 proxy are refused too: the proxy would reach its own host's loopback.
 //! - **The accounts** ([`Run::listing`], [`Run::check_accounts`]): `GET /user/subaccounts`, then
 //!   before each session, for the primary account and every listed subaccount, `GET
 //!   /user/positions` and one `get_user_orders` page on a trade socket of its own that sends
@@ -35,9 +37,11 @@
 //!   the arm's window is kept as decision 0132 item 3 says. The sessions run one after the
 //!   other: no two arms are in flight across the user.
 //! - **The registries** ([`crate::ledger`]): each session's own, since each arms its own account
-//!   (decision 0082), built as decision 0132 item 7 says as the session starts, with one fill
-//!   ledger under the owner's bounds (decision 0132 item 5). Its span bound runs from then, and
-//!   its ledger's horizon and replay counts are recorded as the session ends, for the report.
+//!   (decision 0082), built as the session starts: as decision 0132 item 7 says on
+//!   pre-production, and with no testnet declaration on production (decisions 0067 and 0143
+//!   item 3), each with one fill ledger under the owner's bounds (decision 0132 item 5). Its span
+//!   bound runs from then, and its ledger's horizon and replay counts are recorded as the session
+//!   ends, for the report.
 //! - **The provider rate refusals** ([`crate::refusals`]): each read socket's and each session's,
 //!   counted as decision 0135 item 2 says, for the report: the limiter's count while it ran
 //!   ([`Run::rejected`]), and its frames that were refusals or unread, a read socket's two as it
@@ -77,7 +81,7 @@ use fbc_venue_qfex::account_reads::{
 };
 use fbc_venue_qfex::auth::{ACCOUNT_KEY, AccountSelection, ReadAuth, TRADE_URL, account_selection};
 use fbc_venue_qfex::probe::{
-    self, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins, PREPROD_PROBE,
+    self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
 };
 use fbc_venue_qfex::sign::QfexNonces;
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_URL};
@@ -132,6 +136,23 @@ fn name(armed: Armed) -> &'static str {
     }
 }
 
+/// Where a run's origins pointed, as the report names it.
+pub fn target(origins: Origins) -> &'static str {
+    match origins {
+        Origins::PreProduction => "QFEX pre-production",
+        Origins::Production => "QFEX production",
+        Origins::Loopback => "a loopback test stub",
+    }
+}
+
+/// The environment a run's probe mode names, as the report names it (decision 0143 item 3).
+pub fn environment(environment: Environment) -> &'static str {
+    match environment {
+        Environment::PreProduction => "pre-production",
+        Environment::Production => "production",
+    }
+}
+
 /// What a run ended with (the evidence is read by the integration test; the program prints the
 /// result on its DONE line).
 #[allow(dead_code)]
@@ -158,13 +179,20 @@ impl NonceSource for Nonces {
 pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome, String> {
     auth_qfex::check(lookup, &opts.arms)?;
     let base = base_config(opts);
-    let mut origins = Vec::new();
+    // What the guard admitted of each session's configuration: the environment its mode names
+    // and the side its origins are on. Every session's is the base plus its account and keys,
+    // so they are all one pair, which the run's environment and the report's target are read
+    // from; the proxy's refusal still looks at every session's.
+    let mut admitted = Vec::new();
     for armed in &opts.arms {
         let (cfg, _) = configured(&base, lookup, *armed)?;
         let to = probe::connections(&cfg).map_err(|e| format!("refused, nothing sent: {e}"))?;
-        origins.push(to.origins);
+        admitted.push((to.environment, to.origins));
     }
-    if origins.contains(&Origins::Loopback) && opts.proxy != ProxyConfig::Direct {
+    let (env, origins) = admitted[0];
+    assert!(admitted.iter().all(|a| *a == (env, origins)), "one base");
+    let loopback = admitted.iter().any(|(_, o)| *o == Origins::Loopback);
+    if loopback && opts.proxy != ProxyConfig::Direct {
         return Err(
             "--socks5 with loopback origins: the proxy would reach its own host's \
                     loopback, not this machine's; connect to a stub directly"
@@ -204,10 +232,7 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
     let writing = drain
         .spawn(writer)
         .map_err(|e| format!("the journal: {e}"))?;
-    let target = match origins[0] {
-        Origins::PreProduction => "QFEX pre-production",
-        Origins::Loopback => "a loopback test stub",
-    };
+    let target = target(origins);
     // The sessions' clock, then the run's monotonic origin just after it, on the same runtime
     // clock ([`ledger::mono_since`]).
     let clock = IngestClock::new();
@@ -224,14 +249,19 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
         clock,
         journal: Journal::new(Rc::clone(&sink)),
         origin,
+        environment: env,
         ev: Evidence {
             started: evidence::utc(wall_secs()),
+            environment: environment(env),
+            mode: env.mode(),
             target,
             ..Evidence::default()
         },
     };
     run.line(format_args!(
-        "PROBE stage one against {target}: arms on {:?}",
+        "PROBE stage one on QFEX {} ({}), against {target}: arms on {:?}",
+        environment(env),
+        env.mode(),
         opts.arms
     ));
     if let Err(why) = run.stage().await {
@@ -269,12 +299,13 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
     Ok(Outcome { ok, evidence: ev })
 }
 
-/// The configuration every session and read shares: the probe mode, its settings and the
-/// origins. Each session's account and public key are added from the environment, and its
-/// account key from the program's numbering ([`configured`]).
+/// The configuration every session and read shares: the probe mode of the run's environment
+/// (`preprod_probe`, or `production_probe` with `--production`), its settings and the origins.
+/// Each session's account and public key are added from the environment, and its account key
+/// from the program's numbering ([`configured`]).
 fn base_config(opts: &Options) -> VenueConfig {
     let mut cfg = VenueConfig::new();
-    cfg.insert(KEY_EXEC_MODE, PREPROD_PROBE);
+    cfg.insert(KEY_EXEC_MODE, opts.environment().mode());
     cfg.insert(TRADE_URL, &opts.trade_url);
     cfg.insert(KEY_REST_URL, &opts.rest_url);
     cfg.insert(KEY_MDS_URL, &opts.mds_url);
@@ -355,6 +386,8 @@ struct Run<'a> {
     journal: Journal,
     /// The run's monotonic origin, on the runtime's clock, taken just after `clock`'s.
     origin: tokio::time::Instant,
+    /// The environment the run's probe mode names, which its registries are built for.
+    environment: Environment,
     ev: Evidence,
 }
 
@@ -383,8 +416,13 @@ impl Run<'_> {
             // Stage one's registries serve one session each: each arms its own account.
             let opened = Opened::now(self.origin, wall_ns());
             let label = name(armed);
-            let mut registry =
-                RegistryLedger::new(label, account_key(armed), &self.opts.ledger, opened);
+            let mut registry = RegistryLedger::new(
+                label,
+                account_key(armed),
+                &self.opts.ledger,
+                opened,
+                self.environment,
+            );
             let ran = self
                 .session(n, armed, cfg, creds, registry.deadline())
                 .await;

@@ -1,16 +1,17 @@
-//! qfex_preprod_probe: stage one of the QFEX pre-production probe (decision 0132 item 7,
-//! FBC-l931). On QFEX's PRE-PRODUCTION environment only, an owner-assisted run (decision 0067)
-//! that arms cancel-on-disconnect once per account and records what answers the arm, in a
-//! report, a machine-readable evidence file and a scrubbed slice of its journal. It places
-//! nothing and sends no command but each session's arm and its own reads. An owner-run program:
-//! CI builds it, and its wiring is tested against the conformance stub
+//! qfex_preprod_probe: stage one of the QFEX probe (decision 0132 item 7, FBC-l931). On QFEX's
+//! PRE-PRODUCTION environment, or with `--production` on QFEX PRODUCTION (decision 0143), an
+//! owner-assisted run (on pre-production a declared testnet run, decision 0067; on production
+//! with no such declaration) that arms cancel-on-disconnect once per account and records what
+//! answers the arm, in a report, a machine-readable evidence file and a scrubbed slice of its
+//! journal. It places nothing and sends no command but each session's arm and its own reads. An
+//! owner-run program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
 //! ```text
-//! export QFEX_PUBLIC_KEY=...       # the primary credential QFEX supplied for pre-production
+//! export QFEX_PUBLIC_KEY=...       # the primary credential, for the environment run on
 //! export QFEX_SECRET_KEY=...
 //! export QFEX_SUBACCOUNT_ID=...    # the subaccount to arm on
-//! cargo run -p fbc-examples --example qfex_preprod_probe -- \
+//! cargo run -p fbc-examples --example qfex_preprod_probe -- [--production] \
 //!     --evidence-dir /abs/new/dir --arm primary --arm subaccount \
 //!     --registry-span <S> --ledger-max-age <S> --ledger-max-entries <N>
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --help

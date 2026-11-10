@@ -198,15 +198,18 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   (`src/factory.rs`, market data and order entry, 0072),
   `crates/venues/fbc-venue-binance-usdm` with its market-data-only factory and codec,
   `crates/venues/fbc-venue-qfex` with its read-only public MDS factory and codec (0117) and,
-  under `qfex.exec.mode` `preprod_probe` alone, a host-guarded pre-production probe's order
-  entry (`src/probe.rs`; its caps in `src/exec/caps.rs`, account-wide cancel-on-disconnect
-  offering no disarm, which `caps_truthful` holds it to in `tests/conformance.rs`, 0141; its
-  REST reads' headers from `src/auth`, `TradeAuth::rest_headers`; 0132 item 6) and the probe's
-  own reads of every account of the provider user (`src/account_reads.rs`:
-  `GET /user/subaccounts`, `GET /user/positions` and a `get_user_orders` page after that
-  account's authentication, each built only under the guard and signed by `src/auth`'s
-  `ReadAuth` for an account and credentials the caller names, and decoded exactly; 0132 item 7,
-  FBC-h3z1),
+  under `qfex.exec.mode` `preprod_probe` or `production_probe` alone, a host-guarded probe's
+  order entry (`src/probe.rs`: each mode names its `Environment` and admits exactly that
+  environment's three origins, QFEX's pre-production ones under `preprod_probe` (0132 item 6)
+  and its production ones under `production_probe` (0143 item 2), or all three loopback,
+  refusing the other environment's domain; its caps in `src/exec/caps.rs`, alike in both,
+  account-wide cancel-on-disconnect offering no disarm, which `caps_truthful` holds it to in
+  `tests/conformance.rs`, 0141; its REST reads' headers from `src/auth`,
+  `TradeAuth::rest_headers`) and the probe's own reads of every account of the provider user
+  (`src/account_reads.rs`: `GET /user/subaccounts`, `GET /user/positions` and a `get_user_orders`
+  page after that account's authentication, each built only under the guard and signed by
+  `src/auth`'s `ReadAuth` for an account and credentials the caller names, and decoded exactly;
+  0132 item 7, FBC-h3z1),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -655,18 +658,22 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, the operator's own
     positive caps (required, no defaults, no ceiling: FBC-thks), offsets of at least 20 bps,
     `--duration` of at most an hour, never seeded by hand.
-    And `examples/qfex_preprod_probe/` (FBC-l931): stage one of decision 0132 item 7's QFEX
-    probe, an owner-assisted run (0067) on QFEX PRE-PRODUCTION only, arming cancel-on-disconnect
-    once per account and placing nothing: before anything connects it refuses any origin the
-    adapter's probe guard refuses, an account 0122 item 1 refuses, missing credentials, a
-    proxied loopback origin and fill-ledger bounds that cannot outlast a registry (0132 item 5,
-    FBC-5hif: the required `--registry-span`, a `--ledger-max-age` longer than it and a
-    `--ledger-max-entries` above the fill ceiling, every order a registry's sessions may place
-    at its largest size in size steps, zero in stage one); it reads `GET /user/subaccounts`
-    and, before each session, every account's REST positions and one `get_user_orders` page on
-    a socket that never arms (the adapter's `account_reads`), starting a session only when
-    each is flat with no open order on the page and none counted by REST;
-    one unchanged `ExecSession` per `--arm`, one after the other, with the
+    And `examples/qfex_preprod_probe/` (FBC-l931): stage one of decision 0132 item 7's QFEX probe,
+    an owner-assisted run on QFEX PRE-PRODUCTION, a declared testnet run there (0067), or with
+    `--production` (FBC-3prm, 0143) on QFEX PRODUCTION under the adapter's `production_probe`
+    with the production origins as its defaults and registries built with no testnet
+    declaration, arming cancel-on-disconnect once
+    per account and placing nothing; its report, evidence and fixture README name the environment.
+    Before anything connects it refuses any origin the adapter's probe guard refuses (so a
+    production origin without `--production`, and a pre-production one with it), an account 0122
+    item 1 refuses, missing credentials, a proxied loopback origin and fill-ledger bounds that
+    cannot outlast a registry (0132 item 5, FBC-5hif: the required `--registry-span`, a
+    `--ledger-max-age` longer than it and a `--ledger-max-entries` above the fill ceiling, every
+    order a registry's sessions may place at its largest size in size steps, zero in stage one);
+    it reads `GET /user/subaccounts` and, before each session, every account's REST positions and
+    one `get_user_orders` page on a socket that never arms (the adapter's `account_reads`),
+    starting a session only when each is flat with no open order on the page and none counted by
+    REST; one unchanged `ExecSession` per `--arm`, one after the other, with the
     `AccountWideCodAuthority` (0121) and a registry of its own whose one fill ledger it keeps
     (`ledger.rs`), stopped at its arm's outcome, the connection's end or the span bound, its
     pacing allowing no second attempt; it writes a report, evidence (each registry's ledger
@@ -676,8 +683,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     frames as a journal keeps them, and its frames unread (kept whole by 0134 item 2, or not
     JSON), a read socket's read once more in memory for a refusal kept whole, a count above zero
     named as evidence for FBC-s5ox; `refusals.rs`), its journal and
-    a scrubbed fixture slice for `fixtures/qfex/exec-recorded/arm/`
-    (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped conformance stub). Its credentials
+    a scrubbed fixture slice for `fixtures/qfex/exec-recorded/arm/` (a production run's for
+    `arm-production/`, 0143 item 4) (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped conformance stub). Its credentials
     come from the environment through `src/auth_qfex.rs`, a review path, which also hands each
     signed read to the connector; it reuses `paradex_testnet_acceptance`'s privacy patterns by
     path. The samples that trade share

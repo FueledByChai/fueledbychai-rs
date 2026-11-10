@@ -1,7 +1,8 @@
-//! QFEX's order and fill capabilities under decision 0132 item 6's pre-production probe mode,
-//! and only there (decisions 0003, 0015, 0054): each value cites the page it is read from, and
-//! where the pages are silent the value is the one under which the OMS and the planner do less.
-//! Production declares `exec: None` (decisions 0117, 0122).
+//! QFEX's order and fill capabilities under decision 0132 item 6's pre-production probe mode
+//! and decision 0143 item 2's production one, and only there (decisions 0003, 0015, 0054): each
+//! value cites the page it is read from, and where the pages are silent the value is the one
+//! under which the OMS and the planner do less. Every other configuration declares
+//! `exec: None` (decisions 0117, 0122).
 //!
 //! Every value matches what this crate's encoder does (`order.rs` and [`super::QfexExec`]), so
 //! a command these caps leave out is refused unsent for the reason they give, and one they

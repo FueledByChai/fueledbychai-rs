@@ -1,16 +1,18 @@
 //! Each registry's fill ledger and the bounds it is held to (decision 0132 item 5, FBC-5hif).
 //!
 //! The probe builds its registries as decision 0132 item 7 says
-//! (`Registry::for_testnet_run(TestnetRun::owner_assisted())`), each bound to the one account
-//! its sessions trade (decision 0082), and gives each one fill ledger, kept across every session
-//! the registry serves ([`RegistryLedger`]). A ledger forgets a fill once it is older than its
-//! age bound or beyond its count bound, and each fill it forgets moves its horizon: to
+//! (`Registry::for_testnet_run(TestnetRun::owner_assisted())`) on pre-production, and on production
+//! without that declaration, which decision 0067 says a consumer trading a live venue never makes
+//! (decision 0143 item 3: stage one seeds and arms no market, so it needs none). Each is bound to
+//! the one account its sessions trade (decision 0082), and each has one fill ledger, kept across
+//! every session the registry serves ([`RegistryLedger`]). A ledger forgets a fill once it is older
+//! than its age bound or beyond its count bound, and each fill it forgets moves its horizon: to
 //! `Horizon::Lost` when the forgotten fill had no matching-engine or publish time. A resync can
-//! read again fills heard live (0132 item 5's start time), and the ledger judges a duplicate
-//! before it judges time; a fill it forgot is judged by its time instead, and until FBC-jdj7 a
-//! replayed fill has none, so it is refused `Untimed`, which stops the probe (0132 item 7). So
-//! the bounds are the owner's, with no defaults, and refused before anything connects unless
-//! they outlast every registry's sessions and fills ([`Bounds::new`]):
+//! read again fills heard live (0132 item 5's start time), and the ledger judges a duplicate before
+//! it judges time; a fill it forgot is judged by its time instead, and until FBC-jdj7 a replayed
+//! fill has none, so it is refused `Untimed`, which stops the probe (0132 item 7). So the bounds
+//! are the owner's, with no defaults, and refused before anything connects unless they outlast
+//! every registry's sessions and fills ([`Bounds::new`]):
 //!
 //! - the **span bound** (`--registry-span`) is the longest from a registry's first session's
 //!   start to its last session's end; a session that reaches it is stopped
@@ -66,6 +68,7 @@ use fbc_oms::{
     Admission, FillLedger, FillRouted, FillTime, Horizon, LedgerConfig, OmsError, Registry,
     ReplayCounts, TestnetRun,
 };
+use fbc_venue_qfex::probe::Environment;
 use serde_json::{Value, json};
 
 /// The longest `--registry-span` taken: a day.
@@ -254,17 +257,25 @@ pub struct RegistryLedger {
 }
 
 impl RegistryLedger {
-    /// The registry of `account` (the account key `acct`), built as decision 0132 item 7 says,
-    /// with an empty ledger under `bounds`, opened as its first session starts. The watermark is
-    /// that start: the reads before the session showed every account flat with no open order
-    /// (0132 item 7), so the position it starts from holds every fill before it.
+    /// The registry of `account` (the account key `acct`), for a run on `environment`, with an
+    /// empty ledger under `bounds`, opened as its first session starts. On pre-production it is
+    /// built as decision 0132 item 7 says, a declared owner-assisted testnet run; on production
+    /// with no declaration (decisions 0067 and 0143 item 3). The watermark is that start: the
+    /// reads before the session showed every account flat with no open order (0132 item 7), so
+    /// the position it starts from holds every fill before it.
     pub fn new(
         account: &'static str,
         acct: AccountKey,
         bounds: &Bounds,
         opened: Opened,
+        environment: Environment,
     ) -> RegistryLedger {
-        let mut reg = Registry::new().for_testnet_run(TestnetRun::owner_assisted());
+        let mut reg = match environment {
+            Environment::PreProduction => {
+                Registry::new().for_testnet_run(TestnetRun::owner_assisted())
+            }
+            Environment::Production => Registry::new(),
+        };
         reg.bind_account(acct)
             .expect("a new registry binds to its account");
         let ledger = FillLedger::new(bounds.config(), opened.wall);
@@ -272,6 +283,7 @@ impl RegistryLedger {
         RegistryLedger {
             run: RegistryRun {
                 account,
+                testnet_run: reg.testnet_run(),
                 bounds: bounds.clone(),
                 ends: Vec::new(),
             },
@@ -340,6 +352,10 @@ impl AtEnd {
 pub struct RegistryRun {
     /// The account its sessions trade (`primary` or `subaccount`, never an id).
     pub account: &'static str,
+    /// Whether it was built for a declared owner-assisted testnet run, as the registry reports
+    /// it (`Registry::testnet_run`): on pre-production, never on production (decision 0143 item
+    /// 3).
+    pub testnet_run: bool,
     pub bounds: Bounds,
     /// Its ledger at each of its sessions' ends, in order.
     pub ends: Vec<AtEnd>,
@@ -395,22 +411,26 @@ pub fn markdown(s: &mut String, registries: &[RegistryRun]) {
          stopped, and then takes a moment to end (past the span bound, below). The bounds held \
          for a registry when, at each of its sessions' ends, its horizon is still full and the \
          session ended within the age bound of the registry's first session's start: its ledger \
-         forgot no fill, and none it applied could have aged out.\n\n\
-         | registry | max age | max entries | span bound | fill ceiling | what the ceiling counts | held |\n\
-         | --- | --- | --- | --- | --- | --- | --- |"
+         forgot no fill, and none it applied could have aged out. A registry is a declared \
+         owner-assisted testnet run (decision 0067) on pre-production, as decision 0132 item 7 \
+         says, and never on production (decision 0143 item 3): stage one seeds and arms no \
+         market.\n\n\
+         | registry | max age | max entries | span bound | fill ceiling | what the ceiling counts | held | testnet run |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     for r in registries {
         let b = &r.bounds;
         let _ = writeln!(
             s,
-            "| {} | {:?} | {} | {:?} | {} | {} | {} |",
+            "| {} | {:?} | {} | {:?} | {} | {} | {} | {} |",
             r.account,
             b.max_age,
             b.max_entries,
             b.span,
             b.ceiling,
             counted(b),
-            if r.held() { "yes" } else { "NO" }
+            if r.held() { "yes" } else { "NO" },
+            if r.testnet_run { "yes" } else { "no" }
         );
     }
     let _ = writeln!(
@@ -464,7 +484,8 @@ pub fn to_json(registries: &[RegistryRun]) -> Value {
                             "beyond_horizon": c.beyond_horizon, "untimed": c.untimed}})
                 })
                 .collect();
-            json!({"account": r.account, "ledger_max_age_ms": ms(b.max_age),
+            json!({"account": r.account, "testnet_run": r.testnet_run,
+                "ledger_max_age_ms": ms(b.max_age),
                 "ledger_max_entries": b.max_entries, "registry_span_ms": ms(b.span),
                 "fill_ceiling": b.ceiling, "ceiling_counts": places, "held": r.held(),
                 "session_ends": ends})

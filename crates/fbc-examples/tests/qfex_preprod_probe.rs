@@ -10,7 +10,11 @@
 //!   other, and stops each at its arm's first failure with no second connection attempt;
 //! - journals the arm's window as decision 0132 item 3 keeps it, and writes the report, the
 //!   evidence and a scrubbed fixture slice that pass scripts/privacy-check.sh, with no
-//!   credential or account id in any of them.
+//!   credential or account id in any of them;
+//! - with `--production` (FBC-3prm, decision 0143 item 3), runs stage one in the adapter's
+//!   `production_probe` mode to a complete run whose report, evidence and fixture README name
+//!   production and whose registries carry no testnet declaration, and refuses a pre-production
+//!   origin with it, and a production origin without it, before anything connects.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): the account listing,
 //! each account's positions selected by `x-qfex-requested-account-id`, the authentication reply,
@@ -61,6 +65,10 @@ use fbc_journal::{
 use fbc_runtime::http::Method;
 use fbc_runtime::{ProxyConfig, RateUserKey};
 use fbc_venue_qfex::exec::ARM;
+use fbc_venue_qfex::probe::{
+    Environment, Origins, PREPROD_MDS, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS,
+    PRODUCTION_REST, PRODUCTION_TRADE,
+};
 use probe_args::{Options, Parsed};
 use refusals::Refusals;
 use serde_json::Value;
@@ -232,6 +240,7 @@ fn options(dir: &Path, server: &StubServer, arms: &[Armed]) -> Options {
     Options {
         evidence_dir: dir.join("evidence"),
         arms: arms.to_vec(),
+        production: false,
         trade_url: server.ws_url(""),
         rest_url: server.http_url(""),
         mds_url: server.ws_url(""),
@@ -527,6 +536,39 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     assert_no_secret(&opts.evidence_dir);
     assert!(printed.contains("DONE ok"), "{printed}");
 
+    // A run without --production is on pre-production's mode, whatever its origins (a stub's
+    // here), and builds its registries as decision 0132 item 7 says, declared owner-assisted
+    // testnet runs (decision 0143 item 3).
+    assert_eq!(
+        (ev.environment, ev.mode, ev.target),
+        ("pre-production", "preprod_probe", "a loopback test stub")
+    );
+    assert!(ev.registries.iter().all(|r| r.testnet_run));
+    assert!(
+        report.starts_with("# QFEX pre-production stage one"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "Environment: QFEX pre-production, under the probe mode `preprod_probe`. Started"
+        ),
+        "{report}"
+    );
+    assert_eq!(
+        (&evidence["environment"], &evidence["exec_mode"]),
+        (&json("\"pre-production\""), &json("\"preprod_probe\""))
+    );
+    assert_eq!(evidence["registries"][0]["testnet_run"], true);
+    assert!(
+        read("README.md").contains("on QFEX pre-production (the probe mode `preprod_probe`)"),
+        "{}",
+        read("README.md")
+    );
+    assert!(
+        printed.contains("PROBE stage one on QFEX pre-production (preprod_probe)"),
+        "{printed}"
+    );
+
     // Each session's own registry (each arms its own account), its ledger under the run's
     // bounds, and at its session's end a full horizon and no replay (decision 0132 item 5), in
     // the report and the evidence, which pass the privacy check.
@@ -639,6 +681,270 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     assert_eq!(rates["sessions"][1]["frames"], json("[]"));
     assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
     assert!(!printed.contains(SUB) && !printed.contains(PUBLIC));
+}
+
+// ----- On production (FBC-3prm, decision 0143) -----
+
+#[tokio::test]
+async fn with_production_stage_one_completes_names_production_and_its_registries_carry_no_testnet_declaration()
+ {
+    let (dir, _removed) = temp_dir("production");
+    // As a pre-production run: every account read on a socket that never arms, then the
+    // session, whose arm is echoed in its window.
+    let mut steps = Vec::new();
+    steps.extend(read_socket(0, EMPTY_PAGE));
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    steps.extend(read_socket(2, EMPTY_PAGE));
+    steps.extend(session_socket(3, &[ARM_ACK]));
+    let listing = ok(&fixture("subaccounts.json"));
+    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+        .await
+        .unwrap();
+    // The run's options are the ones the command line's --production gives, the stub's origins
+    // named in place of production's defaults, and its waits short enough for a test.
+    let evidence_dir = dir.join("evidence");
+    let (ws, http) = (server.ws_url(""), server.http_url(""));
+    let argv = [
+        "--production",
+        "--evidence-dir",
+        evidence_dir.to_str().unwrap(),
+        "--arm",
+        "primary",
+        "--trade-url",
+        &ws,
+        "--rest-url",
+        &http,
+        "--mds-url",
+        &ws,
+        "--rpc-timeout-ms",
+        "600",
+        "--read-wait-ms",
+        "5000",
+        "--connect-wait-ms",
+        "5000",
+        "--registry-span",
+        "70",
+        "--ledger-max-age",
+        "71",
+        "--ledger-max-entries",
+        "1",
+    ];
+    let Ok(Parsed::Run(parsed)) = probe_args::parse(argv.iter().map(|a| (*a).to_owned())) else {
+        panic!("not parsed");
+    };
+    let mut opts = *parsed;
+    assert!(opts.production);
+    assert_eq!(opts.environment(), Environment::Production);
+    // A provider user of the test's own: the program's is one per process (decision 0123).
+    opts.rate_user = user();
+
+    let (ran, printed) = probe(&opts, &environment()).await;
+    let outcome = ran.unwrap();
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    server.finished().await.unwrap();
+
+    // Every check of decision 0132 item 7 ran unchanged: the listing, each account read before
+    // the session, and one session that sent its authentication, its subscriptions and its arm
+    // on one connection attempt, and nothing else.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.connections().len(), 4);
+    for (conn, account, public) in [
+        (0, None, PUBLIC),
+        (1, Some(SUB), SUB_PUBLIC),
+        (2, Some(SUB2), PUBLIC),
+    ] {
+        assert_read_socket(&received(&server, conn), account, public);
+    }
+    assert_session_socket(&received(&server, 3), None, PUBLIC);
+    let mut asked = vec!["GET /user/subaccounts".to_owned()];
+    asked.extend(std::iter::repeat_n("GET /user/positions".to_owned(), 3));
+    assert_eq!(server.http_requests(), asked);
+    let ev = &outcome.evidence;
+    assert_eq!(ev.reads.len(), 3);
+    let [run] = ev.sessions.as_slice() else {
+        panic!("{:#?}", ev.sessions);
+    };
+    assert!(run.ok() && run.authenticated && run.arm_sent, "{run:?}");
+    assert_eq!(run.arm.as_deref(), Some("Unknown"));
+    assert!(run.answer().starts_with("An ack echoing the arm"));
+
+    // The environment the mode names, beside where the origins pointed: a stub, here.
+    assert_eq!(
+        (ev.environment, ev.mode, ev.target),
+        ("production", "production_probe", "a loopback test stub")
+    );
+    // Its registries carry no testnet declaration (decision 0067), and their bounds held.
+    let [registry] = ev.registries.as_slice() else {
+        panic!("{:#?}", ev.registries);
+    };
+    assert_eq!(registry.account, "primary");
+    assert!(!registry.testnet_run && registry.held(), "{registry:?}");
+
+    // The report, the evidence and the fixtures' README name production.
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.starts_with("# QFEX production stage one"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "Environment: QFEX production, under the probe mode `production_probe`. Started"
+        ),
+        "{report}"
+    );
+    assert!(report.contains("against a loopback test stub. Result: complete."));
+    assert!(
+        report.contains(
+            "| primary | 71s | 1 | 70s | 0 | no order: its sessions place none | yes | no |"
+        ),
+        "{report}"
+    );
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["ok"], true);
+    assert_eq!(evidence["environment"], "production");
+    assert_eq!(evidence["exec_mode"], "production_probe");
+    assert_eq!(evidence["target"], "a loopback test stub");
+    assert_eq!(evidence["registries"][0]["testnet_run"], false);
+    let fixtures = opts.evidence_dir.join("fixtures");
+    let readme = fs::read_to_string(fixtures.join("README.md")).unwrap();
+    assert!(
+        readme.contains(
+            "on QFEX production (the probe mode `production_probe`), from a loopback test stub"
+        ),
+        "{readme}"
+    );
+    assert!(readme.contains("not synthetic"), "{readme}");
+    assert_eq!(
+        fs::read_to_string(fixtures.join("primary-005-in-window.json")).unwrap(),
+        ARM_ACK
+    );
+    // Scrubbed exactly as a pre-production run's (decision 0009).
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &fixtures).unwrap();
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+    assert!(
+        printed.contains(
+            "PROBE stage one on QFEX production (production_probe), against a loopback test stub"
+        ),
+        "{printed}"
+    );
+    assert!(printed.contains("DONE ok"), "{printed}");
+}
+
+#[tokio::test]
+async fn with_production_a_preproduction_origin_and_without_it_a_production_origin_are_refused_before_connecting()
+ {
+    let (dir, _removed) = temp_dir("environments");
+    let listing = ok(&fixture("subaccounts.json"));
+    let server = StubServer::start(WsScript::new(Vec::new()), rest(listing, flat()))
+        .await
+        .unwrap();
+    let base = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
+    let with = |production: bool, f: &dyn Fn(&mut Options)| {
+        let mut opts = base.clone();
+        opts.production = production;
+        f(&mut opts);
+        opts
+    };
+    let production = "a production qfex.com host";
+    let preproduction = "a pre-production qfex.io host";
+    // A run naming no loopback origin goes through a SOCKS5 proxy no one listens on, so a guard
+    // that let it through would still reach no QFEX host.
+    let nowhere = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        ProxyConfig::Socks5 {
+            host: "127.0.0.1".into(),
+            port,
+        }
+    };
+    let cases: Vec<(Options, String)> = vec![
+        // Without --production: each production origin, and all three.
+        (
+            with(false, &|o| o.trade_url = PRODUCTION_TRADE.into()),
+            format!("qfex.trade_url: {production}"),
+        ),
+        (
+            with(false, &|o| o.rest_url = PRODUCTION_REST.into()),
+            format!("qfex.rest_url: {production}"),
+        ),
+        (
+            with(false, &|o| o.mds_url = PRODUCTION_MDS.into()),
+            format!("qfex.mds_url: {production}"),
+        ),
+        (
+            with(false, &|o| {
+                o.trade_url = PRODUCTION_TRADE.into();
+                o.rest_url = PRODUCTION_REST.into();
+                o.mds_url = PRODUCTION_MDS.into();
+                o.proxy = nowhere.clone();
+            }),
+            format!("qfex.trade_url: {production}"),
+        ),
+        // With it: each pre-production origin, and all three, the defaults without it.
+        (
+            with(true, &|o| o.trade_url = PREPROD_TRADE.into()),
+            format!("qfex.trade_url: {preproduction}"),
+        ),
+        (
+            with(true, &|o| o.rest_url = PREPROD_REST.into()),
+            format!("qfex.rest_url: {preproduction}"),
+        ),
+        (
+            with(true, &|o| o.mds_url = PREPROD_MDS.into()),
+            format!("qfex.mds_url: {preproduction}"),
+        ),
+        (
+            with(true, &|o| {
+                o.trade_url = PREPROD_TRADE.into();
+                o.rest_url = PREPROD_REST.into();
+                o.mds_url = PREPROD_MDS.into();
+                o.proxy = nowhere.clone();
+            }),
+            format!("qfex.trade_url: {preproduction}"),
+        ),
+        // With it: a mix of sides, and loopback origins behind a proxy.
+        (
+            with(true, &|o| o.trade_url = PRODUCTION_TRADE.into()),
+            "qfex.rest_url: mixes a loopback origin with a production one".to_owned(),
+        ),
+        (
+            with(true, &|o| {
+                o.proxy = ProxyConfig::Socks5 {
+                    host: "127.0.0.1".into(),
+                    port: 1080,
+                }
+            }),
+            "--socks5 with loopback origins".to_owned(),
+        ),
+    ];
+    for (opts, refused) in cases {
+        let (ran, printed) = probe(&opts, &environment()).await;
+        let err = ran
+            .err()
+            .unwrap_or_else(|| panic!("not refused: {refused}"));
+        assert!(err.contains(&refused), "{err} (expected {refused})");
+        for value in [
+            PUBLIC,
+            SECRET,
+            SUB,
+            PREPROD_TRADE,
+            PRODUCTION_TRADE,
+            PREPROD_MDS,
+        ] {
+            assert!(!err.contains(value), "{err}");
+        }
+        assert!(printed.is_empty(), "{printed}");
+        assert!(
+            !opts.evidence_dir.exists(),
+            "{refused}: the evidence directory was made"
+        );
+    }
+    // Nothing connected: no socket and no request.
+    assert!(server.connections().is_empty());
+    assert!(server.http_requests().is_empty());
 }
 
 // ----- Refusals before anything connects -----
@@ -2095,6 +2401,78 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     }
 }
 
+#[test]
+fn the_production_flag_selects_production_probe_and_its_origins_as_the_defaults() {
+    let parse = |args: &[&str]| {
+        let least = ["--evidence-dir", "/abs/dir", "--arm", "primary"];
+        let argv = [&least[..], &LEDGER[..], args].concat();
+        match probe_args::parse(argv.iter().map(|a| (*a).to_owned())) {
+            Ok(Parsed::Run(opts)) => *opts,
+            other => panic!("{args:?}: {other:?}"),
+        }
+    };
+    let origins = |o: &Options| [o.trade_url.clone(), o.rest_url.clone(), o.mds_url.clone()];
+    // Without it nothing changes: the pre-production mode and origins (decision 0143 item 3).
+    let opts = parse(&[]);
+    assert!(!opts.production);
+    assert_eq!(opts.environment(), Environment::PreProduction);
+    assert_eq!(origins(&opts), [PREPROD_TRADE, PREPROD_REST, PREPROD_MDS]);
+    // With it, the production mode and origins.
+    let opts = parse(&["--production"]);
+    assert!(opts.production);
+    assert_eq!(opts.environment(), Environment::Production);
+    assert_eq!(
+        origins(&opts),
+        [PRODUCTION_TRADE, PRODUCTION_REST, PRODUCTION_MDS]
+    );
+    // An origin given is taken, before or after the flag; the adapter's guard judges it.
+    for args in [
+        ["--trade-url", "ws://127.0.0.1:1", "--production"],
+        ["--production", "--trade-url", "ws://127.0.0.1:1"],
+    ] {
+        let opts = parse(&args);
+        assert!(opts.production, "{args:?}");
+        assert_eq!(
+            origins(&opts),
+            ["ws://127.0.0.1:1", PRODUCTION_REST, PRODUCTION_MDS]
+        );
+    }
+    let opts = parse(&["--mds-url", "ws://127.0.0.1:3"]);
+    assert_eq!(
+        origins(&opts),
+        [PREPROD_TRADE, PREPROD_REST, "ws://127.0.0.1:3"]
+    );
+    // --help names the flag, both environments' defaults and what it refuses.
+    let usage = probe_args::usage();
+    let flat = usage.split_whitespace().collect::<Vec<_>>().join(" ");
+    for said in [
+        "--production",
+        "production_probe",
+        PRODUCTION_TRADE,
+        PRODUCTION_REST,
+        PRODUCTION_MDS,
+        PREPROD_TRADE,
+        "without --production, a production origin is refused; with it, a pre-production one",
+        "on pre-production a declared testnet run (decision 0067), on production with no such \
+         declaration (decision 0143)",
+        "or as fixtures/qfex/exec-recorded/arm-production/ with --production",
+    ] {
+        assert!(flat.contains(said), "{said}: {usage}");
+    }
+}
+
+#[test]
+fn the_report_names_each_environment_and_each_side_of_the_guard() {
+    assert_eq!(
+        stage::environment(Environment::PreProduction),
+        "pre-production"
+    );
+    assert_eq!(stage::environment(Environment::Production), "production");
+    assert_eq!(stage::target(Origins::PreProduction), "QFEX pre-production");
+    assert_eq!(stage::target(Origins::Production), "QFEX production");
+    assert_eq!(stage::target(Origins::Loopback), "a loopback test stub");
+}
+
 // ----- The fill ledger's bounds (FBC-5hif, decision 0132 item 5) -----
 
 #[test]
@@ -2383,7 +2761,13 @@ async fn a_fill_heard_live_at_the_registrys_start_is_a_duplicate_when_replayed_a
     // ceiling.
     let accepted = bounds(span);
     let acct = fbc_core::AccountKey::new(1);
-    let mut registry = ledger::RegistryLedger::new("primary", acct, &accepted, opened(start));
+    let mut registry = ledger::RegistryLedger::new(
+        "primary",
+        acct,
+        &accepted,
+        opened(start),
+        Environment::PreProduction,
+    );
     assert!(registry.deadline() >= tokio::time::Instant::now() + span - Duration::from_secs(1));
     // The first session: the fill heard live as it starts, with no venue time (QFEX's until
     // FBC-jdj7), is applied, and counted for our namespace's order.
@@ -2451,7 +2835,13 @@ async fn every_judgement_of_the_ledger_and_the_registry_is_reported() {
     )
     .unwrap();
     let acct = fbc_core::AccountKey::new(2);
-    let mut registry = ledger::RegistryLedger::new("subaccount", acct, &tight, opened(start));
+    let mut registry = ledger::RegistryLedger::new(
+        "subaccount",
+        acct,
+        &tight,
+        opened(start),
+        Environment::PreProduction,
+    );
     let first = qfex_fill(cid, T1, false);
     let second = qfex_fill(cid, T2, false);
     let applied = Judged::Applied(FillRouted::OursUntracked(cid));
@@ -2581,6 +2971,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     }];
     let held = ledger::RegistryRun {
         account: "primary",
+        testnet_run: true,
         bounds: ledger::Bounds::new(secs(301), 10, secs(300), &places).unwrap(),
         ends: vec![ledger::AtEnd {
             session: "primary",
@@ -2599,6 +2990,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     };
     let forgot = ledger::RegistryRun {
         account: "subaccount",
+        testnet_run: false,
         bounds: bounds(secs(60)),
         ends: vec![
             ledger::AtEnd {
@@ -2634,7 +3026,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     );
     assert!(
         report.contains(
-            "| primary | 301s | 10 | 300s | 2 | 1 far post-only GTC of at most 2 steps | yes |"
+            "| primary | 301s | 10 | 300s | 2 | 1 far post-only GTC of at most 2 steps | yes | yes |"
         ),
         "{report}"
     );
@@ -2650,6 +3042,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     assert_eq!(r["fill_ceiling"], 2);
     assert_eq!(r["ceiling_counts"][0]["largest_steps"], 2);
     assert_eq!(r["held"], true);
+    assert_eq!(r["testnet_run"], true);
     assert_eq!(r["session_ends"][0]["after_ms"], 1_250);
     assert_eq!(r["session_ends"][0]["past_span_ms"], Value::Null);
     // A registry whose ledger forgot a fill: its horizon moved, the bounds did not hold, and
@@ -2660,7 +3053,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     assert!(report.contains("Result: INCOMPLETE"), "{report}");
     assert!(
         report.contains(
-            "| subaccount | 61s | 1 | 60s | 0 | no order: its sessions place none | NO |"
+            "| subaccount | 61s | 1 | 60s | 0 | no order: its sessions place none | NO | no |"
         ),
         "{report}"
     );
@@ -2678,6 +3071,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     let v = json(&evidence);
     let r = &v["registries"][1];
     assert_eq!(r["held"], false);
+    assert_eq!(r["testnet_run"], false);
     assert_eq!(r["session_ends"][1]["horizon"], "lost");
     let replays = &r["session_ends"][0]["replays"];
     for (field, n) in [
@@ -2708,7 +3102,13 @@ async fn a_registry_whose_session_ends_at_its_age_bound_has_not_held_them_though
     let span = secs(5);
     let bounds = ledger::Bounds::new(secs(10), 5, span, &ledger::stage_one()).unwrap();
     let acct = fbc_core::AccountKey::new(1);
-    let mut registry = ledger::RegistryLedger::new("primary", acct, &bounds, opened(start));
+    let mut registry = ledger::RegistryLedger::new(
+        "primary",
+        acct,
+        &bounds,
+        opened(start),
+        Environment::PreProduction,
+    );
     let live = qfex_fill(cid, T1, false);
     let applied = Judged::Applied(FillRouted::OursUntracked(cid));
     assert_eq!(registry.admit(&live, None, start), applied);
@@ -2784,7 +3184,13 @@ async fn a_registrys_times_are_read_on_the_runtimes_clock_as_the_sessions_stamps
     assert_eq!(opened.at, tokio::time::Instant::now());
     let span = secs(600);
     let acct = fbc_core::AccountKey::new(1);
-    let mut registry = ledger::RegistryLedger::new("primary", acct, &bounds(span), opened);
+    let mut registry = ledger::RegistryLedger::new(
+        "primary",
+        acct,
+        &bounds(span),
+        opened,
+        Environment::PreProduction,
+    );
     assert_eq!(registry.deadline(), opened.at + span);
     // The span bound's timer and the registry's times move together: at the deadline its
     // session has run the whole span and no more.

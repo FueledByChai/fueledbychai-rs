@@ -427,6 +427,13 @@ instruments, and BT-502's conformance suite runs on its factory.
   with the primary and subaccount credentials QFEX supplies. The runs' report answers each
   question 0132's Consequences list for the primary account and for a subaccount, and their
   scrubbed evidence lands under `fixtures/qfex/exec-recorded/` (0009).
+- Stage one of the probe, which arms and places nothing, may also run on QFEX production: under
+  the host-guarded production probe mode, which admits only QFEX's production origins, behind
+  the probe's `--production` flag, its registries carrying no testnet declaration (0143). A
+  capture from either environment then decides how the arm is answered, where the criterion
+  above names the pre-production capture, and production stays `exec: None` under every
+  configuration but that probe mode, which is no admission of QFEX order entry (0143 item 4).
+  The place stages on production are not decided yet.
 - Every `ExecCaps` value cites a QFEX page or a captured fixture (0054), and the named
   conformance suite passes on the QFEX factory (0025).
 - Production stays `exec: None` and `Readiness::Record` until a merged record admits QFEX order

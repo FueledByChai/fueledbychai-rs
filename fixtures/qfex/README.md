@@ -151,10 +151,12 @@ decodes to, and `tests/private_orders.rs` which v1 places the encoder sends on e
 discovered spec.
 
 `exec-recorded/` holds no capture yet. The owner-run `qfex_preprod_probe` (crates/fbc-examples,
-FBC-l931) writes one: every frame QFEX sent on its pre-production sessions' trade sockets, read
-back from the journal with the codec's spans blanked to `2`s and, in a frame that is not a
-top-level `ack` or `err` envelope echoing a request, every number zeroed, with a README of its
-own. Its string values are kept as QFEX sent them, so the owner reads every file for an
+FBC-l931) writes one: every frame QFEX sent on its sessions' trade sockets, on pre-production or,
+with `--production`, on production (decision 0143), read back from the journal with the codec's
+spans blanked to `2`s and, in a frame that is not a top-level `ack` or `err` envelope echoing a
+request, every number zeroed, with a README of its own. Its string values are kept as QFEX sent them, so the owner reads every file for an
 identifying string the privacy check cannot know (an email, a user name, an address in another
-form) before committing it. It is committed as `exec-recorded/arm/` and, being recorded, carries
-no `SYNTHETIC` marker; FBC-jxau decodes the arm's answer from it (decision 0132 item 1).
+form) before committing it. A pre-production capture is committed as `exec-recorded/arm/`, a
+production one as `exec-recorded/arm-production/` (decision 0143 item 4), each README naming its
+environment; being recorded, neither carries a `SYNTHETIC` marker. FBC-jxau decodes the arm's
+answer from a capture of either (decision 0132 item 1, decision 0143 item 4).

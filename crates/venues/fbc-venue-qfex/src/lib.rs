@@ -3,15 +3,17 @@
 //! order-entry codec ([`exec::QfexExec`]: authentication, private subscriptions, rate feedback,
 //! inspected private state and the offline v1 order encoder, whose commands no reply settles).
 //!
-//! Order entry is off unless the configuration sets decision 0132 item 6's pre-production probe
-//! mode ([`probe`]): with `qfex.exec.mode` absent, `caps.exec` is `None`, `plan_exec` plans
-//! nothing and `exec_codec` builds nothing (decisions 0117 and 0122). Under `preprod_probe`,
-//! whose guard admits only QFEX's pre-production origins or loopback stubs, the factory declares
-//! the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade socket and builds the
-//! codec in its probe mode. Readiness stays `Record` in both, and production stays `exec: None`.
-//! Under the mode alone, [`account_reads`] builds and decodes the probe's own reads of every
-//! account of the provider user (decision 0132 item 7): the account listing, each account's
-//! positions, and its open orders on a trade socket of its own.
+//! Order entry is off unless the configuration sets a probe mode ([`probe`]): decision 0132
+//! item 6's `preprod_probe`, or decision 0143 item 2's `production_probe`, each for the
+//! owner-assisted probe alone. With `qfex.exec.mode` absent, `caps.exec` is `None`, `plan_exec`
+//! plans nothing and `exec_codec` builds nothing (decisions 0117 and 0122). Under a probe mode,
+//! whose guard admits only the origins of the environment it names or loopback stubs, the
+//! factory declares the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade
+//! socket and builds the codec in its probe mode. Readiness stays `Record` in every mode, and a
+//! configuration with no probe mode stays `exec: None`. Under a probe mode alone,
+//! [`account_reads`] builds and decodes the probe's own reads of every account of the provider
+//! user (decision 0132 item 7): the account listing, each account's positions, and its open
+//! orders on a trade socket of its own.
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
@@ -74,7 +76,7 @@ const SCHEMA: &[FieldSpec] = &[
     // Read by `exec_account_key` (decision 0122).
     auth::ACCOUNT_ID_FIELD,
     auth::ACCOUNT_KEY_FIELD,
-    // The pre-production probe mode and what it reads (decision 0132 item 6).
+    // The probe modes and what they read (decision 0132 item 6, decision 0143 item 2).
     probe::EXEC_MODE_FIELD,
     auth::TRADE_URL_FIELD,
     auth::PUBLIC_KEY_FIELD,
@@ -151,9 +153,10 @@ pub(crate) fn valid_host_port(authority: &str) -> bool {
         })
 }
 
-/// The QFEX venue factory: market data, and order entry only under decision 0132's
-/// pre-production probe mode ([`probe::mode`]), which every method that plans or builds
-/// anything asks first, so a configuration the mode or its guard refuses plans nothing.
+/// The QFEX venue factory: market data, and order entry only under a probe mode
+/// ([`probe::mode`]: decision 0132's `preprod_probe` or decision 0143's `production_probe`),
+/// which every method that plans or builds anything asks first, so a configuration the mode or
+/// its guard refuses plans nothing.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
 pub struct Qfex;
 
@@ -166,7 +169,7 @@ impl VenueFactory for Qfex {
         SCHEMA
     }
 
-    /// Market data only, or with the probe's order entry under `preprod_probe`.
+    /// Market data only, or with the probe's order entry under a probe mode.
     fn caps(&self, cfg: &VenueConfig) -> Result<VenueCaps, ConfigError> {
         let probe = probe::mode(cfg)?;
         mds_url(cfg)?;
@@ -223,7 +226,7 @@ impl VenueFactory for Qfex {
         Box::new(QfexMd::new(ep.stream))
     }
 
-    /// Nothing, or under `preprod_probe` exactly one order-entry connection, the account's
+    /// Nothing, or under a probe mode exactly one order-entry connection, the account's
     /// trade socket (decision 0132 items 2 and 6): it authenticates in its frames, so its
     /// handshake carries no header.
     fn plan_exec(&self, cfg: &VenueConfig) -> Result<Vec<ExecEndpoint>, VenueError> {
@@ -237,7 +240,7 @@ impl VenueFactory for Qfex {
         }])
     }
 
-    /// Nothing, or under `preprod_probe` the codec in its probe mode, its credentials handed
+    /// Nothing, or under a probe mode the codec in its probe mode, its credentials handed
     /// to `src/auth` unread.
     fn exec_codec(
         &self,

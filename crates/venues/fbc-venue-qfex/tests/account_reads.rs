@@ -1,8 +1,10 @@
-//! FBC-h3z1: the pre-production probe's account reads (decision 0132 item 7), built and decoded
-//! in the venue crate so the probe (FBC-l931) writes no QFEX wire or credential code.
+//! FBC-h3z1: the probe's account reads (decision 0132 item 7), built and decoded in the venue
+//! crate so the probe (FBC-l931) writes no QFEX wire or credential code.
 //!
-//! - Nothing is built without `preprod_probe`, or under a configuration FBC-mfey's guard or
-//!   decision 0122 item 1's check refuses.
+//! - Nothing is built without a probe mode, or under a configuration its guard or decision 0122
+//!   item 1's check refuses. These tests read under `preprod_probe`; `production_probe`'s guard
+//!   (decision 0143 item 2) is held in `tests/probe_mode.rs`, through the same
+//!   `probe::connections`.
 //! - `GET /user/subaccounts` carries the four signed headers from `src/auth`, each `redact: true`,
 //!   and no account header; `GET /user/positions` selects a subaccount by its redacted header and
 //!   the primary account by none; both are charged `OpKind::Rest`.

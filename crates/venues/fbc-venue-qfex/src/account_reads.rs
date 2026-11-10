@@ -1,15 +1,16 @@
-//! The pre-production probe's account reads (decision 0132 item 7, FBC-h3z1): what the probe
-//! sends, outside an order-entry session, to read every account of the provider user before it
-//! starts and to check, before every session, that each holds no open order and a flat position.
+//! The probe's account reads (decision 0132 item 7, FBC-h3z1): what the probe sends, outside an
+//! order-entry session, to read every account of the provider user before it starts and to
+//! check, before every session, that each holds no open order and a flat position.
 //!
 //! - **The requests.** `GET /user/subaccounts` ([`subaccounts`]) and `GET /user/positions`
 //!   ([`positions`]) on `qfex.rest_url`; and, on `qfex.trade_url` ([`trade_url`]), the
 //!   connection's authentication for one account ([`authentication`]) and then one
 //!   `get_user_orders` page ([`user_orders`]). Each takes its origin only from a configuration
-//!   that FBC-mfey's guard admits under `preprod_probe` and whose provider account and account
-//!   key decision 0122 item 1 admits ([`probe::connections`]): without the mode, or under a
-//!   configuration the guard refuses, nothing is built. Every signed part, and every account
-//!   identifier, comes from `src/auth`'s [`ReadAuth`], which the caller builds for an account it
+//!   that a probe mode's guard admits (`preprod_probe`, FBC-mfey, or `production_probe`,
+//!   decision 0143 item 2) and whose provider account and account key decision 0122 item 1
+//!   admits ([`probe::connections`]): without a probe mode, or under a configuration the guard
+//!   refuses, nothing is built. Every signed part, and every account identifier, comes from
+//!   `src/auth`'s [`ReadAuth`], which the caller builds for an account it
 //!   names, the primary or an id the decoded listing returned ([`Subaccounts::accounts`]), with
 //!   that account's credentials; nothing here reads or holds a credential. `ReadAuth` signs and
 //!   names its spans for this crate only, so these functions are the one way to them.
