@@ -12,8 +12,8 @@
 //!   inbound frame to redact ([`TradeAuth::inbound_spans`]), and gets bytes whose credentials
 //!   are already marked for the journal; for a private REST read, it gives the signed headers
 //!   ([`TradeAuth::rest_headers`], decision 0132 item 5).
-//! - [`ReadAuth`] is what the pre-production probe reads each account of the provider user
-//!   with (decision 0132 item 7, FBC-h3z1): built from an account the caller names and that
+//! - [`ReadAuth`] is what the probe, in either probe mode, reads each account of the provider
+//!   user with (decision 0132 item 7, FBC-h3z1): built from an account the caller names and that
 //!   account's own credentials, it gives that account's authentication frame, its REST reads'
 //!   headers and the spans of what they answer, and is bound to no consumer account key. Each
 //!   of those is crate-only: `crate::account_reads` builds the requests around it, and only
@@ -104,7 +104,8 @@ pub const SECRET_KEY_FIELD: FieldSpec = FieldSpec {
 };
 
 /// The trade socket's schema entry, which the factory lists for the probe mode (decision 0132
-/// item 6), whose guard admits only its pre-production origin or a loopback address.
+/// item 6), whose guard admits only its origin in the environment the mode names (decision 0143
+/// item 2) or a loopback address.
 pub const TRADE_URL_FIELD: FieldSpec = FieldSpec {
     key: TRADE_URL,
     scope: ConfigScope::Account,

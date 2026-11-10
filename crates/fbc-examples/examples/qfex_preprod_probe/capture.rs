@@ -1,6 +1,7 @@
 //! What stage one found, and the files it writes from it: the report (`report.md`), the same
 //! machine-readable (`evidence.json`), and the scrubbed slice of the sessions' journal
-//! (`fixtures/`, to commit as `fixtures/qfex/exec-recorded/arm/`).
+//! (`fixtures/`, to commit as `fixtures/qfex/exec-recorded/arm/`, or a production run's as
+//! `fixtures/qfex/exec-recorded/arm-production/`, decision 0143 item 4).
 //!
 //! **The slice** ([`slice`]) is every frame QFEX sent on a session's trade socket, read back from
 //! the journal (decision 0006) with every span the codec named blanked to `2`s: the account's
@@ -266,7 +267,12 @@ impl SessionRun {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Evidence {
     pub started: String,
-    /// QFEX pre-production, or a loopback test stub.
+    /// The environment the run's probe mode names, `pre-production` or `production` (decision
+    /// 0143 item 3), whichever side of the guard its origins are on.
+    pub environment: &'static str,
+    /// That mode: `preprod_probe` or `production_probe`.
+    pub mode: &'static str,
+    /// Where the origins pointed: QFEX pre-production, QFEX production, or a loopback test stub.
     pub target: &'static str,
     /// How many subaccounts `GET /user/subaccounts` listed.
     pub listed: Option<usize>,
@@ -700,9 +706,10 @@ pub fn readme(ev: &Evidence) -> String {
     };
     format!(
         "# QFEX trade-socket frames: what answered the cancel-on-disconnect arm\n\n\
-         Recorded {} from {} by the owner-run program `qfex_preprod_probe` (crates/fbc-examples, \
-         FBC-l931), stage one of decision 0132 item 7: one session per account ({}), each \
-         arming cancel-on-disconnect once and placing nothing. These are recorded frames, not \
+         Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
+         `qfex_preprod_probe` (crates/fbc-examples, FBC-l931; decision 0143 for production), \
+         stage one of decision 0132 item 7: one session per account ({}), each arming \
+         cancel-on-disconnect once and placing nothing. These are recorded frames, not \
          synthetic ones: this directory carries no SYNTHETIC marker.\n\n\
          Each file is one frame QFEX sent on a session's trade socket, in the order received, \
          named `<account>-<n>-<when>.json`: `before-arm` (the authentication reply, the \
@@ -723,6 +730,8 @@ pub fn readme(ev: &Evidence) -> String {
          form) before committing this directory, starting from the members the run found \
          keeping a string value: {}.\n{gap}",
         ev.started.get(..10).unwrap_or(""),
+        ev.environment,
+        ev.mode,
         ev.target,
         accounts.join(" then "),
         list(&ev.strings),
@@ -814,9 +823,10 @@ pub fn markdown(ev: &Evidence) -> String {
     let result = if ev.ok() { "complete" } else { "INCOMPLETE" };
     let _ = writeln!(
         s,
-        "# QFEX pre-production stage one: what answers the cancel-on-disconnect arm\n\n\
-         FBC-l931, decision 0132 items 1, 3 and 7. Started {} against {}. Result: {result}.\n",
-        ev.started, ev.target
+        "# QFEX {} stage one: what answers the cancel-on-disconnect arm\n\n\
+         FBC-l931, decision 0132 items 1, 3 and 7, and decision 0143. Environment: QFEX {}, \
+         under the probe mode `{}`. Started {} against {}. Result: {result}.\n",
+        ev.environment, ev.environment, ev.mode, ev.started, ev.target
     );
     let sessions = shown(ev);
     if let Some(line) = refusals::headline(ev, &sessions) {
@@ -966,7 +976,8 @@ pub fn to_json(ev: &Evidence) -> Value {
         })
         .collect();
     let [normal, safety] = ev.dropped;
-    json!({"ticket": "FBC-l931", "started": ev.started, "target": ev.target, "ok": ev.ok(),
+    json!({"ticket": "FBC-l931", "started": ev.started, "environment": ev.environment,
+        "exec_mode": ev.mode, "target": ev.target, "ok": ev.ok(),
         "journal_dropped": {"normal": normal, "safety": safety},
         "journal_writer_failed": ev.writer_failed,
         "stopped": ev.stopped, "subaccounts_listed": ev.listed, "reads": reads,

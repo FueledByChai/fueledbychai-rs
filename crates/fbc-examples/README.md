@@ -12,7 +12,7 @@ program's flags.
 | `testnet_quote` | A plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). Paradex TESTNET, or with `--mainnet` a supervised short session on Paradex MAINNET (FBC-tyft). See below. |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 | `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of `--order-usd`, the operator's own size, well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It Starts only after a trustworthy resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094) and the account is flat. See below. |
-| `qfex_preprod_probe` | QFEX PRE-PRODUCTION only: stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing. See below. |
+| `qfex_preprod_probe` | QFEX PRE-PRODUCTION, or with `--production` QFEX PRODUCTION (decision 0143): stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing. See below. |
 
 ## md_watch
 
@@ -279,17 +279,22 @@ flag and output line.
 
 ## qfex_preprod_probe
 
-Stage one of decision 0132 item 7's QFEX probe (FBC-l931): an owner-assisted run (decision 0067)
-on QFEX's PRE-PRODUCTION environment, with the credentials QFEX supplied for it. It arms
+Stage one of decision 0132 item 7's QFEX probe (FBC-l931): an owner-assisted run on QFEX's
+PRE-PRODUCTION environment, with the credentials QFEX supplied for it, as a declared testnet run
+(decision 0067), or, with `--production`, on QFEX PRODUCTION with your production keys and no
+such declaration (decision 0143; below). It arms
 cancel-on-disconnect once per account and records what answers the arm. It places nothing, and
 it sends no command but each session's arm and its own reads. FBC-9sk2's place stages build on
-it once FBC-jxau has landed.
+it once FBC-jxau has landed; they are not decided for production.
 
 Before anything connects, it refuses:
 
-- any origin but QFEX's pre-production ones (the defaults: `wss://trade.qfex.io`,
-  `https://api.qfex.io`, `wss://mds.qfex.io`), or, for a test stub, all three loopback addresses;
-  any `qfex.com` host, and any mix of the two (decision 0132 item 6's guard, in the adapter);
+- any origin but the environment's own, or, for a test stub, all three loopback addresses, and
+  any mix of the two (the guard of the adapter's probe mode: decision 0132 item 6, decision 0143
+  item 2). Without `--production` that is QFEX's pre-production origins (the defaults:
+  `wss://trade.qfex.io`, `https://api.qfex.io`, `wss://mds.qfex.io`), and any `qfex.com` host is
+  refused. With it, QFEX's production origins (the defaults then: `wss://trade.qfex.com`,
+  `https://api.qfex.com`, `wss://mds.qfex.com`), and any `qfex.io` host is refused;
 - an account decision 0122 item 1 refuses: `QFEX_SUBACCOUNT_ID` must be a lowercase subaccount
   UUID, as QFEX writes one;
 - a missing or empty credential, and a subaccount credential with one half set;
@@ -356,8 +361,9 @@ is named in the report as provider rate-limit evidence to record under FBC-s5ox,
 session's refusal from its journal; a refusal met on a read socket has only its count.
 
 **The fill ledger's bounds** (decision 0132 item 5, FBC-5hif). Each session runs on a registry
-of its own, built as decision 0132 item 7 says (each arms its own account, and a registry is
-for one account), with one fill ledger kept across every session the registry serves. A ledger
+of its own (each arms its own account, and a registry is for one account), built as decision
+0132 item 7 says on pre-production and with no testnet declaration on production (decision
+0143), with one fill ledger kept across every session the registry serves. A ledger
 forgets a fill older than its age bound or beyond its count bound, and a fill heard live that
 it forgot is refused `Untimed` when a resync reads it again, which stops the probe (0132
 item 7). So the three bounds are yours, with no defaults:
@@ -386,13 +392,46 @@ Prerequisites, which the run cannot check (decision 0132 item 2, asserted by the
 user. No QFEX web session, no other program, no other API client. The accounts must also be flat
 with no open order; the run checks that.
 
+**On production** (`--production`, decision 0143, FBC-3prm). The owner chose on 2026-11-10 to
+run stage one on QFEX production, keeping a minimal balance on the accounts it reads and arms:
+QFEX supplies pre-production credentials, and a production key is refused there (HTTP 401 at
+`GET /user/subaccounts`, FBC-291a's first run).
+
+- `--production` sets the adapter's `production_probe` mode, and `--trade-url`, `--rest-url` and
+  `--mds-url` default to QFEX's production origins. A pre-production origin is then refused, and
+  a production origin without `--production` is refused too, before anything connects.
+- Every check above runs unchanged: the listing, the reads before every session, one session at
+  a time, one arm each, the stop with no second attempt.
+- Each registry is built with no testnet declaration (decision 0067: a consumer trading a live
+  venue never makes it). Stage one seeds and arms no market, so it needs none. With none, and
+  QFEX's resync seeding nothing (decision 0132 item 5), no market of the probe's can arm, so it
+  can place nothing.
+- `report.md`, `evidence.json` (`environment`, `exec_mode`, and each registry's `testnet_run`)
+  and the fixtures' README name the environment. The fixtures are scrubbed exactly as a
+  pre-production run's (decision 0009): read every file before committing it, as below.
+- The keys: the same variables as on pre-production, set to production keys. Give each account
+  its own key, the primary account's as `QFEX_PUBLIC_KEY` and `QFEX_SECRET_KEY` and the
+  subaccount's as `QFEX_SUBACCOUNT_PUBLIC_KEY` and `QFEX_SUBACCOUNT_SECRET_KEY`, each with
+  Execute orders, View orders and View positions, and none with Deposit and withdraw. The
+  primary key reads the listing and every listed subaccount with no key of its own, so it must
+  reach them, or the run stops before any session.
+- If an order of ours is ever left resting, decision 0132 item 7's hand cancel is on QFEX's
+  production site, outside any session and while nothing of the user is armed. Stage one places
+  nothing, so it should never be needed.
+
 ```text
-export QFEX_PUBLIC_KEY=...             # the primary credential QFEX supplied for pre-production
+export QFEX_PUBLIC_KEY=...             # the primary credential, for the environment run on
 export QFEX_SECRET_KEY=...
 export QFEX_SUBACCOUNT_ID=...          # the subaccount to arm on, lowercase
-export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # only if QFEX scoped a credential to that subaccount
+export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # only if a credential is scoped to that subaccount
 export QFEX_SUBACCOUNT_SECRET_KEY=...  # (both or neither)
+# pre-production:
 cargo run -p fbc-examples --example qfex_preprod_probe -- \
+    --evidence-dir "$HOME/fbc-qfex-probe/$(date -u +%Y%m%dT%H%M%SZ)" \
+    --arm primary --arm subaccount \
+    --registry-span <SECONDS> --ledger-max-age <SECONDS> --ledger-max-entries <N>
+# production (decision 0143), with production keys:
+cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
     --evidence-dir "$HOME/fbc-qfex-probe/$(date -u +%Y%m%dT%H%M%SZ)" \
     --arm primary --arm subaccount \
     --registry-span <SECONDS> --ledger-max-age <SECONDS> --ledger-max-entries <N>
@@ -422,8 +461,10 @@ cargo run -p fbc-examples --example qfex_preprod_probe -- \
   them (but the codec's spans). So before committing, read every file for an identifying string
   (an email, a user name, a wallet address in another form, a name), starting from the members
   `report.md` names as keeping a string value; remove or blank any you find. Then commit the
-  directory as `fixtures/qfex/exec-recorded/arm/`, with `report.md`, in the PR that records the
-  capture, and run the check again after copying.
+  directory as `fixtures/qfex/exec-recorded/arm/`, or a production run's as
+  `fixtures/qfex/exec-recorded/arm-production/` (decision 0143 item 4, so a capture from each
+  environment can be compared), with `report.md`, in the PR that records the capture, and run
+  the check again after copying.
 
 If QFEX does not confirm a subscription in the shape the adapter reads, the stream is never
 reported authenticated and no arm is sent. The report then says so, and the fixtures hold the
@@ -439,9 +480,8 @@ files are named `<account>-<n>-partial.json`.
 
 The exit status is 0 only when every session authenticated, wrote its arm, saw its outcome with
 one connection attempt and kept a whole capture, every registry's ledger bounds held, and every
-file was written. Agents never run
-this program against QFEX; its test (`tests/qfex_preprod_probe.rs`) runs it against a
-QFEX-shaped conformance stub.
+file was written. Agents never run this program against QFEX, pre-production or production; its
+test (`tests/qfex_preprod_probe.rs`) runs it against a QFEX-shaped conformance stub.
 
 ## paradex_testnet_acceptance
 

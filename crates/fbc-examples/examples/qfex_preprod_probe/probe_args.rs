@@ -6,7 +6,10 @@ use std::time::Duration;
 
 use fbc_runtime::{ProxyConfig, RateUserKey};
 use fbc_venue_qfex::exec::AUTH_DEADLINE;
-use fbc_venue_qfex::probe::{PREPROD_MDS, PREPROD_REST, PREPROD_TRADE};
+use fbc_venue_qfex::probe::{
+    Environment, PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS,
+    PRODUCTION_PROBE, PRODUCTION_REST, PRODUCTION_TRADE,
+};
 
 use crate::auth_qfex::{Armed, PUBLIC_VAR, SECRET_VAR, SUB_ID_VAR, SUB_PUBLIC_VAR, SUB_SECRET_VAR};
 use crate::ledger::{self, Bounds, MAX_AGE_S, MAX_ENTRIES, MAX_SPAN_S};
@@ -19,13 +22,16 @@ pub const USER: RateUserKey = RateUserKey::new(1);
 pub fn usage() -> String {
     format!(
         "\
-qfex_preprod_probe: stage one of the QFEX pre-production probe (decision 0132 item 7, FBC-l931):
-on QFEX's PRE-PRODUCTION environment only, an owner-assisted run (decision 0067) that arms
-cancel-on-disconnect once per account and records what answers the arm. It places nothing and
-sends no command but each session's arm and the probe's own reads.
+qfex_preprod_probe: stage one of the QFEX probe (decision 0132 item 7, FBC-l931): on QFEX's
+PRE-PRODUCTION environment, or with --production on QFEX PRODUCTION (decision 0143), an
+owner-assisted run that arms cancel-on-disconnect once per account and records what answers
+the arm: on pre-production a declared testnet run (decision 0067), on production with no such
+declaration (decision 0143). It places nothing and sends no command but each session's arm and
+the probe's own reads.
 
-Before anything connects it refuses any origin but QFEX's pre-production ones (or, for a test
-stub, all of them loopback addresses), an account decision 0122 refuses, missing or empty
+Before anything connects it refuses any origin but the environment's own (or, for a test stub,
+all of them loopback addresses): without --production, a production origin is refused; with it,
+a pre-production one. It also refuses an account decision 0122 refuses, missing or empty
 credentials, a SOCKS5 proxy with loopback origins, and a missing or unaccepted --registry-span,
 --ledger-max-age or --ledger-max-entries: fill-ledger bounds that cannot outlast a registry's
 sessions and fills (decision 0132 item 5). Then it reads GET /user/subaccounts, and before each
@@ -40,9 +46,14 @@ across the user.
 Usage: cargo run -p fbc-examples --example qfex_preprod_probe -- [OPTIONS]
 
 Options:
+  --production             run on QFEX PRODUCTION: the adapter's production_probe mode, the
+                           production origins as the defaults, and registries built with no
+                           testnet declaration (decision 0143); without it, {PREPROD_PROBE} on
+                           pre-production
   --evidence-dir <DIR>     required: an absolute path, empty or not there, where the run writes
                            report.md, evidence.json, its journal (journal/) and the scrubbed
-                           fixtures (fixtures/, to commit as fixtures/qfex/exec-recorded/arm/)
+                           fixtures (fixtures/, to commit as fixtures/qfex/exec-recorded/arm/,
+                           or as fixtures/qfex/exec-recorded/arm-production/ with --production)
   --arm <ACCOUNT>          required, once or twice, in run order: primary, or subaccount (the
                            one {SUB_ID_VAR} names)
   --rpc-timeout-ms <MS>    the arm's deadline, its window of capture: 501 to 60000 (default
@@ -65,9 +76,9 @@ Options:
   --ledger-max-entries <N> required, no default: the most fills it keeps, 1 to {MAX_ENTRIES};
                            above the fill ceiling, every order a registry's sessions may place
                            at its largest size in size steps (stage one places nothing: 0)
-  --trade-url <URL>        default {PREPROD_TRADE}
-  --rest-url <URL>         default {PREPROD_REST}
-  --mds-url <URL>          default {PREPROD_MDS}
+  --trade-url <URL>        default {PREPROD_TRADE}, or {PRODUCTION_TRADE} with --production
+  --rest-url <URL>         default {PREPROD_REST}, or {PRODUCTION_REST} with --production
+  --mds-url <URL>          default {PREPROD_MDS}, or {PRODUCTION_MDS} with --production
   --socks5 <HOST:PORT>     connect through this SOCKS5 proxy (default: directly)
 
 Credentials, from the environment only:
@@ -76,6 +87,8 @@ Credentials, from the environment only:
   {SUB_PUBLIC_VAR}, {SUB_SECRET_VAR}
                                        a credential scoped to that subaccount (optional, both
                                        or neither); otherwise the primary credential reads it
+  The same variables on either environment, set to that environment's keys (QFEX refused a
+  production key on pre-production). With --production the mode is {PRODUCTION_PROBE}.
 "
     )
 }
@@ -87,6 +100,9 @@ pub struct Options {
     pub evidence_dir: PathBuf,
     /// The accounts a session arms on, in run order, each at most once.
     pub arms: Vec<Armed>,
+    /// `--production`: the run is on QFEX production, under the adapter's `production_probe`
+    /// mode (decision 0143 item 3); otherwise on pre-production, under `preprod_probe`.
+    pub production: bool,
     pub trade_url: String,
     pub rest_url: String,
     pub mds_url: String,
@@ -107,6 +123,21 @@ pub struct Options {
     pub rate_user: RateUserKey,
 }
 
+impl Options {
+    /// The environment the run's probe mode names.
+    pub fn environment(&self) -> Environment {
+        environment(self.production)
+    }
+}
+
+/// The environment `--production` names, or its absence.
+fn environment(production: bool) -> Environment {
+    match production {
+        true => Environment::Production,
+        false => Environment::PreProduction,
+    }
+}
+
 /// What the command line asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
@@ -118,11 +149,9 @@ pub enum Parsed {
 pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut evidence_dir = None;
     let mut arms = Vec::new();
-    let (mut trade_url, mut rest_url, mut mds_url) = (
-        PREPROD_TRADE.to_owned(),
-        PREPROD_REST.to_owned(),
-        PREPROD_MDS.to_owned(),
-    );
+    let mut production = false;
+    // Each defaults to the environment's own origin once the flags are read.
+    let (mut trade_url, mut rest_url, mut mds_url) = (None, None, None);
     let mut proxy = ProxyConfig::Direct;
     let (mut rpc_timeout_ms, mut page_size) = (10_000, 1000);
     let mut read_wait = Duration::from_millis(10_000);
@@ -140,6 +169,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         };
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "--production" => production = true,
             "--evidence-dir" => evidence_dir = Some(absolute(&value()?)?),
             "--arm" => arms.push(armed(&value()?, &arms)?),
             "--rpc-timeout-ms" => rpc_timeout_ms = number(&arg, &value()?, 501, 60_000)?,
@@ -152,9 +182,9 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--ledger-max-entries" => {
                 max_entries = Some(number(&arg, &value()?, 1, MAX_ENTRIES)? as usize);
             }
-            "--trade-url" => trade_url = value()?,
-            "--rest-url" => rest_url = value()?,
-            "--mds-url" => mds_url = value()?,
+            "--trade-url" => trade_url = Some(value()?),
+            "--rest-url" => rest_url = Some(value()?),
+            "--mds-url" => mds_url = Some(value()?),
             "--socks5" => proxy = socks5(&value()?)?,
             _ => return Err("an unknown argument (not shown); --help lists the flags".to_owned()),
         }
@@ -188,12 +218,14 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         ));
     }
     let ledger = Bounds::new(max_age, max_entries, span, &ledger::stage_one())?;
+    let [trade, rest, mds] = environment(production).origins();
     Ok(Parsed::Run(Box::new(Options {
         evidence_dir,
         arms,
-        trade_url,
-        rest_url,
-        mds_url,
+        production,
+        trade_url: trade_url.unwrap_or_else(|| trade.to_owned()),
+        rest_url: rest_url.unwrap_or_else(|| rest.to_owned()),
+        mds_url: mds_url.unwrap_or_else(|| mds.to_owned()),
         proxy,
         rpc_timeout_ms,
         page_size,

@@ -9,14 +9,15 @@
 //!   cancel-on-disconnect arm, and ends its epoch on every private state frame and on a resync.
 //!   The factory never builds it: with `qfex.exec.mode` absent, `caps.exec` stays `None` and
 //!   the factory builds no order-entry codec (decisions 0117, 0122).
-//! - **The pre-production probe** ([`QfexExec::probe`], decision 0132 item 6, FBC-mfey), which
-//!   the factory builds under `preprod_probe` alone, its caps [`probe_exec_caps`]. It encodes
-//!   one cancel-on-disconnect arm per epoch, and refuses unsent every later arm on that epoch
-//!   and every disarm (item 1), so at most one arm is in flight on a connection. No frame
-//!   answers the arm yet: every arm ends `Unknown` at its deadline, and the session ends the
-//!   epoch (decision 0058). The journal keeps the arm's echo and, while the arm is the only
-//!   request in flight, the shape of every other echo (item 3, as 0134 item 7 narrows it;
-//!   `echo.rs`), so a capture shows whatever answers the arm. Its epoch stays open on the
+//! - **The probe** ([`QfexExec::probe`], decision 0132 item 6, FBC-mfey), which the factory
+//!   builds under `preprod_probe` or `production_probe` alone (decision 0143 item 2), its caps
+//!   [`probe_exec_caps`] in both. It encodes one cancel-on-disconnect arm per epoch, and
+//!   refuses unsent every later arm on that epoch and every disarm (item 1), so at most one arm
+//!   is in flight on a connection. No frame answers the arm yet: every arm ends `Unknown` at
+//!   its deadline, and the session ends the epoch (decision 0058). The journal keeps the arm's
+//!   echo and, while the arm is the only request in flight, the shape of every other echo
+//!   (item 3, as 0134 item 7 narrows it; `echo.rs`), so a capture shows whatever answers the
+//!   arm. Its epoch stays open on the
 //!   private state frames stage one brings, which it still inspects and normalizes into
 //!   nothing, and its resync asks for nothing, so the session places nothing (0058) until
 //!   FBC-jxau lands item 5's resync.
@@ -170,8 +171,8 @@ enum Phase {
 /// Every channel confirmed.
 const ALL_CONFIRMED: u8 = (1 << CHANNELS.len()) - 1;
 
-/// The order-entry codec for one QFEX account's trade WebSocket, recording-only or in the
-/// pre-production probe mode.
+/// The order-entry codec for one QFEX account's trade WebSocket, recording-only or in a probe
+/// mode.
 pub struct QfexExec {
     auth: TradeAuth,
     /// Each command's deadline, after which it ends `Unknown`.
@@ -210,10 +211,10 @@ impl QfexExec {
         QfexExec::with(auth, rpc_timeout, None)
     }
 
-    /// The codec in decision 0132 item 6's pre-production probe mode, for the account `auth`
-    /// authenticates as, under the settings `probe` the mode's guard admitted
-    /// ([`crate::probe::mode`]): each command it sends, its one arm per epoch included, awaits
-    /// its reply for `qfex.exec.rpc_timeout`.
+    /// The codec in a probe mode (decision 0132 item 6, decision 0143 item 2), alike in both,
+    /// for the account `auth` authenticates as, under the settings `probe` the mode's guard
+    /// admitted ([`crate::probe::mode`]): each command it sends, its one arm per epoch included,
+    /// awaits its reply for `qfex.exec.rpc_timeout`.
     pub fn probe(auth: TradeAuth, probe: Probe) -> QfexExec {
         QfexExec::with(auth, probe.rpc_timeout(), Some(probe))
     }
