@@ -888,6 +888,12 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   balance and a stop order) and answers to `GET /user/subaccounts` and `GET /user/positions` in
   its REST reference's shapes, every id, `user_id` and value made up, its `SYNTHETIC` file
   citing each shape.
+  `fixtures/qfex/exec-recorded/arm-production/` holds the frames QFEX production sent on the
+  trade sockets of stage one's two sessions (FBC-291a), as the probe captured them: identifiers
+  blanked to `2`s, every number of a frame that echoes no request zeroed, and each `symbol`
+  replaced by one fixed placeholder after the run. The run's `report.md` sits beside them, and
+  the README says what answered the arm on each account. Being recorded, it carries no
+  `SYNTHETIC` marker.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs

@@ -150,8 +150,8 @@ and a repeat), and `AMZN-USD` only ignored order types, with `IOC`. The variant'
 decodes to, and `tests/private_orders.rs` which v1 places the encoder sends on each symbol's
 discovered spec.
 
-`exec-recorded/` holds no capture yet. The owner-run `qfex_preprod_probe` (crates/fbc-examples,
-FBC-l931) writes one: every frame QFEX sent on its sessions' trade sockets, on pre-production or,
+`exec-recorded/` holds what the owner-run `qfex_preprod_probe` (crates/fbc-examples, FBC-l931)
+captures: every frame QFEX sent on its sessions' trade sockets, on pre-production or,
 with `--production`, on production (decision 0143), read back from the journal with the codec's
 spans blanked to `2`s and, in a frame that is not a top-level `ack` or `err` envelope echoing a
 request, every number zeroed, with a README of its own. Its string values are kept as QFEX sent them, so the owner reads every file for an
@@ -160,3 +160,10 @@ form) before committing it. A pre-production capture is committed as `exec-recor
 production one as `exec-recorded/arm-production/` (decision 0143 item 4), each README naming its
 environment; being recorded, neither carries a `SYNTHETIC` marker. FBC-jxau decodes the arm's
 answer from a capture of either (decision 0132 item 1, decision 0143 item 4).
+
+`exec-recorded/arm-production/` holds the production run of 2026-11-13 (FBC-291a): QFEX answered
+the arm on the primary account and on the subaccount with an ack echoing it. After the run each
+`symbol` in it was also replaced by one fixed placeholder of `2`s, since together they named the
+markets the primary account has position rows in. Its README says what answered the arm on each
+account and what was blanked, and the run's `report.md` sits beside it. There is no
+pre-production capture.
