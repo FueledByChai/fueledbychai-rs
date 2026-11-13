@@ -31,8 +31,8 @@
 //!   documented, off the grid or off the step refuses the page.
 //! - **Missed fills.** Once the orders' pages end, and only when the codec has a start time,
 //!   `get_user_trades` pages run the same way from offset 0: `start_ts`, the earlier of the latest
-//!   fill time this codec decoded and the send time of the oldest order it placed and has not
-//!   seen end, rounded down to whole seconds; with neither, nothing is read. The
+//!   fill time this codec decoded and the send time of the oldest order a row may be matched
+//!   to (below), rounded down to whole seconds; with neither, nothing is read. The
 //!   [get_user_trades page](https://docs.qfex.com/websocket/channels/trade/get_user_trades) and
 //!   the AsyncAPI give the request's members, `start_ts` an inclusive Unix time in seconds,
 //!   `limit` and `offset`, every one optional; neither states a largest `limit` (1000 is the
@@ -43,12 +43,16 @@
 //!   update or a page bound to it, on that order's instrument, is a replayed fill
 //!   (`FillEvent::replay`) keyed by its `trade_id`, with our side from the order placed, since
 //!   the page's row names only the aggressor's. The orders it is matched to are those the
-//!   codec had not seen end when the resync began, kept by the resync until it ends whatever
-//!   ends meanwhile, an order update or a page binding their venue ids there too, and any
-//!   placed since: an order a live update ends while the reads run still has the fills it
-//!   missed replayed. The resync's copy goes with it, so the codec holds an ended order no
-//!   longer than the resync that began before its end. A replayed fill is untimed, so fbc-oms's
-//!   ledger refuses it (`Admission::Untimed`) until captures show what QFEX's timestamps are.
+//!   codec has not seen end, and those an order update ended on an epoch whose resync had not
+//!   yet pushed its `ResyncEnd` when the order was placed on an earlier epoch: its fills while
+//!   the connection was down are read by no resync yet. Such an order is kept, with the venue id
+//!   its end names, until a resync pushes its `ResyncEnd`, across every resync whose epoch ends
+//!   first: an order a live update ends before or while the reads run
+//!   still has the fills it missed replayed. An order placed and ended on one epoch, or ended
+//!   after its epoch's resync ended, is forgotten at its end, since its stream carried its
+//!   fills. So the codec holds an ended order no longer than the first resync that ends after
+//!   its end. A replayed fill is untimed, so fbc-oms's ledger refuses it (`Admission::Untimed`)
+//!   until captures show what QFEX's timestamps are.
 //!   Any other row is not pushed: it is counted and kept as evidence. A row on a symbol the
 //!   table does not hold is read for its `trade_id` and `order_id` alone (decision 0147 item 2);
 //!   one on a held symbol not as documented, off the grid or off the step refuses the page. Rows
@@ -97,15 +101,16 @@ pub const TRADES_WEIGHT: NonZeroU32 = NonZeroU32::new(5).expect("five is not zer
 /// The order types the enums page calls stop orders.
 const STOP_KINDS: [&str; 2] = ["TAKE_PROFIT", "STOP_LOSS"];
 
-/// An order this codec placed and has not seen end, across its epochs: what a missed fill is
-/// matched to, and the start time of the trades read. A resync keeps a copy of those it began
-/// with, whatever ends meanwhile.
-#[derive(Clone)]
+/// An order this codec placed, across its epochs, until it sees it end or, for one ended
+/// before its epoch's resync ended, until a resync ends: what a missed fill is matched to, and
+/// the start time of the trades read.
 pub(super) struct Placed {
     cid: ClientOrderId,
     inst: InstrumentId,
     side: Side,
     sent: WallNs,
+    /// The number of the opening it was placed on.
+    opened: u32,
     /// The venue's id for it, once an order update or a page named it with our client id.
     vid: Option<VenueOrderId>,
 }
@@ -170,10 +175,6 @@ pub(super) struct Resync {
     /// The page in flight; `None` once the last page answered.
     reading: Option<Read>,
     start_ts: Option<u64>,
-    /// The orders placed the codec had not seen end when the resync began, kept until it ends
-    /// with the venue ids an order update or a page bound to them since: what its trades read
-    /// matches a row to, with the orders placed since.
-    known: Vec<Placed>,
     /// Every order id (`false`) and TWAP id (`true`) a page of it listed.
     seen: HashSet<(bool, String)>,
     orders: Vec<VenueOrderSnapshot>,
@@ -202,25 +203,27 @@ fn next(ask: PageAsk) -> Result<PageAsk, Stop> {
         .ok_or(Stop::Paging("a QFEX resync page offset past its range"))
 }
 
-/// Binds the venue id of the order `placed` holds under our client id `cid` on `inst`, when it
-/// names one, and forgets it when `ended`; an order named by a venue id already bound to it is
-/// the same order.
+/// Binds the venue id of the order `orders` holds under our client id `cid` on `inst`, when it
+/// names one, and takes it out when `ended`, giving back what it took; an order named by a
+/// venue id already bound to it is the same order.
 fn track(
-    placed: &mut Vec<Placed>,
+    orders: &mut Vec<Placed>,
     cid: Option<CidMatch>,
     vid: Option<&VenueOrderId>,
     inst: InstrumentId,
     ended: bool,
-) {
-    placed.retain_mut(|order| {
-        let ours = order.inst == inst
-            && (cid == Some(CidMatch::Ours(order.cid))
-                || order.vid.is_some() && order.vid.as_ref() == vid);
-        if ours {
-            order.vid = vid.cloned();
-        }
-        !(ours && ended)
-    });
+) -> Vec<Placed> {
+    orders
+        .extract_if(.., |order| {
+            let ours = order.inst == inst
+                && (cid == Some(CidMatch::Ours(order.cid))
+                    || order.vid.is_some() && order.vid.as_ref() == vid);
+            if ours {
+                order.vid = vid.cloned();
+            }
+            ours && ended
+        })
+        .collect()
 }
 
 impl QfexExec {
@@ -252,24 +255,29 @@ impl QfexExec {
                 inst: order.inst,
                 side: order.side,
                 sent: ctx.wall,
+                opened: self.opens,
                 vid: None,
             });
         }
     }
 
     /// Reads an order update off the stream for the orders the codec placed: binds the venue
-    /// id it names under our client id, and forgets an order it shows ended, but for the copy
-    /// a resync in flight keeps, where it only binds.
+    /// id it names under our client id, and takes out an order it shows ended, keeping it, with
+    /// the venue id every QFEX order update names, among the ended orders a resync still reads
+    /// when the epoch's resync has not ended and the order was placed on an earlier epoch, and
+    /// forgetting it otherwise.
     pub(super) fn track_update(&mut self, update: &fbc_core::OrderUpdate) {
         let ended = !matches!(
             update.state,
             VenueOrderState::Open | VenueOrderState::Amended { .. }
         );
         let (cid, vid, inst) = (update.cid, update.vid.as_ref(), update.inst);
-        track(&mut self.placed, cid, vid, inst, ended);
-        if let Some(resync) = self.resync.as_mut() {
-            track(&mut resync.known, cid, vid, inst, false);
-        }
+        let gone = track(&mut self.placed, cid, vid, inst, ended);
+        let (resynced, opens) = (self.resynced, self.opens);
+        let unread = gone
+            .into_iter()
+            .filter(|order| !resynced && order.opened != opens);
+        self.ended.extend(unread);
     }
 
     /// The resync call (decision 0132 item 5): the positions read, the first `get_user_orders`
@@ -311,6 +319,7 @@ impl QfexExec {
         let sent = self
             .placed
             .iter()
+            .chain(&self.ended)
             .map(|order| order.sent.0.div_euclid(1_000_000_000))
             .min()
             .and_then(|secs| u64::try_from(secs).ok());
@@ -320,7 +329,6 @@ impl QfexExec {
             positions: None,
             reading: Some(Read::Orders(ask)),
             start_ts,
-            known: self.placed.clone(),
             seen: HashSet::new(),
             orders: Vec::new(),
             trades: HashSet::new(),
@@ -368,6 +376,7 @@ impl QfexExec {
                 resync.orders_page(top, ask, scope, specs, counts, placed)
             }
             (Read::Trades(start, ask), "user_trades" | "user_trades_response") => {
+                let placed = [&placed[..], &self.ended[..]];
                 resync.trades_page((name, body, top), start, ask, scope, specs, counts, placed)
             }
             _ => return None,
@@ -446,7 +455,8 @@ impl QfexExec {
     }
 
     /// Pushes the resync's bracket once every read has answered: `ResyncBegin`, the open orders,
-    /// the positions, the replayed fills and `ResyncEnd`.
+    /// the positions, the replayed fills and `ResyncEnd`. Its trades read matched every ended
+    /// order the codec kept, so it forgets them.
     fn finish(&mut self, sink: &mut dyn ExecSink) {
         let Some(resync) = self
             .resync
@@ -454,6 +464,8 @@ impl QfexExec {
         else {
             return;
         };
+        self.ended.clear();
+        self.resynced = true;
         let push = |sink: &mut dyn ExecSink, event| sink.push(VenueMeta::NONE, event);
         push(
             sink,
@@ -524,13 +536,6 @@ impl Resync {
                 continue;
             };
             track(placed, order.cid, Some(&order.vid), order.inst, false);
-            track(
-                &mut self.known,
-                order.cid,
-                Some(&order.vid),
-                order.inst,
-                false,
-            );
             match self.orders.iter_mut().find(|kept| kept.vid == order.vid) {
                 Some(kept) => {
                     counts.duplicate_rows += 1;
@@ -557,7 +562,8 @@ impl Resync {
     }
 
     /// One `get_user_trades` page answering `ask`, `page` its envelope's name and body among
-    /// the frame's top-level members: the next read, `None` once the reads are done.
+    /// the frame's top-level members, `placed` the codec's orders not seen end and those it
+    /// keeps ended: the next read, `None` once the reads are done.
     #[expect(
         clippy::too_many_arguments,
         reason = "the page, its read and the codec's state"
@@ -570,7 +576,7 @@ impl Resync {
         scope: &DecodeScope<'_>,
         specs: &SpecTable,
         counts: &mut super::QfexExecCounts,
-        placed: &mut [Placed],
+        placed: [&[Placed]; 2],
     ) -> Result<Option<Read>, Stop> {
         let (name, body, top) = page;
         let rows = private::trade_rows(name, body, top)?;
@@ -581,11 +587,14 @@ impl Resync {
                 continue;
             }
             let ours = trade.at.as_ref().and_then(|at| {
-                self.known.iter().chain(placed.iter()).find(|order| {
-                    order.inst == at.inst
-                        && (trade.cid == Some(CidMatch::Ours(order.cid))
-                            || order.vid.as_ref() == Some(&trade.vid))
-                })
+                placed
+                    .iter()
+                    .flat_map(|orders| orders.iter())
+                    .find(|order| {
+                        order.inst == at.inst
+                            && (trade.cid == Some(CidMatch::Ours(order.cid))
+                                || order.vid.as_ref() == Some(&trade.vid))
+                    })
             });
             let (Some(order), Some(at)) = (ours, trade.at) else {
                 counts.unplaced_trades += 1;
