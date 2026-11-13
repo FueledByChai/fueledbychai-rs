@@ -11,10 +11,11 @@
 //! has no room), and each reply the WebSocket layer writes for it is recorded there, never
 //! refused, as a session records one (decision 0030). It runs before the run's sessions, while
 //! no other connection of the probe is open, after every named account was read as before a
-//! session, and every named account is read again once its connection is over (item 3). It ends
-//! at its duration (`--hold-secs`, from the connection's opening), at the owner's interrupt
-//! (Ctrl-C), at a server close, at the connection's end or at a refusal, whichever comes first;
-//! nothing reconnects (item 4). `stage.rs` drives the connection; this module holds what it
+//! session, and every named account is read again once its connection is over, each whatever
+//! another showed (item 3). It ends at its duration (`--hold-secs`, from the connection's
+//! opening), at the owner's interrupt (Ctrl-C), at a server close, at the connection's end or at
+//! a refusal, whichever comes first, and an err read while it closes is a refusal too; nothing
+//! reconnects (item 4). `stage.rs` drives the connection; this module holds what it
 //! heard ([`HoldRun`]).
 //!
 //! What it keeps (item 5): each ping, pong and close it received, with its time since the
@@ -194,7 +195,8 @@ pub enum ReadAfter {
     NotRead,
     /// Every named account showed no open order and flat positions, as before the hold.
     Clean,
-    /// A read failed, or an account showed an open order or a position: the error says which.
+    /// A read failed, or an account showed an open order or a position: the error says which,
+    /// each such account's, every named account having been read.
     Stopped(String),
 }
 
@@ -247,7 +249,8 @@ pub struct HoldRun {
     pub ended_at: Option<Duration>,
     /// For an end with no close frame, the stream's error, when it gave one.
     pub dropped: Option<String>,
-    /// Why it was refused, or what failed.
+    /// Why it was refused, or what failed: the first refusal, an err read while it closed
+    /// included.
     pub error: Option<String>,
     /// The provider rate refusals it met (decision 0135 item 2): the limiter's count while it
     /// ran, and its frames, each read as a journal would keep it, and in memory as it arrived
