@@ -1408,6 +1408,147 @@ fn an_order_ended_during_a_resync_is_forgotten_once_that_resync_ends() {
     assert_eq!(evidence.unplaced_trades, vec![fill_id(&tid(2))]);
 }
 
+/// Our order's `CANCELLED`, under our first client id.
+fn our_cancelled() -> Step {
+    Step::Frame(order_frame(&[
+        ("client_order_id", Some(&quoted(&wire_cid(0)))),
+        ("status", Some("\"CANCELLED\"")),
+    ]))
+}
+
+#[test]
+fn an_order_ended_live_before_a_resync_ends_is_kept_until_one_ends() {
+    // Our order, placed on epoch 1, fills while the connection is down, and a live
+    // order_response ends it on epoch 2 before that epoch's resync has ended. No resync has read
+    // its missed fill yet, so the codec keeps it, across every resync whose epoch ends first,
+    // until one ends: that resync reads trades from its send time and replays the fill
+    // (decision 0132 item 5).
+    let cfg = preprod(SUB);
+    let positions = |nth: usize| Step::Http {
+        nth,
+        status: 200,
+        body: flat(),
+    };
+    let row = || Step::Frame(trades(&[trade(1, ORDER, Some(&wire_cid(0)))]));
+    // Epoch 2's resync, the order ended during it, then left unfinished: by its deadline with
+    // the trades read in flight, by a failed positions read, or by the next opening alone.
+    let abandoned = [
+        (
+            "its deadline",
+            vec![
+                our_cancelled(),
+                positions(0),
+                Step::Frame(page(&[], &[])),
+                Step::Timer { nth: 2, at: 30 },
+            ],
+        ),
+        (
+            "a failed positions read",
+            vec![
+                our_cancelled(),
+                Step::HttpFailed {
+                    nth: 0,
+                    failure: HttpFailure::TimedOut,
+                },
+            ],
+        ),
+        ("the next opening", vec![our_cancelled()]),
+    ];
+    for (case, epoch_2) in abandoned {
+        let mut steps = epoch(1);
+        steps.push(Step::Encode(gtc_place(), 3));
+        steps.extend(epoch(2));
+        steps.push(Step::Resync(9));
+        steps.extend(epoch_2);
+        steps.extend(epoch(3));
+        steps.push(Step::Resync(20));
+        steps.push(positions(1));
+        steps.push(Step::Frame(page(&[], &[])));
+        let asked = steps.len() - 1;
+        steps.push(row());
+        let (codec, outs, _) = run_twice(|| probe_on(&cfg), &steps);
+        assert_eq!(
+            outs[asked],
+            Out::effects(vec![trades_ask(1_760_000_003, 1000, 0)]),
+            "{case}"
+        );
+        assert_eq!(
+            untimed(outs.last().unwrap()),
+            bracket(20, vec![replayed_fill_by_cid()]),
+            "{case}"
+        );
+        let counts = codec.counts();
+        assert_eq!(
+            (
+                counts.resyncs,
+                counts.resyncs_unfinished,
+                counts.unplaced_trades
+            ),
+            (1, 1, 0),
+            "{case}"
+        );
+    }
+
+    // Ended on epoch 2 before its resync call: before the last subscription confirmation, and
+    // once the stream is authenticated.
+    let confirms = CHANNELS.map(|c| Step::Frame(confirm(c)));
+    for before_last in [true, false] {
+        let mut steps = epoch(1);
+        steps.push(Step::Encode(gtc_place(), 3));
+        steps.push(Step::Open(2));
+        steps.push(Step::frame(AUTHENTICATED));
+        let (early, last) = confirms.split_at(CHANNELS.len() - 1);
+        steps.extend(early.iter().cloned());
+        if before_last {
+            steps.push(our_cancelled());
+        }
+        steps.extend(last.iter().cloned());
+        if !before_last {
+            steps.push(our_cancelled());
+        }
+        steps.push(Step::Resync(9));
+        steps.push(positions(0));
+        steps.push(Step::Frame(page(&[], &[])));
+        let asked = steps.len() - 1;
+        steps.push(row());
+        let (codec, outs, _) = run_twice(|| probe_on(&cfg), &steps);
+        assert_eq!(
+            outs[asked],
+            Out::effects(vec![trades_ask(1_760_000_003, 1000, 0)]),
+            "before the last confirmation: {before_last}"
+        );
+        assert_eq!(
+            untimed(outs.last().unwrap()),
+            bracket(9, vec![replayed_fill_by_cid()])
+        );
+        assert_eq!(codec.counts().unplaced_trades, 0);
+    }
+
+    // Ended on epoch 2 once its resync ended, which read the order's trades from its send time:
+    // forgotten at its end, so epoch 3's resync has no start time and reads nothing.
+    let mut steps = epoch(1);
+    steps.push(Step::Encode(gtc_place(), 3));
+    steps.extend(epoch(2));
+    steps.push(Step::Resync(9));
+    steps.push(positions(0));
+    steps.push(Step::Frame(page(&[], &[])));
+    let asked = steps.len() - 1;
+    steps.push(Step::Frame(trades(&[])));
+    steps.push(our_cancelled());
+    steps.extend(epoch(3));
+    steps.push(Step::Resync(20));
+    steps.push(positions(1));
+    steps.push(Step::Frame(page(&[], &[])));
+    let (codec, outs, _) = run_twice(|| probe_on(&cfg), &steps);
+    assert_eq!(
+        outs[asked],
+        Out::effects(vec![trades_ask(1_760_000_003, 1000, 0)])
+    );
+    assert_eq!(untimed(outs.last().unwrap()), bracket(20, vec![]));
+    assert_eq!(codec.counts().resyncs, 2);
+    assert_eq!(codec.last_resync().unwrap().start_ts, None);
+}
+
 #[test]
 fn a_page_after_the_last_or_a_twap_naming_no_id_is_read_as_the_rules_say() {
     // The pages ended before the positions answered: a page frame then is not one the resync

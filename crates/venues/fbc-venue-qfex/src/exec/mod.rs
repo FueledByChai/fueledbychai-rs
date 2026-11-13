@@ -304,11 +304,16 @@ pub struct QfexExec {
     /// recording-only codec, which reads nothing over REST.
     rest: String,
     /// The orders this codec placed and has not seen end, across its epochs (decision 0132
-    /// item 5): each leaves on an order update showing it ended, a resync in flight keeping its
-    /// own copy of those it began with until it ends (`resync.rs`). As `armed` says, a place the
-    /// session's buckets refused after it was encoded is recorded all the same; it only moves
-    /// the trades read's start time earlier, the cautious side.
+    /// item 5): each leaves on an order update showing it ended, for `ended` or for good
+    /// (`resync.rs`). As `armed` says, a place the session's buckets refused after it was
+    /// encoded is recorded all the same; it only moves the trades read's start time earlier,
+    /// the cautious side.
     placed: Vec<resync::Placed>,
+    /// The orders an order update ended on an epoch whose resync had not ended, placed on an
+    /// earlier epoch, until a resync ends: the fills they missed are not read yet (`resync.rs`).
+    ended: Vec<resync::Placed>,
+    /// Whether the current epoch's resync has pushed its `ResyncEnd`.
+    resynced: bool,
     /// The latest `fill_response` time this codec decoded, in whole Unix seconds.
     latest_fill_secs: Option<u64>,
     /// The resync in flight on the current epoch.
@@ -371,6 +376,8 @@ impl QfexExec {
             last: None,
             rest,
             placed: Vec::new(),
+            ended: Vec::new(),
+            resynced: false,
             latest_fill_secs: None,
             resync: None,
             last_resync: None,
@@ -830,8 +837,9 @@ impl ExecCodec for QfexExec {
         self.opens = self.opens.wrapping_add(1);
         self.phase = Phase::Closed;
         // A new connection: nothing sent on it, no arm (QFEX's flag is per connection), and no
-        // resync; the orders placed and the latest fill time span epochs.
+        // resync; the orders placed, those kept ended and the latest fill time span epochs.
         self.drop_resync();
+        self.resynced = false;
         self.armed = None;
         self.arm_rate_refused = false;
         self.in_flight.clear();
