@@ -5446,6 +5446,558 @@ async fn an_account_read_after_the_hold_showing_an_open_order_stops_the_probe() 
     assert_eq!(evidence["hold"]["accounts_read_after"]["stopped"], why);
 }
 
+/// An err refusing a read socket's authentication, synthetic.
+const DENIED: &str =
+    r#"{"type":"Err","error_code":"PermissionDenied","message":"no","incoming_message":"auth"}"#;
+
+/// The stub's REST answers as [`rest`] gives them, but each account's `n`th positions read
+/// answered with the `n`th of its replies, its last repeated.
+fn rest_in_turn(positions: HashMap<Option<&'static str>, Vec<HttpReply>>) -> HttpRouter {
+    let positions: HashMap<Option<String>, Vec<HttpReply>> = positions
+        .into_iter()
+        .map(|(k, v)| (k.map(str::to_owned), v))
+        .collect();
+    let calls: std::sync::Mutex<HashMap<Option<String>, usize>> = std::sync::Mutex::default();
+    HttpRouter::new()
+        .route(
+            Method::GET,
+            PathPattern::exact("/user/subaccounts"),
+            listing_refused(),
+        )
+        .route_fn(
+            Method::GET,
+            PathPattern::exact("/user/positions"),
+            move |req| {
+                let account = req.header("x-qfex-requested-account-id").map(str::to_owned);
+                let replies = &positions[&account];
+                let mut calls = calls.lock().unwrap();
+                let n = calls.entry(account).or_default();
+                let reply = replies[(*n).min(replies.len() - 1)].clone();
+                *n += 1;
+                reply
+            },
+        )
+}
+
+/// A run that arms on the primary account and first holds on it, the subaccount named too:
+/// both accounts read before the hold (connections 0 and 1); the hold's connection (2), pinged
+/// once and closed by QFEX; then the primary account's read after it as `primary_after` plays
+/// it on connection 3, and the subaccount's on connection 4, answered only once the hold's
+/// connection closed; REST answering `positions` in turn ([`rest_in_turn`]). Its directory's
+/// guard, options, outcome, output and stub.
+async fn read_after_the_hold_on_both(
+    what: &str,
+    primary_after: impl FnOnce(&View) -> Vec<Step>,
+    positions: HashMap<Option<&'static str>, Vec<HttpReply>>,
+) -> (Removed, Options, stage::Outcome, String, StubServer) {
+    let (dir, removed) = temp_dir(what);
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    let mut then = pings(2, 1);
+    then.push(Step::Close { conn: 2 });
+    steps.extend(hold_socket(&view, 2, then));
+    steps.extend(primary_after(&view));
+    steps.extend(read_after_hold(&view, 2, 4, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest_in_turn(positions))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let opts = holding(
+        &dir,
+        &server,
+        &[Armed::Primary],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+    let env = environment();
+    let ran = tokio::time::timeout(Duration::from_secs(30), probe(&opts, &env));
+    let (ran, printed) = ran.await.expect("the run ended");
+    (removed, opts, ran.unwrap(), printed, server)
+}
+
+/// The reads after the hold, `(when, label)`, in the order the evidence holds them.
+fn read_labels(ev: &Evidence) -> Vec<(&str, &str)> {
+    (ev.reads.iter())
+        .map(|r| (r.before, r.label.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn every_named_account_is_read_after_the_hold_though_one_before_it_fails_its_check() {
+    // The primary account's read after the hold refused: its read socket's authentication
+    // answered with an err. The subaccount is still read after it, and the run stops with no
+    // session, naming the primary account's failure.
+    let refused = |_: &View| {
+        vec![
+            Step::Accept,
+            Step::Respond {
+                conn: 3,
+                with: reply(&[DENIED]),
+            },
+        ]
+    };
+    let flat_in_turn = || {
+        let flat = ok(&positions_flat(0));
+        HashMap::from([(None, vec![flat.clone()]), (Some(SUB), vec![flat])])
+    };
+    let (_removed, opts, outcome, printed, server) =
+        read_after_the_hold_on_both("hold-after-refused", refused, flat_in_turn()).await;
+    let ev = &outcome.evidence;
+    assert_eq!(
+        read_labels(ev),
+        [
+            ("the hold", "primary (held)"),
+            ("the hold", "subaccount"),
+            ("after the hold", "subaccount")
+        ],
+        "{printed}"
+    );
+    let primary = "primary (held) could not be read: QFEX did not authenticate the read socket";
+    let held = ev.hold.as_ref().unwrap();
+    assert!(held.ok(), "{held:#?}");
+    assert_eq!(
+        held.read_after,
+        hold::ReadAfter::Stopped(primary.to_owned())
+    );
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some(format!("after the hold: {primary}").as_str())
+    );
+    assert!(!outcome.ok && ev.sessions.is_empty(), "{printed}");
+    // Each read socket after the hold is reported, the refused one included.
+    let sockets: Vec<(&str, &str)> = (ev.read_sockets.iter())
+        .map(|s| (s.before, s.label.as_str()))
+        .collect();
+    assert_eq!(
+        sockets[2..],
+        [
+            ("after the hold", "primary (held)"),
+            ("after the hold", "subaccount")
+        ]
+    );
+    server.finished().await.unwrap();
+    // Both reads before the hold, the hold, then both reads after it, and no session.
+    assert_eq!(server.connections().len(), 5);
+    assert_eq!(received(&server, 3).len(), 1, "its authentication alone");
+    assert_read_socket(&received(&server, 4), Some(SUB), SUB_PUBLIC);
+    assert_eq!(server.http_requests(), vec!["GET /user/positions"; 4]);
+    assert!(
+        printed.contains("READ after the hold: subaccount"),
+        "{printed}"
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        format!("- Accounts read after it: STOPPED: {primary}"),
+        "| after the hold | subaccount |".to_owned(),
+        format!("**The probe stopped before its sessions ended:** after the hold: {primary}"),
+    ] {
+        assert!(report.contains(&said), "{said}\n{report}");
+    }
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["accounts_read_after"]["stopped"], primary);
+    let reads: Vec<(&str, &str)> = (evidence["reads"].as_array().unwrap().iter())
+        .map(|r| (r["read"].as_str().unwrap(), r["account"].as_str().unwrap()))
+        .collect();
+    assert_eq!(reads[2..], [("after the hold", "subaccount")]);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+
+    // The primary account shows an open order after the hold, and the subaccount, read after
+    // it all the same, a position: the run stops with both, and no session.
+    let page: &'static str = Box::leak(fixture("all_orders_response.json").into_boxed_str());
+    let open_order = move |view: &View| read_after_hold(view, 2, 3, page);
+    let mut positions = flat_in_turn();
+    let sub = positions.get_mut(&Some(SUB)).unwrap();
+    sub.push(ok(&fixture("positions.json")));
+    let (_removed, opts, outcome, printed, server) =
+        read_after_the_hold_on_both("hold-after-both", open_order, positions).await;
+    let ev = &outcome.evidence;
+    assert_eq!(
+        read_labels(ev),
+        [
+            ("the hold", "primary (held)"),
+            ("the hold", "subaccount"),
+            ("after the hold", "primary (held)"),
+            ("after the hold", "subaccount")
+        ],
+        "{printed}"
+    );
+    let after = "read after the hold, though every account showed none before it: what decision \
+                 0146 says would show it wrong; no session starts";
+    let holds = "holds an open order, a TWAP or a position that is not flat";
+    let both = format!("primary (held) {holds}: {after}; subaccount {holds}: {after}");
+    let held = ev.hold.as_ref().unwrap();
+    assert!(held.ok(), "{held:#?}");
+    assert_eq!(held.read_after, hold::ReadAfter::Stopped(both.clone()));
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some(format!("after the hold: {both}").as_str())
+    );
+    assert!(!outcome.ok && ev.sessions.is_empty(), "{printed}");
+    assert_eq!((ev.reads[2].page_orders, ev.reads[2].flat), (2, true));
+    assert_eq!((ev.reads[3].page_orders, ev.reads[3].flat), (0, false));
+    server.finished().await.unwrap();
+    assert_eq!(server.connections().len(), 5);
+    assert_read_socket(&received(&server, 3), None, PUBLIC);
+    assert_read_socket(&received(&server, 4), Some(SUB), SUB_PUBLIC);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        format!("- Accounts read after it: STOPPED: {both}"),
+        "| after the hold | primary (held) |".to_owned(),
+        "| after the hold | subaccount |".to_owned(),
+    ] {
+        assert!(report.contains(&said), "{said}\n{report}");
+    }
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["accounts_read_after"]["stopped"], both);
+    assert_eq!(evidence["reads"].as_array().unwrap().len(), 4);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+/// `text` as one unmasked text frame, as a server writes it.
+fn server_text(text: &str) -> Vec<u8> {
+    let mut frame = vec![0x81];
+    match u8::try_from(text.len()) {
+        Ok(len) if len < 126 => frame.push(len),
+        _ => {
+            frame.push(126);
+            frame.extend(u16::try_from(text.len()).unwrap().to_be_bytes());
+        }
+    }
+    frame.extend(text.as_bytes());
+    frame
+}
+
+/// What a [`withholding_front`] keeps of what the stub sends its connection.
+#[derive(Default)]
+struct Withheld {
+    /// Whether it withholds what the stub sends, each byte kept in `pending`, in order.
+    paused: bool,
+    pending: Vec<u8>,
+}
+
+/// The test's hand on a [`withholding_front`]'s connection.
+#[derive(Clone)]
+struct Withholding {
+    state: Arc<std::sync::Mutex<Withheld>>,
+    released: Arc<tokio::sync::Notify>,
+}
+
+impl Withholding {
+    /// From now on withholds what the stub sends the connection, after `frames`, text frames
+    /// QFEX could have sent, in flight on it: the probe reads none of them until
+    /// [`Withholding::release`].
+    fn hold_back(&self, frames: &[&str]) {
+        let mut state = self.state.lock().unwrap();
+        state.paused = true;
+        for frame in frames {
+            state.pending.extend(server_text(frame));
+        }
+    }
+
+    /// Carries what it withheld, in order, then everything after it.
+    fn release(&self) {
+        self.released.notify_one();
+    }
+}
+
+/// A listener of the test's own in front of `server`'s trade origin, carrying each connection
+/// to it, the `held`th (from 0) in the stub's direction only as [`Withholding`] says. Its origin.
+async fn withholding_front(server: &StubServer, held: usize) -> (String, Withholding) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let stub = server.ws_url("").trim_start_matches("ws://").to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("ws://{}", listener.local_addr().unwrap());
+    let hand = Withholding {
+        state: Arc::default(),
+        released: Arc::default(),
+    };
+    let withholding = hand.clone();
+    tokio::spawn(async move {
+        for n in 0.. {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let mut carried = tokio::net::TcpStream::connect(&stub).await.unwrap();
+            if n != held {
+                tokio::spawn(async move {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut carried).await;
+                });
+                continue;
+            }
+            let (mut from_client, mut to_client) = client.into_split();
+            let (mut from_stub, mut to_stub) = carried.into_split();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut from_client, &mut to_stub).await;
+                let _ = to_stub.shutdown().await;
+            });
+            let hand = withholding.clone();
+            tokio::spawn(async move {
+                let take = |hand: &Withholding| {
+                    let mut state = hand.state.lock().unwrap();
+                    state.paused = false;
+                    std::mem::take(&mut state.pending)
+                };
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    tokio::select! {
+                        () = hand.released.notified() => {
+                            if to_client.write_all(&take(&hand)).await.is_err() {
+                                return;
+                            }
+                        }
+                        read = from_stub.read(&mut buf) => {
+                            let n = match read {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            let carry = {
+                                let mut state = hand.state.lock().unwrap();
+                                if state.paused {
+                                    state.pending.extend_from_slice(&buf[..n]);
+                                }
+                                !state.paused
+                            };
+                            if carry && to_client.write_all(&buf[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+                // The stub's end: what it withheld still goes, once released.
+                if hand.state.lock().unwrap().paused {
+                    hand.released.notified().await;
+                }
+                let _ = to_client.write_all(&take(&hand)).await;
+                let _ = to_client.shutdown().await;
+            });
+        }
+    });
+    (origin, hand)
+}
+
+/// What [`hold_behind_a_front`] sets up: the stub, how many steps it plays before the read after
+/// the hold, and the options of a run against it through the front, with the test's hand on the
+/// hold's connection.
+struct Fronted {
+    _removed: Removed,
+    server: StubServer,
+    all: usize,
+    opts: Options,
+    hand: Withholding,
+}
+
+/// A run that arms on `arms` and first holds on the primary account for `duration`, against a
+/// stub whose connection 0 is the read socket before the hold, whose connection 1 is the hold's,
+/// authenticated, subscribed and pinged once, and whose connection 2 is the read socket after
+/// it, opened once the hold's connection closed; the hold's connection behind a
+/// [`withholding_front`].
+async fn hold_behind_a_front(what: &str, arms: &[Armed], duration: Duration) -> Fronted {
+    let (dir, removed) = temp_dir(what);
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(hold_socket(&view, 1, pings(1, 1)));
+    let all = steps.len();
+    steps.extend(read_after_hold(&view, 1, 2, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let (origin, hand) = withholding_front(&server, 1).await;
+    let mut opts = holding(&dir, &server, arms, Armed::Primary, duration);
+    opts.trade_url = origin.clone();
+    opts.mds_url = origin;
+    Fronted {
+        _removed: removed,
+        server,
+        all,
+        opts,
+        hand,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_err_read_as_the_hold_closes_is_its_refusal_and_the_accounts_are_still_read_after_it() {
+    let frozen = freeze();
+    // Held for an hour on a paused clock that never moves. Once the stub has pinged it, two errs
+    // are in flight on its connection, which the hold has not read when the owner's interrupt
+    // ends it: it reads them as it closes, before the server's echo of its close.
+    let Fronted {
+        _removed,
+        server,
+        all,
+        opts,
+        hand,
+    } = hold_behind_a_front("hold-err-closing", &[], Duration::from_secs(3_600)).await;
+    let server = &server;
+    let (press, pressed) = tokio::sync::oneshot::channel::<()>();
+    let interrupt: stage::Interrupt = Box::pin(async move {
+        let _ = pressed.await;
+    });
+    let drive = async {
+        until("the script", || server.played() >= all).await;
+        hand.hold_back(&[OTHER_ERR, DENIED]);
+        press.send(()).unwrap();
+        until("the hold's close", || server.connections()[1].client_closed).await;
+        hand.release();
+    };
+    let env = primary_only();
+    let ((ran, printed), ()) = tokio::join!(probe_until(&opts, &env, interrupt), drive);
+    drop(frozen);
+    let outcome = ran.unwrap();
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    // The first err read as it closed is its refusal: the hold is not what the record asks.
+    let said = "QFEX answered an err: InvalidParameter, read as the hold closed";
+    assert_eq!(held.error.as_deref(), Some(said), "{held:#?}");
+    assert_eq!(held.ended_by, hold::End::Interrupted);
+    assert!(!held.ok() && !outcome.ok, "{printed}");
+    assert_eq!(held.kinds.get("err"), Some(&2));
+    assert!(
+        held.close_sent.is_some() && held.close_echoed(),
+        "{held:#?}"
+    );
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some(format!("the hold: {said}").as_str())
+    );
+    // The reads after it still ran.
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        read_labels(&outcome.evidence),
+        [
+            ("the hold", "primary (held)"),
+            ("after the hold", "primary (held)")
+        ]
+    );
+    server.finished().await.unwrap();
+    assert_eq!(server.connections().len(), 3);
+    assert_hold_socket(&received(server, 1), None, PUBLIC);
+    assert_read_socket(&received(server, 2), None, PUBLIC);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "Result: INCOMPLETE.".to_owned(),
+        "- Ended by: the owner's interrupt (Ctrl-C), at".to_owned(),
+        format!("- Error: {said}"),
+        format!("**The probe stopped before its sessions ended:** the hold: {said}"),
+        "| after the hold | primary (held) |".to_owned(),
+    ] {
+        assert!(report.contains(&said), "{said}\n{report}");
+    }
+    // The second err is counted and kept nowhere.
+    assert!(!report.contains("PermissionDenied"), "{report}");
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["error"], said);
+    assert_eq!(evidence["hold"]["ok"], false);
+    assert_eq!(evidence["hold"]["accounts_read_after"], "clean");
+    assert_eq!(evidence["stopped"], format!("the hold: {said}"));
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+
+    // An err that ended the hold at a refusal stays its refusal: one read as it closes after it
+    // does not take its place.
+    let frozen = freeze();
+    let Fronted {
+        _removed,
+        server,
+        all,
+        opts,
+        hand,
+    } = hold_behind_a_front("hold-err-then-err", &[], Duration::from_secs(3_600)).await;
+    let server = &server;
+    let drive = async {
+        until("the script", || server.played() >= all).await;
+        hand.hold_back(&[OTHER_ERR, DENIED]);
+        hand.release();
+    };
+    let ((ran, printed), ()) = tokio::join!(probe(&opts, &env), drive);
+    drop(frozen);
+    let outcome = ran.unwrap();
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::Refused, "{printed}");
+    let first = "QFEX answered an err: InvalidParameter";
+    assert_eq!(held.error.as_deref(), Some(first));
+    assert_eq!(held.kinds.get("err"), Some(&2));
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some(format!("the hold: {first}").as_str())
+    );
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    server.finished().await.unwrap();
+    assert_eq!(server.connections().len(), 3);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_err_read_as_the_hold_closes_at_its_duration_stops_a_run_that_also_arms() {
+    let frozen = freeze();
+    // Held for a second on a paused clock that moves only when the test moves it. Once the stub
+    // has pinged it, an err is in flight on its connection, which the hold has not read when its
+    // duration ends it: it reads it as it closes.
+    let Fronted {
+        _removed,
+        server,
+        all,
+        opts,
+        hand,
+    } = hold_behind_a_front(
+        "hold-err-closing-arm",
+        &[Armed::Primary],
+        Duration::from_secs(1),
+    )
+    .await;
+    let server = &server;
+    let drive = async {
+        until("the script", || server.played() >= all).await;
+        hand.hold_back(&[OTHER_ERR]);
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        until("the hold's close", || server.connections()[1].client_closed).await;
+        hand.release();
+    };
+    let env = primary_only();
+    // A session that started would wait on the frozen clock: a minute of wall-clock time fails
+    // the test instead of hanging it.
+    let (late, hung) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(60));
+        let _ = late.send(());
+    });
+    let ((ran, printed), ()) = tokio::select! {
+        ran = async { tokio::join!(probe(&opts, &env), drive) } => ran,
+        _ = hung => panic!("the run did not stop within 60 s: a session started"),
+    };
+    drop(frozen);
+    let outcome = ran.unwrap();
+    let ev = &outcome.evidence;
+    let held = ev.hold.as_ref().unwrap();
+    let said = "QFEX answered an err: InvalidParameter, read as the hold closed";
+    assert_eq!(held.error.as_deref(), Some(said), "{held:#?}");
+    assert_eq!(held.ended_by, hold::End::Duration);
+    assert!(!held.ok() && !outcome.ok, "{printed}");
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some(format!("the hold: {said}").as_str())
+    );
+    assert!(ev.sessions.is_empty() && ev.registries.is_empty());
+    server.finished().await.unwrap();
+    assert_eq!(
+        server.connections().len(),
+        3,
+        "no session's read, no session"
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "- Ended by: its duration, --hold-secs, at".to_owned(),
+        format!("- Error: {said}"),
+    ] {
+        assert!(report.contains(&said), "{said}\n{report}");
+    }
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["error"], said);
+    assert_eq!(evidence["stopped"], format!("the hold: {said}"));
+}
+
 #[test]
 fn a_data_frame_is_counted_by_its_kind_name_only() {
     let kind = |text: &str| hold::kind_of(text, text);

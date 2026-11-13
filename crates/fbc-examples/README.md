@@ -530,10 +530,12 @@ connection before any session, while no other connection of the probe is open:
    confirmation missing at the deadline, an err such as `RateLimited`, which holds the shared
    budget as on a read socket; an err a journal would keep whole is read in memory as it
    arrived, for its code alone, and holds none), with a close as at its duration; whichever
-   comes first. Nothing reconnects.
+   comes first. An err read while it closes, whatever ended it, is a refusal too, unless one
+   already refused it. Nothing reconnects.
 5. Once its connection is over, whatever ended it, it reads every named account again, as in
-   step 1; the report gives both reads (the accounts table's `before the hold` and `after the
-   hold` rows). A hold whose connection never opened held nothing and is not read after.
+   step 1, each whatever another showed; the report gives both reads (the accounts table's
+   `before the hold` and `after the hold` rows). A hold whose connection never opened held
+   nothing and is not read after.
 
 A hold that did not authenticate and confirm its three subscriptions, an order or fill frame on
 it, an account read after it that shows an open order or a position, and Ctrl-C in a run that

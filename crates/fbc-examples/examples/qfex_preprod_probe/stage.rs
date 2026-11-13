@@ -52,15 +52,17 @@
 //!   provider rate refusal, never kept, and a `RateLimited` err among them holds the shared
 //!   budget as on a read socket (an err a journal would keep whole is read in memory as it
 //!   arrived, for its code alone, and holds none). A refusal (authentication refused, a
-//!   confirmation missing at the deadline, an err) ends it with a close as its duration does.
-//!   Once its connection is over, whatever ended it, every named account is read again; an
-//!   account that then shows an open order or a position, a hold that did not do what decision
-//!   0146 asks, an order or fill frame on it, or the owner's interrupt in a run that also arms
-//!   stops the probe, so no session starts. The interrupt is the hold's from its connection's
-//!   opening, when the hold polls it before writing anything, until its close and the read of
-//!   the echo are over: one that comes as it closes is recorded as such and stops a run that
-//!   arms too. An interrupt at any other time is not the hold's: the program (`main.rs`,
-//!   [`crate::interrupt`]) then ends at once, writing no report, as the probe always has.
+//!   confirmation missing at the deadline, an err) ends it with a close as its duration does,
+//!   and an err read while it closes, whatever ended it, is its refusal too, unless one already
+//!   refused it. Once its connection is over, whatever ended it, every named account is read
+//!   again, each whatever another showed; an account that then shows an open order or a
+//!   position, a hold that did not do what decision 0146 asks, an order or fill frame on it, or
+//!   the owner's interrupt in a run that also arms stops the probe, so no session starts. The
+//!   interrupt is the hold's from its connection's opening, when the hold polls it before
+//!   writing anything, until its close and the read of the echo are over: one that comes as it
+//!   closes is recorded as such and stops a run that arms too. An interrupt at any other time
+//!   is not the hold's: the program (`main.rs`, [`crate::interrupt`]) then ends at once,
+//!   writing no report, as the probe always has.
 //! - **The session** ([`Run::session`]): fbc-runtime's `ExecSession`, unchanged, with the
 //!   consumer's `AccountWideCodAuthority` for the account it arms on. The program submits
 //!   nothing: the session sends its own arm once the codec reports the stream authenticated
@@ -585,7 +587,8 @@ impl Run<'_> {
     /// Reads every account the configuration names before `before`, the session on `on` or the
     /// hold ([`HOLD`]) on it, `on`'s label marked `mark`, each under its own configuration
     /// ([`configured`]), which the guard admitted before anything connected; stops the probe
-    /// when one cannot be read, or holds an open order, a TWAP or a position that is not flat.
+    /// at the first that cannot be read, or holds an open order, a TWAP or a position that is
+    /// not flat.
     async fn check_accounts(
         &mut self,
         before: &'static str,
@@ -593,44 +596,72 @@ impl Run<'_> {
         mark: &'static str,
     ) -> Result<(), String> {
         for account in self.named.clone() {
-            let mut label = name(account).to_owned();
-            label.push_str(if account == on { mark } else { "" });
-            let (cfg, _) = configured(&self.base, self.lookup, account)?;
-            let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
-            let mut met = None;
-            let read = self.read_account(&cfg, selection, &mut met).await;
-            // A read socket's refusals are reported whether or not its read succeeded.
-            if let Some(refusals) = met {
-                self.ev.read_sockets.push(ReadSocket {
-                    before,
-                    label: label.clone(),
-                    refusals,
-                });
-            }
-            let read = read.map_err(|e| format!("{label} could not be read: {e}"))?;
-            let refusal = read.refusal();
-            let shown = format!(
-                "{} open orders, {} TWAPs, flat {}, REST open_orders {}",
-                read.page_orders, read.page_twaps, read.flat, read.rest_open_orders
-            );
-            let when = refusals::read_when(before);
-            self.line(format_args!("READ {when}: {label}: {shown}"));
-            self.ev.reads.push(AccountRead {
+            self.check_account(before, on, mark, account).await?;
+        }
+        Ok(())
+    }
+
+    /// Reads every account the configuration names after the hold on `on` ([`AFTER_HOLD`]), as
+    /// [`Run::check_accounts`] does, but each whatever another showed, so the evidence holds
+    /// every account's read after the hold (decision 0146 item 3); stops the probe once all were
+    /// read when any could not be read or is not clean, naming each.
+    async fn check_accounts_after_hold(&mut self, on: Armed) -> Result<(), String> {
+        let mut failed = Vec::new();
+        for account in self.named.clone() {
+            let checked = self.check_account(AFTER_HOLD, on, " (held)", account).await;
+            failed.extend(checked.err());
+        }
+        match failed.is_empty() {
+            true => Ok(()),
+            false => Err(failed.join("; ")),
+        }
+    }
+
+    /// Reads `account` before `before`, as [`Run::check_accounts`] reads each.
+    async fn check_account(
+        &mut self,
+        before: &'static str,
+        on: Armed,
+        mark: &'static str,
+        account: Armed,
+    ) -> Result<(), String> {
+        let mut label = name(account).to_owned();
+        label.push_str(if account == on { mark } else { "" });
+        let (cfg, _) = configured(&self.base, self.lookup, account)?;
+        let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
+        let mut met = None;
+        let read = self.read_account(&cfg, selection, &mut met).await;
+        // A read socket's refusals are reported whether or not its read succeeded.
+        if let Some(refusals) = met {
+            self.ev.read_sockets.push(ReadSocket {
                 before,
                 label: label.clone(),
-                ..read
+                refusals,
             });
-            if let Some(why) = refusal {
-                let starts = match before {
-                    HOLD => "no hold starts (decision 0146 item 3)",
-                    AFTER_HOLD => {
-                        "read after the hold, though every account showed none before it: what \
-                         decision 0146 says would show it wrong; no session starts"
-                    }
-                    _ => "no session starts (decision 0132 item 7)",
-                };
-                return Err(format!("{label} {why}: {starts}"));
-            }
+        }
+        let read = read.map_err(|e| format!("{label} could not be read: {e}"))?;
+        let refusal = read.refusal();
+        let shown = format!(
+            "{} open orders, {} TWAPs, flat {}, REST open_orders {}",
+            read.page_orders, read.page_twaps, read.flat, read.rest_open_orders
+        );
+        let when = refusals::read_when(before);
+        self.line(format_args!("READ {when}: {label}: {shown}"));
+        self.ev.reads.push(AccountRead {
+            before,
+            label: label.clone(),
+            ..read
+        });
+        if let Some(why) = refusal {
+            let starts = match before {
+                HOLD => "no hold starts (decision 0146 item 3)",
+                AFTER_HOLD => {
+                    "read after the hold, though every account showed none before it: what \
+                     decision 0146 says would show it wrong; no session starts"
+                }
+                _ => "no session starts (decision 0132 item 7)",
+            };
+            return Err(format!("{label} {why}: {starts}"));
         }
         Ok(())
     }
@@ -749,7 +780,8 @@ impl Run<'_> {
 
     /// The liveness hold (decision 0146) on `hold.account`: every named account read as before
     /// a session, then its one connection ([`Run::held`]), then, once that connection opened,
-    /// every named account read again, whatever ended it (item 3). What it heard is the
+    /// every named account read again, whatever ended it and whatever another account's read
+    /// after it showed ([`Run::check_accounts_after_hold`], item 3). What it heard is the
     /// evidence's whether or not it did what the record asks. One that did not, an account read
     /// after it that shows an open order or a position, and the owner's interrupt in a run that
     /// also arms each stop the probe, as a refused read does, so no session starts.
@@ -796,9 +828,7 @@ impl Run<'_> {
         }
         // The reads after it, once its connection opened: a hold that never opened held nothing.
         if run.opened {
-            let after = self
-                .check_accounts(AFTER_HOLD, hold.account, " (held)")
-                .await;
+            let after = self.check_accounts_after_hold(hold.account).await;
             run.read_after = match after {
                 Ok(()) => ReadAfter::Clean,
                 Err(e) => {
@@ -824,7 +854,8 @@ impl Run<'_> {
     /// The hold's connection: opened on `hold.account`'s guarded trade origin, held until it
     /// ends ([`Run::holding`]), then closed: at its duration, the owner's interrupt or a
     /// refusal, a close and the server's echo read for at most `--read-wait-ms`; at a server
-    /// close, read on until the close reply has gone out. The owner's interrupt is the hold's
+    /// close, read on until the close reply has gone out; an err read meanwhile is kept as its
+    /// refusal, unless one already refused it. The owner's interrupt is the hold's
     /// from the connection's opening until then: a press that did not end it, made while it
     /// closed or ready as something else ended it, is recorded as one made as it closed
     /// (`run.interrupted_closing`). An error before it opened is returned; everything after is
@@ -882,11 +913,17 @@ impl Run<'_> {
         }
         if drain {
             // The server's echo of the close, or, after the server's close, the reply the
-            // WebSocket layer writes on the next read; then the stream's end.
+            // WebSocket layer writes on the next read; then the stream's end. A data frame
+            // still in flight is read meanwhile: an err among them is a refusal as one that
+            // ended the hold is (decision 0146 item 4), the first kept, so the hold is not what
+            // the record asks and a run that also arms starts no session.
             let drained = async {
                 while let Some(Ok(msg)) = ws.next().await {
-                    if let Some(data) = hear(run, opened.elapsed(), msg, &self.limiter) {
-                        self.hold_data(run, &reader, &data);
+                    if let Some(data) = hear(run, opened.elapsed(), msg, &self.limiter)
+                        && let Some(err) = self.hold_data(run, &reader, &data)
+                    {
+                        run.error
+                            .get_or_insert_with(|| format!("{err}, read as the hold closed"));
                     }
                 }
             };
