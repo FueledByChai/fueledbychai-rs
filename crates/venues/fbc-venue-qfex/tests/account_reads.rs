@@ -14,6 +14,9 @@
 //! - The listing, the positions and the page decode exactly and refuse what QFEX does not
 //!   document; an err is no page, and a RateLimited one is the codec's rate hold; the
 //!   authentication reply is success exactly where the codec takes it as success.
+//! - The liveness hold's subscriptions (decision 0146) are the codec's own three, frame, charge
+//!   and class, and none is built without a probe mode; a confirmation is read exactly where the
+//!   codec reads one, and an err on a trade socket as a page reads one.
 //! - The redaction spans cover every listed account id, every `user_id` and every balance value,
 //!   and no `Debug`, `Display` or error shows a header value, an account id, a `user_id` or a
 //!   balance value. A listing read back from the journal is refused, its ids blanked to no
@@ -37,7 +40,7 @@ use fbc_core::{
 use fbc_venue_qfex::Qfex;
 use fbc_venue_qfex::account_reads::{
     self, AnswerError, BuildError, MAX_PAGE, NotAPage, OrdersPage, PAGE_WEIGHT, PageAsk, Positions,
-    RateHold, Subaccounts,
+    RateHold, SocketErr, Subaccounts,
 };
 use fbc_venue_qfex::auth::{self, AccountSelection, ReadAuth, TradeAuth};
 use fbc_venue_qfex::exec::{CLIENT_ID_FORMAT, ErrCode, QfexExec, TRADE};
@@ -241,6 +244,7 @@ fn a_config_without_the_probe_mode_or_refused_by_its_guard_builds_no_request() {
         );
         let ask = PageAsk::new(MAX_PAGE, 0).unwrap();
         assert_eq!(account_reads::user_orders(&cfg, ask), Err(build), "{what}");
+        assert_eq!(account_reads::subscriptions(&cfg), Err(build), "{what}");
         assert_eq!(account_reads::trade_url(&cfg, &reader), Err(want), "{what}");
         // Named, never shown: the refusal names the setting, not its value.
         let text = format!("{build} {build:?}");
@@ -1181,6 +1185,218 @@ fn codec_frame(frame: RawFrame<'_>) -> Vec<Effect> {
 
 fn codec_effects(frame: &str) -> Vec<Effect> {
     codec_frame(RawFrame::Text(frame))
+}
+
+// ----- The liveness hold (decision 0146) -----
+
+/// The authenticate page's success reply.
+const AUTH_OK: &str = r#"{"type":"auth","result":"success"}"#;
+
+#[test]
+fn the_holds_subscriptions_are_the_codecs_own_three_built_only_under_the_guard() {
+    let sent: Vec<(String, RateCharge, TrafficClass)> = codec_effects(AUTH_OK)
+        .into_iter()
+        .map(|effect| match effect {
+            Effect::Send {
+                frame,
+                rpc: None,
+                class,
+                charge,
+                ..
+            } => (
+                String::from_utf8(frame.bytes().to_vec()).unwrap(),
+                charge,
+                class,
+            ),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    for cfg in [preprod("primary"), preprod(SUB), loopback(SUB)] {
+        let subs = account_reads::subscriptions(&cfg).unwrap();
+        let built: Vec<(String, RateCharge, TrafficClass)> = (subs.iter())
+            .map(|w| {
+                assert!(
+                    w.frame.redactions().is_empty(),
+                    "a subscription names nothing"
+                );
+                let text = String::from_utf8(w.frame.bytes().to_vec()).unwrap();
+                (text, w.charge, w.class)
+            })
+            .collect();
+        assert_eq!(built, sent);
+    }
+    // The AsyncAPI's three, in the codec's order, each the rate page's 0.1 under Subscribe.
+    let channels: Vec<&str> = sent.iter().map(|(text, ..)| text.as_str()).collect();
+    assert_eq!(
+        channels,
+        [
+            r#"{"type":"subscribe","params":{"channels":["order_responses"]}}"#,
+            r#"{"type":"subscribe","params":{"channels":["fills"]}}"#,
+            r#"{"type":"subscribe","params":{"channels":["positions"]}}"#,
+        ]
+    );
+    assert!(sent.iter().all(|(_, charge, class)| {
+        *charge == RateCharge::one(OpKind::Subscribe, None) && *class == TrafficClass::Safety
+    }));
+}
+
+/// The probe codec for the traded subaccount, its authentication answered, waiting for its
+/// three confirmations.
+fn subscribing_codec() -> QfexExec {
+    let mut codec = opened_codec();
+    let mut sink = Sink::default();
+    let mut fx = Effects::new();
+    scoped(|scope| {
+        let frame = RawFrame::Text(AUTH_OK);
+        codec.on_frame(TRADE, frame, scope, &SpecTable::new(), &mut sink, &mut fx)
+    })
+    .unwrap();
+    assert_eq!(fx.take().len(), 3, "the three subscriptions");
+    codec
+}
+
+#[test]
+fn a_confirmation_is_read_exactly_where_the_codec_reads_one() {
+    let err = flat("InvalidParameter", "null", r#"{"type":"subscribe"}"#);
+    let cases: [(RawFrame<'_>, Option<usize>); 16] = [
+        (
+            RawFrame::Text(r#"{"subscribed":"order_responses"}"#),
+            Some(0),
+        ),
+        (RawFrame::Text(r#"{"subscribed":"fills"}"#), Some(1)),
+        (RawFrame::Text(r#"{"subscribed":"positions"}"#), Some(2)),
+        (RawFrame::Text(r#" { "subscribed" : "fills" } "#), Some(1)),
+        (RawFrame::Text(r#"{"subscribed":"trades"}"#), None),
+        (RawFrame::Text(r#"{"unsubscribed":"fills"}"#), None),
+        (RawFrame::Text(r#"{"subscribed":"fills","x":1}"#), None),
+        (
+            RawFrame::Text(r#"{"subscribed":"fills","subscribed":"fills"}"#),
+            None,
+        ),
+        (RawFrame::Text(r#"{"subscribed":["fills"]}"#), None),
+        (RawFrame::Text(r#"{"subscribed":true}"#), None),
+        (
+            RawFrame::Text(
+                r#"{"ack":{"incoming_message":{"type":"subscribe","params":{"channels":["fills"]}}}}"#,
+            ),
+            None,
+        ),
+        (RawFrame::Text(&err), None),
+        (RawFrame::Text(AUTH_OK), None),
+        (RawFrame::Text("[\"fills\"]"), None),
+        (RawFrame::Text("nope"), None),
+        (RawFrame::Binary(br#"{"subscribed":"fills"}"#), None),
+    ];
+    let reader = reader(SUB);
+    for (frame, want) in cases {
+        assert_eq!(
+            account_reads::confirmation(&reader, frame),
+            want,
+            "{frame:?}"
+        );
+        // The codec counts a confirmation exactly there, and only one completing the three
+        // reports the stream authenticated.
+        let mut codec = subscribing_codec();
+        let mut sink = Sink::default();
+        let mut fx = Effects::new();
+        let _ = scoped(|scope| {
+            codec.on_frame(TRADE, frame, scope, &SpecTable::new(), &mut sink, &mut fx)
+        });
+        assert_eq!(
+            codec.counts().subscribed,
+            u64::from(want.is_some()),
+            "{frame:?}"
+        );
+    }
+    // The three, in any order, are the three the codec reports the stream authenticated on.
+    let mut codec = subscribing_codec();
+    let mut sink = Sink::default();
+    let mut seen = Vec::new();
+    for channel in ["positions", "order_responses", "fills"] {
+        let text = format!(r#"{{"subscribed":"{channel}"}}"#);
+        seen.extend(account_reads::confirmation(&reader, RawFrame::Text(&text)));
+        let mut fx = Effects::new();
+        scoped(|scope| {
+            let frame = RawFrame::Text(&text);
+            codec.on_frame(TRADE, frame, scope, &SpecTable::new(), &mut sink, &mut fx)
+        })
+        .unwrap();
+    }
+    assert_eq!(seen, [2, 0, 1]);
+    assert!(matches!(sink.0.as_slice(), [ExecEvent::Conn { .. }]));
+}
+
+#[test]
+fn an_err_on_a_trade_socket_is_read_as_a_page_reads_one() {
+    let hint_s = r#""Rate limit exceeded, retry after 7 seconds""#;
+    let sub_echo = r#"{"type":"subscribe","params":{"channels":["fills"]}}"#;
+    let reader = reader(SUB);
+    let errs = [
+        (
+            flat("RateLimited", hint_s, PAGE_ECHO),
+            SocketErr::RateLimited(RateHold {
+                charge: Some(RateCharge::one(OpKind::Query, None)),
+                retry_after: Some(Duration::from_secs(7)),
+            }),
+        ),
+        (
+            nested("RateLimited", "null", sub_echo),
+            SocketErr::RateLimited(RateHold {
+                charge: Some(RateCharge::one(OpKind::Subscribe, None)),
+                retry_after: None,
+            }),
+        ),
+        (
+            nested("InvalidParameter", r#""bad channel""#, sub_echo),
+            SocketErr::Other(Some(ErrCode::InvalidParameter)),
+        ),
+        (
+            flat("SomethingNew", "null", sub_echo),
+            SocketErr::Other(None),
+        ),
+    ];
+    for (frame, want) in &errs {
+        assert_eq!(
+            account_reads::socket_err(&reader, RawFrame::Text(frame)),
+            Some(*want),
+            "{frame}"
+        );
+        // The same err a page read is refused with.
+        assert_eq!(page_of(frame, 1000), Err(NotAPage::from(*want)), "{frame}");
+    }
+    // An err echoing the authentication is kept whole (decision 0134 item 2), so it reads as no
+    // JSON object, as a session's codec holds no budget for it (0134 item 6); every frame in no
+    // err envelope is none either.
+    let echoed = format!(
+        r#"{{"type":"Err","error_code":"RateLimited","message":null,"incoming_message":{{"type":"auth","params":{{"hmac":{{"public_key":"{PUBLIC}"}}}}}}}}"#
+    );
+    let repeated = r#"{"type":"Err","error_code":"RateLimited","error_code":"RateLimited"}"#;
+    for frame in [
+        echoed.as_str(),
+        repeated,
+        r#"{"subscribed":"fills"}"#,
+        r#"{"ack":{"incoming_message":{}}}"#,
+        AUTH_OK,
+        "nope",
+    ] {
+        assert_eq!(
+            account_reads::socket_err(&reader, RawFrame::Text(frame)),
+            None,
+            "{frame}"
+        );
+    }
+    let binary = flat("RateLimited", hint_s, PAGE_ECHO);
+    assert_eq!(
+        account_reads::socket_err(&reader, RawFrame::Binary(binary.as_bytes())),
+        None
+    );
+    // What each says: a code, never a value.
+    assert_eq!(errs[0].1.to_string(), "QFEX answered an err: RateLimited");
+    assert_eq!(
+        errs[2].1.to_string(),
+        "QFEX answered an err: InvalidParameter"
+    );
+    assert_eq!(errs[3].1.to_string(), "QFEX answered an undocumented err");
 }
 
 // ----- The authentication reply -----

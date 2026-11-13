@@ -1,28 +1,31 @@
 //! The probe's account reads (decision 0132 item 7, FBC-h3z1): what the probe sends, outside an
 //! order-entry session, to check, before every session, that each account it reads holds no
-//! open order and a flat position; and the account listing, which it no longer sends, since it
-//! reads the accounts its configuration names (decision 0144).
+//! open order and a flat position; the account listing, which it no longer sends, since it
+//! reads the accounts its configuration names (decision 0144); and what its liveness hold sends
+//! and reads on its one trade connection (decision 0146, FBC-39ks).
 //!
 //! - **The requests.** `GET /user/subaccounts` ([`subaccounts`]) and `GET /user/positions`
 //!   ([`positions`]) on `qfex.rest_url`; and, on `qfex.trade_url` ([`trade_url`]), the
 //!   connection's authentication for one account ([`authentication`]) and then one
-//!   `get_user_orders` page ([`user_orders`]). Each takes its origin only from a configuration
-//!   that a probe mode's guard admits (`preprod_probe`, FBC-mfey, or `production_probe`,
-//!   decision 0143 item 2) and whose provider account and account key decision 0122 item 1
-//!   admits ([`probe::connections`]): without a probe mode, or under a configuration the guard
-//!   refuses, nothing is built. Every signed part, and every account identifier, comes from
-//!   `src/auth`'s [`ReadAuth`], which the caller builds for an account it
+//!   `get_user_orders` page ([`user_orders`]), or, on the hold's connection, the three
+//!   subscriptions a session sends ([`subscriptions`]). Each takes its origin only from a
+//!   configuration that a probe mode's guard admits (`preprod_probe`, FBC-mfey, or
+//!   `production_probe`, decision 0143 item 2) and whose provider account and account key
+//!   decision 0122 item 1 admits ([`probe::connections`]): without a probe mode, or under a
+//!   configuration the guard refuses, nothing is built. Every signed part, and every account
+//!   identifier, comes from `src/auth`'s [`ReadAuth`], which the caller builds for an account it
 //!   names, the primary or a subaccount id (the probe's from its configuration, decision 0144;
 //!   a listing's from [`Subaccounts::accounts`]), with that account's credentials; nothing here
-//!   reads or holds a credential. `ReadAuth` signs and
-//!   names its spans for this crate only, so these functions are the one way to them.
-//! - **The decoders.** [`decode_subaccounts`], [`decode_positions`], [`orders_page`] and
-//!   [`authenticated`]. Every number is read from its own JSON text exactly (`exec::exact`, FBC-zeb0),
-//!   never through `f64`. A REST decoder refuses a status outside 2xx, naming the status only,
-//!   malformed JSON, a member repeated, a required member missing and a top-level member QFEX
-//!   does not document (both bodies are `additionalProperties: false`, and a cursor or a count
-//!   added would make the answer partial). A frame is read only from the bytes the journal keeps
-//!   of it ([`redact_inbound`]), as the order-entry codec reads its own (decision 0134 item 5).
+//!   reads or holds a credential. `ReadAuth` signs and names its spans for this crate only, so
+//!   these functions are the one way to them.
+//! - **The decoders.** [`decode_subaccounts`], [`decode_positions`], [`orders_page`],
+//!   [`authenticated`], and, for the hold, [`confirmation`] and [`socket_err`]. Every number is
+//!   read from its own JSON text exactly (`exec::exact`, FBC-zeb0), never through `f64`. A REST
+//!   decoder refuses a status outside 2xx, naming the status only, malformed JSON, a member
+//!   repeated, a required member missing and a top-level member QFEX does not document (both
+//!   bodies are `additionalProperties: false`, and a cursor or a count added would make the
+//!   answer partial). A frame is read only from the bytes the journal keeps of it
+//!   ([`redact_inbound`]), as the order-entry codec reads its own (decision 0134 item 5).
 //! - **The redaction** ([`redact_inbound`]): the spans `src/auth` names (every listed account
 //!   id, every `user_id`, every balance value, and the rest, decisions 0028 and 0122 item 3), an
 //!   err or an ack that echoes a request kept as decision 0134 says (0126 as it narrows it), and
@@ -154,6 +157,25 @@ pub fn authentication(
     })
 }
 
+/// The three subscriptions an order-entry session sends once its authentication succeeded, one
+/// frame per channel of `exec::CHANNELS` in that order, each built and charged exactly as the
+/// codec builds and charges its own (`exec::subscription`: the rate page's 0.1 under
+/// `Subscribe`, Safety traffic): what the probe's liveness hold sends after its authentication
+/// succeeded ([`authenticated`]), and nothing after them (decision 0146 item 2). They name no
+/// account and carry nothing to redact.
+pub fn subscriptions(cfg: &VenueConfig) -> Result<Vec<SocketWrite>, BuildError> {
+    probe::connections(cfg)?;
+    let write = |channel: &&str| {
+        let (frame, charge, class) = exec::subscription(channel);
+        SocketWrite {
+            frame,
+            charge,
+            class,
+        }
+    };
+    Ok(exec::CHANNELS.iter().map(write).collect())
+}
+
 /// One `get_user_orders` page asked for: its page size, 1 to [`MAX_PAGE`], and its offset.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct PageAsk {
@@ -260,9 +282,10 @@ fn rest_read(rest: &str, path: &str, headers: Vec<fbc_core::Header>) -> RestRead
 /// The balance values covered are the positions answer's. A trade socket's `balance_response`
 /// names them by other members (`deposit`, `available_balance` and the rest), which are not
 /// spans, as the order-entry codec's journal does not span them either (FBC-77aa (e) names the
-/// account's identifiers, not its amounts). The probe's read socket subscribes to no channel,
-/// so none is expected on it; one that arrived would keep only its `id` and `user_id` as keyed
-/// hashes.
+/// account's identifiers, not its amounts). The probe's read sockets subscribe to no channel,
+/// so none is expected on one. The liveness hold's connection subscribes to the three a session
+/// does (decision 0146), so one may arrive on it, and keeps only its `id` and `user_id` as keyed
+/// hashes; the hold counts its frames and keeps, prints and writes none of them.
 pub fn redact_inbound(reader: &ReadAuth, input: Inbound<'_>) -> InboundSpans {
     let account = reader.inbound_spans(input);
     match input {
@@ -307,6 +330,67 @@ pub fn authenticated(reader: &ReadAuth, frame: RawFrame<'_>) -> bool {
                 matches!(echo::envelope(top), Envelope::Other) && exec::auth_success(top)
             })
     })
+}
+
+/// Which of `exec::CHANNELS` `frame`, off `reader`'s trade socket, confirms: a
+/// `{"subscribed":"<channel>"}` reply, the frame's one member, naming one of them, exactly where
+/// the order-entry codec takes a frame as a confirmation (`exec::channel_reply`), read from the
+/// bytes the journal keeps. A binary frame, one that is not a JSON object or repeats a member,
+/// an err or an ack, an `{"unsubscribed":…}` reply, a channel the codec never subscribes, and
+/// every other frame confirm nothing.
+pub fn confirmation(reader: &ReadAuth, frame: RawFrame<'_>) -> Option<usize> {
+    let text = kept(reader, frame)?;
+    let root = json::parse(&text).filter(|root| !root.repeats())?;
+    let top = root.members()?;
+    match (echo::envelope(top), exec::channel_reply(top)) {
+        (Envelope::Other, Some(("subscribed", at))) => Some(at),
+        _ => None,
+    }
+}
+
+/// An err off one of the probe's trade sockets, read as [`orders_page`] reads one.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum SocketErr {
+    /// A RateLimited err: the shared budget to hold.
+    RateLimited(RateHold),
+    /// Any other err: its documented code, or `None` for one absent, spanned or undocumented.
+    Other(Option<ErrCode>),
+}
+
+impl fmt::Display for SocketErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SocketErr::RateLimited(_) => f.write_str("QFEX answered an err: RateLimited"),
+            SocketErr::Other(Some(code)) => write!(f, "QFEX answered an err: {}", code.wire()),
+            SocketErr::Other(None) => f.write_str("QFEX answered an undocumented err"),
+        }
+    }
+}
+
+impl std::error::Error for SocketErr {}
+
+impl From<SocketErr> for NotAPage {
+    fn from(err: SocketErr) -> NotAPage {
+        match err {
+            SocketErr::RateLimited(hold) => NotAPage::RateLimited(hold),
+            SocketErr::Other(code) => NotAPage::Err(code),
+        }
+    }
+}
+
+/// The err `frame`, off `reader`'s trade socket, is, read from the bytes the journal keeps as
+/// [`orders_page`] reads one: a RateLimited one's hold, which the caller applies to the shared
+/// provider-user limiter (decision 0126), or its code. `None` for every frame in no err
+/// envelope: a binary frame, one that is not a JSON object or repeats a member, an ack, and the
+/// rest. An err the journal keeps whole (decision 0134 item 2) reads as no JSON object, so as
+/// `None`, as it holds no budget in a session (0134 item 6).
+pub fn socket_err(reader: &ReadAuth, frame: RawFrame<'_>) -> Option<SocketErr> {
+    let text = kept(reader, frame)?;
+    let root = json::parse(&text).filter(|root| !root.repeats())?;
+    match echo::envelope(root.members()?) {
+        Envelope::FlatErr(body) | Envelope::NestedErr(body) => Some(refusal(echo::err(body))),
+        _ => None,
+    }
 }
 
 // ----- The account listing -----
@@ -664,7 +748,7 @@ pub(crate) fn decode_page(
         return Err(NotAPage::Other("a repeated member"));
     }
     match echo::envelope(top) {
-        Envelope::FlatErr(body) | Envelope::NestedErr(body) => Err(refusal(echo::err(body))),
+        Envelope::FlatErr(body) | Envelope::NestedErr(body) => Err(refusal(echo::err(body)).into()),
         Envelope::Ack(_) => Err(NotAPage::Other("an ack")),
         Envelope::Ambiguous => Err(NotAPage::Other("two envelopes")),
         Envelope::Other => page(top, ask, scope).map_err(NotAPage::Other),
@@ -672,16 +756,16 @@ pub(crate) fn decode_page(
 }
 
 /// What an err is: a RateLimited one's hold, read as `src/rate.rs` reads it, or its code.
-fn refusal(err: echo::Err<'_>) -> NotAPage {
+fn refusal(err: echo::Err<'_>) -> SocketErr {
     match err.code {
-        Some(ErrCode::RateLimited) => NotAPage::RateLimited(RateHold {
+        Some(ErrCode::RateLimited) => SocketErr::RateLimited(RateHold {
             charge: err
                 .echo_type
                 .and_then(rate::operation)
                 .map(|op| RateCharge::one(op, None)),
             retry_after: err.message.and_then(rate::hint),
         }),
-        code => NotAPage::Err(code),
+        code => SocketErr::Other(code),
     }
 }
 

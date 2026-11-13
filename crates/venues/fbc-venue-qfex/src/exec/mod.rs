@@ -345,13 +345,13 @@ impl QfexExec {
         // Not yet reported: that waits for the last confirmation.
         self.phase = Phase::Subscribing(0);
         for channel in CHANNELS {
-            let body = format!(r#"{{"type":"subscribe","params":{{"channels":["{channel}"]}}}}"#);
+            let (frame, charge, class) = subscription(channel);
             fx.push(Effect::Send {
                 stream: TRADE,
-                frame: WireSlice::plain(body.into_bytes()),
+                frame,
                 rpc: None,
-                class: TrafficClass::Safety,
-                charge: RateCharge::one(OpKind::Subscribe, None),
+                class,
+                charge,
             });
         }
     }
@@ -387,15 +387,8 @@ impl QfexExec {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        // `{"subscribed":…}` and `{"unsubscribed":…}`, each the frame's one member, naming one
-        // of the channels the epoch subscribed (the AsyncAPI's replies to a subscribe and an
-        // unsubscribe).
-        if let [(name, value)] = top
-            && let Some(at) = value
-                .str()
-                .and_then(|channel| CHANNELS.iter().position(|ours| *ours == channel))
-        {
-            match name.as_ref() {
+        if let Some((name, at)) = channel_reply(top) {
+            match name {
                 "subscribed" => {
                     self.confirmed(at, sink);
                     return Ok(());
@@ -453,6 +446,34 @@ pub(crate) fn frame_spans(account: &[Range<u32>], frame: RawFrame<'_>) -> Vec<Ra
                 .collect()
         }
     }
+}
+
+/// The frame subscribing `channel`, one of [`CHANNELS`], as the AsyncAPI's `subscribe_orders`,
+/// `subscribe_fills` and `subscribe_positions` show it, and what it is charged and sent as: the
+/// rate page's 0.1 under `Subscribe`, Safety traffic. The codec sends one per channel on a
+/// successful auth reply, and the probe's liveness hold the same three
+/// (`account_reads::subscriptions`, decision 0146).
+pub(crate) fn subscription(channel: &str) -> (WireSlice, RateCharge, TrafficClass) {
+    let body = format!(r#"{{"type":"subscribe","params":{{"channels":["{channel}"]}}}}"#);
+    (
+        WireSlice::plain(body.into_bytes()),
+        RateCharge::one(OpKind::Subscribe, None),
+        TrafficClass::Safety,
+    )
+}
+
+/// A reply about one of [`CHANNELS`]: `top`, the members of a frame in none of the err and ack
+/// envelopes, is one member whose value is a string naming a channel the codec subscribes (the
+/// AsyncAPI's `{"subscribed":…}` and `{"unsubscribed":…}` replies to a subscribe and an
+/// unsubscribe). The member's name, and the channel's place in [`CHANNELS`]. The codec and the
+/// probe's liveness hold (`account_reads::confirmation`, decision 0146) read nothing else as one.
+pub(crate) fn channel_reply<'t>(top: &'t [Member<'_>]) -> Option<(&'t str, usize)> {
+    let [(name, value)] = top else {
+        return None;
+    };
+    let channel = value.str()?;
+    let at = CHANNELS.iter().position(|ours| *ours == channel)?;
+    Some((name.as_ref(), at))
 }
 
 /// Whether `top`, the members of a frame in none of the err and ack envelopes, is QFEX's reply

@@ -1,7 +1,9 @@
 //! Stage one of the QFEX probe (decision 0132 items 1, 3, 6 and 7; FBC-l931), on pre-production,
 //! or with `--production` on production (decision 0143): one session per account, each arming
 //! cancel-on-disconnect once, so the journal captures whatever answers the arm. It places
-//! nothing and sends no command but each session's arm and the probe's own reads.
+//! nothing and sends no command but each session's arm and the probe's own reads. With
+//! `--hold-secs` it first holds one trade connection that never arms (decision 0146), and a run
+//! may hold without arming at all.
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
 //!   (`src/auth_qfex.rs`), and the configuration of each account it reads, under the adapter's
@@ -19,9 +21,10 @@
 //!   QFEX's app before the run that the user has no other subaccount, which the probe neither
 //!   checks nor records, and the report says so. Before each session, for each of them,
 //!   `GET /user/positions` and one `get_user_orders` page on a trade socket of its own that
-//!   sends only its authentication and that read, and never arms. Every request takes its origin from the guarded configuration,
-//!   through the adapter's `account_reads`, and is charged to the run's one provider-user rate
-//!   limiter first (refused, not waited for, when it has no room).
+//!   sends only its authentication and that read, and never arms. Every request takes its
+//!   origin from the guarded configuration, through the adapter's `account_reads`, and is
+//!   charged to the run's one provider-user rate limiter first (refused, not waited for, when it
+//!   has no room).
 //!   A `RateLimited` err answering its authentication or its page holds that limiter's shared
 //!   budget, as the adapter asks of its caller (decision 0126), and stops the probe as any
 //!   refused read does.
@@ -30,6 +33,34 @@
 //!   ([`AccountRead::refusal`]). Every read, write and close on a read socket waits at most
 //!   `--read-wait-ms`. The account a session arms on is one of them by construction: the
 //!   primary account, or the subaccount `QFEX_SUBACCOUNT_ID` names.
+//! - **The liveness hold** ([`Run::hold`], decision 0146, FBC-39ks): before the sessions, while no
+//!   other connection of the probe is open, every named account is read as before a session,
+//!   then one trade connection opens on the account `--hold-account` names (the primary unless
+//!   it names the subaccount), through the same adapter functions and shared limiter as the read
+//!   sockets. It sends its authentication and, once that succeeded, the three subscriptions a
+//!   session sends (`account_reads::subscriptions`), whose confirmations it reads, all within
+//!   QFEX's 60 s authentication deadline; then nothing but the pongs and the close reply the
+//!   WebSocket layer writes to each server ping and server close, each recorded on the shared
+//!   limiter as a session records one (`RateLimiter::record`, decision 0030). It never arms,
+//!   places, cancels or reads, and sends no ping of its own. It ends at `--hold-secs` from its
+//!   opening or at the owner's interrupt (Ctrl-C, [`Interrupt`]), each a close charged as a
+//!   control frame (none, and the connection dropped, when the limiter has no room, as a
+//!   session's) and then the server's echo read for at most `--read-wait-ms`; at a server close
+//!   (read on until the close reply has gone out); or at the connection's end; nothing
+//!   reconnects. Every ping, pong and close it receives is recorded with its time since the
+//!   connection opened ([`crate::hold`]); every data frame is counted by kind and read for a
+//!   provider rate refusal, never kept, and a `RateLimited` err among them holds the shared
+//!   budget as on a read socket (an err a journal would keep whole is read in memory as it
+//!   arrived, for its code alone, and holds none). A refusal (authentication refused, a
+//!   confirmation missing at the deadline, an err) ends it with a close as its duration does.
+//!   Once its connection is over, whatever ended it, every named account is read again; an
+//!   account that then shows an open order or a position, a hold that did not do what decision
+//!   0146 asks, an order or fill frame on it, or the owner's interrupt in a run that also arms
+//!   stops the probe, so no session starts. The interrupt is the hold's from its connection's
+//!   opening, when the hold polls it before writing anything, until its close and the read of
+//!   the echo are over: one that comes as it closes is recorded as such and stops a run that
+//!   arms too. An interrupt at any other time is not the hold's: the program (`main.rs`,
+//!   [`crate::interrupt`]) then ends at once, writing no report, as the probe always has.
 //! - **The session** ([`Run::session`]): fbc-runtime's `ExecSession`, unchanged, with the
 //!   consumer's `AccountWideCodAuthority` for the account it arms on. The program submits
 //!   nothing: the session sends its own arm once the codec reports the stream authenticated
@@ -60,16 +91,18 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::io::Write;
 use std::path::Path;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     AccountKey, ConnKey, ConnState, EncodeCtx, Envelope, ExecEvent, HttpResponse, Inbound, MonoNs,
-    Namespace, NonceBlock, NonceSource, RateCharge, RawFrame, SpecTable, TrafficClass, VenueCaps,
-    VenueConfig, VenueFactory, Via, WallNs, dispatch,
+    Namespace, NonceBlock, NonceSource, OpKind, RateCharge, RawFrame, SpecTable, TrafficClass,
+    VenueCaps, VenueConfig, VenueFactory, Via, WallNs, dispatch,
 };
 use fbc_journal::{
     JournalError, JournalWriter, NonceSourceId, QueueSink, RedactionKey, SinkConfig, journal_queue,
@@ -81,24 +114,44 @@ use fbc_runtime::{
     RpcIds, SafetyReserve, WriteStall,
 };
 use fbc_venue_qfex::Qfex;
-use fbc_venue_qfex::account_reads::{self, NotAPage, OrdersPage, PageAsk, RestRead, SocketWrite};
+use fbc_venue_qfex::account_reads::{
+    self, NotAPage, OrdersPage, PageAsk, RestRead, SocketErr, SocketWrite,
+};
 use fbc_venue_qfex::auth::{ACCOUNT_KEY, AccountSelection, ReadAuth, TRADE_URL, account_selection};
+use fbc_venue_qfex::exec::{AUTH_DEADLINE, CHANNELS};
 use fbc_venue_qfex::probe::{
     self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
 };
 use fbc_venue_qfex::sign::QfexNonces;
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_URL};
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 
 use crate::auth_qfex::{self, Armed, Lookup, SUB_ID_VAR};
 use crate::capture::{self, AccountRead, Evidence, SessionRun};
 use crate::evidence;
+use crate::hold::{self as held_frames, Control, End, Heard, HoldRun, ReadAfter};
 use crate::ledger::{self, Opened, RegistryLedger};
-use crate::probe_args::Options;
-use crate::refusals::{self, ReadSocket, Refusals};
+use crate::probe_args::{Hold, Options};
+use crate::refusals::{self, AFTER_HOLD, HOLD, ReadSocket, Refusals};
 
 /// Where the lines go: standard output when run, a buffer under test.
 pub type Out = Rc<RefCell<dyn Write>>;
+
+/// The owner's interrupt, as the liveness hold waits on it: it resolves when the owner presses
+/// Ctrl-C (`main.rs` wires tokio's `ctrl_c` through [`crate::interrupt`]; a test resolves its
+/// own). Only the hold's connection polls it: once as the connection opens, before anything is
+/// written, then while it holds, and once more when its close is over, before it drops it
+/// (decision 0146 item 4).
+pub type Interrupt = Pin<Box<dyn Future<Output = ()>>>;
+
+/// What a pong, a close reply or the hold's own close is charged: a control frame, which safety
+/// traffic may send from the reserve, as a session charges one (fbc-runtime's session core,
+/// decision 0030).
+const CONTROL: fbc_runtime::Request = fbc_runtime::Request {
+    charge: RateCharge::one(OpKind::Control, None),
+    via: Via::Frame,
+    class: TrafficClass::Safety,
+};
 
 /// The venue, for the sessions' `&'static dyn VenueFactory`.
 static QFEX: Qfex = Qfex;
@@ -187,15 +240,31 @@ impl NonceSource for Nonces {
     }
 }
 
-/// Runs stage one: the guard, the reads, one session per account in `opts.arms`, then the
-/// files. An error is a refusal before anything connected; once the evidence directory exists,
-/// the outcome is in the report.
+/// Runs stage one as [`run_until`] does, with no interrupt: the integration test's entry, the
+/// program passing the owner's.
+#[allow(dead_code)]
 pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome, String> {
-    auth_qfex::check(lookup, &opts.arms)?;
-    // Every account a session arms on is among them: `check` refuses an arm on the subaccount
-    // that no variable names.
+    run_until(opts, lookup, out, Box::pin(std::future::pending())).await
+}
+
+/// Runs stage one: the guard, the reads, the hold when `opts.hold` asks for one (ended early by
+/// `interrupt`), one session per account in `opts.arms`, then the files. An error is a refusal
+/// before anything connected; once the evidence directory exists, the outcome is in the report.
+pub async fn run_until(
+    opts: &Options,
+    lookup: Lookup<'_>,
+    out: Out,
+    interrupt: Interrupt,
+) -> Result<Outcome, String> {
+    // The accounts a session arms on, then the one the hold authenticates as.
+    let mut used = opts.arms.clone();
+    used.extend(opts.hold.map(|hold| hold.account));
+    let first = *(used.first()).ok_or("--arm or --hold-secs is required: nothing to run")?;
+    auth_qfex::check(lookup, &used)?;
+    // Every account a session arms on or the hold authenticates as is among them: `check`
+    // refuses the subaccount when no variable names it.
     let named = named(lookup);
-    assert!(opts.arms.iter().all(|a| named.contains(a)), "a named arm");
+    assert!(used.iter().all(|a| named.contains(a)), "a named account");
     let base = base_config(opts);
     // What the guard admitted of the configuration of each account the run reads, every one a
     // session may arm on included: the environment its mode names and the side its origins are
@@ -234,7 +303,7 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
     if listing.next().is_some() {
         return Err("--evidence-dir is not empty: give a new directory".to_owned());
     }
-    let (cfg, _) = configured(&base, lookup, opts.arms[0])?;
+    let (cfg, _) = configured(&base, lookup, first)?;
     let caps = QFEX.caps(&cfg).map_err(|e| e.to_string())?;
     let limits = caps.exec_limits.clone().unwrap_or_default();
     let reserve = SafetyReserve::percent(10).expect("10% is a reserve");
@@ -279,18 +348,28 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
         journal: Journal::new(Rc::clone(&sink)),
         origin,
         environment: env,
+        interrupt: Some(interrupt),
         ev: Evidence {
             started: evidence::utc(wall_secs()),
             environment: environment(env),
             mode: env.mode(),
             target,
             accounts: named.iter().map(|a| name(*a)).collect(),
+            arms: opts.arms.iter().map(|a| name(*a)).collect(),
+            hold_asked: opts.hold.is_some(),
             ..Evidence::default()
         },
         named,
     };
+    let held = opts.hold.map_or(String::new(), |hold| {
+        format!(
+            "; first holds one trade connection on {} for {} s",
+            name(hold.account),
+            hold.duration.as_secs()
+        )
+    });
     run.line(format_args!(
-        "PROBE stage one on QFEX {} ({}), against {target}: arms on {:?}",
+        "PROBE stage one on QFEX {} ({}), against {target}: arms on {:?}{held}",
         environment(env),
         env.mode(),
         opts.arms
@@ -419,6 +498,8 @@ struct Run<'a> {
     origin: tokio::time::Instant,
     /// The environment the run's probe mode names, which its registries are built for.
     environment: Environment,
+    /// The owner's interrupt, until the hold takes it.
+    interrupt: Option<Interrupt>,
     ev: Evidence,
     /// The accounts the run's configuration names, read before every session ([`named`]).
     named: Vec<Armed>,
@@ -429,27 +510,27 @@ impl Run<'_> {
         let _ = writeln!(self.out.borrow_mut(), "{args}");
     }
 
-    /// Each session, after the checks of every account the configuration names.
+    /// The hold, when the run asks for one, then each session, each after the checks of every
+    /// account the configuration names.
     async fn stage(&mut self) -> Result<(), String> {
         self.line(format_args!(
             "ACCOUNTS {} named by the run's configuration, not listed by QFEX (decision 0144): {}",
             self.ev.accounts.len(),
             self.ev.accounts.join(", ")
         ));
+        if let Some(hold) = self.opts.hold {
+            self.hold(hold).await?;
+        }
         let arms = self.opts.arms.clone();
         for (n, armed) in arms.into_iter().enumerate() {
             let (cfg, creds) = configured(&self.base, self.lookup, armed)?;
-            self.check_accounts(armed).await?;
+            self.check_accounts(name(armed), armed, " (armed)").await?;
+            let bounds = (self.opts.ledger.as_ref()).ok_or("--arm without the ledger's bounds")?;
             // Stage one's registries serve one session each: each arms its own account.
             let opened = Opened::now(self.origin, wall_ns());
             let label = name(armed);
-            let mut registry = RegistryLedger::new(
-                label,
-                account_key(armed),
-                &self.opts.ledger,
-                opened,
-                self.environment,
-            );
+            let mut registry =
+                RegistryLedger::new(label, account_key(armed), bounds, opened, self.environment);
             let ran = self
                 .session(n, armed, cfg, creds, registry.deadline())
                 .await;
@@ -492,29 +573,28 @@ impl Run<'_> {
         auth_qfex::send(&self.connector, &read.req, self.opts.read_wait).await
     }
 
-    /// Writes one of the adapter's frames on a read socket, waiting at most `--read-wait-ms`
-    /// for a peer that stopped reading.
+    /// Writes one of the adapter's frames on a read socket or the hold's connection, waiting at
+    /// most `--read-wait-ms` for a peer that stopped reading.
     async fn write(&self, ws: &mut WebSocket, write: &SocketWrite) -> Result<(), String> {
         self.admit(write.charge, Via::Frame, write.class)?;
         let wait = self.opts.read_wait;
         let written = tokio::time::timeout(wait, auth_qfex::write(ws, &write.frame)).await;
-        written.map_err(|_| {
-            format!(
-                "the read socket took no frame within {} ms",
-                wait.as_millis()
-            )
-        })?
+        written.map_err(|_| format!("the socket took no frame within {} ms", wait.as_millis()))?
     }
 
-    /// Reads every account the configuration names before the session on `armed`, each under
-    /// its own configuration ([`configured`]), which the guard admitted before anything
-    /// connected; stops the probe when one cannot be read, or holds an open order, a TWAP or a
-    /// position that is not flat.
-    async fn check_accounts(&mut self, armed: Armed) -> Result<(), String> {
-        let before = name(armed);
+    /// Reads every account the configuration names before `before`, the session on `on` or the
+    /// hold ([`HOLD`]) on it, `on`'s label marked `mark`, each under its own configuration
+    /// ([`configured`]), which the guard admitted before anything connected; stops the probe
+    /// when one cannot be read, or holds an open order, a TWAP or a position that is not flat.
+    async fn check_accounts(
+        &mut self,
+        before: &'static str,
+        on: Armed,
+        mark: &'static str,
+    ) -> Result<(), String> {
         for account in self.named.clone() {
             let mut label = name(account).to_owned();
-            label.push_str(if account == armed { " (armed)" } else { "" });
+            label.push_str(if account == on { mark } else { "" });
             let (cfg, _) = configured(&self.base, self.lookup, account)?;
             let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
             let mut met = None;
@@ -533,16 +613,23 @@ impl Run<'_> {
                 "{} open orders, {} TWAPs, flat {}, REST open_orders {}",
                 read.page_orders, read.page_twaps, read.flat, read.rest_open_orders
             );
-            self.line(format_args!("READ before {before}: {label}: {shown}"));
+            let when = refusals::read_when(before);
+            self.line(format_args!("READ {when}: {label}: {shown}"));
             self.ev.reads.push(AccountRead {
                 before,
                 label: label.clone(),
                 ..read
             });
             if let Some(why) = refusal {
-                return Err(format!(
-                    "{label} {why}: no session starts (decision 0132 item 7)"
-                ));
+                let starts = match before {
+                    HOLD => "no hold starts (decision 0146 item 3)",
+                    AFTER_HOLD => {
+                        "read after the hold, though every account showed none before it: what \
+                         decision 0146 says would show it wrong; no session starts"
+                    }
+                    _ => "no session starts (decision 0132 item 7)",
+                };
+                return Err(format!("{label} {why}: {starts}"));
             }
         }
         Ok(())
@@ -660,6 +747,289 @@ impl Run<'_> {
         self.limiter.counts().rejected.user
     }
 
+    /// The liveness hold (decision 0146) on `hold.account`: every named account read as before
+    /// a session, then its one connection ([`Run::held`]), then, once that connection opened,
+    /// every named account read again, whatever ended it (item 3). What it heard is the
+    /// evidence's whether or not it did what the record asks. One that did not, an account read
+    /// after it that shows an open order or a position, and the owner's interrupt in a run that
+    /// also arms each stop the probe, as a refused read does, so no session starts.
+    async fn hold(&mut self, hold: Hold) -> Result<(), String> {
+        self.check_accounts(HOLD, hold.account, " (held)").await?;
+        let label = name(hold.account);
+        self.line(format_args!(
+            "HOLD {label}: one trade connection for {} s: its authentication and three \
+             subscriptions, then nothing; it never arms or places",
+            hold.duration.as_secs()
+        ));
+        let mut run = HoldRun {
+            account: label,
+            duration: hold.duration,
+            ..HoldRun::default()
+        };
+        let before = self.rejected();
+        let held = self.held(hold, &mut run).await;
+        run.refusals.limiter = self.rejected().saturating_sub(before);
+        if let Err(why) = held {
+            run.error.get_or_insert(why);
+        }
+        let pings = run.pings();
+        let closes = run.server_closes().len();
+        self.line(format_args!(
+            "HOLD {label}: ended by {}; {} pings ({} before authentication), {closes} server \
+             closes",
+            run.ended_by.says(),
+            pings.len(),
+            run.pings_before_auth()
+        ));
+        let mut why = run.stops();
+        if why.is_none() && !self.opts.arms.is_empty() {
+            why = match (&run.ended_by, run.interrupted_closing) {
+                (End::Interrupted, _) => {
+                    Some("the owner's interrupt (Ctrl-C) ended the hold: no session starts".into())
+                }
+                (_, true) => Some(
+                    "the owner's interrupt (Ctrl-C) came as the hold closed: no session starts"
+                        .into(),
+                ),
+                _ => None,
+            };
+        }
+        // The reads after it, once its connection opened: a hold that never opened held nothing.
+        if run.opened {
+            let after = self
+                .check_accounts(AFTER_HOLD, hold.account, " (held)")
+                .await;
+            run.read_after = match after {
+                Ok(()) => ReadAfter::Clean,
+                Err(e) => {
+                    let after = format!("after the hold: {e}");
+                    why = Some(match why {
+                        Some(why) => format!("{why}; {after}"),
+                        None => after,
+                    });
+                    ReadAfter::Stopped(e)
+                }
+            };
+        }
+        self.ev.hold = Some(run);
+        why.map_or(Ok(()), Err)
+    }
+
+    /// Charges the hold's own close to the run's limiter as a control frame, as a session
+    /// charges its own: refused, nothing sent, when the buckets have no room for it.
+    fn admit_close(&self) -> Result<(), String> {
+        self.admit(CONTROL.charge, CONTROL.via, CONTROL.class)
+    }
+
+    /// The hold's connection: opened on `hold.account`'s guarded trade origin, held until it
+    /// ends ([`Run::holding`]), then closed: at its duration, the owner's interrupt or a
+    /// refusal, a close and the server's echo read for at most `--read-wait-ms`; at a server
+    /// close, read on until the close reply has gone out. The owner's interrupt is the hold's
+    /// from the connection's opening until then: a press that did not end it, made while it
+    /// closed or ready as something else ended it, is recorded as one made as it closed
+    /// (`run.interrupted_closing`). An error before it opened is returned; everything after is
+    /// in `run`.
+    async fn held(&mut self, hold: Hold, run: &mut HoldRun) -> Result<(), String> {
+        let (cfg, _) = configured(&self.base, self.lookup, hold.account)?;
+        let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
+        let reader = auth_qfex::reader(self.lookup, selection)?;
+        let url = account_reads::trade_url(&cfg, &reader).map_err(|e| e.to_string())?;
+        let subscriptions = account_reads::subscriptions(&cfg).map_err(|e| e.to_string())?;
+        // The owner's interrupt, which only this connection waits on, and which goes with it.
+        let mut interrupt =
+            (self.interrupt.take()).unwrap_or_else(|| Box::pin(std::future::pending()));
+        let ws = auth_qfex::open(&self.connector, &url, self.opts.connect_wait).await;
+        let mut ws = ws.map_err(of_the_hold)?;
+        let opened = tokio::time::Instant::now();
+        run.opened = true;
+        // Polled now, before anything is written, so the interrupt listens from the
+        // connection's opening (`main.rs` hands it each Ctrl-C from its first poll on).
+        let ended = match interrupt.as_mut().now_or_never() {
+            Some(()) => End::Interrupted,
+            None => {
+                self.holding(
+                    &cfg,
+                    &reader,
+                    &subscriptions,
+                    &mut ws,
+                    opened,
+                    &mut interrupt,
+                    run,
+                )
+                .await
+            }
+        };
+        run.ended_at = Some(opened.elapsed());
+        let wait = self.opts.read_wait;
+        let mut drain = ended != End::NoCloseFrame;
+        if matches!(ended, End::Duration | End::Interrupted | End::Refused) {
+            match self.admit_close() {
+                Ok(()) => {
+                    // From here a close read is the echo of its own, though the write may not
+                    // finish: the next read flushes a close queued and not yet written.
+                    run.close_begun = Some(opened.elapsed());
+                    let closed = tokio::time::timeout(wait, ws.close(None)).await;
+                    if matches!(closed, Ok(Ok(()))) {
+                        run.close_sent = Some(opened.elapsed());
+                    }
+                }
+                // No room for it: the connection is dropped with no close, as a session's is.
+                Err(_) => {
+                    run.close_refused = true;
+                    drain = false;
+                }
+            }
+        }
+        if drain {
+            // The server's echo of the close, or, after the server's close, the reply the
+            // WebSocket layer writes on the next read; then the stream's end.
+            let drained = async {
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Some(data) = hear(run, opened.elapsed(), msg, &self.limiter) {
+                        self.hold_data(run, &reader, &data);
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(wait, drained).await;
+        }
+        // A press while it closed, or one ready as its duration ended it and the wait took the
+        // duration, is the owner's interrupt as much as one that ended it. An interrupt that
+        // ended the hold is not polled again.
+        run.interrupted_closing =
+            ended != End::Interrupted && interrupt.as_mut().now_or_never().is_some();
+        drop(ws);
+        drop(interrupt);
+        run.ended_by = ended;
+        Ok(())
+    }
+
+    /// The hold's connection from its opening to its end: its authentication, then, once QFEX
+    /// answers it with success, the three subscriptions, then nothing; every frame it receives
+    /// recorded ([`hear`], [`Run::hold_data`]). It ends at its duration from `opened`, at
+    /// `interrupt`, at a server close, at the connection's end, or at a refusal (`run.error`
+    /// says which): the authentication refused, a frame that is an err, or the three
+    /// confirmations not all in within QFEX's authentication deadline.
+    #[allow(clippy::too_many_arguments)]
+    async fn holding(
+        &mut self,
+        cfg: &VenueConfig,
+        reader: &ReadAuth,
+        subscriptions: &[SocketWrite],
+        ws: &mut WebSocket,
+        opened: tokio::time::Instant,
+        interrupt: &mut Interrupt,
+        run: &mut HoldRun,
+    ) -> End {
+        fn refused(run: &mut HoldRun, why: String) -> End {
+            run.error = Some(why);
+            End::Refused
+        }
+        let ctx = self.ctx();
+        let sent = match account_reads::authentication(cfg, reader, &ctx) {
+            Ok(auth) => self.write(ws, &auth).await.map_err(of_the_hold),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(why) = sent {
+            return refused(run, why);
+        }
+        run.sent.push("authentication".to_owned());
+        let end = opened + run.duration;
+        let deadline = opened + AUTH_DEADLINE;
+        let mut confirmed = [false; CHANNELS.len()];
+        loop {
+            let settled = run.subscribed.is_some();
+            let msg = tokio::select! {
+                msg = ws.next() => msg,
+                () = tokio::time::sleep_until(end) => return End::Duration,
+                () = &mut *interrupt => return End::Interrupted,
+                () = tokio::time::sleep_until(deadline), if !settled => {
+                    let why = format!(
+                        "QFEX did not authenticate the hold's connection and confirm its three \
+                         subscriptions within {} s",
+                        AUTH_DEADLINE.as_secs()
+                    );
+                    return refused(run, why);
+                }
+            };
+            let at = opened.elapsed();
+            let msg = match msg {
+                Some(Ok(msg)) => msg,
+                // The stream failed, with its error, or ended.
+                ended => {
+                    run.dropped = ended.and_then(Result::err).map(|e| e.to_string());
+                    return End::NoCloseFrame;
+                }
+            };
+            let closing = matches!(msg, Message::Close(_));
+            let Some(data) = hear(run, at, msg, &self.limiter) else {
+                match closing {
+                    true => return End::ServerClose,
+                    false => continue,
+                }
+            };
+            if let Some(err) = self.hold_data(run, reader, &data) {
+                return refused(run, err);
+            }
+            let raw = data.raw();
+            if run.authenticated.is_none() {
+                if !account_reads::authenticated(reader, raw) {
+                    let why = "QFEX did not authenticate the hold's connection".to_owned();
+                    return refused(run, why);
+                }
+                run.authenticated = Some(at);
+                for (subscription, channel) in subscriptions.iter().zip(CHANNELS) {
+                    if let Err(why) = self.write(ws, subscription).await {
+                        return refused(run, of_the_hold(why));
+                    }
+                    run.sent.push(format!("subscribe {channel}"));
+                }
+            } else if let Some(at_channel) = account_reads::confirmation(reader, raw)
+                && !std::mem::replace(&mut confirmed[at_channel], true)
+            {
+                run.confirmed += 1;
+                if run.confirmed == CHANNELS.len() {
+                    run.subscribed = Some(at);
+                }
+            }
+        }
+    }
+
+    /// Counts `frame`, a data frame off the hold's connection, by kind ([`held_frames::kind_of`])
+    /// and reads it for a provider rate refusal as a read socket's ([`Refusals::hear`]): as a
+    /// journal would keep it, and, when that is unread, as it arrived, in memory only; nothing of
+    /// it is kept but its kind's name. Returns the refusal it is when it is an err, which ends
+    /// the hold (decision 0146 item 4): read as the adapter reads one from what the journal
+    /// keeps, having held the shared budget for a `RateLimited` one, as for a read socket's
+    /// (decision 0126); or, for an err the journal would keep whole, read in memory as it
+    /// arrived ([`held_frames::whole_err`]), holding no budget, as a session's codec holds none
+    /// for one (decision 0134 item 6).
+    fn hold_data(&self, run: &mut HoldRun, reader: &ReadAuth, frame: &Data) -> Option<String> {
+        run.data_frames += 1;
+        let raw = frame.raw();
+        let spans = account_reads::redact_inbound(reader, Inbound::Frame(raw));
+        let (kept, arrived) = (
+            refusals::kept(raw, &spans),
+            String::from_utf8_lossy(raw.bytes()),
+        );
+        let kind = match frame {
+            Data::Binary(_) => held_frames::BINARY.to_owned(),
+            Data::Text(_) => held_frames::kind_of(&kept, &arrived),
+        };
+        let whole = kind == format!("err {}", held_frames::KEPT_WHOLE);
+        *run.kinds.entry(kind).or_default() += 1;
+        (run.refusals).hear(&kept, &arrived);
+        let err = account_reads::socket_err(reader, raw);
+        if let Some(SocketErr::RateLimited(hold)) = &err {
+            let now = tokio::time::Instant::now();
+            (self.limiter).provider_rejected(now, NO_CONN, hold.charge, hold.retry_after);
+        }
+        match err {
+            Some(err) => Some(err.to_string()),
+            None if whole => held_frames::whole_err(&arrived),
+            None => None,
+        }
+    }
+
     /// One session on `armed`, connection `n` of the run: it arms once and places nothing, and
     /// is stopped at `span_end` at the latest, its registry's span bound.
     async fn session(
@@ -755,8 +1125,59 @@ impl Run<'_> {
     }
 }
 
-/// A data frame off a read socket.
-enum Data {
+/// `error`, from `auth_qfex`'s socket helpers, which the read sockets share and which name the
+/// read socket, said of the hold's connection.
+fn of_the_hold(error: String) -> String {
+    error
+        .replacen(
+            "no read socket within",
+            "the hold's connection did not open within",
+            1,
+        )
+        .replacen("the read socket", "the hold's connection", 1)
+}
+
+/// Records `msg`, which the hold's connection received `at` after it opened: a ping, pong or
+/// close in `run.heard` (a payload and a reason by length only, a code in full, a close after
+/// the hold began its own as its echo); a data frame is handed back, for [`Run::hold_data`]. The
+/// reply the WebSocket layer writes to a ping (its pong, none once either side began to close)
+/// or to a server close (its close reply; none to the echo of the hold's own) is recorded on
+/// `limiter` as a control frame, past its cap if need be, as a session records it (decision
+/// 0030).
+pub fn hear(run: &mut HoldRun, at: Duration, msg: Message, limiter: &RateLimiter) -> Option<Data> {
+    let control = match msg {
+        Message::Text(text) => return Some(Data::Text(text.as_str().to_owned())),
+        Message::Binary(bytes) => return Some(Data::Binary(bytes.to_vec())),
+        Message::Ping(payload) => Control::Ping { len: payload.len() },
+        Message::Pong(payload) => Control::Pong { len: payload.len() },
+        Message::Close(frame) => Control::Close {
+            code: frame.as_ref().map(|f| u16::from(f.code)),
+            reason_len: frame.as_ref().map_or(0, |f| f.reason.len()),
+            echo: run.close_begun.is_some(),
+        },
+        // A raw frame is something to send: reading never yields one.
+        Message::Frame(_) => return None,
+    };
+    // The WebSocket layer answers a ping only while the connection is open both ways: before
+    // the hold began its own close and before any close of the server's (tungstenite answers a
+    // ping only in its active state). A close of the server's is yielded only in that state,
+    // and answered.
+    let open = run.close_begun.is_none() && run.server_closes().is_empty();
+    let answered = match control {
+        Control::Ping { .. } => open,
+        Control::Close { echo, .. } => !echo,
+        Control::Pong { .. } => false,
+    };
+    if answered {
+        limiter.record(tokio::time::Instant::now(), NO_CONN, CONTROL);
+        run.replies += 1;
+    }
+    run.heard.push(Heard { at, control });
+    None
+}
+
+/// A data frame off a read socket or the hold's connection.
+pub enum Data {
     Text(String),
     Binary(Vec<u8>),
 }
