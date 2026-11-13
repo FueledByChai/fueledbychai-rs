@@ -10,7 +10,8 @@
 //! - Its own deadline and a failed, refused or malformed read ask to reconnect.
 //! - One read of a kind: a query is refused while the orders' pages run.
 //! - Missed fills are read from item 5's start time, and only rows of orders this codec placed
-//!   become replayed fills, with our side, keyed by `trade_id`.
+//!   become replayed fills, with our side, keyed by `trade_id`: an order a live update ends
+//!   while the reads run included, and none the codec held only for a resync that has ended.
 //! - Nothing is pushed until the last read answers, then one bracket, the open orders before
 //!   the fills; and fbc-oms seeds no position from it.
 //! - Replaying the redacted journal gives the same events and effects, and the journal holds
@@ -1208,6 +1209,203 @@ fn a_page_row_under_our_client_id_binds_its_venue_id_for_the_trades_read() {
             assert_eq!(codec.counts().unplaced_trades, 1);
         }
     }
+}
+
+/// Trade 1 of our order, by our first client id, as the resync pushes it.
+fn replayed_fill_by_cid() -> ExecEvent {
+    let ExecEvent::Fill(fill) = replayed_fill() else {
+        unreachable!()
+    };
+    ExecEvent::Fill(FillEvent {
+        origin: FillOrigin::Order {
+            cid: Some(CidMatch::Ours(cids()[0])),
+            px: Ticks(20_000),
+        },
+        ..fill
+    })
+}
+
+/// A case of an order ended live during the resync: its name, what epoch 1 saw after the place,
+/// the reads and the live end in their order, the trade row's client id, and whether the page
+/// lists the order.
+type Ended<'a> = (&'a str, Vec<Step>, Vec<Step>, Option<&'a str>, bool);
+
+#[test]
+fn an_order_ended_live_during_the_resync_still_has_its_missed_fill_replayed() {
+    // Our order, placed on epoch 1, fills while the connection is down. On epoch 2 a live
+    // order_response ends it while the resync's reads run: the trades read was asked from its
+    // send time, so the fill its page lists is our replayed fill, with our side, keyed by its
+    // trade_id, and not an unplaced trade (decision 0132 item 5).
+    let cfg = preprod(SUB);
+    let wire = wire_cid(0);
+    let ours = quoted(&wire);
+    let ends = [
+        vec![("status", Some("\"CANCELLED\""))],
+        vec![
+            ("status", Some("\"FILLED\"")),
+            ("quantity_remaining", Some("0")),
+        ],
+    ];
+    for end in &ends {
+        let ended = |cid: &str| {
+            let mut changes = end.clone();
+            changes.push(("client_order_id", Some(cid)));
+            Step::Frame(order_frame(&changes))
+        };
+        let positions = Step::Http {
+            nth: 0,
+            status: 200,
+            body: flat(),
+        };
+        let listed = row(ORDER_ROW, &[("client_order_id", Some(ours.as_str()))]);
+        let cases: [Ended<'_>; 5] = [
+            // Ended under our client id while the orders' pages run; the row names it.
+            (
+                "by client id",
+                vec![],
+                vec![ended(&ours), positions.clone(), Step::Frame(page(&[], &[]))],
+                Some(wire.as_str()),
+                false,
+            ),
+            // Its venue id bound by epoch 1's ack, ended by that id alone; the row names it.
+            (
+                "by the venue id its ack bound",
+                vec![Step::Frame(our_ack())],
+                vec![
+                    ended("\"\""),
+                    positions.clone(),
+                    Step::Frame(page(&[], &[])),
+                ],
+                None,
+                false,
+            ),
+            // Its venue id bound by the live end itself.
+            (
+                "by the venue id its end bound",
+                vec![],
+                vec![positions.clone(), ended(&ours), Step::Frame(page(&[], &[]))],
+                None,
+                false,
+            ),
+            // Its venue id bound only by the resync's page, ended by that id alone while the
+            // trades read is in flight.
+            (
+                "by the venue id the page bound",
+                vec![],
+                vec![
+                    positions.clone(),
+                    Step::Frame(page(std::slice::from_ref(&listed), &[])),
+                    ended("\"\""),
+                ],
+                None,
+                true,
+            ),
+            // Ended under our client id while the trades read is in flight.
+            (
+                "by client id while trades are read",
+                vec![],
+                vec![positions.clone(), Step::Frame(page(&[], &[])), ended(&ours)],
+                Some(wire.as_str()),
+                false,
+            ),
+        ];
+        for (case, first, reads, cid, listed) in cases {
+            let mut steps = epoch(1);
+            steps.push(Step::Encode(gtc_place(), 3));
+            steps.extend(first);
+            steps.extend(epoch(2));
+            steps.push(Step::Resync(9));
+            steps.extend(reads);
+            steps.push(Step::Frame(trades(&[trade(1, ORDER, cid)])));
+            let (codec, outs, _) = run_twice(|| probe_on(&cfg), &steps);
+            let asked = outs
+                .iter()
+                .any(|out| out.effects == vec![trades_ask(1_760_000_003, 1000, 0)]);
+            assert!(asked, "{case}: {end:?}");
+            let fill = if cid.is_some() {
+                replayed_fill_by_cid()
+            } else {
+                replayed_fill()
+            };
+            let events = untimed(outs.last().unwrap());
+            if listed {
+                let [
+                    ExecEvent::ResyncBegin { .. },
+                    ExecEvent::ResyncOrder(order),
+                    pushed,
+                    ExecEvent::ResyncEnd,
+                ] = events.as_slice()
+                else {
+                    panic!("{case}: {end:?}: {events:?}");
+                };
+                assert_eq!(order.vid, venue_id(ORDER), "{case}");
+                assert_eq!(*pushed, fill, "{case}: {end:?}");
+            } else {
+                assert_eq!(events, bracket(9, vec![fill]), "{case}: {end:?}");
+            }
+            assert_eq!(codec.counts().unplaced_trades, 0, "{case}: {end:?}");
+            let evidence = codec.last_resync().unwrap();
+            assert!(evidence.finished, "{case}");
+            assert!(evidence.unplaced_trades.is_empty(), "{case}: {end:?}");
+        }
+    }
+}
+
+#[test]
+fn an_order_ended_during_a_resync_is_forgotten_once_that_resync_ends() {
+    // Our order ends live during epoch 2's resync, which replays its missed fill. A fill of
+    // another order then gives epoch 3's resync a start time, and its trades page lists a
+    // second trade of our order under our client id: no resync can need the order any more,
+    // so the codec no longer holds it, and that row is an unplaced trade (decision 0132 item 5).
+    let cfg = preprod(SUB);
+    let ours = quoted(&wire_cid(0));
+    let other = quoted(&oid(77));
+    let mut steps = epoch(1);
+    steps.push(Step::Encode(gtc_place(), 3));
+    steps.extend(epoch(2));
+    steps.push(Step::Resync(9));
+    steps.push(Step::Frame(order_frame(&[
+        ("client_order_id", Some(ours.as_str())),
+        ("status", Some("\"CANCELLED\"")),
+    ])));
+    steps.push(Step::Http {
+        nth: 0,
+        status: 200,
+        body: flat(),
+    });
+    steps.push(Step::Frame(page(&[], &[])));
+    steps.push(Step::Frame(trades(&[trade(1, ORDER, Some(&wire_cid(0)))])));
+    let first = steps.len() - 1;
+    steps.push(Step::Frame(fill_frame(&[
+        ("order_id", Some(other.as_str())),
+        ("timestamp", Some("1760000005.5")),
+    ])));
+    steps.extend(epoch(3));
+    steps.push(Step::Resync(20));
+    steps.push(Step::Http {
+        nth: 1,
+        status: 200,
+        body: flat(),
+    });
+    steps.push(Step::Frame(page(&[], &[])));
+    let asked = steps.len() - 1;
+    steps.push(Step::Frame(trades(&[trade(2, ORDER, Some(&wire_cid(0)))])));
+    let (codec, outs, _) = run_twice(|| probe_on(&cfg), &steps);
+    assert_eq!(
+        untimed(&outs[first]),
+        bracket(9, vec![replayed_fill_by_cid()])
+    );
+    // The latest fill alone gives the start time: our order is no longer one not seen to end.
+    assert_eq!(
+        outs[asked],
+        Out::effects(vec![trades_ask(1_760_000_005, 1000, 0)])
+    );
+    assert_eq!(untimed(outs.last().unwrap()), bracket(20, vec![]));
+    let counts = codec.counts();
+    assert_eq!((counts.resyncs, counts.unplaced_trades), (2, 1));
+    let evidence = codec.last_resync().unwrap();
+    assert!(evidence.finished);
+    assert_eq!(evidence.unplaced_trades, vec![fill_id(&tid(2))]);
 }
 
 #[test]

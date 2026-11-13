@@ -304,7 +304,8 @@ pub struct QfexExec {
     /// recording-only codec, which reads nothing over REST.
     rest: String,
     /// The orders this codec placed and has not seen end, across its epochs (decision 0132
-    /// item 5): each leaves on an order update showing it ended. As `armed` says, a place the
+    /// item 5): each leaves on an order update showing it ended, a resync in flight keeping its
+    /// own copy of those it began with until it ends (`resync.rs`). As `armed` says, a place the
     /// session's buckets refused after it was encoded is recorded all the same; it only moves
     /// the trades read's start time earlier, the cautious side.
     placed: Vec<resync::Placed>,
