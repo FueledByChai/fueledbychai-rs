@@ -14,11 +14,18 @@
 //! - with `--production` (FBC-3prm, decision 0143 item 3), runs stage one in the adapter's
 //!   `production_probe` mode to a complete run whose report, evidence and fixture README name
 //!   production and whose registries carry no testnet declaration, and refuses a pre-production
-//!   origin with it, and a production origin without it, before anything connects.
+//!   origin with it, and a production origin without it, before anything connects;
+//! - on either environment (FBC-5ph8, decision 0144), sends no `GET /user/subaccounts`: before
+//!   every session it reads the accounts its configuration names, the primary account and the
+//!   subaccount `QFEX_SUBACCOUNT_ID` names, and its report, evidence and output say the accounts
+//!   came from the configuration and not from QFEX; a configured subaccount it cannot read stops
+//!   it before anything arms.
 //!
-//! The stub answers as QFEX's pages show (each frame below names its page): the account listing,
-//! each account's positions selected by `x-qfex-requested-account-id`, the authentication reply,
-//! the subscription confirmations and the `get_user_orders` page. Every key, secret, account id
+//! The stub answers as QFEX's pages show (each frame below names its page): each account's
+//! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
+//! subscription confirmations and the `get_user_orders` page. It answers `GET /user/subaccounts`
+//! HTTP 403, as QFEX answered a key scoped to one account in FBC-291a's first production run, and
+//! records every request, so a test can show the probe sent none. Every key, secret, account id
 //! and answer is synthetic: the REST answers are `fixtures/qfex/private` (its `SYNTHETIC` file).
 //! The run is on real time; each session waits out its arm's 600 ms deadline.
 
@@ -78,9 +85,9 @@ const PUBLIC: &str = "qfex_pub_SYNTHETIC_0001";
 const SECRET: &str = "synthetic-qfex-secret-0001";
 const SUB_PUBLIC: &str = "qfex_pub_SYNTHETIC_0002";
 const SUB_SECRET: &str = "synthetic-qfex-secret-0002";
-/// The made-up subaccounts `fixtures/qfex/private/subaccounts.json` lists; the first is armed.
+/// The made-up subaccount the environment names (`QFEX_SUBACCOUNT_ID`), in the shape QFEX writes
+/// one.
 const SUB: &str = "5a5a5a5a-0000-4000-8000-00000000c0de";
-const SUB2: &str = "5a5a5a5a-0000-4000-8000-00000000beef";
 
 /// The authenticate page's success reply.
 const AUTH_OK: &str = r#"{"type":"auth","result":"success"}"#;
@@ -134,9 +141,21 @@ fn environment() -> HashMap<&'static str, String> {
     ])
 }
 
-/// The stub's REST answers: the listing, and each account's positions by its selection header
-/// (`None` for the primary account).
-fn rest(listing: HttpReply, positions: HashMap<Option<&'static str>, HttpReply>) -> HttpRouter {
+/// What QFEX answered FBC-291a's first production run's `GET /user/subaccounts`, made with a key
+/// scoped to the primary account: HTTP 403, insufficient API key permissions (decision 0144), in
+/// the REST reference's problem shape, synthetic.
+fn listing_refused() -> HttpReply {
+    HttpReply {
+        status: 403,
+        body: br#"{"title":"Forbidden","status":403,"detail":"insufficient API key permissions"}"#
+            .to_vec(),
+    }
+}
+
+/// The stub's REST answers: each account's positions by its selection header (`None` for the
+/// primary account), and the listing refused ([`listing_refused`]), which the probe never asks
+/// for (decision 0144): a run that sent it would stop there.
+fn rest(positions: HashMap<Option<&'static str>, HttpReply>) -> HttpRouter {
     let positions: HashMap<Option<String>, HttpReply> = positions
         .into_iter()
         .map(|(k, v)| (k.map(str::to_owned), v))
@@ -145,7 +164,7 @@ fn rest(listing: HttpReply, positions: HashMap<Option<&'static str>, HttpReply>)
         .route(
             Method::GET,
             PathPattern::exact("/user/subaccounts"),
-            listing,
+            listing_refused(),
         )
         .route_fn(
             Method::GET,
@@ -167,14 +186,20 @@ fn positions_flat(open_orders: u64) -> String {
     body.to_string()
 }
 
-/// Every account flat, with no open order counted.
+/// Both accounts flat, with no open order counted.
 fn flat() -> HashMap<Option<&'static str>, HttpReply> {
     let flat = ok(&positions_flat(0));
-    HashMap::from([
-        (None, flat.clone()),
-        (Some(SUB), flat.clone()),
-        (Some(SUB2), flat),
-    ])
+    HashMap::from([(None, flat.clone()), (Some(SUB), flat)])
+}
+
+/// Asserts the stub received no `GET /user/subaccounts` (decision 0144): every request it
+/// received is a positions read.
+fn assert_no_listing(server: &StubServer) {
+    let asked = server.http_requests();
+    assert!(
+        asked.iter().all(|r| r == "GET /user/positions"),
+        "{asked:?}"
+    );
 }
 
 /// A responder sending `frames`, whatever it read.
@@ -352,7 +377,7 @@ fn assert_no_secret(dir: &Path) {
         .into_iter()
         .filter(|(p, _)| !p.starts_with(dir.join("journal")));
     for (path, text) in outputs {
-        for secret in [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB, SUB2] {
+        for secret in [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB] {
             assert!(
                 !text.contains(secret),
                 "{} holds a credential or id",
@@ -365,26 +390,24 @@ fn assert_no_secret(dir: &Path) {
 // ----- The capture -----
 
 #[tokio::test]
-async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
+async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its_capture_is_written_scrubbed()
+ {
     let (dir, _removed) = temp_dir("capture");
     let position = fixture("position_response.json");
     let position = position.split_whitespace().collect::<String>();
     let mut steps = Vec::new();
-    // Before the primary account's session: the primary account, then each listed subaccount,
-    // the first read pinged between its two replies (a ping is passed over).
+    // Before the primary account's session: the primary account, then the subaccount the
+    // environment names, the first read pinged between its two replies (a ping is passed over).
     steps.extend(read_socket(0, EMPTY_PAGE));
     steps.insert(2, Step::Barrier { conn: 0 });
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
-    steps.extend(session_socket(3, &[ARM_ACK, OTHER_ERR, &position]));
-    // Before the subaccount's session, every account again; then its session, whose arm
+    steps.extend(session_socket(2, &[ARM_ACK, OTHER_ERR, &position]));
+    // Before the subaccount's session, both accounts again; then its session, whose arm
     // nothing answers.
+    steps.extend(read_socket(3, EMPTY_PAGE));
     steps.extend(read_socket(4, EMPTY_PAGE));
-    steps.extend(read_socket(5, EMPTY_PAGE));
-    steps.extend(read_socket(6, EMPTY_PAGE));
-    steps.extend(session_socket(7, &[]));
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+    steps.extend(session_socket(5, &[]));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
     let opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
@@ -395,32 +418,34 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     server.finished().await.unwrap();
 
     // No command but the arm: each read socket sent its authentication and one page, each
-    // session its authentication, its subscriptions and one arm. Eight connections, so no
+    // session its authentication, its subscriptions and one arm. Six connections, so no
     // session attempted a second.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(server.connections().len(), 8);
+    assert_eq!(server.connections().len(), 6);
     for (conn, account, public) in [
         (0, None, PUBLIC),
         (1, Some(SUB), SUB_PUBLIC),
-        (2, Some(SUB2), PUBLIC),
-        (4, None, PUBLIC),
-        (5, Some(SUB), SUB_PUBLIC),
-        (6, Some(SUB2), PUBLIC),
+        (3, None, PUBLIC),
+        (4, Some(SUB), SUB_PUBLIC),
     ] {
         assert_read_socket(&received(&server, conn), account, public);
     }
-    assert_session_socket(&received(&server, 3), None, PUBLIC);
-    assert_session_socket(&received(&server, 7), Some(SUB), SUB_PUBLIC);
-    let mut asked = vec!["GET /user/subaccounts".to_owned()];
-    asked.extend(std::iter::repeat_n("GET /user/positions".to_owned(), 6));
+    assert_session_socket(&received(&server, 2), None, PUBLIC);
+    assert_session_socket(&received(&server, 5), Some(SUB), SUB_PUBLIC);
+    // No GET /user/subaccounts (decision 0144): only the two accounts' positions, before each
+    // session, though the stub would have refused a listing 403.
+    let asked = vec!["GET /user/positions".to_owned(); 4];
     assert_eq!(server.http_requests(), asked);
+    assert_no_listing(&server);
 
     // What the sessions reported: each authenticated, armed once, its arm Unknown at its
     // deadline (no frame answers it yet), stopped there by the program, one attempt each.
     let ev = &outcome.evidence;
-    assert_eq!(ev.listed, Some(2));
-    assert_eq!(ev.reads.len(), 6);
+    // The accounts the configuration names, read before every session, flat with no order.
+    assert_eq!(ev.accounts, ["primary", "subaccount"]);
+    assert_eq!(ev.reads.len(), 4);
     assert!(ev.reads.iter().all(|r| r.refusal().is_none()));
+    assert!(ev.reads.iter().all(|r| r.flat && r.page_orders == 0));
     let labels: Vec<(&str, &str)> = ev
         .reads
         .iter()
@@ -430,11 +455,9 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
         labels,
         [
             ("primary", "primary (armed)"),
-            ("primary", "subaccount 1"),
-            ("primary", "subaccount 2"),
+            ("primary", "subaccount"),
             ("subaccount", "primary"),
-            ("subaccount", "subaccount 1 (armed)"),
-            ("subaccount", "subaccount 2"),
+            ("subaccount", "subaccount (armed)"),
         ]
     );
     for (run, account) in ev.sessions.iter().zip(["primary", "subaccount"]) {
@@ -500,6 +523,14 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
         r#"{"subscribed":"order_responses"}"#
     );
     assert!(read("README.md").contains("not synthetic"));
+    assert!(
+        read("README.md").contains(
+            "one session per account (primary then subaccount, each named by the run's \
+             configuration, not listed by QFEX: decision 0144)"
+        ),
+        "{}",
+        read("README.md")
+    );
     // The members whose string value a fixture keeps, named for the owner's reading: never a
     // span the codec blanked (the position's id, the err's message).
     assert_eq!(
@@ -524,8 +555,32 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
         "Records the journal's sink dropped: 0 Normal, 0 Safety. Sessions whose capture is \
          partial: none."
     ));
+    // They say the accounts came from the configuration, not from QFEX, and that the owner, not
+    // the probe, must confirm there is no other subaccount, which the probe does not record
+    // (decision 0144).
+    assert!(
+        report.contains(
+            "Accounts named by the run's configuration, to be read before every session: 2 \
+             (primary, subaccount; ids not shown), not a list QFEX gave: the probe sends no \
+             `GET /user/subaccounts` (decision 0144). The table below lists the reads made. \
+             Before the run the owner must confirm in QFEX's app that the user has no \
+             subaccount the configuration does not name; the probe records no such \
+             confirmation and cannot check it, so the checks below, and what they show of the \
+             user's other accounts, cover the named accounts only."
+        ),
+        "{report}"
+    );
+    assert!(report.contains("whether the user has a subaccount the configuration does not name"));
+    assert!(!report.contains("listed:"), "{report}");
     let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
     assert_eq!(evidence["ok"], true);
+    assert_eq!(
+        evidence["accounts"],
+        json(
+            r#"{"source":"configuration","named":["primary","subaccount"],"count":2,"others_checked":false,"note":"named by the run's configuration, not listed by QFEX: the probe sends no GET /user/subaccounts. The owner must confirm in QFEX's app before the run that the user has no other subaccount; the probe records no such confirmation and cannot check it (decision 0144)"}"#
+        )
+    );
+    assert_eq!(evidence.get("subaccounts_listed"), None);
     assert_eq!(evidence["kept_string_members"][0], "error_code");
     assert_eq!(evidence["sessions"][1]["arm_outcome"], "Unknown");
     assert_eq!(evidence["journal_dropped"]["normal"], 0);
@@ -568,6 +623,14 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
         printed.contains("PROBE stage one on QFEX pre-production (preprod_probe)"),
         "{printed}"
     );
+    assert!(
+        printed.contains(
+            "ACCOUNTS 2 named by the run's configuration, not listed by QFEX (decision 0144): \
+             primary, subaccount"
+        ),
+        "{printed}"
+    );
+    assert!(!printed.contains("LISTED"), "{printed}");
 
     // Each session's own registry (each arms its own account), its ledger under the run's
     // bounds, and at its session's end a full horizon and no replay (decision 0132 item 5), in
@@ -620,19 +683,9 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     // A clean run met no provider rate refusal (decision 0135 item 2): every read socket and
     // both sessions count none, the in-window err of another request included, and the report
     // and the evidence say so.
-    assert_eq!(ev.read_sockets.len(), 6);
+    assert_eq!(ev.read_sockets.len(), 4);
     let befores: Vec<&str> = ev.read_sockets.iter().map(|r| r.before).collect();
-    assert_eq!(
-        befores,
-        [
-            "primary",
-            "primary",
-            "primary",
-            "subaccount",
-            "subaccount",
-            "subaccount"
-        ]
-    );
+    assert_eq!(befores, ["primary", "primary", "subaccount", "subaccount"]);
     assert!(
         ev.read_sockets
             .iter()
@@ -651,7 +704,7 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
         "Met by each session, at least, with the read sockets before it: primary 0; subaccount 0."
     ));
     assert!(report.contains(
-        "| subaccount | read socket: subaccount 1 (armed) | 0 | 0 | 0 | 0 | 0 | 0 | not journaled |"
+        "| subaccount | read socket: subaccount (armed) | 0 | 0 | 0 | 0 | 0 | 0 | not journaled |"
     ));
     assert!(report.contains("| primary | the session | 0 | 0 | 0 | 0 | not seen | 0 | none |"));
     assert!(!report.contains("Provider rate-limit evidence"), "{report}");
@@ -659,7 +712,7 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
     assert_eq!(rates["met_at_least"], 0);
     assert_eq!(rates["record_under"], Value::Null);
     assert_eq!(rates["frames_unread"], 0);
-    assert_eq!(rates["read_sockets"].as_array().unwrap().len(), 6);
+    assert_eq!(rates["read_sockets"].as_array().unwrap().len(), 4);
     assert_eq!(
         rates["read_sockets"][0]["counts"],
         json(
@@ -686,18 +739,17 @@ async fn each_account_arms_once_in_turn_and_its_capture_is_written_scrubbed() {
 // ----- On production (FBC-3prm, decision 0143) -----
 
 #[tokio::test]
-async fn with_production_stage_one_completes_names_production_and_its_registries_carry_no_testnet_declaration()
+async fn with_production_stage_one_completes_with_no_subaccount_listing_names_production_and_its_registries_carry_no_testnet_declaration()
  {
     let (dir, _removed) = temp_dir("production");
-    // As a pre-production run: every account read on a socket that never arms, then the
-    // session, whose arm is echoed in its window.
+    // As a pre-production run: the primary account and the subaccount the environment names,
+    // each read on a socket that never arms, then the session, whose arm is echoed in its
+    // window.
     let mut steps = Vec::new();
     steps.extend(read_socket(0, EMPTY_PAGE));
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
-    steps.extend(session_socket(3, &[ARM_ACK]));
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+    steps.extend(session_socket(2, &[ARM_ACK]));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
     // The run's options are the ones the command line's --production gives, the stub's origins
@@ -743,24 +795,29 @@ async fn with_production_stage_one_completes_names_production_and_its_registries
     assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
     server.finished().await.unwrap();
 
-    // Every check of decision 0132 item 7 ran unchanged: the listing, each account read before
-    // the session, and one session that sent its authentication, its subscriptions and its arm
-    // on one connection attempt, and nothing else.
+    // Every other check of decision 0132 item 7 ran unchanged: each account the configuration
+    // names read before the session, flat with no open order, and one session that sent its
+    // authentication, its subscriptions and its arm on one connection attempt, and nothing
+    // else. No GET /user/subaccounts (decision 0144), though the stub would have refused it.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(server.connections().len(), 4);
-    for (conn, account, public) in [
-        (0, None, PUBLIC),
-        (1, Some(SUB), SUB_PUBLIC),
-        (2, Some(SUB2), PUBLIC),
-    ] {
+    assert_eq!(server.connections().len(), 3);
+    for (conn, account, public) in [(0, None, PUBLIC), (1, Some(SUB), SUB_PUBLIC)] {
         assert_read_socket(&received(&server, conn), account, public);
     }
-    assert_session_socket(&received(&server, 3), None, PUBLIC);
-    let mut asked = vec!["GET /user/subaccounts".to_owned()];
-    asked.extend(std::iter::repeat_n("GET /user/positions".to_owned(), 3));
+    assert_session_socket(&received(&server, 2), None, PUBLIC);
+    let asked = vec!["GET /user/positions".to_owned(); 2];
     assert_eq!(server.http_requests(), asked);
+    assert_no_listing(&server);
     let ev = &outcome.evidence;
-    assert_eq!(ev.reads.len(), 3);
+    assert_eq!(ev.accounts, ["primary", "subaccount"]);
+    let labels: Vec<(&str, &str)> = (ev.reads.iter())
+        .map(|r| (r.before, r.label.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [("primary", "primary (armed)"), ("primary", "subaccount")]
+    );
+    assert!(ev.reads.iter().all(|r| r.refusal().is_none()));
     let [run] = ev.sessions.as_slice() else {
         panic!("{:#?}", ev.sessions);
     };
@@ -799,8 +856,22 @@ async fn with_production_stage_one_completes_names_production_and_its_registries
         ),
         "{report}"
     );
+    assert!(
+        report.contains(
+            "Accounts named by the run's configuration, to be read before every session: 2 \
+             (primary, subaccount; ids not shown), not a list QFEX gave"
+        ),
+        "{report}"
+    );
     let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
     assert_eq!(evidence["ok"], true);
+    assert_eq!(evidence["accounts"]["source"], "configuration");
+    assert_eq!(
+        evidence["accounts"]["named"],
+        json(r#"["primary","subaccount"]"#)
+    );
+    assert_eq!(evidence["accounts"]["others_checked"], false);
+    assert_eq!(evidence.get("subaccounts_listed"), None);
     assert_eq!(evidence["environment"], "production");
     assert_eq!(evidence["exec_mode"], "production_probe");
     assert_eq!(evidence["target"], "a loopback test stub");
@@ -829,6 +900,7 @@ async fn with_production_stage_one_completes_names_production_and_its_registries
         ),
         "{printed}"
     );
+    assert!(printed.contains("ACCOUNTS 2 named by the run's configuration"));
     assert!(printed.contains("DONE ok"), "{printed}");
 }
 
@@ -836,8 +908,7 @@ async fn with_production_stage_one_completes_names_production_and_its_registries
 async fn with_production_a_preproduction_origin_and_without_it_a_production_origin_are_refused_before_connecting()
  {
     let (dir, _removed) = temp_dir("environments");
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(Vec::new()), rest(listing, flat()))
+    let server = StubServer::start(WsScript::new(Vec::new()), rest(flat()))
         .await
         .unwrap();
     let base = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
@@ -953,8 +1024,7 @@ async fn with_production_a_preproduction_origin_and_without_it_a_production_orig
 async fn a_production_host_an_invalid_account_a_proxied_loopback_or_a_missing_credential_is_refused_before_connecting()
  {
     let (dir, _removed) = temp_dir("refused");
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(Vec::new()), rest(listing, flat()))
+    let server = StubServer::start(WsScript::new(Vec::new()), rest(flat()))
         .await
         .unwrap();
     let base = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
@@ -996,6 +1066,26 @@ async fn a_production_host_an_invalid_account_a_proxied_loopback_or_a_missing_cr
         (
             base.clone(),
             env_with(SUB_ID_VAR, "Primary"),
+            "qfex.account_id",
+        ),
+        // `primary` is an account id 0122 item 1 admits, but not a subaccount: the subaccount
+        // slot naming it would read the primary account twice and count it as two, whether or
+        // not a session arms on it (decision 0144 item 1).
+        (
+            base.clone(),
+            env_with(SUB_ID_VAR, "primary"),
+            "QFEX_SUBACCOUNT_ID selects the primary account",
+        ),
+        (
+            with(&|o| o.arms = vec![Armed::Primary]),
+            env_with(SUB_ID_VAR, "primary"),
+            "QFEX_SUBACCOUNT_ID selects the primary account",
+        ),
+        // A subaccount the environment names is read before every session, so its id is judged
+        // before anything connects even when no session arms on it (decision 0144 item 1).
+        (
+            with(&|o| o.arms = vec![Armed::Primary]),
+            env_with(SUB_ID_VAR, &SUB.to_uppercase()),
             "qfex.account_id",
         ),
         (
@@ -1066,19 +1156,18 @@ async fn a_production_host_an_invalid_account_a_proxied_loopback_or_a_missing_cr
 
 // ----- Refusals before a session -----
 
-/// Runs the probe against a stub playing `steps` and answering `listing` and `positions`, arming
-/// on the primary account then the subaccount: the evidence, which must say the probe stopped
-/// with `stopped`, and the stub.
+/// Runs the probe against a stub playing `steps` and answering `positions`, arming on the
+/// primary account then the subaccount: the evidence, which must say the probe stopped with
+/// `stopped` before any session armed, and the stub, which received no listing.
 async fn stopped(
     what: &str,
     steps: Vec<Step>,
-    listing: HttpReply,
     positions: HashMap<Option<&'static str>, HttpReply>,
     tune: impl Fn(&mut Options),
     stopped: &str,
 ) -> (Evidence, StubServer) {
     let (dir, _removed) = temp_dir(what);
-    let server = StubServer::start(WsScript::new(steps), rest(listing, positions))
+    let server = StubServer::start(WsScript::new(steps), rest(positions))
         .await
         .unwrap();
     let mut opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
@@ -1099,11 +1188,20 @@ async fn stopped(
         outcome.evidence.sessions.is_empty(),
         "{what}: a session started"
     );
+    assert_no_session(&server);
+    assert_no_listing(&server);
+    // The accounts it was to read are named whatever stopped it, as the configuration gives them.
+    assert_eq!(outcome.evidence.accounts, ["primary", "subaccount"]);
     let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
     assert!(
         report.contains("**The probe stopped before its sessions ended:**"),
         "{report}"
     );
+    // Named, not read: the table holds the reads that were made.
+    assert!(report.contains(
+        "Accounts named by the run's configuration, to be read before every session: 2 \
+         (primary, subaccount; ids not shown)"
+    ));
     assert_no_secret(&opts.evidence_dir);
     (outcome.evidence, server)
 }
@@ -1121,13 +1219,11 @@ fn assert_no_session(server: &StubServer) {
 
 #[tokio::test]
 async fn an_open_order_or_a_position_not_flat_refuses_the_session() {
-    let listing = || ok(&fixture("subaccounts.json"));
     // The primary account lists an open order: nothing more is read.
     let page = fixture("all_orders_response.json");
     let (ev, server) = stopped(
         "open-order",
         read_socket(0, &page),
-        listing(),
         flat(),
         |_| {},
         "primary (armed) holds an open order",
@@ -1135,103 +1231,105 @@ async fn an_open_order_or_a_position_not_flat_refuses_the_session() {
     .await;
     assert_eq!((ev.reads[0].page_orders, ev.reads[0].page_twaps), (2, 1));
     assert_eq!(server.connections().len(), 1);
-    assert_no_session(&server);
 
-    // The second subaccount holds a position: every account was read, no session opened.
-    let mut positions = flat();
-    positions.insert(Some(SUB2), ok(&fixture("positions.json")));
+    // The configured subaccount holds an open order: both accounts were read, no session
+    // opened.
     let mut steps = read_socket(0, EMPTY_PAGE);
-    steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
+    steps.extend(read_socket(1, &page));
     let (ev, server) = stopped(
-        "not-flat",
+        "sub-open-order",
         steps,
-        listing(),
-        positions,
+        flat(),
         |_| {},
-        "subaccount 2 holds",
+        "subaccount holds an open order",
     )
     .await;
-    assert_eq!(ev.reads.len(), 3);
-    assert!(!ev.reads[2].flat && ev.reads[2].rest_open_orders == 2);
-    assert_eq!(server.connections().len(), 3);
-    assert_no_session(&server);
+    assert_eq!(ev.reads.len(), 2);
+    assert_eq!(ev.reads[1].label, "subaccount");
+    assert_eq!(ev.reads[1].page_orders, 2);
+    assert_eq!(server.connections().len(), 2);
 
-    // The second subaccount is flat and its page empty, but REST counts an open order: the
-    // two reads disagree, and the probe reads that strictly.
+    // The configured subaccount holds a position: both accounts were read, no session opened.
     let mut positions = flat();
-    positions.insert(Some(SUB2), ok(&fixture("positions_flat.json")));
+    positions.insert(Some(SUB), ok(&fixture("positions.json")));
     let mut steps = read_socket(0, EMPTY_PAGE);
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
+    let (ev, server) = stopped("not-flat", steps, positions, |_| {}, "subaccount holds").await;
+    assert_eq!(ev.reads.len(), 2);
+    assert!(!ev.reads[1].flat && ev.reads[1].rest_open_orders == 2);
+    assert_eq!(server.connections().len(), 2);
+
+    // The configured subaccount is flat and its page empty, but REST counts an open order: the
+    // two reads disagree, and the probe reads that strictly.
+    let mut positions = flat();
+    positions.insert(Some(SUB), ok(&fixture("positions_flat.json")));
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
     let (ev, server) = stopped(
         "rest-count",
         steps,
-        listing(),
         positions,
         |_| {},
-        "subaccount 2 shows no open order on get_user_orders, but GET /user/positions counts 1",
+        "subaccount shows no open order on get_user_orders, but GET /user/positions counts 1",
     )
     .await;
-    let read = &ev.reads[2];
+    let read = &ev.reads[1];
     assert!(read.flat && read.page_orders == 0 && read.rest_open_orders == 1);
     assert!(read.refusal().is_some());
-    assert_eq!(server.connections().len(), 3);
-    assert_no_session(&server);
+    assert_eq!(server.connections().len(), 2);
 }
 
 #[tokio::test]
-async fn an_account_that_cannot_be_read_or_a_subaccount_not_listed_stops_the_probe() {
-    let listing = || ok(&fixture("subaccounts.json"));
-    let refused = |status| HttpReply {
+async fn an_account_that_cannot_be_read_stops_the_probe_before_anything_arms() {
+    let refused = |status, body: &str| HttpReply {
         status,
-        body: Vec::new(),
+        body: body.as_bytes().to_vec(),
     };
-    // The listing refused.
-    let (ev, _) = stopped(
-        "listing",
-        Vec::new(),
-        refused(500),
+    // The configured subaccount's positions refused: with a key that does not reach it, as
+    // QFEX refused the listing to a key scoped to the primary account (decision 0144), and
+    // unauthenticated. The primary account was read; nothing armed.
+    for (status, body) in [
+        (403, r#"{"detail":"insufficient API key permissions"}"#),
+        (401, ""),
+    ] {
+        let mut positions = flat();
+        positions.insert(Some(SUB), refused(status, body));
+        let (ev, server) = stopped(
+            "sub-positions",
+            read_socket(0, EMPTY_PAGE),
+            positions,
+            |_| {},
+            &format!(
+                "subaccount could not be read: GET /user/positions: QFEX answered HTTP {status}"
+            ),
+        )
+        .await;
+        assert_eq!(ev.reads.len(), 1);
+        assert_eq!(server.connections().len(), 1);
+        assert_eq!(server.http_requests().len(), 2);
+    }
+    // The configured subaccount's read socket not authenticated: its positions were read, its
+    // page never asked for, and nothing armed.
+    let err = r#"{"type":"Err","error_code":"PermissionDenied","message":"no","incoming_message":"auth"}"#;
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend([
+        Step::Accept,
+        Step::Respond {
+            conn: 1,
+            with: reply(&[err]),
+        },
+    ]);
+    let (ev, server) = stopped(
+        "sub-auth",
+        steps,
         flat(),
         |_| {},
-        "HTTP 500",
-    )
-    .await;
-    assert_eq!(ev.listed, None);
-    // The subaccount armed on is not listed.
-    let only = ok(&format!(r#"{{"account_ids":["{SUB2}"]}}"#));
-    let read_all = || {
-        let mut steps = read_socket(0, EMPTY_PAGE);
-        steps.extend(read_socket(1, EMPTY_PAGE));
-        steps
-    };
-    let mut positions = flat();
-    positions.remove(&Some(SUB));
-    let (ev, _) = stopped(
-        "unlisted",
-        read_all(),
-        only,
-        positions,
-        |o| o.arms.reverse(),
-        "names no subaccount",
-    )
-    .await;
-    assert!(ev.reads.is_empty());
-    // A subaccount's positions refused.
-    let mut positions = flat();
-    positions.insert(Some(SUB), refused(401));
-    let (ev, _) = stopped(
-        "positions",
-        read_socket(0, EMPTY_PAGE),
-        listing(),
-        positions,
-        |_| {},
-        "subaccount 1 could not be read: GET /user/positions: QFEX answered HTTP 401",
+        "subaccount could not be read: QFEX did not authenticate the read socket",
     )
     .await;
     assert_eq!(ev.reads.len(), 1);
-    // The read socket's authentication refused.
-    let err = r#"{"type":"Err","error_code":"PermissionDenied","message":"no","incoming_message":"auth"}"#;
+    assert_eq!(received(&server, 1).len(), 1);
+    // The primary account's read socket's authentication refused.
     let steps = vec![
         Step::Accept,
         Step::Respond {
@@ -1242,7 +1340,6 @@ async fn an_account_that_cannot_be_read_or_a_subaccount_not_listed_stops_the_pro
     stopped(
         "auth",
         steps,
-        listing(),
         flat(),
         |_| {},
         "QFEX did not authenticate the read socket",
@@ -1253,7 +1350,6 @@ async fn an_account_that_cannot_be_read_or_a_subaccount_not_listed_stops_the_pro
     stopped(
         "limited",
         read_socket(0, limited),
-        listing(),
         flat(),
         |_| {},
         "get_user_orders: QFEX refused the page read: RateLimited",
@@ -1265,75 +1361,123 @@ async fn an_account_that_cannot_be_read_or_a_subaccount_not_listed_stops_the_pro
         conn: 0,
         frame: Frame::Binary(EMPTY_PAGE.as_bytes().to_vec()),
     });
-    stopped(
-        "binary",
-        steps,
-        listing(),
-        flat(),
-        |_| {},
-        "not a text frame",
-    )
-    .await;
+    stopped("binary", steps, flat(), |_| {}, "not a text frame").await;
     let mut steps = read_socket(0, EMPTY_PAGE);
     steps[2] = Step::Read { conn: 0 };
     steps.push(Step::Close { conn: 0 });
-    stopped(
-        "closed",
-        steps,
-        listing(),
-        flat(),
-        |_| {},
-        "closed before it answered",
-    )
-    .await;
+    stopped("closed", steps, flat(), |_| {}, "closed before it answered").await;
     let mut steps = read_socket(0, EMPTY_PAGE);
     steps[2] = Step::Read { conn: 0 };
     let fast = |o: &mut Options| o.read_wait = Duration::from_millis(300);
-    stopped(
-        "silent",
-        steps,
-        listing(),
-        flat(),
-        fast,
-        "no answer within 300 ms",
-    )
-    .await;
+    stopped("silent", steps, flat(), fast, "no answer within 300 ms").await;
     // The trade socket's origin refuses connections.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = closed.local_addr().unwrap().port();
     drop(closed);
     let gone = move |o: &mut Options| o.trade_url = format!("ws://127.0.0.1:{port}");
-    stopped(
-        "no-socket",
-        Vec::new(),
-        listing(),
-        flat(),
-        gone,
-        "the read socket:",
-    )
-    .await;
-    // The REST origin refuses connections.
+    stopped("no-socket", Vec::new(), flat(), gone, "the read socket:").await;
+    // The REST origin refuses connections: the first request, the primary account's positions,
+    // is not answered.
     let gone = move |o: &mut Options| o.rest_url = format!("http://127.0.0.1:{port}");
     stopped(
         "no-rest",
         Vec::new(),
-        listing(),
         flat(),
         gone,
-        "GET /user/subaccounts:",
+        "primary (armed) could not be read: GET /user/positions:",
     )
     .await;
+}
+
+// ----- The accounts the configuration names (FBC-5ph8, decision 0144) -----
+
+#[tokio::test]
+async fn the_probe_reads_only_the_accounts_its_configuration_names() {
+    // Runs a complete stage one arming on the primary account under `env`, with `reads` read
+    // sockets before its session: the outcome, what it printed, the stub and the report.
+    let run = |what: &'static str, env: HashMap<&'static str, String>, reads: usize| async move {
+        let (dir, _removed) = temp_dir(what);
+        let mut steps = Vec::new();
+        for conn in 0..reads {
+            steps.extend(read_socket(conn, EMPTY_PAGE));
+        }
+        steps.extend(session_socket(reads, &[ARM_ACK]));
+        let server = StubServer::start(WsScript::new(steps), rest(flat()))
+            .await
+            .unwrap();
+        let opts = options(&dir, &server, &[Armed::Primary]);
+        let (ran, printed) = probe(&opts, &env).await;
+        let outcome = ran.unwrap();
+        assert!(outcome.ok, "{what}: {printed}\n{:#?}", outcome.evidence);
+        server.finished().await.unwrap();
+        let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+        let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+        assert_no_secret(&opts.evidence_dir);
+        (outcome.evidence, printed, server, report, evidence)
+    };
+
+    // No subaccount named: the primary account alone is read before its session, and nothing
+    // else is asked, the listing included.
+    let mut env = environment();
+    env.retain(|var, _| [PUBLIC_VAR, SECRET_VAR].contains(var));
+    let (ev, printed, server, report, evidence) = run("primary-only", env, 1).await;
+    assert_eq!(ev.accounts, ["primary"]);
+    let labels: Vec<&str> = ev.reads.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["primary (armed)"]);
+    assert_read_socket(&received(&server, 0), None, PUBLIC);
+    assert_session_socket(&received(&server, 1), None, PUBLIC);
+    assert_eq!(server.http_requests(), ["GET /user/positions"]);
+    assert_no_listing(&server);
+    assert!(
+        report.contains(
+            "Accounts named by the run's configuration, to be read before every session: 1 \
+             (primary; ids not shown), not a list QFEX gave"
+        ),
+        "{report}"
+    );
+    assert_eq!(evidence["accounts"]["named"], json(r#"["primary"]"#));
+    assert_eq!(evidence["accounts"]["count"], 1);
+    assert!(printed.contains(
+        "ACCOUNTS 1 named by the run's configuration, not listed by QFEX (decision 0144): primary"
+    ));
+
+    // A subaccount variable set but empty names no subaccount: the primary account alone is read.
+    let mut env = environment();
+    env.insert(SUB_ID_VAR, String::new());
+    env.remove(SUB_PUBLIC_VAR);
+    env.remove(SUB_SECRET_VAR);
+    let (ev, printed, server, _, evidence) = run("empty-sub-id", env, 1).await;
+    assert_eq!(ev.accounts, ["primary"]);
+    let labels: Vec<&str> = ev.reads.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["primary (armed)"]);
+    assert_eq!(server.http_requests(), ["GET /user/positions"]);
+    assert_eq!(evidence["accounts"]["count"], 1);
+    assert!(printed.contains("ACCOUNTS 1 named"), "{printed}");
+
+    // A subaccount named with no pair of its own: it is read too, with the primary account's
+    // credential, as before (decision 0144 item 1), though no session arms on it.
+    let mut env = environment();
+    env.remove(SUB_PUBLIC_VAR);
+    env.remove(SUB_SECRET_VAR);
+    let (ev, _, server, _, evidence) = run("sub-with-primary-key", env, 2).await;
+    assert_eq!(ev.accounts, ["primary", "subaccount"]);
+    let labels: Vec<&str> = ev.reads.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["primary (armed)", "subaccount"]);
+    assert_read_socket(&received(&server, 0), None, PUBLIC);
+    assert_read_socket(&received(&server, 1), Some(SUB), PUBLIC);
+    assert_session_socket(&received(&server, 2), None, PUBLIC);
+    assert_eq!(server.http_requests().len(), 2);
+    assert_no_listing(&server);
+    assert_eq!(evidence["accounts"]["count"], 2);
 }
 
 // ----- A session that never arms -----
 
 #[tokio::test]
 async fn a_session_that_never_arms_is_stopped_with_no_second_attempt() {
-    let listing = || ok(&fixture("subaccounts.json"));
     let read_all = || {
         let mut steps = read_socket(0, EMPTY_PAGE);
         steps.extend(read_socket(1, EMPTY_PAGE));
-        steps.extend(read_socket(2, EMPTY_PAGE));
         steps
     };
     let run = |what: &'static str, session: Vec<Step>, wait: u64| {
@@ -1341,7 +1485,7 @@ async fn a_session_that_never_arms_is_stopped_with_no_second_attempt() {
         steps.extend(session);
         async move {
             let (dir, _removed) = temp_dir(what);
-            let server = StubServer::start(WsScript::new(steps), rest(listing(), flat()))
+            let server = StubServer::start(WsScript::new(steps), rest(flat()))
                 .await
                 .unwrap();
             let mut opts = options(&dir, &server, &[Armed::Primary]);
@@ -1350,8 +1494,8 @@ async fn a_session_that_never_arms_is_stopped_with_no_second_attempt() {
             let outcome = ran.unwrap();
             assert!(!outcome.ok, "{printed}");
             tokio::time::sleep(Duration::from_millis(300)).await;
-            // Three read sockets and the one session: no second attempt.
-            assert_eq!(server.connections().len(), 4, "{what}");
+            // Two read sockets and the one session: no second attempt.
+            assert_eq!(server.connections().len(), 3, "{what}");
             let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
             assert!(report.contains("Result: INCOMPLETE") && report.contains("No arm was sent"));
             assert_no_secret(&opts.evidence_dir);
@@ -1364,7 +1508,7 @@ async fn a_session_that_never_arms_is_stopped_with_no_second_attempt() {
     let refused = vec![
         Step::Accept,
         Step::Respond {
-            conn: 3,
+            conn: 2,
             with: reply(&[refusal]),
         },
     ];
@@ -1375,7 +1519,7 @@ async fn a_session_that_never_arms_is_stopped_with_no_second_attempt() {
     assert_eq!(session.frames.len(), 1);
     assert_eq!(session.frames[0].kind, "not a JSON object");
     // QFEX never answers it: the program stops the session at --session-wait.
-    let silent = vec![Step::Accept, Step::Read { conn: 3 }];
+    let silent = vec![Step::Accept, Step::Read { conn: 2 }];
     let session = run("auth-silent", silent, 1).await;
     assert!(!session.authenticated && !session.arm_sent);
     assert_eq!(session.ended_by, "--session-wait");
@@ -2889,12 +3033,10 @@ async fn a_stage_one_session_at_its_span_bound_is_stopped_through_its_stop_contr
     let (dir, _removed) = temp_dir("span");
     let mut steps = read_socket(0, EMPTY_PAGE);
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
     // QFEX never answers the session's authentication, so nothing but the span bound, before
     // --session-wait, ends it.
-    steps.extend([Step::Accept, Step::Read { conn: 3 }]);
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+    steps.extend([Step::Accept, Step::Read { conn: 2 }]);
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
     let mut opts = options(&dir, &server, &[Armed::Primary]);
@@ -2916,7 +3058,7 @@ async fn a_stage_one_session_at_its_span_bound_is_stopped_through_its_stop_contr
     assert_eq!((session.attempts, session.failed_attempts), (1, 0));
     assert!(session.error.is_none(), "{session:?}");
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(server.connections().len(), 4);
+    assert_eq!(server.connections().len(), 3);
     assert!(
         !outcome.ok && printed.contains("ended by --registry-span"),
         "{printed}"
@@ -3233,11 +3375,9 @@ async fn a_read_answered_rate_limited_reports_one_provider_rate_refusal_for_its_
     // subaccount's, QFEX refuses the first read's page for its rate.
     let mut steps = read_socket(0, EMPTY_PAGE);
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
-    steps.extend(session_socket(3, &[ARM_ACK]));
-    steps.extend(read_socket(4, LIMITED_PAGE));
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+    steps.extend(session_socket(2, &[ARM_ACK]));
+    steps.extend(read_socket(3, LIMITED_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
     let opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
@@ -3259,7 +3399,7 @@ async fn a_read_answered_rate_limited_reports_one_provider_rate_refusal_for_its_
         ),
         "{stopped}"
     );
-    assert_eq!(server.connections().len(), 5);
+    assert_eq!(server.connections().len(), 4);
     assert_eq!(ev.sessions.len(), 1);
 
     // One provider rate refusal, for the subaccount's session: the read socket before it held
@@ -3278,8 +3418,7 @@ async fn a_read_answered_rate_limited_reports_one_provider_rate_refusal_for_its_
         met,
         [
             ("primary", "primary (armed)", none),
-            ("primary", "subaccount 1", none),
-            ("primary", "subaccount 2", none),
+            ("primary", "subaccount", none),
             ("subaccount", "primary", one),
         ]
     );
@@ -3331,7 +3470,7 @@ async fn a_read_answered_rate_limited_reports_one_provider_rate_refusal_for_its_
         )
     );
     assert_eq!(
-        rates["read_sockets"][3],
+        rates["read_sockets"][2],
         json(
             r#"{"before":"subaccount","account":"primary","counts":{"limiter_rejected":1,"rate_limited_errs":1,"rate_limited_order_responses":0,"frames_unread":0,"rate_limited_in_frames_kept_whole":0,"met_at_least":1}}"#
         )
@@ -3357,8 +3496,7 @@ async fn authentication_answered(
             with: reply(&[answer]),
         },
     ];
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
     let opts = options(&dir, &server, &[Armed::Primary]);
@@ -3492,10 +3630,8 @@ async fn a_session_that_meets_rate_refusals_reports_each_from_its_limiter_and_it
     // QFEX refuses for its rate in the arm's window: an err echoing the arm, and an order.
     let mut steps = read_socket(0, EMPTY_PAGE);
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(read_socket(2, EMPTY_PAGE));
-    steps.extend(session_socket(3, &[LIMITED_ARM, LIMITED_ORDER]));
-    let listing = ok(&fixture("subaccounts.json"));
-    let server = StubServer::start(WsScript::new(steps), rest(listing, flat()))
+    steps.extend(session_socket(2, &[LIMITED_ARM, LIMITED_ORDER]));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
     let opts = options(&dir, &server, &[Armed::Primary]);

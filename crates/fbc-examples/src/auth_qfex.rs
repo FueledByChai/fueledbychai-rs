@@ -6,9 +6,9 @@
 //! reads one:
 //!
 //! - **The environment.** The provider user's primary credential, [`PUBLIC_VAR`] and
-//!   [`SECRET_VAR`], required: it reads the account listing, the primary account and every
-//!   listed subaccount that has no credential of its own. The subaccount a session arms on,
-//!   [`SUB_ID_VAR`] (a lowercase UUID, as decision 0122 selects one), and optionally a
+//!   [`SECRET_VAR`], required: it reads the primary account, and the subaccount [`SUB_ID_VAR`]
+//!   names when it has no credential of its own (decision 0144). The subaccount a session arms
+//!   on, [`SUB_ID_VAR`] (a lowercase UUID, as decision 0122 selects one), and optionally a
 //!   credential QFEX scoped to that subaccount alone, [`SUB_PUBLIC_VAR`] and [`SUB_SECRET_VAR`]
 //!   (both or neither). Each value moves straight into fbc-core's [`Secret`] or the venue's
 //!   configuration; a refusal names variables only, never a value.
@@ -16,7 +16,7 @@
 //!   the environment, beside the consumer's settings, and the credentials the order-entry codec
 //!   takes. The QFEX adapter's `src/auth` checks both, naming keys and never values.
 //! - **A read's credentials** ([`reader`]): the adapter's `ReadAuth` for the account named, the
-//!   primary or a subaccount the listing returned, built from the credential that reaches it.
+//!   primary or the subaccount [`SUB_ID_VAR`] names, built from the credential that reaches it.
 //! - **What carries a credential to the wire**: a signed REST read ([`send`]), the trade
 //!   socket's URL whose query holds the public key ([`open`]), and a frame the adapter signed
 //!   ([`write`]). Each request and frame is built, signed and spanned by the adapter
@@ -134,7 +134,7 @@ pub fn session(
     Ok((cfg, secrets(lookup, vars)?))
 }
 
-/// The adapter's reader of `account`, the primary or a subaccount the listing returned, with
+/// The adapter's reader of `account`, the primary or the subaccount [`SUB_ID_VAR`] names, with
 /// the credential that reaches it; refused naming that credential's variable and the
 /// adapter's key, never a value.
 pub fn reader(lookup: Lookup<'_>, account: AccountSelection<'_>) -> Result<ReadAuth, String> {

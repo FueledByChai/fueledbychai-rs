@@ -34,10 +34,13 @@ all of them loopback addresses): without --production, a production origin is re
 a pre-production one. It also refuses an account decision 0122 refuses, missing or empty
 credentials, a SOCKS5 proxy with loopback origins, and a missing or unaccepted --registry-span,
 --ledger-max-age or --ledger-max-entries: fill-ledger bounds that cannot outlast a registry's
-sessions and fills (decision 0132 item 5). Then it reads GET /user/subaccounts, and before each
-session the primary account and every listed subaccount (GET /user/positions, and
-get_user_orders on a trade socket that never arms): a session starts only when every account
-holds no open order (none on the page, none counted by REST) and a flat position. Each session
+sessions and fills (decision 0132 item 5). Then, before each session, it reads the accounts its
+configuration names: the primary account, and the subaccount {SUB_ID_VAR} names when it is set
+(GET /user/positions, and get_user_orders on a trade socket that never arms). A session starts
+only when every one of them holds no open order (none on the page, none counted by REST) and a
+flat position. It sends no GET /user/subaccounts (decision 0144): before each run, confirm in
+QFEX's app that the user has no subaccount the configuration does not name, which the probe
+cannot check. {SUB_ID_VAR} must name a subaccount, never the primary account. Each session
 arms once; at the arm's answer, its deadline, the connection's end, --session-wait or its
 registry's span bound the program stops it, through its stop control, with no second
 connection attempt. The sessions run one after the other, so no two arms are ever in flight
@@ -82,13 +85,15 @@ Options:
   --socks5 <HOST:PORT>     connect through this SOCKS5 proxy (default: directly)
 
 Credentials, from the environment only:
-  {PUBLIC_VAR}, {SECRET_VAR}   the provider user's primary credential (required)
-  {SUB_ID_VAR}                   the subaccount to arm on (required with --arm subaccount)
+  {PUBLIC_VAR}, {SECRET_VAR}   the primary account's credential (required)
+  {SUB_ID_VAR}                   the subaccount the run reads before every session and arms
+                                       on with --arm subaccount (required with it)
   {SUB_PUBLIC_VAR}, {SUB_SECRET_VAR}
                                        a credential scoped to that subaccount (optional, both
                                        or neither); otherwise the primary credential reads it
   The same variables on either environment, set to that environment's keys (QFEX refused a
-  production key on pre-production). With --production the mode is {PRODUCTION_PROBE}.
+  production key on pre-production). With --production the mode is {PRODUCTION_PROBE}. No
+  All-accounts key is needed: give each account a key scoped to it alone.
 "
     )
 }

@@ -11,9 +11,9 @@
 //! factory declares the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade
 //! socket and builds the codec in its probe mode. Readiness stays `Record` in every mode, and a
 //! configuration with no probe mode stays `exec: None`. Under a probe mode alone,
-//! [`account_reads`] builds and decodes the probe's own reads of every account of the provider
-//! user (decision 0132 item 7): the account listing, each account's positions, and its open
-//! orders on a trade socket of its own.
+//! [`account_reads`] builds and decodes the probe's own account reads (decision 0132 item 7):
+//! each account's positions and its open orders on a trade socket of its own, and the account
+//! listing, which the probe no longer sends (decision 0144).
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the

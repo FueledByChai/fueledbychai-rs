@@ -205,11 +205,11 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   refusing the other environment's domain; its caps in `src/exec/caps.rs`, alike in both,
   account-wide cancel-on-disconnect offering no disarm, which `caps_truthful` holds it to in
   `tests/conformance.rs`, 0141; its REST reads' headers from `src/auth`,
-  `TradeAuth::rest_headers`) and the probe's own reads of every account of the provider user
-  (`src/account_reads.rs`: `GET /user/subaccounts`, `GET /user/positions` and a `get_user_orders`
-  page after that account's authentication, each built only under the guard and signed by
-  `src/auth`'s `ReadAuth` for an account and credentials the caller names, and decoded exactly;
-  0132 item 7, FBC-h3z1),
+  `TradeAuth::rest_headers`) and the probe's own account reads (`src/account_reads.rs`:
+  `GET /user/positions` and a `get_user_orders` page after that account's authentication, and
+  `GET /user/subaccounts`, which the probe no longer sends (0144), each built only under the guard
+  and signed by `src/auth`'s `ReadAuth` for an account and credentials the caller names, and
+  decoded exactly; 0132 item 7, FBC-h3z1),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -666,12 +666,15 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     per account and placing nothing; its report, evidence and fixture README name the environment.
     Before anything connects it refuses any origin the adapter's probe guard refuses (so a
     production origin without `--production`, and a pre-production one with it), an account 0122
-    item 1 refuses, missing credentials, a proxied loopback origin and fill-ledger bounds that
+    item 1 refuses, a `QFEX_SUBACCOUNT_ID` selecting the primary account (0144), missing
+    credentials, a proxied loopback origin and fill-ledger bounds that
     cannot outlast a registry (0132 item 5, FBC-5hif: the required `--registry-span`, a
     `--ledger-max-age` longer than it and a `--ledger-max-entries` above the fill ceiling, every
     order a registry's sessions may place at its largest size in size steps, zero in stage one);
-    it reads `GET /user/subaccounts` and, before each session, every account's REST positions and
-    one `get_user_orders` page on a socket that never arms (the adapter's `account_reads`),
+    before each session it reads the accounts its configuration names, the primary and the
+    subaccount `QFEX_SUBACCOUNT_ID` names, and sends no `GET /user/subaccounts`, the owner
+    confirming before each run that no other subaccount exists (0144): each one's REST positions
+    and one `get_user_orders` page on a socket that never arms (the adapter's `account_reads`),
     starting a session only when each is flat with no open order on the page and none counted by
     REST; one unchanged `ExecSession` per `--arm`, one after the other, with the
     `AccountWideCodAuthority` (0121) and a registry of its own whose one fill ledger it keeps

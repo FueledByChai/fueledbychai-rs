@@ -4,27 +4,32 @@
 //! nothing and sends no command but each session's arm and the probe's own reads.
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
-//!   (`src/auth_qfex.rs`), and each session's configuration, under the adapter's probe mode for
-//!   the run's environment (`preprod_probe`, or `production_probe` with `--production`), passes
-//!   that mode's guard and decision 0122 item 1's account check (the adapter's
-//!   `probe::connections`): any QFEX origin but the environment's own, a host of the other
-//!   environment's domain (`qfex.com` on pre-production, `qfex.io` on production), a mix of
-//!   loopback and other origins, or an account id that is not `primary` or a lowercase
-//!   subaccount UUID is refused, naming the setting and never its value. Loopback origins with
-//!   a SOCKS5 proxy are refused too: the proxy would reach its own host's loopback.
-//! - **The accounts** ([`Run::listing`], [`Run::check_accounts`]): `GET /user/subaccounts`, then
-//!   before each session, for the primary account and every listed subaccount, `GET
-//!   /user/positions` and one `get_user_orders` page on a trade socket of its own that sends
-//!   only its authentication and that read, and never arms. Every request takes its origin from
-//!   the guarded configuration, through the adapter's `account_reads`, and is charged to the
-//!   run's one provider-user rate limiter first (refused, not waited for, when it has no room).
+//!   (`src/auth_qfex.rs`), and the configuration of each account it reads, under the adapter's
+//!   probe mode for the run's environment (`preprod_probe`, or `production_probe` with
+//!   `--production`), passes that mode's guard and decision 0122 item 1's account check (the
+//!   adapter's `probe::connections`): any QFEX origin but the environment's own, a host of the
+//!   other environment's domain (`qfex.com` on pre-production, `qfex.io` on production), a mix
+//!   of loopback and other origins, or an account id that is not `primary` or a lowercase
+//!   subaccount UUID is refused, naming the setting and never its value, and so is a
+//!   `QFEX_SUBACCOUNT_ID` that selects the primary account (decision 0144 item 1). Loopback
+//!   origins with a SOCKS5 proxy are refused too: the proxy would reach its own host's loopback.
+//! - **The accounts** ([`named`], [`Run::check_accounts`]): the ones the run's configuration
+//!   names, the primary account and the subaccount `QFEX_SUBACCOUNT_ID` names when it is set
+//!   (decision 0144). The probe sends no `GET /user/subaccounts`: the owner must confirm in
+//!   QFEX's app before the run that the user has no other subaccount, which the probe neither
+//!   checks nor records, and the report says so. Before each session, for each of them,
+//!   `GET /user/positions` and one `get_user_orders` page on a trade socket of its own that
+//!   sends only its authentication and that read, and never arms. Every request takes its origin from the guarded configuration,
+//!   through the adapter's `account_reads`, and is charged to the run's one provider-user rate
+//!   limiter first (refused, not waited for, when it has no room).
 //!   A `RateLimited` err answering its authentication or its page holds that limiter's shared
 //!   budget, as the adapter asks of its caller (decision 0126), and stops the probe as any
 //!   refused read does.
-//!   An account that cannot be read, a listing that does not name the subaccount armed on, an
-//!   open order, a TWAP or a position that is not flat stops the probe before the session, and
-//!   so does a REST `open_orders` count above zero ([`AccountRead::refusal`]). Every read, write
-//!   and close on a read socket waits at most `--read-wait-ms`.
+//!   An account that cannot be read, an open order, a TWAP or a position that is not flat stops
+//!   the probe before the session, and so does a REST `open_orders` count above zero
+//!   ([`AccountRead::refusal`]). Every read, write and close on a read socket waits at most
+//!   `--read-wait-ms`. The account a session arms on is one of them by construction: the
+//!   primary account, or the subaccount `QFEX_SUBACCOUNT_ID` names.
 //! - **The session** ([`Run::session`]): fbc-runtime's `ExecSession`, unchanged, with the
 //!   consumer's `AccountWideCodAuthority` for the account it arms on. The program submits
 //!   nothing: the session sends its own arm once the codec reports the stream authenticated
@@ -76,9 +81,7 @@ use fbc_runtime::{
     RpcIds, SafetyReserve, WriteStall,
 };
 use fbc_venue_qfex::Qfex;
-use fbc_venue_qfex::account_reads::{
-    self, NotAPage, OrdersPage, PageAsk, RestRead, SocketWrite, Subaccounts,
-};
+use fbc_venue_qfex::account_reads::{self, NotAPage, OrdersPage, PageAsk, RestRead, SocketWrite};
 use fbc_venue_qfex::auth::{ACCOUNT_KEY, AccountSelection, ReadAuth, TRADE_URL, account_selection};
 use fbc_venue_qfex::probe::{
     self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
@@ -136,6 +139,17 @@ fn name(armed: Armed) -> &'static str {
     }
 }
 
+/// The accounts the run's configuration names, which it reads before every session (decision
+/// 0144 item 1): the primary account, then the subaccount [`SUB_ID_VAR`] names, when it is set
+/// and not empty. Only whether it is set is read here; `src/auth_qfex.rs` reads its value. Never
+/// a list QFEX gave: the probe sends no `GET /user/subaccounts`.
+fn named(lookup: Lookup<'_>) -> Vec<Armed> {
+    let sub = lookup(SUB_ID_VAR).is_some_and(|id| !id.is_empty());
+    let mut named = vec![Armed::Primary];
+    named.extend(sub.then_some(Armed::Subaccount));
+    named
+}
+
 /// Where a run's origins pointed, as the report names it.
 pub fn target(origins: Origins) -> &'static str {
     match origins {
@@ -178,15 +192,30 @@ impl NonceSource for Nonces {
 /// the outcome is in the report.
 pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome, String> {
     auth_qfex::check(lookup, &opts.arms)?;
+    // Every account a session arms on is among them: `check` refuses an arm on the subaccount
+    // that no variable names.
+    let named = named(lookup);
+    assert!(opts.arms.iter().all(|a| named.contains(a)), "a named arm");
     let base = base_config(opts);
-    // What the guard admitted of each session's configuration: the environment its mode names
-    // and the side its origins are on. Every session's is the base plus its account and keys,
-    // so they are all one pair, which the run's environment and the report's target are read
-    // from; the proxy's refusal still looks at every session's.
+    // What the guard admitted of the configuration of each account the run reads, every one a
+    // session may arm on included: the environment its mode names and the side its origins are
+    // on. Each is the base plus its account and keys, so they are all one pair, which the run's
+    // environment and the report's target are read from; the proxy's refusal still looks at
+    // every one.
     let mut admitted = Vec::new();
-    for armed in &opts.arms {
-        let (cfg, _) = configured(&base, lookup, *armed)?;
+    for account in &named {
+        let (cfg, _) = configured(&base, lookup, *account)?;
         let to = probe::connections(&cfg).map_err(|e| format!("refused, nothing sent: {e}"))?;
+        // 0122 item 1 admits `primary` as an account id, but the subaccount slot must name a
+        // subaccount: otherwise the primary account is read twice, counted as two accounts, and
+        // armed under the subaccount's key (decision 0144 item 1).
+        let selected = account_selection(&cfg);
+        if *account == Armed::Subaccount && matches!(selected, Ok(AccountSelection::Primary)) {
+            return Err(format!(
+                "refused, nothing sent: {SUB_ID_VAR} selects the primary account, which the \
+                 probe reads already: give a subaccount's UUID, or unset it"
+            ));
+        }
         admitted.push((to.environment, to.origins));
     }
     let (env, origins) = admitted[0];
@@ -255,8 +284,10 @@ pub async fn run(opts: &Options, lookup: Lookup<'_>, out: Out) -> Result<Outcome
             environment: environment(env),
             mode: env.mode(),
             target,
+            accounts: named.iter().map(|a| name(*a)).collect(),
             ..Evidence::default()
         },
+        named,
     };
     run.line(format_args!(
         "PROBE stage one on QFEX {} ({}), against {target}: arms on {:?}",
@@ -389,6 +420,8 @@ struct Run<'a> {
     /// The environment the run's probe mode names, which its registries are built for.
     environment: Environment,
     ev: Evidence,
+    /// The accounts the run's configuration names, read before every session ([`named`]).
+    named: Vec<Armed>,
 }
 
 impl Run<'_> {
@@ -396,23 +429,17 @@ impl Run<'_> {
         let _ = writeln!(self.out.borrow_mut(), "{args}");
     }
 
-    /// The listing, then each session after its accounts' checks.
+    /// Each session, after the checks of every account the configuration names.
     async fn stage(&mut self) -> Result<(), String> {
+        self.line(format_args!(
+            "ACCOUNTS {} named by the run's configuration, not listed by QFEX (decision 0144): {}",
+            self.ev.accounts.len(),
+            self.ev.accounts.join(", ")
+        ));
         let arms = self.opts.arms.clone();
-        let (cfg, _) = configured(&self.base, self.lookup, arms[0])?;
-        let subs = self.listing(&cfg).await?;
-        self.ev.listed = Some(subs.len());
-        self.line(format_args!("LISTED {} subaccounts", subs.len()));
         for (n, armed) in arms.into_iter().enumerate() {
             let (cfg, creds) = configured(&self.base, self.lookup, armed)?;
-            let account = account_selection(&cfg).map_err(|e| e.to_string())?;
-            if !subs.admits(account) {
-                return Err(format!(
-                    "{SUB_ID_VAR} names no subaccount GET /user/subaccounts lists"
-                ));
-            }
-            self.check_accounts(&cfg, &subs, account, name(armed))
-                .await?;
+            self.check_accounts(armed).await?;
             // Stage one's registries serve one session each: each arms its own account.
             let opened = Opened::now(self.origin, wall_ns());
             let label = name(armed);
@@ -479,38 +506,19 @@ impl Run<'_> {
         })?
     }
 
-    /// `GET /user/subaccounts`, with the primary credential.
-    async fn listing(&mut self, cfg: &VenueConfig) -> Result<Subaccounts, String> {
-        let lister = auth_qfex::reader(self.lookup, AccountSelection::Primary)?;
-        let ctx = self.ctx();
-        let read = account_reads::subaccounts(cfg, &lister, &ctx).map_err(|e| e.to_string())?;
-        let (status, body) = self.rest(&read).await?;
-        let resp = HttpResponse {
-            status,
-            headers: &[],
-            body: &body,
-        };
-        account_reads::decode_subaccounts(&resp).map_err(|e| format!("GET /user/subaccounts: {e}"))
-    }
-
-    /// Reads every account before the session on `armed`; stops the probe when one cannot be
-    /// read, or holds an open order, a TWAP or a position that is not flat.
-    async fn check_accounts(
-        &mut self,
-        cfg: &VenueConfig,
-        subs: &Subaccounts,
-        armed: AccountSelection<'_>,
-        before: &'static str,
-    ) -> Result<(), String> {
-        for (n, account) in subs.accounts().enumerate() {
-            let mut label = if n == 0 {
-                "primary".to_owned()
-            } else {
-                format!("subaccount {n}")
-            };
+    /// Reads every account the configuration names before the session on `armed`, each under
+    /// its own configuration ([`configured`]), which the guard admitted before anything
+    /// connected; stops the probe when one cannot be read, or holds an open order, a TWAP or a
+    /// position that is not flat.
+    async fn check_accounts(&mut self, armed: Armed) -> Result<(), String> {
+        let before = name(armed);
+        for account in self.named.clone() {
+            let mut label = name(account).to_owned();
             label.push_str(if account == armed { " (armed)" } else { "" });
+            let (cfg, _) = configured(&self.base, self.lookup, account)?;
+            let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
             let mut met = None;
-            let read = self.read_account(cfg, account, &mut met).await;
+            let read = self.read_account(&cfg, selection, &mut met).await;
             // A read socket's refusals are reported whether or not its read succeeded.
             if let Some(refusals) = met {
                 self.ev.read_sockets.push(ReadSocket {

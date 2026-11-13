@@ -189,8 +189,9 @@ pub fn account_key(cfg: &VenueConfig) -> Result<AccountKey, ConfigError> {
 }
 
 /// Whether `id` is a UUID as QFEX writes one: 8-4-4-4-12 lowercase hex digits, not all zero
-/// (the nil UUID is a placeholder, never an account). The probe's account listing holds every
-/// id it lists to this rule too (FBC-h3z1), so a listed id is one [`account_selection`] takes.
+/// (the nil UUID is a placeholder, never an account). The adapter's account-listing decoder,
+/// which the probe no longer calls (0144), holds every id it lists to this rule too (FBC-h3z1),
+/// so a listed id is one [`account_selection`] takes.
 pub(crate) fn canonical_uuid(id: &str) -> bool {
     id.len() == 36
         && id.bytes().enumerate().all(|(at, byte)| match at {
@@ -426,7 +427,7 @@ impl fmt::Debug for TradeAuth {
 }
 
 /// The credentials one of the probe's account reads uses (decision 0132 item 7, FBC-h3z1): the
-/// provider account the caller names, the primary or a subaccount the account listing returned,
+/// provider account the caller names, the primary or a subaccount the caller configures (0144),
 /// with credentials that reach it, which need not be the configured account's. It signs that
 /// account's trade socket authentication and private REST reads, and names the spans of what
 /// they answer, as [`TradeAuth`] does for the configured account; it is bound to no consumer
