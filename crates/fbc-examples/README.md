@@ -426,7 +426,8 @@ the first request of FBC-291a's first run, on pre-production).
 - Each registry is built with no testnet declaration (decision 0067: a consumer trading a live
   venue never makes it). Stage one seeds and arms no market, so it needs none. With none, and
   QFEX's resync seeding nothing (decision 0132 item 5), no market of the probe's can arm, so it
-  can place nothing.
+  can place nothing. Beneath that, the adapter's codec under `production_probe` refuses every
+  place, batch place and amend unsent (decision 0145).
 - `report.md`, `evidence.json` (`environment`, `exec_mode`, and each registry's `testnet_run`)
   and the fixtures' README name the environment. The fixtures are scrubbed exactly as a
   pre-production run's (decision 0009): read every file before committing it, as below.

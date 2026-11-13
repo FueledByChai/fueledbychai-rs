@@ -6,7 +6,9 @@
 //!
 //! Every value matches what this crate's encoder does (`order.rs` and [`super::QfexExec`]), so
 //! a command these caps leave out is refused unsent for the reason they give, and one they
-//! declare is sent: decision 0003's `caps_truthful` rule.
+//! declare is sent: decision 0003's `caps_truthful` rule. The one departure is
+//! `production_probe`'s: the caps are the same there, but the codec refuses every place, batch
+//! place and amend unsent until a record admits places on production (decision 0145).
 //!
 //! Sources, named below by their short names, read 2026-11-04:
 //!

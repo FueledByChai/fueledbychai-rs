@@ -22,6 +22,12 @@
 //!   pre-production origin, a mixed set and any other origin, each in every factory method and in
 //!   the probe's own connections, naming the key and never the value; it declares the same caps
 //!   and plan as `preprod_probe`, and `preprod_probe` still refuses every `qfex.com` host.
+//! - FBC-5d7x (decision 0145): a `production_probe` codec, built directly or by the factory, on
+//!   production or loopback origins, refuses every place, batch place and amend
+//!   `NotSent(Unsupported)` with nothing written, before and after authentication, and leaves
+//!   the arm the only request in flight; it sends every other command as a `preprod_probe` codec
+//!   does at the same rpc, its arm, deadlines and resync included. A `preprod_probe` codec
+//!   encodes every command as before, and the recording-only codec still sends places.
 //!
 //! Every key, account, id and frame here is synthetic: the frames are built from the shapes
 //! QFEX's pages show (each test names the page), or are `fixtures/qfex/private` (its
@@ -1416,6 +1422,370 @@ fn the_codec_writes_one_arm_per_epoch_refuses_a_second_and_a_disarm_and_leaves_i
     );
     assert!(off.probe_settings().is_none());
     assert!(codec.probe_settings().is_some());
+}
+
+// ----- Places under production_probe (FBC-5d7x, decision 0145) -----
+
+/// The probe codec `cfg` configures, built directly.
+fn probe_on(cfg: &VenueConfig) -> QfexExec {
+    QfexExec::probe(TradeAuth::new(cfg, secrets()).unwrap(), settings(cfg))
+}
+
+/// The probe codec `cfg` configures, built directly and through the factory.
+fn both_ways(cfg: &VenueConfig) -> [Box<dyn ExecCodec>; 2] {
+    [
+        Box::new(probe_on(cfg)),
+        Qfex.exec_codec(cfg, secrets()).unwrap().unwrap(),
+    ]
+}
+
+/// An amend of a resting order by its venue id, a valid one but for the caps' leaving amends
+/// out.
+fn amend() -> VenueCommand {
+    VenueCommand::Amend(fbc_core::AmendOrder {
+        target: OrderRef::Venue(venue_id()),
+        inst: AAPL,
+        side: Side::Buy,
+        tif: Tif::Gtc,
+        channel: Channel::Public,
+        post_only: false,
+        reduce_only: false,
+        reducing: false,
+        px: Ticks(20_100),
+        qty: Lots::new(250).unwrap(),
+        cum_filled: Lots::ZERO,
+    })
+}
+
+/// Every place, batch place and amend these tests send, each with what a pre-production probe
+/// answers it with once authenticated (`None`: sent, one frame): the three shapes the caps
+/// allow, an order the OMS classifies as reducing, the shapes it refuses for other reasons, an
+/// unknown instrument, a batch of one and an empty batch, and an amend.
+fn placements() -> Vec<(&'static str, VenueCommand, Option<NotSentReason>)> {
+    use NotSentReason::{FlagConflict, Unencodable, Unsupported};
+    let place = |kind, tif, channel, post_only, reduce| {
+        VenueCommand::Place(order(kind, tif, channel, post_only, reduce))
+    };
+    let gtc = || order(limit(), Tif::Gtc, Channel::Public, false, false);
+    let reducing = NewOrder {
+        reducing: true,
+        side: Side::Sell,
+        ..gtc()
+    };
+    let unknown = NewOrder {
+        inst: InstrumentId::new(99),
+        ..gtc()
+    };
+    vec![
+        ("limit GTC", VenueCommand::Place(gtc()), None),
+        (
+            "ALO GTC",
+            place(limit(), Tif::Gtc, Channel::Public, true, false),
+            None,
+        ),
+        (
+            "limit IOC",
+            place(limit(), Tif::Ioc, Channel::Public, false, false),
+            None,
+        ),
+        ("reducing GTC", VenueCommand::Place(reducing), None),
+        (
+            "market IOC",
+            place(OrderKind::Market, Tif::Ioc, Channel::Public, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "limit FOK",
+            place(limit(), Tif::Fok, Channel::Public, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "RPI",
+            place(limit(), Tif::Gtc, Channel::Rpi, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "reduce-only",
+            place(limit(), Tif::Gtc, Channel::Public, false, true),
+            Some(Unsupported),
+        ),
+        (
+            "post-only IOC",
+            place(limit(), Tif::Ioc, Channel::Public, true, false),
+            Some(FlagConflict),
+        ),
+        (
+            "price zero",
+            place(
+                OrderKind::Limit { px: Ticks(0) },
+                Tif::Gtc,
+                Channel::Public,
+                false,
+                false,
+            ),
+            Some(Unencodable),
+        ),
+        (
+            "unknown instrument",
+            VenueCommand::Place(unknown),
+            Some(Unencodable),
+        ),
+        (
+            "batch of one",
+            VenueCommand::PlaceBatch(vec![gtc()]),
+            Some(Unsupported),
+        ),
+        (
+            "empty batch",
+            VenueCommand::PlaceBatch(vec![]),
+            Some(Unsupported),
+        ),
+        ("amend", amend(), Some(Unsupported)),
+    ]
+}
+
+/// Every other command these tests send: each cancel and query by every reference, the
+/// cancel-many and cancel-alls, the dead-man refresh, the fee query, and the arm, a second arm
+/// and a disarm, in that order.
+fn the_rest() -> Vec<VenueCommand> {
+    let both = OrderRef::Both(cids()[1], venue_id());
+    let by_client = OrderRef::Client(cids()[1]);
+    vec![
+        VenueCommand::Cancel(cancel(OrderRef::Venue(venue_id()))),
+        VenueCommand::Cancel(cancel(both.clone())),
+        VenueCommand::Cancel(cancel(by_client.clone())),
+        query(OrderRef::Venue(venue_id())),
+        query(both.clone()),
+        query(by_client),
+        VenueCommand::CancelMany(vec![cancel(both)]),
+        VenueCommand::CancelAll(CancelScope::Account),
+        VenueCommand::CancelAll(CancelScope::Instrument(AAPL)),
+        VenueCommand::RefreshDeadMan,
+        VenueCommand::FeeQuery,
+        ARM_ON,
+        ARM_ON,
+        DISARM,
+    ]
+}
+
+/// One rpc per command, past the arm's and the authentication's.
+const FIRST_RPC: u64 = 100;
+
+#[test]
+fn under_production_probe_every_place_batch_place_and_amend_is_refused_unsent() {
+    let unsupported = refused(NotSentReason::Unsupported);
+    for cfg in [
+        production(SUB),
+        production("primary"),
+        production_loopback(SUB),
+    ] {
+        for mut codec in both_ways(&cfg) {
+            let codec = codec.as_mut();
+            // Before the stream is authenticated, and once it is, on two epochs.
+            open(codec, 1);
+            for (what, cmd, _) in placements() {
+                assert_eq!(encode(codec, &cmd, 1), unsupported, "{what}, opening");
+            }
+            for epoch in [1, 2] {
+                authenticate(codec, epoch);
+                for (at, (what, cmd, _)) in placements().into_iter().enumerate() {
+                    let out = encode(codec, &cmd, FIRST_RPC + at as u64);
+                    assert_eq!(out, unsupported, "{what}, epoch {epoch}");
+                }
+                // The arm still goes out after them, once: no refusal changed the epoch.
+                assert_eq!(encode(codec, &ARM_ON, epoch), sent(arm_sent(epoch)));
+            }
+        }
+        assert_eq!(settings(&cfg).environment(), Environment::Production);
+    }
+}
+
+#[test]
+fn a_refused_production_place_leaves_the_codec_counts_unchanged() {
+    // Decision 0145 item 1: a refusal changes nothing, the counts the probe's evidence reads
+    // included, before the stream is authenticated and once it is, on two epochs.
+    for cfg in [production(SUB), production_loopback(SUB)] {
+        let mut codec = probe_on(&cfg);
+        open(&mut codec, 1);
+        let before = codec.counts();
+        for (what, cmd, _) in placements() {
+            encode(&mut codec, &cmd, 1);
+            assert_eq!(codec.counts(), before, "{what}, opening");
+        }
+        for epoch in [1, 2] {
+            authenticate(&mut codec, epoch);
+            let before = codec.counts();
+            assert_ne!(before.subscribed, 0, "the counts moved with the epoch");
+            for (at, (what, cmd, _)) in placements().into_iter().enumerate() {
+                encode(&mut codec, &cmd, FIRST_RPC + at as u64);
+                assert_eq!(codec.counts(), before, "{what}, epoch {epoch}");
+            }
+        }
+    }
+}
+
+/// What the same script gives a codec: each command's answer, then each sent request's
+/// deadline, then the resync's effects.
+fn script(codec: &mut dyn ExecCodec, rest: bool, places: bool) -> Vec<Out> {
+    let mut outs = Vec::new();
+    authenticate(codec, 1);
+    let mut rpc = FIRST_RPC;
+    let mut sent = Vec::new();
+    let mut cmds: Vec<VenueCommand> = Vec::new();
+    if places {
+        cmds.extend(placements().into_iter().map(|(_, cmd, _)| cmd));
+    }
+    if rest {
+        cmds.extend(the_rest());
+    }
+    for cmd in &cmds {
+        rpc += 1;
+        let out = encode(codec, cmd, rpc);
+        if out.result.is_ok() {
+            sent.push(rpc);
+        }
+        outs.push(out);
+    }
+    for rpc in sent {
+        outs.push(deadline(codec, rpc));
+    }
+    let mut fx = Effects::new();
+    codec.resync(&ctx(2), &mut fx);
+    outs.push(Out {
+        effects: fx.take(),
+        ..Out::quiet()
+    });
+    assert_eq!(codec.nonces_for(fbc_core::CtxCall::Resync), 0);
+    outs
+}
+
+#[test]
+fn under_production_probe_the_rest_is_sent_as_under_preprod_probe() {
+    // The same commands at the same rpcs: cancels and queries sent, the arm once, every other
+    // command refused as before, each deadline Unknown and the resync asking for nothing.
+    for (production_cfg, preprod_cfg) in [
+        (production(SUB), preprod(SUB)),
+        (production_loopback(SUB), loopback(SUB)),
+    ] {
+        let want = script(&mut probe_on(&preprod_cfg), true, false);
+        // The arm sent once, the disarm and the second arm refused, and something sent besides.
+        let arm_at = the_rest().len() - 3;
+        assert_eq!(want[arm_at], sent(arm_sent(FIRST_RPC + arm_at as u64 + 1)));
+        assert_eq!(want[arm_at + 1], refused(NotSentReason::Unsupported));
+        assert_eq!(want[arm_at + 2], refused(NotSentReason::Unsupported));
+        let sends = want.iter().filter(|out| out.effects.len() == 1).count();
+        assert_eq!(sends, 5, "two cancels, two queries and the arm: {want:#?}");
+        for mut codec in both_ways(&production_cfg) {
+            assert_eq!(script(codec.as_mut(), true, false), want);
+        }
+    }
+}
+
+#[test]
+fn under_preprod_probe_the_codec_encodes_every_command_as_before() {
+    for cfg in [preprod(SUB), loopback(SUB)] {
+        for mut codec in both_ways(&cfg) {
+            let codec = codec.as_mut();
+            authenticate(codec, 1);
+            for (at, (what, cmd, why)) in placements().into_iter().enumerate() {
+                let rpc = FIRST_RPC + at as u64;
+                let out = encode(codec, &cmd, rpc);
+                match why {
+                    Some(why) => assert_eq!(out, refused(why), "{what}"),
+                    None => {
+                        let [
+                            Effect::Send {
+                                stream,
+                                rpc: Some(call),
+                                class,
+                                charge,
+                                ..
+                            },
+                        ] = out.effects.as_slice()
+                        else {
+                            panic!("{what}: {out:?}");
+                        };
+                        assert!(out.result.is_ok() && out.events.is_empty(), "{what}");
+                        assert_eq!((*stream, call.id), (TRADE, RpcId(rpc)), "{what}");
+                        assert_eq!(*class, cmd.traffic_class(), "{what}");
+                        assert_eq!(charge.op, OpKind::Place, "{what}");
+                    }
+                }
+            }
+        }
+        // And its places and the rest together, as its script shows them.
+        let outs = script(&mut probe_on(&cfg), true, true);
+        let sends = outs.iter().filter(|out| out.effects.len() == 1).count();
+        assert_eq!(
+            sends,
+            4 + 5,
+            "four places, two cancels, two queries and the arm"
+        );
+    }
+    // Before the stream is authenticated a pre-production place is not sent as every command
+    // is, where a production one is refused for what it is (decision 0145 item 1).
+    let gtc = VenueCommand::Place(order(limit(), Tif::Gtc, Channel::Public, false, false));
+    let cancel_cmd = VenueCommand::Cancel(cancel(OrderRef::Venue(venue_id())));
+    for (cfg, place_why) in [
+        (preprod(SUB), NotSentReason::Disconnected),
+        (production(SUB), NotSentReason::Unsupported),
+    ] {
+        let mut codec = probe_on(&cfg);
+        open(&mut codec, 1);
+        assert_eq!(encode(&mut codec, &gtc, 1), refused(place_why));
+        assert_eq!(
+            encode(&mut codec, &cancel_cmd, 2),
+            refused(NotSentReason::Disconnected)
+        );
+    }
+}
+
+#[test]
+fn a_refused_production_place_leaves_the_arm_the_only_request_in_flight() {
+    // An err with an escaped message, read once the arm is sent: kept as its shape in the arm's
+    // window, while the arm is the only request in flight (0132 item 3), and whole outside it,
+    // once another request was sent (0134 item 2).
+    let frame = nested("InvalidOrder", r#""a \"quoted\" reason""#, "{}");
+    let spans = |codec: &QfexExec| {
+        codec
+            .redact_inbound(Inbound::Frame(RawFrame::Text(&frame)))
+            .body()
+            .to_vec()
+    };
+    let gtc = VenueCommand::Place(order(limit(), Tif::Gtc, Channel::Public, false, false));
+
+    let mut armed_only = probe_on(&preprod(SUB));
+    authenticate(&mut armed_only, 1);
+    assert_eq!(encode(&mut armed_only, &ARM_ON, 2), sent(arm_sent(2)));
+
+    let mut placed = probe_on(&preprod(SUB));
+    authenticate(&mut placed, 1);
+    assert_eq!(encode(&mut placed, &gtc, 1).effects.len(), 1);
+    assert_eq!(encode(&mut placed, &ARM_ON, 2), sent(arm_sent(2)));
+    assert_ne!(spans(&placed), spans(&armed_only));
+
+    let mut production_codec = probe_on(&production(SUB));
+    authenticate(&mut production_codec, 1);
+    assert_eq!(
+        encode(&mut production_codec, &gtc, 1),
+        refused(NotSentReason::Unsupported)
+    );
+    assert_eq!(encode(&mut production_codec, &ARM_ON, 2), sent(arm_sent(2)));
+    assert_eq!(spans(&production_codec), spans(&armed_only));
+}
+
+#[test]
+fn the_recording_codec_still_sends_places() {
+    let mut off = recording(SUB);
+    assert!(off.probe_settings().is_none());
+    authenticate(&mut off, 1);
+    let gtc = VenueCommand::Place(order(limit(), Tif::Gtc, Channel::Public, false, false));
+    let out = encode(&mut off, &gtc, 1);
+    assert!(out.result.is_ok() && out.effects.len() == 1, "{out:?}");
+    assert_eq!(
+        encode(&mut off, &amend(), 2),
+        refused(NotSentReason::Unsupported)
+    );
 }
 
 // ----- What stage one brings -----
