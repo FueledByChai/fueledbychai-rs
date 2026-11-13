@@ -49,6 +49,15 @@ answered "Approve 0147".
    - A frame or row on a held symbol whose price is off the grid or whose size is off the step
      is still refused: a live frame is a decode error with the epoch open, and a resync row asks
      to reconnect.
+3. **An order whose end came before a resync ended.** An order the codec placed on an earlier
+   connection epoch, and saw end before the current epoch's resync pushed `ResyncEnd`, still
+   counts for that resync and for each later one until one pushes `ResyncEnd`. Its send time
+   bounds the trades read's start time, and a trade row naming it is replayed as ours. So 0132
+   item 5's "the oldest order it placed and has not seen end" reads as including such an order:
+   its missed fill is not lost when it ends, by a cancel the consumer sends on reconnecting or
+   otherwise, before a resync has read the trades. An order placed and ended on an epoch whose
+   resync had already ended is forgotten as before, since that epoch's own stream carried its
+   fills.
 
 ## Alternatives
 
@@ -65,7 +74,9 @@ answered "Approve 0147".
   arm rejecting it under every code but `RateLimited`, which holds for its hint and settles
   nothing. `tests/probe_resync.rs` and `tests/probe_settle.rs` show rows and frames on a symbol
   the table does not hold left out and counted, and off-grid or off-step ones on a held symbol
-  refused.
+  refused. `tests/probe_resync.rs` shows an order ended live before its epoch's resync ends, and
+  one ended while a resync was left unfinished, still bounding the next trades read and having
+  its missed fill replayed, and such an order forgotten once a resync has ended.
 - **What production sees.** As 0143 item 4 says, what FBC-jxau lands under `preprod_probe` it
   lands under `production_probe` too. A production stage-one session now has its arm accepted
   and runs the resync's reads: the signed `GET /user/positions` and the first `get_user_orders`
@@ -77,3 +88,5 @@ answered "Approve 0147".
 - QFEX answering an arm it accepted with an err echoing it, or an arm it refused with an ack.
 - A position or order on a market the consumer trades left out because its symbol was missing
   from the spec table it gave.
+- A fill of an order this codec placed, made while no connection was open, and missing from
+  every resync bracket after it.
