@@ -30,7 +30,9 @@ the consumer's `SpecTable` does not hold.
   account with any such row could never finish a resync.
 
 **The owner's choice.** On 2026-11-13 the owner was asked to approve this record as drafted, and
-answered "Approve 0147".
+answered "Approve 0147". Item 3 was added afterwards, while FBC-jxau's review fixed Codex's
+finding on missed fills; asked "Approve 0147's new item 3 (the start-time reading)?", the owner
+answered "Approve item 3".
 
 ## Decision
 
