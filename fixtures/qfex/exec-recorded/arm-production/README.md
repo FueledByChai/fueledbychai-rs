@@ -1,0 +1,22 @@
+# QFEX trade-socket frames: what answered the cancel-on-disconnect arm
+
+Recorded 2026-11-13 on QFEX production (the probe mode `production_probe`), from QFEX production, by the owner-run program `qfex_preprod_probe` (crates/fbc-examples, FBC-l931; decision 0143 for production), stage one of decision 0132 item 7: one session per account (primary then subaccount, each named by the run's configuration, not listed by QFEX: decision 0144), each arming cancel-on-disconnect once and placing nothing. These are recorded frames, not synthetic ones: this directory carries no SYNTHETIC marker.
+
+Each file is one frame QFEX sent on a session's trade socket, in the order received, named `<account>-<n>-<when>.json`: `before-arm` (the authentication reply, the subscription confirmations and whatever came before the arm was written), `in-window` (from the arm's write to its deadline or the connection's end, what decision 0132 item 3 keeps: when the capture is whole, whatever answered the arm is here) and `after-window`.
+
+Method: the sessions' journal (decision 0006), read back with every span the codec named blanked to `2`s: the account's identifiers and credentials (decisions 0028 and 0122 item 3) and, in an echo, the spans decisions 0132 item 3 and 0134 keep in place of the whole frame, so the arm's own echo is as received but its err message. A frame that echoes no request has every JSON number replaced by `0`, so no amount of the account is published (decision 0009); its member names, strings and nesting are as received, except each `symbol` (see "Blanked after the run"). No frame we wrote is kept: the arm we sent was `{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true}}`. Every file passed the privacy check's patterns before it was written, and scripts/privacy-check.sh then scanned the directory. Those patterns know credential and address shapes only, so the owner reads every file for an identifying string (an email, a user name, an address in another form) before committing this directory, starting from the members the run found keeping a string value: margin_mode; subscribed; symbol; type.
+
+## What answered the arm
+
+Both sessions authenticated, had their three subscriptions (`order_responses`, `fills` and `positions`) confirmed, and wrote the arm once. On each account QFEX answered with an ack echoing the arm, `{"ack":{"incoming_message":{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true}}}}`, which decision 0132 item 1 reads as the arm's Final acceptance. Neither session received an err, and neither connection closed before the arm's deadline.
+
+- **primary:** the ack is `primary-016-in-window.json`, the last of the window's 12 frames. The 11 before it are `position_response` frames, one for each of the account's 11 position rows, all flat. The probe's REST read before the session counted 11 rows as well.
+- **subaccount:** the ack is `subaccount-005-in-window.json`, the window's only frame. The subaccount has no position row.
+
+Each session still reported the arm's outcome as `Unknown`. Stage one's codec settles no reply (`on_rpc_timeout` in crates/venues/fbc-venue-qfex/src/exec/mod.rs), so every arm ends `Unknown` at its deadline, 10 s in this run, whatever answered it. That deadline ended each session, so no `after-window` frame was written. FBC-jxau decodes the ack from these files (decision 0132 item 1, decision 0143 item 4).
+
+`report.md` beside these files is the run's report, committed as the probe wrote it at the owner's choice (FBC-291a). It says "Result: complete", its journal's sink dropped no record, and no session's capture was partial. The run's `evidence.json` and journal stay with the owner.
+
+## Blanked after the run
+
+Every file was read before this directory was committed. The strings the probe kept as received were the confirmed channel names (`order_responses`, `fills`, `positions`), `margin_mode` (`cross`), the arm's echo and each `position_response`'s `symbol`. Together the 11 symbols named the markets the primary account has position rows in, so at the owner's direction (FBC-291a) each was replaced by one fixed placeholder, `22222222`, whatever its length. Neither the values nor the file sizes tell those markets apart. Nothing else in any frame file was changed, and no other file holds a symbol. This README differs from the one the probe wrote only by the Method paragraph's exception for `symbol` and the sections after it.
