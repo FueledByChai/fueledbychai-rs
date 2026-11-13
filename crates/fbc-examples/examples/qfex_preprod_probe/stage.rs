@@ -1,9 +1,9 @@
 //! Stage one of the QFEX probe (decision 0132 items 1, 3, 6 and 7; FBC-l931), on pre-production,
 //! or with `--production` on production (decision 0143): one session per account, each arming
 //! cancel-on-disconnect once, so the journal captures whatever answers the arm. It places
-//! nothing and sends no command but each session's arm and the probe's own reads. With
-//! `--hold-secs` it first holds one trade connection that never arms (decision 0146), and a run
-//! may hold without arming at all.
+//! nothing and sends no command but each session's arm, its resync's reads and the probe's own
+//! reads. With `--hold-secs` it first holds one trade connection that never arms (decision 0146),
+//! and a run may hold without arming at all.
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
 //!   (`src/auth_qfex.rs`), and the configuration of each account it reads, under the adapter's
@@ -66,14 +66,19 @@
 //! - **The session** ([`Run::session`]): fbc-runtime's `ExecSession`, unchanged, with the
 //!   consumer's `AccountWideCodAuthority` for the account it arms on. The program submits
 //!   nothing: the session sends its own arm once the codec reports the stream authenticated
-//!   (decision 0058), and the probe codec's resync asks for nothing, so nothing places. The
-//!   handler stops the session through its control at the arm's outcome (its answer, or
-//!   `Unknown` at its deadline) or at the connection's end, whichever comes first, and the
-//!   program at `--session-wait` or at its registry's span bound (`--registry-span`), through
-//!   the same control; the reconnect pacing allows one attempt a day, so no second attempt
-//!   starts meanwhile. The journal keeps every frame as the codec names its spans, so
-//!   the arm's window is kept as decision 0132 item 3 says. The sessions run one after the
-//!   other: no two arms are in flight across the user.
+//!   (decision 0058), and asks for its resync, whose reads the probe codec sends (decision 0132
+//!   item 5: one signed `GET /user/positions` on the REST origin and `get_user_orders` pages on
+//!   the session's socket; no `get_user_trades`, since the session places nothing and decodes no
+//!   fill before it), so nothing places. The codec answers the arm from its echo (an ack accepts
+//!   it, an err rejects it, decision 0132 item 1; FBC-jxau). The handler stops the session
+//!   through its control once the arm has its outcome (its answer, or `Unknown` at its deadline)
+//!   and the resync has ended, so the journal holds each read with its answer, or at the
+//!   connection's end (the codec ends the epoch on a read that fails or outlasts
+//!   `qfex.exec.resync_timeout`), whichever comes first, and the program at `--session-wait` or at
+//!   its registry's span bound (`--registry-span`), through the same control; the reconnect pacing
+//!   allows one attempt a day, so no second attempt starts meanwhile. The journal keeps every frame
+//!   as the codec names its spans, so the arm's window is kept as decision 0132 item 3 says. The
+//!   sessions run one after the other: no two arms are in flight across the user.
 //! - **The registries** ([`crate::ledger`]): each session's own, since each arms its own account
 //!   (decision 0082), built as the session starts: as decision 0132 item 7 says on
 //!   pre-production, and with no testnet declaration on production (decisions 0067 and 0143
@@ -133,7 +138,7 @@ use crate::capture::{self, AccountRead, Evidence, SessionRun};
 use crate::evidence;
 use crate::hold::{self as held_frames, Control, End, Heard, HoldRun, ReadAfter};
 use crate::ledger::{self, Opened, RegistryLedger};
-use crate::probe_args::{Hold, Options};
+use crate::probe_args::{Hold, Options, RESYNC_TIMEOUT};
 use crate::refusals::{self, AFTER_HOLD, HOLD, ReadSocket, Refusals};
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -163,9 +168,6 @@ const NS: Namespace = Namespace::new(1);
 
 /// The journal's shard.
 const SHARD: u16 = 0;
-
-/// The probe codec's resync deadline, which nothing reads until FBC-jxau lands the resync.
-const RESYNC_TIMEOUT: &str = "30s";
 
 /// The reconnect pacing's floor, ceiling and window: one connection attempt a day.
 const DAY: Duration = Duration::from_secs(86_400);
@@ -422,7 +424,8 @@ fn base_config(opts: &Options) -> VenueConfig {
     cfg.insert(KEY_REST_URL, &opts.rest_url);
     cfg.insert(KEY_MDS_URL, &opts.mds_url);
     cfg.insert(KEY_PAGE_SIZE, &opts.page_size.to_string());
-    cfg.insert(KEY_RESYNC_TIMEOUT, RESYNC_TIMEOUT);
+    let resync = format!("{}s", RESYNC_TIMEOUT.as_secs());
+    cfg.insert(KEY_RESYNC_TIMEOUT, &resync);
     cfg.insert(KEY_RPC_TIMEOUT, &format!("{}ms", opts.rpc_timeout_ms));
     cfg
 }
@@ -1245,6 +1248,9 @@ async fn next(ws: &mut WebSocket, wait: Duration) -> Result<Data, String> {
     waited.map_err(|_| format!("no answer within {} ms", wait.as_millis()))?
 }
 
+/// What stops a session that ran its course: the arm's outcome and the resync's end.
+pub const ARM_AND_RESYNC: &str = "the arm's outcome and the resync's end";
+
 /// What a session's handler saw.
 #[derive(Default)]
 struct Seen {
@@ -1252,11 +1258,14 @@ struct Seen {
     /// The arm's outcome: the first outcome the session reports, since the program submits
     /// nothing and the arm is the session's only request.
     arm: Option<String>,
+    /// Whether the session's resync has ended (`ResyncEnd`).
+    resynced: bool,
     /// What stopped the session, when the program did.
     stopped: Option<&'static str>,
 }
 
-/// The session's handler: it stops the session at the arm's outcome or the connection's end.
+/// The session's handler: it stops the session once the arm has its outcome and the resync has
+/// ended, in either order, or at the connection's end.
 struct Watch {
     seen: Rc<RefCell<Seen>>,
     control: Rc<RefCell<Option<ExecControl>>>,
@@ -1272,7 +1281,7 @@ impl Watch {
 
 impl ExecHandler for Watch {
     fn on_exec(&mut self, env: Envelope<ExecEvent>) {
-        let answered = {
+        let done = {
             let mut seen = self.seen.borrow_mut();
             let state = ConnState::Authenticated;
             seen.authenticated |=
@@ -1280,13 +1289,14 @@ impl ExecHandler for Watch {
             match env.body {
                 ExecEvent::Outcome { outcome, .. } if seen.arm.is_none() => {
                     seen.arm = Some(format!("{outcome:?}"));
-                    true
                 }
-                _ => false,
+                ExecEvent::ResyncEnd => seen.resynced = true,
+                _ => {}
             }
+            seen.arm.is_some() && seen.resynced
         };
-        if answered {
-            Watch::stop(&self.seen, &self.control, "the arm's outcome");
+        if done {
+            Watch::stop(&self.seen, &self.control, ARM_AND_RESYNC);
         }
     }
 

@@ -166,8 +166,8 @@ const NOT_SENT: &str = "No arm was sent: the stream was never reported authentic
      known of what answers the arm; the frames before it show why (the authentication reply and \
      the subscription confirmations, whose exact shape FBC-bsou's note asks for first).";
 const ACKED: &str = "An ack echoing the arm arrived in its window: the shape decision 0132 item 1 \
-     reads as the arm's Final acceptance. FBC-jxau decodes it from this capture; the drop test \
-     (0132 item 4) then shows whether the reading holds.";
+     reads as the arm's Final acceptance, which the probe codec reports (FBC-jxau decodes it from \
+     FBC-291a's capture); the drop test (0132 item 4) then shows whether the reading holds.";
 const ERRED: &str = "An err echoing the arm arrived in its window: under decision 0132 item 1 \
      the arm's rejection, unless its code is RateLimited.";
 const OTHER: &str = "This capture shows none of them answering the arm. If one does, a new \
@@ -686,7 +686,8 @@ fn read(
                 window[at] = When::InWindow;
             }
         }
-        // The arm is the only request a session sends: its deadline ends the window.
+        // The arm is the only request with a deadline a session sends: its deadline ends the
+        // window.
         Record::RpcTimeout { stamp, .. } => close(window, stamp.conn.conn),
         Record::Control {
             ev: ControlEvent::Closed(key),

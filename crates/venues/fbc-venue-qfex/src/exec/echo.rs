@@ -15,6 +15,12 @@
 //! RateLimited err's `message` in one of the two hint forms, every other value a span of its
 //! own; or one span, whole, when it is malformed, holds a backslash, repeats a member name,
 //! echoes authentication, or would not blank to the same shape.
+//!
+//! On an epoch whose arm the codec encoded, a frame is redacted by [`armed_spans`] instead
+//! (decision 0132 item 3, as 0134 item 7 narrows it). The arm's own echo ([`arm_echo`]) is kept
+//! in clear but its `message`, and it is the one frame that answers the arm (0132 item 1): an
+//! ack accepts it, and an err rejects it unless its code is `RateLimited` (decision 0147 item 1).
+//! Redaction and the answer decide by the same test, on the bytes the journal keeps.
 
 use core::ops::Range;
 
@@ -280,17 +286,16 @@ pub const ARM: &str = r#"{"type":"cancel_on_disconnect","params":{"cancel_on_dis
 /// The members each envelope's body documents (0134 item 1), the flat err's `type` included.
 const ERR_MEMBERS: [&str; 4] = ["type", "error_code", "message", "incoming_message"];
 
-/// The spans of a frame whose only content is an err or ack envelope whose echo equals the arm
-/// ([`same`]), or `None` for any other frame: nothing in clear but its `message`, unless the
-/// frame is a RateLimited err whose message is exactly one of the two hint forms (0132 item 3,
-/// 0134 item 7). The arm carries no credential, account identifier or order.
-fn arm_kept(text: &str) -> Option<Vec<Range<usize>>> {
-    let root = json::parse(text)?;
-    let top = root.members()?;
-    if root.repeats() {
-        return None;
-    }
-    // The body's documented members: the flat err's four, the nested err's three, the ack's one.
+/// The body of a frame that is the arm's own echo (decision 0132 items 1 and 3), and whether it
+/// is an err: its only content an err or ack envelope whose body holds only its documented
+/// members (the flat err's four, the nested err's three, the ack's one) and whose
+/// `incoming_message`, parsed as JSON, equals [`ARM`] ([`same`]): order and whitespace ignored, a
+/// member added or a value of another type not equal. `None` for any other frame.
+///
+/// Redaction ([`arm_kept`]) and the codec's answer to the arm both decide by this one test, so
+/// what the journal keeps of the arm's echo and what answers the arm never disagree; the codec
+/// applies it to the bytes the journal keeps, so replay answers the arm where live did.
+pub(crate) fn arm_echo<'n, 'a>(top: &'n [Member<'a>]) -> Option<(&'n [Member<'a>], bool)> {
     let (body, documented, is_err): (_, &[&str], _) = match envelope(top) {
         Envelope::FlatErr(body) => (body, &ERR_MEMBERS, true),
         Envelope::NestedErr(body) if top.len() == 1 => (body, &ERR_MEMBERS[1..], true),
@@ -302,9 +307,22 @@ fn arm_kept(text: &str) -> Option<Vec<Range<usize>>> {
         return None;
     }
     let arm = json::parse(ARM).expect("the arm is JSON");
-    if !json::get(body, "incoming_message").is_some_and(|echo| same(echo, &arm)) {
+    json::get(body, "incoming_message")
+        .is_some_and(|echo| same(echo, &arm))
+        .then_some((body, is_err))
+}
+
+/// The spans of a frame that is the arm's own echo ([`arm_echo`]), or `None` for any other
+/// frame: nothing in clear but its `message`, unless the frame is a RateLimited err whose
+/// message is exactly one of the two hint forms (0132 item 3, 0134 item 7). The arm carries no
+/// credential, account identifier or order.
+fn arm_kept(text: &str) -> Option<Vec<Range<usize>>> {
+    let root = json::parse(text)?;
+    let top = root.members()?;
+    if root.repeats() {
         return None;
     }
+    let (body, is_err) = arm_echo(top)?;
     let rate_limited = is_err && plain_code(body) == Some(ErrCode::RateLimited);
     let mut spans = Vec::new();
     for (name, value) in body {
@@ -556,6 +574,84 @@ mod tests {
         let value = named.find(":1").unwrap() as u32 + 1;
         let one = value..value + 1;
         assert_eq!(spans(named, std::slice::from_ref(&one)), vec![one]);
+    }
+
+    /// Whether `text` is the arm's own echo, and an err.
+    fn arm_echoed(text: &str) -> Option<bool> {
+        let root = json::parse(text).unwrap();
+        arm_echo(root.members().unwrap()).map(|(_, is_err)| is_err)
+    }
+
+    #[test]
+    fn only_an_envelope_echoing_the_arm_exactly_is_its_echo() {
+        let nested = |echo: &str| {
+            format!(
+                r#"{{"err":{{"error_code":"InvalidParameter","message":"m","incoming_message":{echo}}}}}"#
+            )
+        };
+        let flat = |echo: &str| {
+            format!(
+                r#"{{"type":"Err","error_code":"RateLimited","message":null,"incoming_message":{echo}}}"#
+            )
+        };
+        let ack = |echo: &str| format!(r#"{{"ack":{{"incoming_message":{echo}}}}}"#);
+        // The arm's echo in each envelope, reordered and spaced, or a value escaped.
+        let reordered =
+            r#"{ "params" : { "cancel_on_disconnect" : true } , "type" : "cancel_on_disconnect" }"#;
+        let escaped =
+            r#"{"type":"cancel\u005fon_disconnect","params":{"cancel_on_disconnect":true}}"#;
+        for (text, is_err) in [
+            (ack(ARM), false),
+            (nested(ARM), true),
+            (flat(ARM), true),
+            (ack(reordered), false),
+            (nested(reordered), true),
+            (ack(escaped), false),
+            (
+                r#"{"err":{"incoming_message":ARM_HERE}}"#.replace("ARM_HERE", ARM),
+                true,
+            ),
+        ] {
+            assert_eq!(arm_echoed(&text), Some(is_err), "{text}");
+        }
+        // A member added, in the params, in the echo, in the body or beside the envelope.
+        let plus_params =
+            r#"{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true,"x":"y"}}"#;
+        let plus_echo =
+            r#"{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true},"id":1}"#;
+        let other = |value: &str| {
+            format!(
+                r#"{{"type":"cancel_on_disconnect","params":{{"cancel_on_disconnect":{value}}}}}"#
+            )
+        };
+        let mut refused = vec![
+            ack(plus_params),
+            ack(plus_echo),
+            format!(r#"{{"ack":{{"incoming_message":{ARM},"note":"n"}}}}"#),
+            format!(r#"{{"ack":{{"incoming_message":{ARM}}},"seq":3}}"#),
+            format!(
+                r#"{{"err":{{"error_code":"InvalidParameter","incoming_message":{ARM}}},"seq":3}}"#
+            ),
+            format!(
+                r#"{{"type":"Err","error_code":"RateLimited","incoming_message":{ARM},"extra":1}}"#
+            ),
+            // Another type for a value, or for the echo.
+            ack(r#"{"type":"cancel_on_disconnect","params":[]}"#),
+            ack(r#""cancel_on_disconnect""#),
+            ack("{}"),
+            ack("null"),
+            ack(r#"{"type":"subscribe","params":{"cancel_on_disconnect":true}}"#),
+            r#"{"ack":{}}"#.to_owned(),
+            r#"{"order_response":{"status":"CANCELLED"}}"#.to_owned(),
+        ];
+        refused.extend(
+            ["\"true\"", "1", "null", "false"]
+                .map(other)
+                .map(|e| ack(&e)),
+        );
+        for text in refused {
+            assert_eq!(arm_echoed(&text), None, "{text}");
+        }
     }
 
     #[test]

@@ -300,9 +300,9 @@ impl RegistryLedger {
     }
 
     /// Gives `fill` to the ledger and, accepted, to the registry ([`judge`]): the path every
-    /// fill of the registry's sessions takes. Stage one places nothing and its codec decodes no
-    /// fill until FBC-jxau, so only its tests give one; FBC-9sk2's handler routes each fill
-    /// through it.
+    /// fill of the registry's sessions takes. Stage one places nothing, so its codec, which
+    /// decodes fills (FBC-jxau), is handed none of its own, and only its tests give one;
+    /// FBC-9sk2's handler routes each fill through it.
     #[allow(dead_code)]
     pub fn admit(&mut self, fill: &FillEvent, time: Option<FillTime>, now: MonoNs) -> Judged {
         judge(&mut self.reg, &mut self.ledger, fill, time, now)

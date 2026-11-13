@@ -207,7 +207,21 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   `tests/conformance.rs`, 0141; under `production_probe` alone its codec refusing every place,
   batch place and amend unsent, `NotSent(Unsupported)` before the epoch is read, until a record
   admits places on production, so `caps_truthful` there breaches exactly the placement checks
-  (FBC-5d7x, 0145, `tests/probe_mode.rs`, `tests/conformance.rs`); its REST reads' headers
+  (FBC-5d7x, 0145, `tests/probe_mode.rs`, `tests/conformance.rs`); in either mode (FBC-jxau,
+  0143 item 4) the arm answered by its own echo alone (`src/exec/echo.rs`, `arm_echo`: an ack
+  accepting it at Final, as FBC-291a's capture shows, an err rejecting it unless `RateLimited`,
+  which holds every frame budget for its kept hint and leaves the arm to its deadline, 0132 item
+  1, 0147), the private frames decoded into order updates, fills and positions with the epoch kept
+  open, a frame on a symbol the spec table does not hold counted and pushing nothing
+  (`src/exec/private.rs`, 0147 item 2), a cancel settled by the `order_response` naming its order,
+  `CANCELLED` accepting and `NO_SUCH_ORDER` rejecting `NotFound`, an err settling nothing and every
+  place ending `Unknown` (0132 item 8), and item 5's resync (`src/exec/resync.rs`): a signed
+  `GET /user/positions`, the `get_user_orders` pages deduplicated by order id until a short page,
+  a full page adding no new id or its own deadline reconnecting, `get_user_trades` from the start
+  time for the orders it placed as replayed fills, one bracket that seeds no position; FBC-zeb0's
+  rule that a private state frame ends the epoch holding only for the recording-only codec
+  (`tests/probe_settle.rs`, `tests/probe_resync.rs`, sharing `tests/probe_harness/`, with fbc-oms
+  a dev-dependency); its REST reads' headers
   from `src/auth`, `TradeAuth::rest_headers`) and the probe's own account reads (`src/account_reads.rs`:
   `GET /user/positions` and a `get_user_orders` page after that account's authentication, and
   `GET /user/subaccounts`, which the probe no longer sends (0144), each built only under the guard
@@ -218,7 +232,8 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   (`exec::channel_reply`) and an err read as a page reads one, `SocketErr`, each from the bytes
   the journal keeps; 0146, FBC-39ks), its trade session's liveness on server pings alone held in
   `tests/liveness.rs` (an `ExecSession` under `preprod_probe` against the conformance stub on a
-  paused clock: each ping answered, no frame of its own; FBC-39ks),
+  paused clock: its arm accepted and its resync answered before the first ping, then each ping
+  answered, no frame of its own; FBC-39ks),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -687,14 +702,16 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     starting a session only when each is flat with no open order on the page and none counted by
     REST; one unchanged `ExecSession` per `--arm`, one after the other, with the
     `AccountWideCodAuthority` (0121) and a registry of its own whose one fill ledger it keeps
-    (`ledger.rs`), stopped at its arm's outcome, the connection's end or the span bound, its
-    pacing allowing no second attempt; it writes a report, evidence (each registry's ledger
-    bounds, and its horizon and replay counts at each session's end; the provider rate refusals
-    each read socket and session met, at least, 0135 item 2, FBC-m9rj: the shared limiter's
-    `counts().rejected`, the `RateLimited` errs and `RATE_LIMITED` order responses among its
-    frames as a journal keeps them, and its frames unread (kept whole by 0134 item 2, or not
-    JSON), a read socket's read once more in memory for a refusal kept whole, a count above zero
-    named as evidence for FBC-s5ox; `refusals.rs`), its journal and
+    (`ledger.rs`), its arm answered by the codec (Accepted on its ack, FBC-jxau) and its resync's
+    reads sent (one `GET /user/positions` and the `get_user_orders` pages; no `get_user_trades`,
+    since nothing places), stopped once its arm has its outcome and its resync has ended, at the
+    connection's end or at the span bound, its pacing allowing no second attempt; it writes a
+    report, evidence (each registry's ledger bounds, and its horizon and replay counts at each
+    session's end; the provider rate refusals each read socket and session met, at least, 0135 item
+    2, FBC-m9rj: the shared limiter's `counts().rejected`, the `RateLimited` errs and `RATE_LIMITED`
+    order responses among its frames as a journal keeps them, and its frames unread (kept whole by
+    0134 item 2, or not JSON), a read socket's read once more in memory for a refusal kept whole, a
+    count above zero named as evidence for FBC-s5ox; `refusals.rs`), its journal and
     a scrubbed fixture slice for `fixtures/qfex/exec-recorded/arm/` (a production run's for
     `arm-production/`, 0143 item 4) (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped
     conformance stub).

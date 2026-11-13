@@ -10,8 +10,8 @@
 //!   6's `ExecCaps`, each value cited, matching what the encoder does, and one order-entry
 //!   endpoint.
 //! - The codec writes one arm per epoch, refuses a second arm and a disarm with nothing written,
-//!   and leaves the arm unanswered at its deadline; its epoch stays open on private state, and
-//!   its resync asks for nothing.
+//!   and its own echo answers it, nothing else (FBC-jxau, `tests/probe_settle.rs`); its epoch
+//!   stays open on private state and through its resync (`tests/probe_resync.rs`).
 //! - The journal keeps an equal arm echo but its message, and a RateLimited err echoing the arm
 //!   with a documented hint in clear; a non-equal echo in the arm's window as its shape, but for
 //!   what 0134 item 3 keeps; every other echo as 0126 and 0134 say; and decoder replay of the
@@ -39,16 +39,17 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, AckModel, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope, Channel, CidMint,
-    ClientOrderId, ConfigError, ConnKey, ConnState, DecodeError, Effect, Effects, EncodeCtx,
-    EncodeReceipt, ExecCodec, ExecEvent, ExecSink, Feature, FundingSpec, Inbound, InstrumentId,
-    InstrumentKind, InstrumentSpec, Lots, MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock,
-    NotSentReason, OpKind, OrderKind, OrderKindTag, OrderRef, OrderShapes, OrderingKey, PathStamps,
-    PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RefKind, RpcCall, RpcId, Secret,
-    Secrets, Side, SignError, SizeStep, SnapshotReads, SnapshotSource, SpecTable, Stamp,
-    SubmitOutcome, Support, TagSet, Ticks, Tif, TifTag, TradingStatus, TrafficClass, UnderlyingId,
-    VenueCaps, VenueCommand, VenueConfig, VenueError, VenueFactory, VenueId, VenueMeta,
-    VenueOrderId, Via, WallNs, check_redactions, dispatch, dispatch_market_data,
+    AccountKey, AckLevel, AckModel, AssetSym, CancelOnDisconnect, CancelOrder, CancelScope,
+    Channel, CidMint, ClientOrderId, ConfigError, ConnKey, ConnState, DecodeError, Effect, Effects,
+    EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent, ExecSink, Feature, FundingSpec, Inbound,
+    InstrumentId, InstrumentKind, InstrumentSpec, Lots, MonoNs, Namespace, NamespaceLease,
+    NewOrder, NonceBlock, NotSentReason, OpKind, OrderKind, OrderKindTag, OrderRef, OrderShapes,
+    OrderingKey, PathStamps, PriceGrid, QueryOrder, RateCharge, RawFrame, Readiness, RefKind,
+    Reject, RejectKind, RpcCall, RpcId, Secret, Secrets, Side, SignError, SizeStep, SnapshotReads,
+    SnapshotSource, SpecTable, Stamp, SubmitOutcome, Support, TagSet, Ticks, Tif, TifTag,
+    TradingStatus, TrafficClass, UnderlyingId, VenueCaps, VenueCommand, VenueConfig, VenueError,
+    VenueFactory, VenueId, VenueMeta, VenueOrderId, Via, WallNs, check_redactions, dispatch,
+    dispatch_market_data,
 };
 use fbc_journal::{JournalReader, JournalWriter, Record, RedactionKey};
 use fbc_venue_qfex::auth::{self, TradeAuth};
@@ -178,8 +179,7 @@ fn settings(cfg: &VenueConfig) -> probe::Probe {
 // ----- Building and driving a codec -----
 
 fn probe_codec(account: &str) -> QfexExec {
-    let cfg = preprod(account);
-    QfexExec::probe(TradeAuth::new(&cfg, secrets()).unwrap(), settings(&cfg))
+    probe_on(&preprod(account))
 }
 
 fn recording(account: &str) -> QfexExec {
@@ -354,6 +354,27 @@ fn unknown(rpc: u64) -> ExecEvent {
         item: None,
         outcome: SubmitOutcome::Unknown,
     }
+}
+
+/// The arm on `rpc` accepted by its own ack (FBC-jxau, decision 0132 item 1).
+fn accepted(rpc: u64) -> ExecEvent {
+    ExecEvent::Outcome {
+        rpc: RpcId(rpc),
+        item: None,
+        outcome: SubmitOutcome::Accepted {
+            ack: AckLevel::Final,
+        },
+    }
+}
+
+/// The arm's rejection by an err echoing it with the documented code `code` (decision 0147
+/// item 1): the code alone, the message a span read as absent.
+fn rejected_by(code: Option<&str>) -> SubmitOutcome {
+    SubmitOutcome::Rejected(Reject {
+        kind: RejectKind::Other,
+        venue_code: code.map(Into::into),
+        raw: Arc::from(""),
+    })
 }
 
 // ----- Specs, ids and commands -----
@@ -1110,6 +1131,67 @@ fn an_absent_mode_gives_market_data_only_and_no_codec() {
     }
 }
 
+#[test]
+fn the_probe_codec_takes_its_settings_account_and_rest_origin_from_one_admitted_configuration() {
+    // Built directly as the factory builds it (FBC-jxau): its settings and the REST origin of
+    // its signed positions read come from the configuration the guard admits, so the read goes
+    // only there. No mode, a REST origin of the other environment or a mix with loopback, and a
+    // handle built for another account each build nothing.
+    let handle = |cfg: &VenueConfig| TradeAuth::new(cfg, secrets()).unwrap();
+    assert!(matches!(
+        QfexExec::probe(handle(&preprod(SUB)), &without(SUB, KEY_EXEC_MODE)),
+        Err(ConfigError::Missing(KEY_EXEC_MODE))
+    ));
+    for refused in [
+        with(preprod(SUB), KEY_REST_URL, PRODUCTION_REST),
+        with(production(SUB), KEY_REST_URL, PREPROD_REST),
+        with(preprod(SUB), KEY_REST_URL, "http://127.0.0.1:9002"),
+        with(loopback(SUB), KEY_REST_URL, "https://example.com"),
+    ] {
+        let want = probe::mode(&refused).unwrap_err();
+        assert!(
+            matches!(QfexExec::probe(handle(&preprod(SUB)), &refused), Err(e) if e == want),
+            "{want:?}"
+        );
+    }
+    let other_account = ConfigError::Invalid {
+        key: auth::ACCOUNT_KEY,
+        reason: "the trade handle was built for another account",
+    };
+    for (n, (built_for, cfg)) in [
+        (preprod("primary"), preprod(SUB)),
+        (preprod(SUB), preprod("primary")),
+        (with(preprod(SUB), auth::ACCOUNT_KEY, "4"), preprod(SUB)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            matches!(QfexExec::probe(handle(&built_for), &cfg), Err(e) if e == other_account),
+            "case {n}"
+        );
+    }
+    for (cfg, origin) in [
+        (preprod(SUB), PREPROD_REST),
+        (production(SUB), PRODUCTION_REST),
+        (loopback("primary"), "http://127.0.0.1:9002"),
+        (
+            with(preprod(SUB), KEY_REST_URL, "https://api.qfex.io/"),
+            PREPROD_REST,
+        ),
+    ] {
+        let mut codec = QfexExec::probe(handle(&cfg), &cfg).unwrap();
+        assert_eq!(codec.probe_settings(), probe::mode(&cfg).unwrap());
+        authenticate(&mut codec, 1);
+        let mut fx = Effects::new();
+        codec.resync(&ctx(2), &mut fx);
+        let Some(Effect::Http { req, .. }) = fx.take().into_iter().next() else {
+            panic!("no positions read");
+        };
+        assert_eq!(req.url.as_str(), format!("{origin}/user/positions"));
+    }
+}
+
 // ----- What the mode declares and plans -----
 
 #[test]
@@ -1323,7 +1405,7 @@ fn the_probe_caps_declare_exactly_what_the_codec_sends() {
 // ----- The arm -----
 
 #[test]
-fn the_codec_writes_one_arm_per_epoch_refuses_a_second_and_a_disarm_and_leaves_it_unanswered() {
+fn the_codec_writes_one_arm_per_epoch_refuses_a_second_and_a_disarm_and_its_echo_answers_it() {
     let mut codec = probe_codec(SUB);
     // Before the stream is authenticated: not sent, as every command.
     open(&mut codec, 1);
@@ -1360,37 +1442,42 @@ fn the_codec_writes_one_arm_per_epoch_refuses_a_second_and_a_disarm_and_leaves_i
         refused(NotSentReason::Unsupported)
     );
 
-    // Nothing answers it: an echo of it, an err echoing it, a cancelled order and a position
-    // settle nothing.
-    let arm_echoes = [
-        format!(r#"{{"ack":{{"incoming_message":{ARM}}}}}"#),
-        format!(
-            r#"{{"err":{{"error_code":"InvalidParameter","message":"no","incoming_message":{ARM}}}}}"#
-        ),
-        format!(
-            r#"{{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 2 seconds","incoming_message":{ARM}}}"#
-        ),
+    // Nothing but its own echo answers it: a cancelled order and a position answer nothing
+    // (decision 0132 item 1).
+    let others = [
         fixture("order_response.json").replace("\"ACK\"", "\"CANCELLED\""),
         fixture("position_response.json"),
     ];
-    for frame in &arm_echoes {
-        let out = text(&mut codec, frame);
-        assert!(out.events.is_empty(), "{frame}: {out:?}");
+    let quiet = |out: &Out, frame: &str| {
+        assert!(
+            !out.events
+                .iter()
+                .any(|e| matches!(e, ExecEvent::Outcome { .. })),
+            "{frame}: {out:?}"
+        );
         assert!(
             !out.effects
                 .iter()
                 .any(|e| matches!(e, Effect::Reconnect { .. })),
             "{frame}: {out:?}"
         );
+    };
+    for frame in &others {
+        quiet(&text(&mut codec, frame), frame);
     }
-    // Unanswered at its deadline: Unknown, as every request.
+    // Its ack accepts it, at Final; answered, an err echoing it answers nothing more.
+    let arm_ack = format!(r#"{{"ack":{{"incoming_message":{ARM}}}}}"#);
     assert_eq!(
-        deadline(&mut codec, 3),
+        text(&mut codec, &arm_ack),
         Out {
-            events: vec![unknown(3)],
+            events: vec![accepted(3)],
             ..Out::quiet()
         }
     );
+    let arm_err = format!(
+        r#"{{"err":{{"error_code":"InvalidParameter","message":"no","incoming_message":{ARM}}}}}"#
+    );
+    assert_eq!(text(&mut codec, &arm_err), Out::quiet());
     assert_eq!(
         encode(&mut codec, &ARM_ON, 6),
         refused(NotSentReason::Unsupported)
@@ -1403,6 +1490,23 @@ fn the_codec_writes_one_arm_per_epoch_refuses_a_second_and_a_disarm_and_leaves_i
         encode(&mut codec, &ARM_ON, 8),
         refused(NotSentReason::Unsupported)
     );
+    // A RateLimited err echoing it holds the budget and answers nothing, and leaves it to fail
+    // at its deadline: its ack then answers nothing either (decision 0132 item 1).
+    let rate_limited = format!(
+        r#"{{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 2 seconds","incoming_message":{ARM}}}"#
+    );
+    quiet(&text(&mut codec, &rate_limited), &rate_limited);
+    assert_eq!(text(&mut codec, &arm_ack), Out::quiet());
+    assert_eq!(text(&mut codec, &arm_err), Out::quiet());
+    // Unanswered at its deadline: Unknown, as every request; its ack then answers nothing.
+    assert_eq!(
+        deadline(&mut codec, 7),
+        Out {
+            events: vec![unknown(7)],
+            ..Out::quiet()
+        }
+    );
+    assert_eq!(text(&mut codec, &arm_ack), Out::quiet());
 
     // The codec the factory builds under the mode is this one.
     let mut built = Qfex.exec_codec(&preprod(SUB), secrets()).unwrap().unwrap();
@@ -1428,7 +1532,7 @@ fn the_codec_writes_one_arm_per_epoch_refuses_a_second_and_a_disarm_and_leaves_i
 
 /// The probe codec `cfg` configures, built directly.
 fn probe_on(cfg: &VenueConfig) -> QfexExec {
-    QfexExec::probe(TradeAuth::new(cfg, secrets()).unwrap(), settings(cfg))
+    QfexExec::probe(TradeAuth::new(cfg, secrets()).unwrap(), cfg).unwrap()
 }
 
 /// The probe codec `cfg` configures, built directly and through the factory.
@@ -1625,7 +1729,8 @@ fn a_refused_production_place_leaves_the_codec_counts_unchanged() {
 }
 
 /// What the same script gives a codec: each command's answer, then each sent request's
-/// deadline, then the resync's effects.
+/// deadline, then the resync's effects but its positions read, whose URL is the configuration's
+/// REST origin (`tests/probe_resync.rs` holds that read to its origin and headers).
 fn script(codec: &mut dyn ExecCodec, rest: bool, places: bool) -> Vec<Out> {
     let mut outs = Vec::new();
     authenticate(codec, 1);
@@ -1651,18 +1756,26 @@ fn script(codec: &mut dyn ExecCodec, rest: bool, places: bool) -> Vec<Out> {
     }
     let mut fx = Effects::new();
     codec.resync(&ctx(2), &mut fx);
+    let mut effects = fx.take();
+    let Effect::Http { req, .. } = effects.remove(0) else {
+        panic!("{effects:?}");
+    };
+    assert!(req.url.as_str().ends_with("/user/positions"), "{req:?}");
     outs.push(Out {
-        effects: fx.take(),
+        effects,
         ..Out::quiet()
     });
-    assert_eq!(codec.nonces_for(fbc_core::CtxCall::Resync), 0);
+    assert_eq!(
+        codec.nonces_for(fbc_core::CtxCall::Resync),
+        TradeAuth::REST_NONCES
+    );
     outs
 }
 
 #[test]
 fn under_production_probe_the_rest_is_sent_as_under_preprod_probe() {
     // The same commands at the same rpcs: cancels and queries sent, the arm once, every other
-    // command refused as before, each deadline Unknown and the resync asking for nothing.
+    // command refused as before, each deadline Unknown and the resync's first page and deadline.
     for (production_cfg, preprod_cfg) in [
         (production(SUB), preprod(SUB)),
         (production_loopback(SUB), loopback(SUB)),
@@ -1800,7 +1913,7 @@ fn fixture(name: &str) -> String {
 }
 
 #[test]
-fn the_probe_keeps_its_epoch_open_on_private_state_and_its_resync_asks_for_nothing() {
+fn the_probe_keeps_its_epoch_open_on_private_state_and_through_its_resync() {
     let frames = [
         fixture("order_response.json"),
         fixture("order_response.json").replace("\"ACK\"", "\"CANCELLED\""),
@@ -1812,8 +1925,13 @@ fn the_probe_keeps_its_epoch_open_on_private_state_and_its_resync_asks_for_nothi
     for frame in &frames {
         let mut probe = probe_codec(SUB);
         authenticate(&mut probe, 1);
-        assert_eq!(text(&mut probe, frame), Out::quiet(), "{frame}");
-        assert!(probe.last_private().is_some());
+        // Decoded into its events (FBC-jxau, `tests/probe_settle.rs`), the epoch kept open.
+        let out = text(&mut probe, frame);
+        assert!(
+            out.result.is_ok() && out.effects.is_empty(),
+            "{frame}: {out:?}"
+        );
+        assert!(probe.last_private().is_none());
         assert_eq!(probe.counts().private_state, 1);
         // Still open: the arm goes out after it.
         assert_eq!(encode(&mut probe, &ARM_ON, 1), sent(arm_sent(1)));
@@ -1830,10 +1948,9 @@ fn the_probe_keeps_its_epoch_open_on_private_state_and_its_resync_asks_for_nothi
         text(&mut probe, r#"{"subscribed":"positions"}"#),
         Out::quiet()
     );
-    assert_eq!(
-        text(&mut probe, &fixture("position_response.json")),
-        Out::quiet()
-    );
+    let out = text(&mut probe, &fixture("position_response.json"));
+    assert!(out.result.is_ok() && out.effects.is_empty(), "{out:?}");
+    assert_eq!(out.events.len(), 1, "{out:?}");
     // A private frame not as documented is a decode error, its epoch kept open.
     let mut probe = probe_codec(SUB);
     authenticate(&mut probe, 1);
@@ -1852,17 +1969,37 @@ fn the_probe_keeps_its_epoch_open_on_private_state_and_its_resync_asks_for_nothi
     let out = text(&mut probe, "[1]");
     assert!(out.reconnects() && out.result == Err(format!("{NOT_AN_OBJECT:?}")));
 
-    // The resync asks for nothing and pushes nothing, so the session places nothing (0058),
-    // and the epoch stays open for whatever answers the arm.
+    // The resync asks for its positions read, its first page and its own deadline, and pushes
+    // nothing yet (`tests/probe_resync.rs`); the epoch stays open for whatever answers the arm.
     let mut probe = probe_codec(SUB);
     authenticate(&mut probe, 1);
     assert_eq!(encode(&mut probe, &ARM_ON, 1), sent(arm_sent(1)));
     let mut fx = Effects::new();
     probe.resync(&ctx(2), &mut fx);
-    assert!(fx.is_empty(), "{fx:?}");
-    assert_eq!(probe.nonces_for(fbc_core::CtxCall::Resync), 0);
+    assert!(
+        matches!(
+            fx.take().as_slice(),
+            [
+                Effect::Http { .. },
+                Effect::Send { .. },
+                Effect::Timer { .. }
+            ]
+        ),
+        "the positions read, the first page and the deadline"
+    );
+    assert_eq!(
+        probe.nonces_for(fbc_core::CtxCall::Resync),
+        TradeAuth::REST_NONCES
+    );
+    // The arm's own ack answers it (FBC-jxau).
     let ack = format!(r#"{{"ack":{{"incoming_message":{ARM}}}}}"#);
-    assert_eq!(text(&mut probe, &ack), Out::quiet());
+    assert_eq!(
+        text(&mut probe, &ack),
+        Out {
+            events: vec![accepted(1)],
+            ..Out::quiet()
+        }
+    );
     // Recording-only, it ends the epoch.
     let mut off = recording(SUB);
     authenticate(&mut off, 1);
@@ -2017,9 +2154,6 @@ fn the_journal_keeps_the_arms_echo_and_the_window_and_replay_gives_the_same_even
     steps.extend(CHANNELS.map(|c| frame(&format!(r#"{{"subscribed":"{c}"}}"#))));
     steps.push(Step::Encode(ARM_ON.clone(), 1));
     for f in [
-        &arm_ack,
-        &arm_ack_reordered,
-        &arm_rejected,
         &arm_limited_s,
         &arm_limited_ms,
         &arm_limited_text,
@@ -2037,10 +2171,15 @@ fn the_journal_keeps_the_arms_echo_and_the_window_and_replay_gives_the_same_even
         &arm_escaped_hint,
         &query_escaped_hint,
         &escaped_type,
+        // A RateLimited err echoed the arm above, so its own ack answers it no more: it fails at
+        // its deadline (decision 0132 item 1). The arm's echo is still kept as its own.
+        &arm_ack_reordered,
+        &arm_ack,
+        &arm_rejected,
     ] {
         steps.push(frame(f));
     }
-    // A second request: the window closes, the arm's own echo is still kept.
+    // A second request: the arm's own echo is still kept.
     steps.push(Step::Encode(cancel_cmd.clone(), 2));
     steps.push(frame(&arm_ack));
     steps.push(frame(&request_err));
@@ -2088,6 +2227,15 @@ fn the_journal_keeps_the_arms_echo_and_the_window_and_replay_gives_the_same_even
         steps.push(Step::Encode(ARM_ON.clone(), 10 + n as u64));
         steps.push(frame(last));
     }
+    // An epoch whose arm an err with a request's code rejects (decision 0147 item 1), its epoch
+    // left open for the session to end; the arm's ack then answers nothing.
+    steps.extend([Step::Open(20), frame(AUTHENTICATED)]);
+    steps.extend(CHANNELS.map(|c| frame(&format!(r#"{{"subscribed":"{c}"}}"#))));
+    steps.extend([
+        Step::Encode(ARM_ON.clone(), 30),
+        frame(&arm_rejected),
+        frame(&arm_ack),
+    ]);
 
     // Live, journaling every frame as the runtime would, with the codec's own spans.
     let root = std::env::temp_dir().join(format!("fbc-qfex-mfey-{}", std::process::id()));
@@ -2329,8 +2477,22 @@ fn the_journal_keeps_the_arms_echo_and_the_window_and_replay_gives_the_same_even
         }],
         ..Out::quiet()
     };
+    assert_eq!(live_outs[at(&arm_ack_reordered, 0)], Out::quiet());
     assert_eq!(live_outs[at(&arm_ack, 0)], Out::quiet());
     assert_eq!(live_outs[at(&arm_rejected, 0)], Out::quiet());
+    let invalid_parameter = rejected_by(Some("InvalidParameter"));
+    assert_eq!(
+        live_outs[at(&arm_rejected, 1)],
+        Out {
+            events: vec![ExecEvent::Outcome {
+                rpc: RpcId(30),
+                item: None,
+                outcome: invalid_parameter.clone(),
+            }],
+            ..Out::quiet()
+        }
+    );
+    assert_eq!(live_outs[at(&arm_ack, 4)], Out::quiet());
     assert_eq!(
         live_outs[at(&arm_limited_s, 0)],
         held(Some(Duration::from_secs(3)))
@@ -2380,19 +2542,44 @@ fn the_journal_keeps_the_arms_echo_and_the_window_and_replay_gives_the_same_even
     );
     assert_eq!(live_outs[at(&escaped, 0)], Out::quiet());
     assert!(live_outs[at(&escaped, 1)].reconnects());
-    for last in &ending {
+    // An undocumented code on the arm's echo rejects it and ends the epoch (0134 item 5).
+    let undocumented = rejected_by(None);
+    assert_eq!(
+        live_outs[at(&ending[0], 0)].events,
+        vec![ExecEvent::Outcome {
+            rpc: RpcId(10),
+            item: None,
+            outcome: undocumented.clone(),
+        }]
+    );
+    assert!(matches!(
+        live_outs[at(&ending[0], 0)].effects.as_slice(),
+        [Effect::Reconnect { stream: TRADE, .. }]
+    ));
+    for last in &ending[1..] {
         assert!(live_outs[at(last, 0)].reconnects(), "{last}");
     }
-    // Nothing answered a request: no outcome but at a deadline.
+    // Nothing answered a request but the arm's own echo: no other outcome but at a deadline.
+    let mut answered = Vec::new();
     for (out, step) in live_outs.iter().zip(&steps) {
         for event in &out.events {
             match (event, step) {
                 (ExecEvent::Conn { .. }, _) => {}
                 (ExecEvent::Outcome { rpc, .. }, Step::Deadline(n)) => assert_eq!(rpc.0, *n),
+                (ExecEvent::Outcome { rpc, outcome, .. }, Step::Frame(f)) => {
+                    answered.push((f.clone(), rpc.0, outcome.clone()));
+                }
                 (other, _) => panic!("{other:?}"),
             }
         }
     }
+    assert_eq!(
+        answered,
+        vec![
+            (ending[0].clone(), 10, undocumented),
+            (arm_rejected.clone(), 30, invalid_parameter),
+        ]
+    );
 
     // Replay: a fresh codec, handed the journaled frames, gives what live gave.
     let mut replay = probe_codec(SUB);
@@ -2406,6 +2593,7 @@ fn the_journal_keeps_the_arms_echo_and_the_window_and_replay_gives_the_same_even
     let counts = live.counts();
     assert_eq!(counts.errs(ErrCode::RateLimited), 12);
     assert!(counts.acks >= 5 && counts.undocumented_errs >= 1);
+    assert_eq!((counts.arm_accepted, counts.arm_rejected), (0, 2));
 }
 
 // ----- The private REST reads' headers (src/auth) -----
@@ -2511,6 +2699,8 @@ fn the_probe_mode_reads_no_credential_outside_src_auth_and_src_sign() {
         "exec/caps.rs",
         "exec/echo.rs",
         "exec/mod.rs",
+        "exec/private.rs",
+        "exec/resync.rs",
         "caps.rs",
     ] {
         let text = fs::read_to_string(src.join(file)).unwrap();

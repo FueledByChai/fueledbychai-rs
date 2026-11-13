@@ -1,7 +1,8 @@
 //! QFEX's order commands as trade-socket frames (FBC-blcw, BT-702), built from the command and
 //! the spec table alone, on the owner's v1 scope of 2026-10-29. The codec ([`super::QfexExec`])
-//! sends each as one frame naming its request; no reply settles it, so each ends `Unknown` at
-//! its deadline. QFEX signs no order frame: the HMAC signs only the authentication (`src/sign`),
+//! sends each as one frame naming its request. Only a probe's cancel is settled by a reply, the
+//! `order_response` naming its order (decision 0132 item 8); every other request ends `Unknown`
+//! at its deadline. QFEX signs no order frame: the HMAC signs only the authentication (`src/sign`),
 //! so nothing here touches a credential.
 //!
 //! What is sent, each frame in its page's example member order:
@@ -56,7 +57,7 @@ use std::num::NonZeroU32;
 use fbc_core::{
     CancelOrder, Channel, ClientOrderId, InstrumentId, InstrumentSpec, Lots, NewOrder,
     NotSentReason, OpKind, OrderKind, OrderKindTag, OrderRef, QueryOrder, RateCharge, Side,
-    SpecTable, Ticks, Tif, VenueCommand, encode_cid,
+    SpecTable, Ticks, Tif, VenueCommand, VenueOrderId, encode_cid,
 };
 use rust_decimal::Decimal;
 
@@ -68,10 +69,12 @@ const ONE_UNIT: NonZeroU32 = NonZeroU32::new(10).expect("ten is not zero");
 /// `get_order` weighs 2.0.
 const TWO_UNITS: NonZeroU32 = NonZeroU32::new(20).expect("twenty is not zero");
 
-/// One request: its frame and what QFEX charges for it.
+/// One request: its frame, what QFEX charges for it, and the venue order it names, which a
+/// cancel and a query name and a place and the arm do not.
 pub(crate) struct Request {
     pub(crate) frame: Vec<u8>,
     pub(crate) charge: RateCharge,
+    pub(crate) target: Option<VenueOrderId>,
 }
 
 /// The frame `cmd` is sent as, or why it is not sent.
@@ -121,7 +124,7 @@ fn place(o: &NewOrder, specs: &SpecTable) -> Result<Request, NotSentReason> {
         side(o.side),
         json_string(&cid),
     );
-    Ok(charged(body, OpKind::Place, o.inst, ONE_UNIT))
+    Ok(charged(body, OpKind::Place, o.inst, ONE_UNIT, None))
 }
 
 fn cancel_order(c: &CancelOrder, specs: &SpecTable) -> Result<Request, NotSentReason> {
@@ -129,10 +132,16 @@ fn cancel_order(c: &CancelOrder, specs: &SpecTable) -> Result<Request, NotSentRe
     let spec = spec(specs, c.inst)?;
     let body = format!(
         r#"{{"type":"cancel_order","params":{{"order_id":{},"symbol":{},"cancel_order_id_type":"order_id"}}}}"#,
-        json_string(order_id),
+        json_string(order_id.as_str()),
         symbol(spec),
     );
-    Ok(charged(body, OpKind::Cancel, c.inst, ONE_UNIT))
+    Ok(charged(
+        body,
+        OpKind::Cancel,
+        c.inst,
+        ONE_UNIT,
+        Some(order_id.clone()),
+    ))
 }
 
 fn get_order(q: &QueryOrder, specs: &SpecTable) -> Result<Request, NotSentReason> {
@@ -141,9 +150,15 @@ fn get_order(q: &QueryOrder, specs: &SpecTable) -> Result<Request, NotSentReason
     let body = format!(
         r#"{{"type":"get_order","params":{{"symbol":{},"order_id":{}}}}}"#,
         symbol(spec),
-        json_string(order_id),
+        json_string(order_id.as_str()),
     );
-    Ok(charged(body, OpKind::Query, q.inst, TWO_UNITS))
+    Ok(charged(
+        body,
+        OpKind::Query,
+        q.inst,
+        TWO_UNITS,
+        Some(order_id.clone()),
+    ))
 }
 
 /// `Unsupported` unless the symbol's lists name a limit of this form and time in force: its
@@ -158,7 +173,13 @@ fn listed(spec: &InstrumentSpec, post_only: bool, tif: Tif) -> Result<(), NotSen
     Ok(())
 }
 
-fn charged(body: String, op: OpKind, inst: InstrumentId, weight: NonZeroU32) -> Request {
+fn charged(
+    body: String,
+    op: OpKind,
+    inst: InstrumentId,
+    weight: NonZeroU32,
+    target: Option<VenueOrderId>,
+) -> Request {
     Request {
         frame: body.into_bytes(),
         charge: RateCharge {
@@ -166,6 +187,7 @@ fn charged(body: String, op: OpKind, inst: InstrumentId, weight: NonZeroU32) -> 
             inst: Some(inst),
             weight,
         },
+        target,
     }
 }
 
@@ -225,9 +247,9 @@ fn client_order_id(cid: ClientOrderId) -> Result<String, NotSentReason> {
 /// The venue's order id a cancel or query names: `Unsupported` for a reference that carries
 /// none (QFEX cancels and queries by our client id are not sent), `Unencodable` for one the
 /// order-id rule the private decoder shares refuses.
-fn venue_order_id(target: &OrderRef) -> Result<&str, NotSentReason> {
-    let id = target.venue().ok_or(Unsupported)?.as_str();
-    if !is_venue_order_id(id) {
+fn venue_order_id(target: &OrderRef) -> Result<&VenueOrderId, NotSentReason> {
+    let id = target.venue().ok_or(Unsupported)?;
+    if !is_venue_order_id(id.as_str()) {
         return Err(Unencodable);
     }
     Ok(id)

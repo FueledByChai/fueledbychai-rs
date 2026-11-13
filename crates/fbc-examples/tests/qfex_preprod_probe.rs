@@ -6,8 +6,10 @@
 //!   origin and missing credentials before anything connects;
 //! - refuses to start a session on an open order or a position that is not flat, and on an
 //!   account it cannot read;
-//! - sends no command but each session's arm and its reads, runs the sessions one after the
-//!   other, and stops each at its arm's first failure with no second connection attempt;
+//! - sends no command but each session's arm, its resync's reads (one `GET /user/positions` and
+//!   one `get_user_orders` page, FBC-jxau) and the probe's own reads, runs the sessions one
+//!   after the other, and stops each once its arm has its outcome and its resync has ended, with
+//!   no second connection attempt;
 //! - journals the arm's window as decision 0132 item 3 keeps it, and writes the report, the
 //!   evidence and a scrubbed fixture slice that pass scripts/privacy-check.sh, with no
 //!   credential or account id in any of them;
@@ -34,7 +36,9 @@
 //! HTTP 403, as QFEX answered a key scoped to one account in FBC-291a's first production run, and
 //! records every request, so a test can show the probe sent none. Every key, secret, account id
 //! and answer is synthetic: the REST answers are `fixtures/qfex/private` (its `SYNTHETIC` file).
-//! The run is on real time; each session waits out its arm's 600 ms deadline.
+//! The run is on real time; a session whose arm nothing answers waits out its 600 ms deadline,
+//! and one whose arm its ack answers stops once its resync's page, which the stub answers empty
+//! after the arm's replies, has ended the resync (FBC-jxau).
 
 #[path = "../src/auth_qfex.rs"]
 mod auth_qfex;
@@ -257,8 +261,9 @@ fn read_socket(conn: usize, page: &str) -> Vec<Step> {
     ]
 }
 
-/// Connection `conn`, a session: authenticated, the three subscriptions confirmed, and the arm
-/// read and answered with `after_arm`.
+/// Connection `conn`, a session: authenticated, the three subscriptions confirmed, the arm read
+/// and answered with `after_arm`, then its resync's `get_user_orders` page, which the codec
+/// writes with the arm (FBC-jxau), read and answered empty.
 fn session_socket(conn: usize, after_arm: &[&str]) -> Vec<Step> {
     let mut steps = vec![
         Step::Accept,
@@ -276,6 +281,10 @@ fn session_socket(conn: usize, after_arm: &[&str]) -> Vec<Step> {
     steps.push(Step::Respond {
         conn,
         with: reply(after_arm),
+    });
+    steps.push(Step::Respond {
+        conn,
+        with: reply(&[EMPTY_PAGE]),
     });
     steps
 }
@@ -372,9 +381,10 @@ fn assert_read_socket(frames: &[String], account: Option<&str>, public: &str) {
 }
 
 /// Asserts `frames` are a session's: its authentication of `account` with `public`, the three
-/// subscriptions, then the arm, and nothing else.
+/// subscriptions, then the arm and its resync's one get_user_orders page of 1000 from offset 0
+/// (decision 0132 item 5), and nothing else: no get_user_trades, since nothing placed.
 fn assert_session_socket(frames: &[String], account: Option<&str>, public: &str) {
-    assert_eq!(frames.len(), 5, "{frames:?}");
+    assert_eq!(frames.len(), 6, "{frames:?}");
     let auth = json(&frames[0]);
     assert_eq!(auth["params"]["hmac"]["public_key"], public);
     assert_eq!(auth["params"]["account_id"].as_str(), account);
@@ -386,6 +396,10 @@ fn assert_session_socket(frames: &[String], account: Option<&str>, public: &str)
         assert_eq!(*frame, sub);
     }
     assert_eq!(frames[4], ARM);
+    assert_eq!(
+        frames[5],
+        r#"{"type":"get_user_orders","params":{"limit":1000,"offset":0}}"#
+    );
 }
 
 /// Every file under `dir`, recursively, with its text.
@@ -435,7 +449,8 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     steps.extend(read_socket(0, EMPTY_PAGE));
     steps.insert(2, Step::Barrier { conn: 0 });
     steps.extend(read_socket(1, EMPTY_PAGE));
-    steps.extend(session_socket(2, &[ARM_ACK, OTHER_ERR, &position]));
+    // The arm's ack last: its answer stops the session (FBC-jxau), so what precedes it is read.
+    steps.extend(session_socket(2, &[OTHER_ERR, &position, ARM_ACK]));
     // Before the subaccount's session, both accounts again; then its session, whose arm
     // nothing answers.
     steps.extend(read_socket(3, EMPTY_PAGE));
@@ -444,7 +459,11 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     let server = StubServer::start(WsScript::new(steps), rest(flat()))
         .await
         .unwrap();
-    let opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
+    let mut opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
+    // The subaccount's arm, which nothing answers, ends at its deadline: one far past its
+    // resync's round trips to the local stub, so the session stops at the arm's outcome and
+    // the resync's end whatever the machine's load, not at the connection's end.
+    opts.rpc_timeout_ms = 3_000;
 
     let (ran, printed) = probe(&opts, &environment()).await;
     let outcome = ran.unwrap();
@@ -452,8 +471,8 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     server.finished().await.unwrap();
 
     // No command but the arm: each read socket sent its authentication and one page, each
-    // session its authentication, its subscriptions and one arm. Six connections, so no
-    // session attempted a second.
+    // session its authentication, its subscriptions, one arm and its resync's one page. Six
+    // connections, so no session attempted a second.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(server.connections().len(), 6);
     for (conn, account, public) in [
@@ -467,13 +486,15 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     assert_session_socket(&received(&server, 2), None, PUBLIC);
     assert_session_socket(&received(&server, 5), Some(SUB), SUB_PUBLIC);
     // No GET /user/subaccounts (decision 0144): only the two accounts' positions, before each
-    // session, though the stub would have refused a listing 403.
-    let asked = vec!["GET /user/positions".to_owned(); 4];
+    // session, and each session's resync's own (FBC-jxau), though the stub would have refused a
+    // listing 403.
+    let asked = vec!["GET /user/positions".to_owned(); 6];
     assert_eq!(server.http_requests(), asked);
     assert_no_listing(&server);
 
-    // What the sessions reported: each authenticated, armed once, its arm Unknown at its
-    // deadline (no frame answers it yet), stopped there by the program, one attempt each.
+    // What the sessions reported: each authenticated, armed once, the primary's arm accepted by
+    // its ack and the subaccount's Unknown at its deadline (FBC-jxau), each stopped there by
+    // the program, one attempt each.
     let ev = &outcome.evidence;
     // The accounts the configuration names, read before every session, flat with no order.
     assert_eq!(ev.accounts, ["primary", "subaccount"]);
@@ -494,11 +515,16 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
             ("subaccount", "subaccount (armed)"),
         ]
     );
-    for (run, account) in ev.sessions.iter().zip(["primary", "subaccount"]) {
+    for ((run, account), arm) in ev
+        .sessions
+        .iter()
+        .zip(["primary", "subaccount"])
+        .zip(["Accepted { ack: Final }", "Unknown"])
+    {
         assert_eq!(run.account, account);
         assert!(run.authenticated && run.arm_sent, "{run:?}");
-        assert_eq!(run.arm.as_deref(), Some("Unknown"));
-        assert_eq!(run.ended_by, "the arm's outcome");
+        assert_eq!(run.arm.as_deref(), Some(arm));
+        assert_eq!(run.ended_by, stage::ARM_AND_RESYNC);
         assert_eq!((run.attempts, run.failed_attempts), (1, 0));
         assert!(run.ok());
     }
@@ -520,34 +546,39 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
             ("{subscribed}", When::BeforeArm),
             ("{subscribed}", When::BeforeArm),
             ("{subscribed}", When::BeforeArm),
-            ("ack echoing the arm", When::InWindow),
             (
                 "err echoing another request (InvalidParameter)",
                 When::InWindow
             ),
             ("{position_response}", When::InWindow),
+            ("ack echoing the arm", When::InWindow),
+            // The resync's page, answered after the ack: the session stops once its resync has
+            // ended too (FBC-jxau).
+            ("{all_orders_response}", When::InWindow),
         ]
     );
     assert!(primary.answer().starts_with("An ack echoing the arm"));
+    // The subaccount's window holds its resync's page alone, which echoes nothing of the arm.
+    let sub: Vec<(&str, When)> = (ev.sessions[1].frames.iter())
+        .map(|f| (f.kind.as_str(), f.when))
+        .filter(|(_, when)| *when != When::BeforeArm)
+        .collect();
+    assert_eq!(sub, [("{all_orders_response}", When::InWindow)]);
     assert!(
-        ev.sessions[1]
-            .frames
-            .iter()
-            .all(|f| f.when == When::BeforeArm)
-    );
-    assert!(
-        ev.sessions[1]
-            .answer()
-            .starts_with("Nothing arrived in the arm's window")
+        ev.sessions[1].answer().starts_with(
+            "Frames arrived in the arm's window, but none echoed the arm: {all_orders_response}."
+        ),
+        "{}",
+        ev.sessions[1].answer()
     );
     let fixtures = opts.evidence_dir.join("fixtures");
     let read = |name: &str| fs::read_to_string(fixtures.join(name)).unwrap();
-    assert_eq!(read("primary-005-in-window.json"), ARM_ACK);
+    assert_eq!(read("primary-007-in-window.json"), ARM_ACK);
     assert_eq!(
-        read("primary-006-in-window.json"),
+        read("primary-005-in-window.json"),
         r#"{"type":"Err","error_code":"InvalidParameter","message":"22222222222222","incoming_message":{"type":"get_order","params":{"symbol":"22222222"}}}"#
     );
-    let position = json(&read("primary-007-in-window.json"));
+    let position = json(&read("primary-006-in-window.json"));
     assert_eq!(position["position_response"]["symbol"], "AAPL-USD");
     assert_eq!(position["position_response"]["id"], "2".repeat(36));
     assert_eq!(position["position_response"]["position"], 0);
@@ -573,7 +604,10 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     );
     assert!(read("README.md").contains("error_code; result; subscribed; symbol; type"));
     assert!(ev.withheld.is_empty() && ev.errors.is_empty(), "{ev:#?}");
-    assert_eq!(ev.fixtures.len(), 7 + 4 + 1);
+    // Each session's frames, its resync's page included, and the README.
+    assert_eq!(ev.fixtures.len(), 8 + 5 + 1);
+    assert_eq!(read("primary-008-in-window.json"), EMPTY_PAGE);
+    assert_eq!(read("subaccount-005-in-window.json"), EMPTY_PAGE);
     // The journal kept every record: its sink dropped none, and no capture is partial.
     assert_eq!(ev.dropped, [0, 0]);
     assert!(ev.sessions.iter().all(|run| run.partial.is_empty()));
@@ -583,7 +617,7 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
     assert!(report.contains("Result: complete."), "{report}");
     assert!(report.contains("An ack echoing the arm arrived in its window"));
-    assert!(report.contains("Nothing arrived in the arm's window"));
+    assert!(report.contains("none echoed the arm: {all_orders_response}"));
     assert!(report.contains("read every fixture for an identifying string"));
     assert!(report.contains(
         "Records the journal's sink dropped: 0 Normal, 0 Safety. Sessions whose capture is \
@@ -616,6 +650,10 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
     );
     assert_eq!(evidence.get("subaccounts_listed"), None);
     assert_eq!(evidence["kept_string_members"][0], "error_code");
+    assert_eq!(
+        evidence["sessions"][0]["arm_outcome"],
+        "Accepted { ack: Final }"
+    );
     assert_eq!(evidence["sessions"][1]["arm_outcome"], "Unknown");
     assert_eq!(evidence["journal_dropped"]["normal"], 0);
     assert_eq!(evidence["journal_dropped"]["safety"], 0);
@@ -809,9 +847,9 @@ async fn with_production_stage_one_completes_with_no_subaccount_listing_names_pr
         "--connect-wait-ms",
         "5000",
         "--registry-span",
-        "70",
+        "96",
         "--ledger-max-age",
-        "71",
+        "97",
         "--ledger-max-entries",
         "1",
     ];
@@ -839,7 +877,7 @@ async fn with_production_stage_one_completes_with_no_subaccount_listing_names_pr
         assert_read_socket(&received(&server, conn), account, public);
     }
     assert_session_socket(&received(&server, 2), None, PUBLIC);
-    let asked = vec!["GET /user/positions".to_owned(); 2];
+    let asked = vec!["GET /user/positions".to_owned(); 3];
     assert_eq!(server.http_requests(), asked);
     assert_no_listing(&server);
     let ev = &outcome.evidence;
@@ -856,7 +894,7 @@ async fn with_production_stage_one_completes_with_no_subaccount_listing_names_pr
         panic!("{:#?}", ev.sessions);
     };
     assert!(run.ok() && run.authenticated && run.arm_sent, "{run:?}");
-    assert_eq!(run.arm.as_deref(), Some("Unknown"));
+    assert_eq!(run.arm.as_deref(), Some("Accepted { ack: Final }"));
     assert!(run.answer().starts_with("An ack echoing the arm"));
 
     // The environment the mode names, beside where the origins pointed: a stub, here.
@@ -886,7 +924,7 @@ async fn with_production_stage_one_completes_with_no_subaccount_listing_names_pr
     assert!(report.contains("against a loopback test stub. Result: complete."));
     assert!(
         report.contains(
-            "| primary | 71s | 1 | 70s | 0 | no order: its sessions place none | yes | no |"
+            "| primary | 97s | 1 | 96s | 0 | no order: its sessions place none | yes | no |"
         ),
         "{report}"
     );
@@ -1460,7 +1498,7 @@ async fn the_probe_reads_only_the_accounts_its_configuration_names() {
     assert_eq!(labels, ["primary (armed)"]);
     assert_read_socket(&received(&server, 0), None, PUBLIC);
     assert_session_socket(&received(&server, 1), None, PUBLIC);
-    assert_eq!(server.http_requests(), ["GET /user/positions"]);
+    assert_eq!(server.http_requests(), ["GET /user/positions"; 2]);
     assert_no_listing(&server);
     assert!(
         report.contains(
@@ -1484,7 +1522,7 @@ async fn the_probe_reads_only_the_accounts_its_configuration_names() {
     assert_eq!(ev.accounts, ["primary"]);
     let labels: Vec<&str> = ev.reads.iter().map(|r| r.label.as_str()).collect();
     assert_eq!(labels, ["primary (armed)"]);
-    assert_eq!(server.http_requests(), ["GET /user/positions"]);
+    assert_eq!(server.http_requests(), ["GET /user/positions"; 2]);
     assert_eq!(evidence["accounts"]["count"], 1);
     assert!(printed.contains("ACCOUNTS 1 named"), "{printed}");
 
@@ -1500,7 +1538,7 @@ async fn the_probe_reads_only_the_accounts_its_configuration_names() {
     assert_read_socket(&received(&server, 0), None, PUBLIC);
     assert_read_socket(&received(&server, 1), Some(SUB), PUBLIC);
     assert_session_socket(&received(&server, 2), None, PUBLIC);
-    assert_eq!(server.http_requests().len(), 2);
+    assert_eq!(server.http_requests().len(), 3);
     assert_no_listing(&server);
     assert_eq!(evidence["accounts"]["count"], 2);
 }
@@ -1801,7 +1839,7 @@ fn reported() -> Vec<SessionRun> {
             account,
             authenticated: true,
             arm: Some("Unknown".to_owned()),
-            ended_by: "the arm's outcome",
+            ended_by: stage::ARM_AND_RESYNC,
             attempts: 1,
             ..SessionRun::default()
         })
@@ -2390,12 +2428,13 @@ fn fixtures_the_privacy_check_cannot_pass_are_removed() {
 // ----- The command line -----
 
 /// The ledger's three flags, which every run needs (decision 0132 item 5): a span bound just
-/// longer than the defaults' 10 + 60 + 10 s to the arm's deadline, an age a second longer.
+/// longer than the defaults' 10 + 60 + 30 s to the resync's deadline, which outlasts the arm's,
+/// and an age a second longer.
 const LEDGER: [&str; 6] = [
     "--registry-span",
-    "81",
+    "101",
     "--ledger-max-age",
-    "82",
+    "102",
     "--ledger-max-entries",
     "1",
 ];
@@ -2429,7 +2468,7 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         "--connect-wait-ms",
         "8",
         "--session-wait",
-        "61",
+        "91",
         "--trade-url",
         "ws://127.0.0.1:1",
         "--rest-url",
@@ -2439,7 +2478,7 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         "--socks5",
         "[::1]:1080",
         "--registry-span",
-        "61",
+        "91",
         "--ledger-max-age",
         "604800",
         "--ledger-max-entries",
@@ -2451,7 +2490,7 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     let largest = ledger::Bounds::new(
         Duration::from_secs(604_800),
         1_000_000,
-        Duration::from_secs(61),
+        Duration::from_secs(91),
         &[],
     );
     assert_eq!(opts.ledger, Some(largest.unwrap()));
@@ -2459,7 +2498,7 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     assert_eq!((opts.rpc_timeout_ms, opts.page_size), (501, 1));
     assert_eq!(opts.read_wait, Duration::from_millis(7));
     assert_eq!(opts.connect_wait, Duration::from_millis(8));
-    assert_eq!(opts.session_wait, Duration::from_secs(61));
+    assert_eq!(opts.session_wait, Duration::from_secs(91));
     assert_eq!(
         (
             opts.trade_url.as_str(),
@@ -2502,7 +2541,9 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         );
     }
     // --session-wait must outlast the connection, QFEX's 60 s authentication deadline and the
-    // arm's: 10 + 60 + 10 s at the defaults, 120 + 60 + 60 s at the largest.
+    // longer of the arm's deadline and the resync's 30 s: 10 + 60 + 30 s at the defaults, the
+    // resync's whenever the arm's is shorter, 10 + 60 + 40 s with a 40 s arm deadline and
+    // 120 + 60 + 60 s at the largest.
     let run = [
         "--evidence-dir",
         "/d",
@@ -2516,11 +2557,23 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         "1",
     ];
     let waits = [
-        (vec!["--session-wait", "80"], false),
-        (vec!["--session-wait", "81"], true),
+        (vec!["--session-wait", "100"], false),
+        (vec!["--session-wait", "101"], true),
         (
-            vec!["--rpc-timeout-ms", "20000", "--session-wait", "90"],
+            vec!["--rpc-timeout-ms", "29999", "--session-wait", "100"],
             false,
+        ),
+        (
+            vec!["--rpc-timeout-ms", "29999", "--session-wait", "101"],
+            true,
+        ),
+        (
+            vec!["--rpc-timeout-ms", "40000", "--session-wait", "110"],
+            false,
+        ),
+        (
+            vec!["--rpc-timeout-ms", "40000", "--session-wait", "111"],
+            true,
         ),
         (
             vec![
@@ -2551,6 +2604,7 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
             Ok(Parsed::Run(_)) if taken => {}
             Err(err) if !taken => {
                 assert!(err.contains("--session-wait must be longer than"), "{err}");
+                assert!(err.contains("the resync's 30 s deadline"), "{err}");
                 assert!(err.contains("the values are not shown"), "{err}");
             }
             other => panic!("{args:?}: {other:?}"),
@@ -2575,8 +2629,14 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     for said in [
         "a missing or unaccepted --registry-span, --ledger-max-age or --ledger-max-entries: \
          fill-ledger bounds that cannot outlast a registry's sessions and fills",
-        "at the arm's answer, its deadline, the connection's end, --session-wait or its \
-         registry's span bound the program stops it, through its stop control",
+        "Each session arms once and resyncs. Once the arm has its outcome (its answer, or \
+         Unknown at its deadline) and the resync has ended, or at the connection's end, \
+         --session-wait or its registry's span bound, the program stops it, through its stop \
+         control",
+        "sends no command but each session's arm, its resync's reads (one GET /user/positions \
+         and get_user_orders pages, decision 0132 item 5) and the probe's own reads",
+        "the longer of --rpc-timeout-ms and the resync's 30 s deadline together, so the \
+         program never stops a session while its arm or its resync is in flight",
     ] {
         assert!(flat.contains(said), "{said}");
     }
@@ -2720,33 +2780,34 @@ fn the_ledger_flags_are_required_and_a_bound_that_cannot_outlast_the_registry_is
             "--ledger-max-age must be longer than --registry-span",
         );
     }
-    // The span bound stops a session, so it must outlast the arm as --session-wait does: 10 +
-    // 60 + 10 s at the defaults.
+    // The span bound stops a session, so it must outlast the arm and the resync as
+    // --session-wait does: 10 + 60 + 30 s at the defaults.
     refused(
         with(&[
             "--registry-span",
-            "80",
+            "100",
             "--ledger-max-age",
             "778",
             "--ledger-max-entries",
             "1",
         ]),
-        "--registry-span must be longer than --connect-wait-ms",
+        "--registry-span must be longer than --connect-wait-ms, QFEX's 60 s authentication \
+         deadline and the longer of --rpc-timeout-ms and the resync's 30 s deadline together",
     );
     let Ok(Parsed::Run(opts)) = probe_args::parse(with(&[
         "--registry-span",
-        "81",
+        "101",
         "--ledger-max-age",
-        "82",
+        "102",
         "--ledger-max-entries",
         "1",
     ])) else {
         panic!("not parsed");
     };
-    let taken = ledger::Bounds::new(Duration::from_secs(82), 1, Duration::from_secs(81), &[]);
+    let taken = ledger::Bounds::new(Duration::from_secs(102), 1, Duration::from_secs(101), &[]);
     let taken = taken.unwrap();
     assert_eq!(opts.ledger, Some(taken.clone()));
-    assert_eq!(taken.config().max_age, Duration::from_secs(82));
+    assert_eq!(taken.config().max_age, Duration::from_secs(102));
     assert_eq!(taken.config().max_entries, 1);
 
     // The count must be above the fill ceiling: stage one's is zero, so every count the flag
@@ -4509,6 +4570,9 @@ async fn a_hold_runs_before_the_sessions_and_the_session_opens_only_once_its_con
     assert_read_socket(&received(&server, 2), None, PUBLIC);
     assert_read_socket(&received(&server, 3), None, PUBLIC);
     assert_session_socket(&received(&server, 4), None, PUBLIC);
+    // The account's positions read before the hold, after it and before the session, then the
+    // session's resync's own (FBC-jxau); the hold reads none.
+    assert_eq!(server.http_requests(), ["GET /user/positions"; 4]);
     let ev = &outcome.evidence;
     let labels: Vec<(&str, &str)> = (ev.reads.iter())
         .map(|r| (r.before, r.label.as_str()))
@@ -4528,10 +4592,15 @@ async fn a_hold_runs_before_the_sessions_and_the_session_opens_only_once_its_con
     );
     assert_eq!(held.pings_after_auth().len(), 1);
     assert!(held.intervals().is_empty());
+    // The session after the hold: its arm accepted by its ack, stopped once that outcome and
+    // its resync's end had come (FBC-jxau), with one attempt.
     let [run] = ev.sessions.as_slice() else {
         panic!("{:#?}", ev.sessions);
     };
     assert!(run.ok() && run.arm_sent);
+    assert_eq!(run.arm.as_deref(), Some("Accepted { ack: Final }"));
+    assert_eq!(run.ended_by, stage::ARM_AND_RESYNC);
+    assert_eq!((run.attempts, run.failed_attempts), (1, 0));
     let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
     assert!(report.starts_with(
         "# QFEX pre-production stage one: how a trade connection stays alive (the liveness \

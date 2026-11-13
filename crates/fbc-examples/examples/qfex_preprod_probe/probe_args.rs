@@ -18,17 +18,23 @@ use crate::ledger::{self, Bounds, MAX_AGE_S, MAX_ENTRIES, MAX_SPAN_S};
 /// buckets (decision 0123). The program's own numbering: a process probes one user.
 pub const USER: RateUserKey = RateUserKey::new(1);
 
+/// The probe codec's resync deadline, which each session's configuration gives it as
+/// `qfex.exec.resync_timeout`: a resync not ended by then ends the epoch (decision 0132 item 5).
+pub const RESYNC_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The help text `--help` prints.
 pub fn usage() -> String {
+    let resync = RESYNC_TIMEOUT.as_secs();
     format!(
         "\
 qfex_preprod_probe: stage one of the QFEX probe (decision 0132 item 7, FBC-l931): on QFEX's
 PRE-PRODUCTION environment, or with --production on QFEX PRODUCTION (decision 0143), an
 owner-assisted run that arms cancel-on-disconnect once per account and records what answers
 the arm: on pre-production a declared testnet run (decision 0067), on production with no such
-declaration (decision 0143). It places nothing and sends no command but each session's arm and
-the probe's own reads. With --hold-secs it first holds one trade connection that never arms
-(the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming at all.
+declaration (decision 0143). It places nothing and sends no command but each session's arm,
+its resync's reads (one GET /user/positions and get_user_orders pages, decision 0132 item 5)
+and the probe's own reads. With --hold-secs it first holds one trade connection that never
+arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming at all.
 
 Before anything connects it refuses any origin but the environment's own (or, for a test stub,
 all of them loopback addresses): without --production, a production origin is refused; with it,
@@ -42,10 +48,10 @@ only when every one of them holds no open order (none on the page, none counted 
 flat position. It sends no GET /user/subaccounts (decision 0144): before each run, confirm in
 QFEX's app that the user has no subaccount the configuration does not name, which the probe
 cannot check. {SUB_ID_VAR} must name a subaccount, never the primary account. Each session
-arms once; at the arm's answer, its deadline, the connection's end, --session-wait or its
-registry's span bound the program stops it, through its stop control, with no second
-connection attempt. The sessions run one after the other, so no two arms are ever in flight
-across the user.
+arms once and resyncs. Once the arm has its outcome (its answer, or Unknown at its deadline)
+and the resync has ended, or at the connection's end, --session-wait or its registry's span
+bound, the program stops it, through its stop control, with no second connection attempt. The
+sessions run one after the other, so no two arms are ever in flight across the user.
 
 The liveness hold (decision 0146), before any session and while no other connection of the
 probe is open, reads the named accounts as before a session, then opens one trade connection on
@@ -105,14 +111,16 @@ Options:
   --connect-wait-ms <MS>   how long a connection may take to open, 1 to 120000 (default 10000)
   --session-wait <S>       the longest one session runs before the program stops it, up to 3600
                            (default 120); longer than --connect-wait-ms, QFEX's 60 s
-                           authentication deadline and --rpc-timeout-ms together, so the
-                           program never stops a session while its arm is in flight
+                           authentication deadline and the longer of --rpc-timeout-ms and the
+                           resync's {resync} s deadline together, so the program never stops a
+                           session while its arm or its resync is in flight
   --registry-span <S>      required with --arm, no default, refused without it: the longest
                            from a registry's first session's start to its last session's end,
                            1 to {MAX_SPAN_S}; a session that
                            reaches it is stopped. Longer than --connect-wait-ms, QFEX's 60 s
-                           authentication deadline and --rpc-timeout-ms together, as
-                           --session-wait is. Stage one gives each session its own registry
+                           authentication deadline and the longer of --rpc-timeout-ms and the
+                           resync's {resync} s deadline together, as --session-wait is. Stage
+                           one gives each session its own registry
   --ledger-max-age <S>     required with --arm, no default, refused without it: how long each
                            registry's fill ledger keeps a fill, 1 to {MAX_AGE_S}; longer than
                            --registry-span (decision 0132 item 5)
@@ -311,35 +319,38 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
 }
 
 /// The ledger's bounds of a run that arms, from its three flags, each required, and the waits
-/// `(connect_wait, rpc_timeout_ms, session_wait)` a session's arm takes.
+/// `(connect_wait, rpc_timeout_ms, session_wait)` a session's arm and resync take.
 fn ledger_bounds(
     (connect_wait, rpc_timeout_ms, session_wait): (Duration, u64, Duration),
     span: Option<Duration>,
     max_age: Option<Duration>,
     max_entries: Option<usize>,
 ) -> Result<Bounds, String> {
-    // A session opens, authenticates within QFEX's deadline, then arms and waits out the arm's:
-    // a --session-wait no longer than all three could stop it with its arm in flight, spending
-    // that account's capture with no outcome. The span bound stops a session too, so it must
-    // outlast the same three.
-    let to_arm = connect_wait + AUTH_DEADLINE + Duration::from_millis(rpc_timeout_ms);
-    if session_wait <= to_arm {
+    // A session opens and authenticates within QFEX's deadline, then arms and resyncs at once,
+    // waiting out the arm's deadline and the resync's: a --session-wait no longer than the
+    // three could stop it with its arm in flight, spending that account's capture with no
+    // outcome, or with a resync read unanswered in its journal. The span bound stops a session
+    // too, so it must outlast the same three.
+    let settled = Duration::from_millis(rpc_timeout_ms).max(RESYNC_TIMEOUT);
+    let to_settle = connect_wait + AUTH_DEADLINE + settled;
+    let (auth_s, resync_s) = (AUTH_DEADLINE.as_secs(), RESYNC_TIMEOUT.as_secs());
+    if session_wait <= to_settle {
         return Err(format!(
-            "--session-wait must be longer than --connect-wait-ms, QFEX's {} s authentication \
-             deadline and --rpc-timeout-ms together, or a session could be stopped with its arm \
-             in flight (the values are not shown)",
-            AUTH_DEADLINE.as_secs()
+            "--session-wait must be longer than --connect-wait-ms, QFEX's {auth_s} s \
+             authentication deadline and the longer of --rpc-timeout-ms and the resync's \
+             {resync_s} s deadline together, or a session could be stopped with its arm or its \
+             resync in flight (the values are not shown)"
         ));
     }
     let span = span.ok_or("--registry-span is required: it has no default")?;
     let max_age = max_age.ok_or("--ledger-max-age is required: it has no default")?;
     let max_entries = max_entries.ok_or("--ledger-max-entries is required: it has no default")?;
-    if span <= to_arm {
+    if span <= to_settle {
         return Err(format!(
-            "--registry-span must be longer than --connect-wait-ms, QFEX's {} s authentication \
-             deadline and --rpc-timeout-ms together, or the span bound could stop a session \
-             with its arm in flight (the values are not shown)",
-            AUTH_DEADLINE.as_secs()
+            "--registry-span must be longer than --connect-wait-ms, QFEX's {auth_s} s \
+             authentication deadline and the longer of --rpc-timeout-ms and the resync's \
+             {resync_s} s deadline together, or the span bound could stop a session with its \
+             arm or its resync in flight (the values are not shown)"
         ));
     }
     Bounds::new(max_age, max_entries, span, &ledger::stage_one())

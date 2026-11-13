@@ -41,10 +41,11 @@
 //! (`get_user_orders` weighs 5.0, so 50 in this crate's tenths).
 //!
 //! FBC-l931 sends these but the listing (decision 0144) through fbc-runtime, charged to the
-//! run's shared limiter, and judges the answers. FBC-jxau's resync, inside this crate, can
-//! reuse the positions request with its order-entry handle's signed headers
-//! (`positions_request`) and the page decoder on the bytes its codec keeps of a frame
-//! (`decode_page`), without a `ReadAuth`.
+//! run's shared limiter, and judges the answers. The order-entry codec's resync (FBC-jxau,
+//! decision 0132 item 5), inside this crate, reuses the positions request with its handle's
+//! signed headers (`positions_request`), the positions decoder, the `get_user_orders` frame
+//! (`user_orders_body`) and the page's shape (`page_rows`) on the bytes it keeps of a frame,
+//! without a `ReadAuth`.
 
 use core::fmt;
 use core::ops::Range;
@@ -207,12 +208,8 @@ impl PageAsk {
 /// "offset":M}}`, charged [`PAGE_WEIGHT`] under `Query`, Normal traffic.
 pub fn user_orders(cfg: &VenueConfig, ask: PageAsk) -> Result<SocketWrite, BuildError> {
     probe::connections(cfg)?;
-    let body = format!(
-        r#"{{"type":"get_user_orders","params":{{"limit":{},"offset":{}}}}}"#,
-        ask.limit, ask.offset
-    );
     Ok(SocketWrite {
-        frame: WireSlice::plain(body.into_bytes()),
+        frame: WireSlice::plain(user_orders_body(ask).into_bytes()),
         charge: RateCharge {
             op: OpKind::Query,
             inst: None,
@@ -220,6 +217,15 @@ pub fn user_orders(cfg: &VenueConfig, ask: PageAsk) -> Result<SocketWrite, Build
         },
         class: TrafficClass::Normal,
     })
+}
+
+/// The `get_user_orders` frame for `ask`, as [`user_orders`] and the order-entry codec's resync
+/// both write it.
+pub(crate) fn user_orders_body(ask: PageAsk) -> String {
+    format!(
+        r#"{{"type":"get_user_orders","params":{{"limit":{},"offset":{}}}}}"#,
+        ask.limit, ask.offset
+    )
 }
 
 /// `GET /user/subaccounts`, signed with `reader`'s credentials from the nonces and time `ctx`
@@ -249,8 +255,8 @@ pub fn positions(
 /// The one `GET /user/positions` request: on `rest`, a REST origin that already passed the
 /// probe's guard (`probe::mode`, which the factory applies to every plan too), with `headers`,
 /// the signed headers of the account it reads from either `src/auth` handle, charged as
-/// [`positions`] says. [`positions`] builds it for the probe's reads; FBC-jxau's resync can
-/// build it for the traded account (decision 0132 item 5).
+/// [`positions`] says. [`positions`] builds it for the probe's reads; the order-entry codec's
+/// resync builds it for the traded account (FBC-jxau, decision 0132 item 5).
 pub(crate) fn positions_request(rest: &str, headers: Vec<fbc_core::Header>) -> RestRead {
     rest_read(rest, POSITIONS_PATH, headers)
 }
@@ -297,12 +303,12 @@ pub fn redact_inbound(reader: &ReadAuth, input: Inbound<'_>) -> InboundSpans {
     }
 }
 
-fn success(status: u16) -> bool {
+pub(crate) fn success(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
 /// One span over all of `body`, or none when it is empty.
-fn whole(body: &[u8]) -> Vec<Range<u32>> {
+pub(crate) fn whole(body: &[u8]) -> Vec<Range<u32>> {
     let end = u32::try_from(body.len()).unwrap_or(u32::MAX);
     (end > 0).then_some(0..end).into_iter().collect()
 }
@@ -735,8 +741,8 @@ pub fn orders_page(
 
 /// The page `text` answers `ask` with, as [`orders_page`] reads it, where `text` is what the
 /// journal keeps of a text frame off the trade socket, its spans blanked by whichever `src/auth`
-/// handle's socket it came off: [`orders_page`] for the probe's reads, and FBC-jxau's resync for
-/// the codec's own socket.
+/// handle's socket it came off. The order-entry codec's resync reads its pages' shape through
+/// [`page_rows`] instead, since it reads more of each row.
 pub(crate) fn decode_page(
     text: &str,
     ask: PageAsk,
@@ -774,6 +780,26 @@ fn page(
     ask: PageAsk,
     scope: &DecodeScope<'_>,
 ) -> Result<OrdersPage, &'static str> {
+    let (rows, twaps) = page_rows(top, ask.limit)?;
+    let orders = rows
+        .iter()
+        .map(|row| order(row, scope))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OrdersPage {
+        orders,
+        twaps: twaps.len(),
+        ask,
+    })
+}
+
+/// The rows of the page `top`, a frame's top-level members, lists: one `all_orders_response`
+/// holding exactly an `orders` array and a `twaps` array of objects, at most `limit` together.
+/// A `stop_orders` member, or any other, is not documented on the get_user_orders page and is
+/// refused, as a page it would leave partial. The orders' rows and the TWAPs, each unread.
+pub(crate) fn page_rows<'n, 'a>(
+    top: &'n [Member<'a>],
+    limit: u16,
+) -> Result<(&'n [Node<'a>], &'n [Node<'a>]), &'static str> {
     let page = match top {
         [(name, body)] if name == "all_orders_response" => body.members(),
         _ => None,
@@ -792,18 +818,10 @@ fn page(
         .and_then(Node::items)
         .filter(|twaps| twaps.iter().all(|twap| twap.members().is_some()))
         .ok_or("twaps")?;
-    if rows.len() + twaps.len() > usize::from(ask.limit) {
+    if rows.len() + twaps.len() > usize::from(limit) {
         return Err("more orders and TWAPs than the page size");
     }
-    let orders = rows
-        .iter()
-        .map(|row| order(row, scope))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(OrdersPage {
-        orders,
-        twaps: twaps.len(),
-        ask,
-    })
+    Ok((rows, twaps))
 }
 
 fn order(row: &Node<'_>, scope: &DecodeScope<'_>) -> Result<PageOrder, &'static str> {

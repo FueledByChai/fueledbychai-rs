@@ -3,15 +3,15 @@
 //! owner-assisted run (on pre-production a declared testnet run, decision 0067; on production
 //! with no such declaration) that arms cancel-on-disconnect once per account and records what
 //! answers the arm, in a report, a machine-readable evidence file and a scrubbed slice of its
-//! journal. It places nothing and sends no command but each session's arm and its own reads,
-//! which cover the accounts its configuration names and never ask QFEX for a list of them
-//! (decision 0144): confirm in QFEX's app before each run that the user has no other
-//! subaccount. With `--hold-secs` it first holds one trade connection that never arms and
-//! records each ping, pong and close QFEX sends on it (the liveness hold, decision 0146), and a
-//! run may hold without arming. Ctrl-C from the hold's connection's opening until its close is
-//! over is the hold's ([`interrupt`]): one before the hold ended ends it as its duration does,
-//! its close, the reads after it and the report following, and one while it closes is read as
-//! it drops the interrupt; either stops a run that also arms, so no session starts. Ctrl-C at
+//! journal. It places nothing and sends no command but each session's arm, its resync's reads
+//! (decision 0132 item 5) and its own reads, which cover the accounts its configuration names and
+//! never ask QFEX for a list of them (decision 0144): confirm in QFEX's app before each run that
+//! the user has no other subaccount. With `--hold-secs` it first holds one trade connection that
+//! never arms and records each ping, pong and close QFEX sends on it (the liveness hold, decision
+//! 0146), and a run may hold without arming. Ctrl-C from the hold's connection's opening until its
+//! close is over is the hold's ([`interrupt`]): one before the hold ended ends it as its duration
+//! does, its close, the reads after it and the report following, and one while it closes is read
+//! as it drops the interrupt; either stops a run that also arms, so no session starts. Ctrl-C at
 //! any other time ends the program at once, writing no report, as it always has. An owner-run
 //! program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.

@@ -158,8 +158,10 @@ request, every number zeroed, with a README of its own. Its string values are ke
 identifying string the privacy check cannot know (an email, a user name, an address in another
 form) before committing it. A pre-production capture is committed as `exec-recorded/arm/`, a
 production one as `exec-recorded/arm-production/` (decision 0143 item 4), each README naming its
-environment; being recorded, neither carries a `SYNTHETIC` marker. FBC-jxau decodes the arm's
-answer from a capture of either (decision 0132 item 1, decision 0143 item 4).
+environment; being recorded, neither carries a `SYNTHETIC` marker. The probe codec decodes the
+arm's answer from a capture of either (FBC-jxau; decision 0132 item 1, decision 0143 item 4):
+`tests/probe_settle.rs` holds `arm-production/`'s ack to `Accepted` at Final on both accounts,
+under either probe mode.
 
 `exec-recorded/arm-production/` holds the production run of 2026-11-13 (FBC-291a): QFEX answered
 the arm on the primary account and on the subaccount with an ack echoing it. After the run each
