@@ -212,7 +212,13 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   `GET /user/positions` and a `get_user_orders` page after that account's authentication, and
   `GET /user/subaccounts`, which the probe no longer sends (0144), each built only under the guard
   and signed by `src/auth`'s `ReadAuth` for an account and credentials the caller names, and
-  decoded exactly; 0132 item 7, FBC-h3z1),
+  decoded exactly; 0132 item 7, FBC-h3z1; and, for the probe's liveness hold, the three
+  subscriptions a session sends, built and charged by the codec's own `exec::subscription` and
+  only under the guard, a `{"subscribed":…}` confirmation read where the codec reads one
+  (`exec::channel_reply`) and an err read as a page reads one, `SocketErr`, each from the bytes
+  the journal keeps; 0146, FBC-39ks), its trade session's liveness on server pings alone held in
+  `tests/liveness.rs` (an `ExecSession` under `preprod_probe` against the conformance stub on a
+  paused clock: each ping answered, no frame of its own; FBC-39ks),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -690,7 +696,31 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     JSON), a read socket's read once more in memory for a refusal kept whole, a count above zero
     named as evidence for FBC-s5ox; `refusals.rs`), its journal and
     a scrubbed fixture slice for `fixtures/qfex/exec-recorded/arm/` (a production run's for
-    `arm-production/`, 0143 item 4) (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped conformance stub). Its credentials
+    `arm-production/`, 0143 item 4) (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped
+    conformance stub).
+    With `--hold-secs` (FBC-39ks, 0146), on either environment, it first holds one trade
+    connection that never arms (`hold.rs`; `--arm` then optional, the ledger flags required only
+    with it): after the named accounts' reads, before any session and with no other connection
+    open, on the account `--hold-account` names (the primary by default), it sends its
+    authentication and the three subscriptions a session sends through the adapter's
+    `account_reads` and the shared limiter, then nothing but the pongs and close reply the
+    WebSocket layer writes, each recorded on that limiter as a session records one (0030), its
+    own close charged as a control frame (none, the connection dropped, when it has no room); it
+    records each ping, pong and close with its time since the connection opened (lengths only,
+    codes in full, its own close's echo never a server close), counts its data frames by kind
+    (a kind name read in memory from what a journal would keep, never a value) and their provider
+    rate refusals and keeps none (an err a journal would keep whole read in memory for its code
+    alone), reports an order or fill frame on it, ends at its duration, the owner's Ctrl-C (an
+    injected `stage::Interrupt`; `interrupt.rs` hands each Ctrl-C from tokio's `ctrl_c` to the
+    hold from its connection's opening until its close is over, a press while it closes
+    recorded, and otherwise ends the program with no report, as before), a server close, the
+    connection's end or a refusal, with no reconnection, then reads every named account again,
+    whatever ended it; the report gives both reads, states the owner's two unchecked conditions
+    (no subaccount left out, 0144 item 2; nothing traded from the first read to the last) and
+    reports whether any ping came before authentication, the intervals after it, each server
+    close and that a lifetime longer than the hold was not measured; a hold that fails, an order
+    or fill frame on it, an account read after it that is not clean, or Ctrl-C on the hold in a
+    run that also arms stops the run, so no session starts. Its credentials
     come from the environment through `src/auth_qfex.rs`, a review path, which also hands each
     signed read to the connector; it reuses `paradex_testnet_acceptance`'s privacy patterns by
     path. The samples that trade share

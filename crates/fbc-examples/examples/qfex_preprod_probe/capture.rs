@@ -1,7 +1,9 @@
 //! What stage one found, and the files it writes from it: the report (`report.md`), the same
 //! machine-readable (`evidence.json`), and the scrubbed slice of the sessions' journal
 //! (`fixtures/`, to commit as `fixtures/qfex/exec-recorded/arm/`, or a production run's as
-//! `fixtures/qfex/exec-recorded/arm-production/`, decision 0143 item 4).
+//! `fixtures/qfex/exec-recorded/arm-production/`, decision 0143 item 4). A run that holds a
+//! connection first (decision 0146) reports the hold too ([`crate::hold`]); the hold's frames are
+//! not journaled, so the slice holds none of them.
 //!
 //! **The slice** ([`slice`]) is every frame QFEX sent on a session's trade socket, read back from
 //! the journal (decision 0006) with every span the codec named blanked to `2`s: the account's
@@ -44,13 +46,15 @@ use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value, json};
 
 use crate::evidence::privacy_hits;
+use crate::hold::{self, HoldRun};
 use crate::ledger::{self, RegistryRun};
 use crate::refusals::{self, ReadSocket, Refusals};
 
-/// What one account's reads showed before a session.
+/// What one account's reads showed before a session or the hold, or after the hold.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AccountRead {
-    /// The account the session after them arms on.
+    /// The account the session after them arms on, `the hold` for the reads before the hold, or
+    /// `after the hold` for those after it (`refusals::HOLD`, `refusals::AFTER_HOLD`).
     pub before: &'static str,
     /// `primary` or `subaccount`, as the run's configuration names the account (decision 0144),
     /// `(armed)` when the session arms on it: never an id.
@@ -278,6 +282,13 @@ pub struct Evidence {
     /// configuration names them (decision 0144): never a list QFEX gave, since the probe sends
     /// no `GET /user/subaccounts`, and never an id.
     pub accounts: Vec<&'static str>,
+    /// The accounts the run asked to arm on (`--arm`), in run order: none for a run that only
+    /// holds.
+    pub arms: Vec<&'static str>,
+    /// Whether the run asked for the liveness hold (`--hold-secs`, decision 0146).
+    pub hold_asked: bool,
+    /// What the hold's connection heard, once the hold started.
+    pub hold: Option<HoldRun>,
     pub reads: Vec<AccountRead>,
     pub sessions: Vec<SessionRun>,
     /// Each registry's fill ledger: its bounds, and its horizon and replay counts at each of its
@@ -307,9 +318,10 @@ pub struct Evidence {
 }
 
 impl Evidence {
-    /// Whether the run did all stage one asks: every session armed with its capture whole,
-    /// the journal's sink dropped nothing and its writer wrote everything, every registry's
-    /// ledger bounds held, and every file written.
+    /// Whether the run did all it asked: the hold, when it asked for one, did what decision 0146
+    /// asks; every session armed with its capture whole; the journal's sink dropped nothing and
+    /// its writer wrote everything; every registry's ledger bounds held; and every file written.
+    /// A run did something: a session ran, or the hold did.
     pub fn ok(&self) -> bool {
         self.stopped.is_none()
             && self.registries.iter().all(RegistryRun::held)
@@ -317,8 +329,21 @@ impl Evidence {
             && self.errors.is_empty()
             && self.dropped == [0, 0]
             && self.writer_failed.is_none()
-            && !self.sessions.is_empty()
+            && (!self.sessions.is_empty() || self.hold.is_some())
             && self.sessions.iter().all(SessionRun::ok)
+            && self.hold.as_ref().is_none_or(HoldRun::ok)
+    }
+
+    /// What the report's title says the run is for: the arm's capture, the hold, or both.
+    fn about(&self) -> &'static str {
+        match (self.hold_asked, self.arms.is_empty()) {
+            (false, _) => "what answers the cancel-on-disconnect arm",
+            (true, true) => "how a trade connection stays alive (the liveness hold)",
+            (true, false) => {
+                "how a trade connection stays alive (the liveness hold), and what answers the \
+                 cancel-on-disconnect arm"
+            }
+        }
     }
 }
 
@@ -687,8 +712,29 @@ fn read(
     }
 }
 
+/// The fixture directory's README of a run that armed on no account, so wrote no frame: the hold
+/// keeps none (decision 0146 item 6).
+fn readme_unarmed(ev: &Evidence) -> String {
+    format!(
+        "# QFEX trade-socket frames: none\n\n\
+         Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
+         `qfex_preprod_probe` (crates/fbc-examples): a run that armed on no account, so this \
+         directory holds no frame. Its liveness hold (FBC-39ks, decision 0146) keeps no frame \
+         either: what the hold's connection heard is in the run's report.md and evidence.json, \
+         which the owner reads before committing beside a README of their own (decision 0146 \
+         item 6).\n",
+        ev.started.get(..10).unwrap_or(""),
+        ev.environment,
+        ev.mode,
+        ev.target,
+    )
+}
+
 /// The fixture directory's README.
 pub fn readme(ev: &Evidence) -> String {
+    if ev.arms.is_empty() && ev.hold_asked {
+        return readme_unarmed(ev);
+    }
     let accounts: Vec<&str> = ev.sessions.iter().map(|s| s.account).collect();
     let [normal, safety] = ev.dropped;
     let sessions = shown(ev);
@@ -830,12 +876,21 @@ fn write_checked(dir: &Path, file: String, text: &str, ev: &mut Evidence) -> Res
 pub fn markdown(ev: &Evidence) -> String {
     let mut s = String::new();
     let result = if ev.ok() { "complete" } else { "INCOMPLETE" };
+    let hold = match ev.hold_asked {
+        true => " The liveness hold: FBC-39ks and decision 0146.",
+        false => "",
+    };
     let _ = writeln!(
         s,
-        "# QFEX {} stage one: what answers the cancel-on-disconnect arm\n\n\
-         FBC-l931, decision 0132 items 1, 3 and 7, and decision 0143. Environment: QFEX {}, \
-         under the probe mode `{}`. Started {} against {}. Result: {result}.\n",
-        ev.environment, ev.environment, ev.mode, ev.started, ev.target
+        "# QFEX {} stage one: {}\n\n\
+         FBC-l931, decision 0132 items 1, 3 and 7, and decision 0143.{hold} Environment: QFEX \
+         {}, under the probe mode `{}`. Started {} against {}. Result: {result}.\n",
+        ev.environment,
+        ev.about(),
+        ev.environment,
+        ev.mode,
+        ev.started,
+        ev.target
     );
     let sessions = shown(ev);
     if let Some(line) = refusals::headline(ev, &sessions) {
@@ -865,9 +920,17 @@ pub fn markdown(ev: &Evidence) -> String {
          whose capture is partial: {partial}.{writer}\n"
     );
     let (n, names) = (ev.accounts.len(), ev.accounts.join(", "));
+    let (held, around) = match ev.hold_asked {
+        true => (
+            " The liveness hold reads them as a session does before it opens, and again after \
+             it ends, whatever ended it (decision 0146 item 3).",
+            " and around the hold",
+        ),
+        false => ("", ""),
+    };
     let _ = writeln!(
         s,
-        "## The accounts before each session\n\n\
+        "## The accounts read before each session{around}\n\n\
          Accounts named by the run's configuration, to be read before every session: {n} \
          ({names}; ids not shown), not a list QFEX gave: the probe sends no \
          `GET /user/subaccounts` (decision 0144). The table below lists the reads made. Before \
@@ -876,15 +939,15 @@ pub fn markdown(ev: &Evidence) -> String {
          it, so the checks below, and what they show of the user's other accounts, cover the \
          named accounts only. A session starts only when every account it reads shows no open \
          order on `get_user_orders` (a socket that never arms) and flat REST positions \
-         (decision 0132 item 7), and, reading that strictly, no REST `open_orders` either.\n\n\
-         | before | account | position rows | flat | REST open_orders | page orders | page TWAPs | page full |\n\
+         (decision 0132 item 7), and, reading that strictly, no REST `open_orders` either.{held}\n\n\
+         | read | account | position rows | flat | REST open_orders | page orders | page TWAPs | page full |\n\
          | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
     for r in &ev.reads {
         let _ = writeln!(
             s,
             "| {} | {} | {} | {} | {} | {} | {} | {} |",
-            r.before,
+            refusals::read_when(r.before),
             r.label,
             r.rows,
             yn(r.flat),
@@ -894,7 +957,22 @@ pub fn markdown(ev: &Evidence) -> String {
             yn(r.page_full)
         );
     }
-    let _ = writeln!(s, "\n## The sessions\n");
+    let _ = writeln!(s);
+    match &ev.hold {
+        Some(held) => hold::markdown(&mut s, held, ev.environment),
+        None if ev.hold_asked => {
+            let _ = writeln!(
+                s,
+                "## The liveness hold (FBC-39ks, decision 0146)\n\n\
+                 The run asked for a hold, but it did not start: the probe stopped before it.\n"
+            );
+        }
+        None => {}
+    }
+    let _ = writeln!(s, "## The sessions\n");
+    if ev.arms.is_empty() && ev.hold_asked {
+        let _ = writeln!(s, "None: the run asked for no session (no --arm).\n");
+    }
     for run in &sessions {
         let arm = run.arm.as_deref().unwrap_or("none reported");
         let capture = match run.partial.is_empty() {
@@ -939,7 +1017,9 @@ pub fn markdown(ev: &Evidence) -> String {
         let _ = writeln!(s);
     }
     refusals::markdown(&mut s, ev, &sessions);
-    ledger::markdown(&mut s, &ev.registries);
+    if !(ev.arms.is_empty() && ev.hold_asked) {
+        ledger::markdown(&mut s, &ev.registries);
+    }
     let _ = writeln!(
         s,
         "## Files\n\n\
@@ -966,7 +1046,8 @@ pub fn to_json(ev: &Evidence) -> Value {
         .reads
         .iter()
         .map(|r| {
-            json!({"before": r.before, "account": r.label, "position_rows": r.rows,
+            json!({"read": refusals::read_when(r.before), "before": r.before,
+                "account": r.label, "position_rows": r.rows,
                 "flat": r.flat, "rest_open_orders": r.rest_open_orders,
                 "page_orders": r.page_orders, "page_twaps": r.page_twaps, "page_full": r.page_full})
         })
@@ -997,6 +1078,8 @@ pub fn to_json(ev: &Evidence) -> Value {
         "stopped": ev.stopped,
         "accounts": {"source": "configuration", "named": ev.accounts,
             "count": ev.accounts.len(), "others_checked": false, "note": ACCOUNTS_NOTE},
+        "asked": {"arms": ev.arms, "hold": ev.hold_asked},
+        "hold": ev.hold.as_ref().map(|held| hold::to_json(held, ev.environment)),
         "reads": reads,
         "sessions": sessions,
         "provider_rate_refusals": refusals::to_json(ev, &shown),

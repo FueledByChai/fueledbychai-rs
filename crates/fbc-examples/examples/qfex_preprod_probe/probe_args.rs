@@ -27,7 +27,8 @@ PRE-PRODUCTION environment, or with --production on QFEX PRODUCTION (decision 01
 owner-assisted run that arms cancel-on-disconnect once per account and records what answers
 the arm: on pre-production a declared testnet run (decision 0067), on production with no such
 declaration (decision 0143). It places nothing and sends no command but each session's arm and
-the probe's own reads.
+the probe's own reads. With --hold-secs it first holds one trade connection that never arms
+(the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming at all.
 
 Before anything connects it refuses any origin but the environment's own (or, for a test stub,
 all of them loopback addresses): without --production, a production origin is refused; with it,
@@ -46,6 +47,35 @@ registry's span bound the program stops it, through its stop control, with no se
 connection attempt. The sessions run one after the other, so no two arms are ever in flight
 across the user.
 
+The liveness hold (decision 0146), before any session and while no other connection of the
+probe is open, reads the named accounts as before a session, then opens one trade connection on
+the --hold-account: it sends its authentication and the three subscriptions a session sends,
+then nothing but the pongs and the close reply the WebSocket layer writes to each server ping
+and server close, and never arms, places, cancels or reads. Each frame it writes, and each such
+reply, is charged to the run's shared rate limiter as a session's is. It records each ping, pong
+and close it receives with its time since the connection opened, and counts its data frames by
+kind, keeping none; an order or fill frame on it is reported and stops the probe. It ends at
+--hold-secs, at Ctrl-C, at a server close, at the connection's end or at a refusal (its
+authentication refused, an err frame, or a subscription unconfirmed at QFEX's 60 s deadline),
+with no reconnection. Once its connection is over, whatever ended it, the named accounts are
+read again, and the report gives both reads. Ctrl-C is the hold's from its connection's opening
+until its close and the read of the echo are over: before the hold ended it ends the hold, and
+while the hold closes it is recorded; either stops a run that also arms, so no session starts.
+Ctrl-C at any other time ends the program at once, writing no report, as it always has. A run
+that holds needs no --arm, and one with no --arm takes no --registry-span, --ledger-max-age or
+--ledger-max-entries.
+
+To hold on QFEX production (decision 0146 item 1), with no session:
+
+  cargo run -p fbc-examples --example qfex_preprod_probe -- --production \\
+      --evidence-dir /abs/new/dir --hold-secs <S> --socks5 <HOST:PORT>
+
+Two conditions of such a run, which the probe cannot check and its report states (decision
+0146 item 3): confirm in QFEX's app before the run that the user has no subaccount the
+configuration does not name, and let nothing trade on any account of the user from the first
+read to the last. Read report.md before committing it, beside a README of your own, under
+fixtures/qfex/exec-recorded/hold-production/ (hold/ for pre-production); no frame is committed.
+
 Usage: cargo run -p fbc-examples --example qfex_preprod_probe -- [OPTIONS]
 
 Options:
@@ -56,9 +86,18 @@ Options:
   --evidence-dir <DIR>     required: an absolute path, empty or not there, where the run writes
                            report.md, evidence.json, its journal (journal/) and the scrubbed
                            fixtures (fixtures/, to commit as fixtures/qfex/exec-recorded/arm/,
-                           or as fixtures/qfex/exec-recorded/arm-production/ with --production)
-  --arm <ACCOUNT>          required, once or twice, in run order: primary, or subaccount (the
-                           one {SUB_ID_VAR} names)
+                           or as fixtures/qfex/exec-recorded/arm-production/ with --production);
+                           a run that only holds writes no frame, and its report.md is committed
+                           under fixtures/qfex/exec-recorded/hold/, or hold-production/ with
+                           --production, beside the owner's README (decision 0146 item 6)
+  --arm <ACCOUNT>          once or twice, in run order: primary, or subaccount (the one
+                           {SUB_ID_VAR} names); required unless --hold-secs is given
+  --hold-secs <S>          hold one trade connection that never arms for S whole seconds from
+                           its opening, 1 to {MAX_HOLD_S} (a day), before any session (decision
+                           0146); no default: without it there is no hold, and a run with
+                           neither it nor --arm is refused
+  --hold-account <ACCOUNT> the account the hold authenticates as: primary (the default with
+                           --hold-secs), or subaccount (the one {SUB_ID_VAR} names)
   --rpc-timeout-ms <MS>    the arm's deadline, its window of capture: 501 to 60000 (default
                            10000); it must exceed QFEX's 500 ms speed bump
   --page-size <N>          the get_user_orders page each read asks for, 1 to 1000 (default 1000)
@@ -68,17 +107,19 @@ Options:
                            (default 120); longer than --connect-wait-ms, QFEX's 60 s
                            authentication deadline and --rpc-timeout-ms together, so the
                            program never stops a session while its arm is in flight
-  --registry-span <S>      required, no default: the longest from a registry's first session's
-                           start to its last session's end, 1 to {MAX_SPAN_S}; a session that
+  --registry-span <S>      required with --arm, no default, refused without it: the longest
+                           from a registry's first session's start to its last session's end,
+                           1 to {MAX_SPAN_S}; a session that
                            reaches it is stopped. Longer than --connect-wait-ms, QFEX's 60 s
                            authentication deadline and --rpc-timeout-ms together, as
                            --session-wait is. Stage one gives each session its own registry
-  --ledger-max-age <S>     required, no default: how long each registry's fill ledger keeps a
-                           fill, 1 to {MAX_AGE_S}; longer than --registry-span (decision 0132
-                           item 5)
-  --ledger-max-entries <N> required, no default: the most fills it keeps, 1 to {MAX_ENTRIES};
-                           above the fill ceiling, every order a registry's sessions may place
-                           at its largest size in size steps (stage one places nothing: 0)
+  --ledger-max-age <S>     required with --arm, no default, refused without it: how long each
+                           registry's fill ledger keeps a fill, 1 to {MAX_AGE_S}; longer than
+                           --registry-span (decision 0132 item 5)
+  --ledger-max-entries <N> required with --arm, no default, refused without it: the most
+                           fills it keeps, 1 to {MAX_ENTRIES}; above the fill ceiling, every
+                           order a registry's sessions may place at its largest size in size
+                           steps (stage one places nothing: 0)
   --trade-url <URL>        default {PREPROD_TRADE}, or {PRODUCTION_TRADE} with --production
   --rest-url <URL>         default {PREPROD_REST}, or {PRODUCTION_REST} with --production
   --mds-url <URL>          default {PREPROD_MDS}, or {PRODUCTION_MDS} with --production
@@ -87,7 +128,8 @@ Options:
 Credentials, from the environment only:
   {PUBLIC_VAR}, {SECRET_VAR}   the primary account's credential (required)
   {SUB_ID_VAR}                   the subaccount the run reads before every session and arms
-                                       on with --arm subaccount (required with it)
+                                       on with --arm subaccount, or holds on with --hold-account
+                                       subaccount (required with either)
   {SUB_PUBLIC_VAR}, {SUB_SECRET_VAR}
                                        a credential scoped to that subaccount (optional, both
                                        or neither); otherwise the primary credential reads it
@@ -98,13 +140,29 @@ Credentials, from the environment only:
     )
 }
 
+/// The longest hold `--hold-secs` takes: a day (decision 0146 item 4).
+pub const MAX_HOLD_S: u64 = 86_400;
+
+/// The liveness hold a run asks for (decision 0146).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Hold {
+    /// `--hold-secs`: how long the connection is held from its opening.
+    pub duration: Duration,
+    /// `--hold-account`: the account it authenticates as, the primary unless it names the
+    /// subaccount.
+    pub account: Armed,
+}
+
 /// What to run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Where the evidence is written.
     pub evidence_dir: PathBuf,
-    /// The accounts a session arms on, in run order, each at most once.
+    /// The accounts a session arms on, in run order, each at most once: none for a run that
+    /// only holds.
     pub arms: Vec<Armed>,
+    /// The liveness hold, before any session, when `--hold-secs` asks for one.
+    pub hold: Option<Hold>,
     /// `--production`: the run is on QFEX production, under the adapter's `production_probe`
     /// mode (decision 0143 item 3); otherwise on pre-production, under `preprod_probe`.
     pub production: bool,
@@ -120,8 +178,8 @@ pub struct Options {
     pub connect_wait: Duration,
     pub session_wait: Duration,
     /// Each registry's fill-ledger bounds and the span bound they outlast (decision 0132 item
-    /// 5), accepted against stage one's fill ceiling.
-    pub ledger: Bounds,
+    /// 5), accepted against stage one's fill ceiling: given exactly when a session arms.
+    pub ledger: Option<Bounds>,
     /// The provider user the run's rate limiter counts for, and whose shared budget a refusal
     /// holds (decision 0123): always [`USER`] from the command line. A test that runs several
     /// probes at once in one process gives each its own, since a user's budget is process-wide.
@@ -162,8 +220,10 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let mut read_wait = Duration::from_millis(10_000);
     let mut connect_wait = Duration::from_millis(10_000);
     let mut session_wait = Duration::from_secs(120);
-    // The fill ledger's bounds and the span bound: required, with no defaults.
+    // The fill ledger's bounds and the span bound: required with --arm, with no defaults.
     let (mut span, mut max_age, mut max_entries) = (None, None, None);
+    // The hold: none unless --hold-secs asks for one.
+    let (mut hold_secs, mut hold_account) = (None, None);
     let mut argv = argv.into_iter();
     while let Some(arg) = argv.next() {
         let mut value = || {
@@ -177,6 +237,8 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             "--production" => production = true,
             "--evidence-dir" => evidence_dir = Some(absolute(&value()?)?),
             "--arm" => arms.push(armed(&value()?, &arms)?),
+            "--hold-secs" => hold_secs = Some(secs(&arg, &value()?, MAX_HOLD_S)?),
+            "--hold-account" => hold_account = Some(held(&value()?)?),
             "--rpc-timeout-ms" => rpc_timeout_ms = number(&arg, &value()?, 501, 60_000)?,
             "--page-size" => page_size = number(&arg, &value()?, 1, 1000)? as u16,
             "--read-wait-ms" => read_wait = millis(&arg, &value()?)?,
@@ -195,9 +257,67 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         }
     }
     let evidence_dir = evidence_dir.ok_or("--evidence-dir is required")?;
-    if arms.is_empty() {
-        return Err("--arm is required: primary, subaccount, or both".to_owned());
+    let hold = match (hold_secs, hold_account) {
+        (Some(duration), account) => Some(Hold {
+            duration,
+            account: account.unwrap_or(Armed::Primary),
+        }),
+        (None, Some(_)) => {
+            return Err("--hold-account names the hold's account: give --hold-secs too".to_owned());
+        }
+        (None, None) => None,
+    };
+    if arms.is_empty() && hold.is_none() {
+        return Err(
+            "--arm or --hold-secs is required: arm on primary, subaccount or both, hold a \
+             connection, or both"
+                .to_owned(),
+        );
     }
+    let ledger = match arms.is_empty() {
+        true if span.is_some() || max_age.is_some() || max_entries.is_some() => {
+            return Err(
+                "--registry-span, --ledger-max-age and --ledger-max-entries bound the \
+                        registries --arm builds: a run with no --arm takes none of them"
+                    .to_owned(),
+            );
+        }
+        true => None,
+        false => Some(ledger_bounds(
+            (connect_wait, rpc_timeout_ms, session_wait),
+            span,
+            max_age,
+            max_entries,
+        )?),
+    };
+    let [trade, rest, mds] = environment(production).origins();
+    Ok(Parsed::Run(Box::new(Options {
+        evidence_dir,
+        arms,
+        hold,
+        production,
+        trade_url: trade_url.unwrap_or_else(|| trade.to_owned()),
+        rest_url: rest_url.unwrap_or_else(|| rest.to_owned()),
+        mds_url: mds_url.unwrap_or_else(|| mds.to_owned()),
+        proxy,
+        rpc_timeout_ms,
+        page_size,
+        read_wait,
+        connect_wait,
+        session_wait,
+        ledger,
+        rate_user: USER,
+    })))
+}
+
+/// The ledger's bounds of a run that arms, from its three flags, each required, and the waits
+/// `(connect_wait, rpc_timeout_ms, session_wait)` a session's arm takes.
+fn ledger_bounds(
+    (connect_wait, rpc_timeout_ms, session_wait): (Duration, u64, Duration),
+    span: Option<Duration>,
+    max_age: Option<Duration>,
+    max_entries: Option<usize>,
+) -> Result<Bounds, String> {
     // A session opens, authenticates within QFEX's deadline, then arms and waits out the arm's:
     // a --session-wait no longer than all three could stop it with its arm in flight, spending
     // that account's capture with no outcome. The span bound stops a session too, so it must
@@ -222,24 +342,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
             AUTH_DEADLINE.as_secs()
         ));
     }
-    let ledger = Bounds::new(max_age, max_entries, span, &ledger::stage_one())?;
-    let [trade, rest, mds] = environment(production).origins();
-    Ok(Parsed::Run(Box::new(Options {
-        evidence_dir,
-        arms,
-        production,
-        trade_url: trade_url.unwrap_or_else(|| trade.to_owned()),
-        rest_url: rest_url.unwrap_or_else(|| rest.to_owned()),
-        mds_url: mds_url.unwrap_or_else(|| mds.to_owned()),
-        proxy,
-        rpc_timeout_ms,
-        page_size,
-        read_wait,
-        connect_wait,
-        session_wait,
-        ledger,
-        rate_user: USER,
-    })))
+    Bounds::new(max_age, max_entries, span, &ledger::stage_one())
 }
 
 /// An absolute path; refused, never shown, otherwise.
@@ -261,6 +364,15 @@ fn armed(value: &str, arms: &[Armed]) -> Result<Armed, String> {
     match arms.contains(&armed) {
         true => Err(format!("--arm {value} given twice: each account arms once")),
         false => Ok(armed),
+    }
+}
+
+/// `primary` or `subaccount`, the hold's account.
+fn held(value: &str) -> Result<Armed, String> {
+    match value {
+        "primary" => Ok(Armed::Primary),
+        "subaccount" => Ok(Armed::Subaccount),
+        _ => Err("--hold-account: primary or subaccount (the value is not shown)".to_owned()),
     }
 }
 

@@ -22,10 +22,13 @@ time.workspace = true
 [dev-dependencies]
 fbc-book = { path = "../../fbc-book" }
 # tests/conformance.rs runs fbc-conformance's caps_truthful on the pre-production probe's caps
-# (FBC-3ymj, decision 0141). scripts/check-deps.sh does not count dev-dependencies.
+# (FBC-3ymj, decision 0141), and tests/liveness.rs runs a probe session against its stub server
+# (FBC-39ks). scripts/check-deps.sh does not count dev-dependencies.
 fbc-conformance = { path = "../../fbc-conformance" }
 # tests/signing.rs journals the authentication and private frames and reads them back
-# (decisions 0006 and 0028). scripts/check-deps.sh does not count dev-dependencies.
+# (decisions 0006 and 0028), and tests/liveness.rs runs fbc-runtime's order-entry session and
+# reads its journal (FBC-39ks). scripts/check-deps.sh does not count dev-dependencies.
 fbc-journal = { path = "../../fbc-journal" }
 fbc-runtime = { path = "../../fbc-runtime" }
-tokio.workspace = true
+# The tests' runtime; tests/liveness.rs runs on a paused clock (test-util).
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }

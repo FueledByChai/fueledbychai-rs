@@ -1,7 +1,8 @@
-//! The provider rate refusals each session and each read socket met (decision 0135 item 2,
-//! FBC-m9rj). A count above zero is provider rate-limit evidence: it un-defers FBC-s5ox, which
-//! records the first `RateLimited` a session meets. The probe provokes none (0135 item 1): it
-//! sends only its reads and each session's arm, each charged to the shared budget first.
+//! The provider rate refusals each session, each read socket and the liveness hold's connection
+//! met (decision 0135 item 2, FBC-m9rj; decision 0146 item 2). A count above zero is provider
+//! rate-limit evidence: it un-defers FBC-s5ox, which records the first `RateLimited` a session
+//! meets. The probe provokes none (0135 item 1): it sends only its reads, each session's arm and
+//! the hold's authentication and subscriptions, each charged to the shared budget first.
 //!
 //! Each session and read socket states these counts ([`Refusals`]):
 //!
@@ -34,7 +35,10 @@
 //! journal kept on its connection, as the slice reads it back (`capture.rs`); on a read socket,
 //! whose frames are not journaled, the two it read, each blanked as a journal blanks a frame
 //! ([`kept`]) with the spans the adapter names. An err keeps a documented code in clear (decision
-//! 0134 item 3). Frames after the page are not read: the probe closes the socket.
+//! 0134 item 3). Frames after the page are not read: the probe closes the socket. The hold's
+//! connection is counted as a read socket is, every data frame it received read the same way:
+//! the probe holds the shared budget for each `RateLimited` err among them, and its frames are not
+//! journaled either. It is reported beside the read sockets before it, under [`HOLD`].
 //!
 //! What a session or read socket **met** ([`Refusals::met`]) is at least the larger of the
 //! limiter's count and the refusals its frames show. The two count the same refusals, but each
@@ -52,9 +56,27 @@ use fbc_journal::BLANK;
 use serde_json::{Map, Value, json};
 
 use crate::capture::{self, Evidence, SessionRun};
+use crate::hold::HoldRun;
 
 /// The ticket a refusal met is recorded under (decision 0135 item 2).
 pub const RECORD_UNDER: &str = "FBC-s5ox";
+
+/// What the read sockets before the liveness hold read before, and what the hold's own counts
+/// are reported under, in place of a session's name.
+pub const HOLD: &str = "the hold";
+
+/// What the read sockets after the liveness hold (decision 0146 item 3) are reported under, in
+/// place of the session they would read before.
+pub const AFTER_HOLD: &str = "after the hold";
+
+/// When a read was made, as the report and the evidence say it: `after the hold`, or before the
+/// session or the hold `before` names.
+pub fn read_when(before: &str) -> String {
+    match before {
+        AFTER_HOLD => AFTER_HOLD.to_owned(),
+        _ => format!("before {before}"),
+    }
+}
 
 /// The provider rate refusals one session or read socket met.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -165,10 +187,11 @@ fn classify(top: &Map<String, Value>) -> Option<Refusal> {
     }
 }
 
-/// One read socket the probe opened before a session, and the refusals it met.
+/// One read socket the probe opened before a session or the hold, or after the hold, and the
+/// refusals it met.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReadSocket {
-    /// The session it read before: `primary` or `subaccount`.
+    /// The session it read before (`primary` or `subaccount`), [`HOLD`], or [`AFTER_HOLD`].
     pub before: &'static str,
     /// The account it read, as the reads name it (`AccountRead::label`): never an id.
     pub label: String,
@@ -182,12 +205,26 @@ pub fn total(reads: &[ReadSocket], sessions: &[SessionRun]) -> u64 {
     reads.chain(sessions).fold(0, u64::saturating_add)
 }
 
+/// What the run met, at least: every read socket, every one of `sessions` and the hold's
+/// connection.
+pub fn met(ev: &Evidence, sessions: &[SessionRun]) -> u64 {
+    let hold = ev.hold.as_ref().map_or(0, |hold| hold.refusals.met());
+    total(&ev.read_sockets, sessions).saturating_add(hold)
+}
+
 /// What each session met, with the read sockets before it, in run order: its name, the count,
-/// and whether it ran (a probe stopped by a read before it starts none).
-pub fn by_session(reads: &[ReadSocket], sessions: &[SessionRun]) -> Vec<(&'static str, u64, bool)> {
+/// and whether it ran (a probe stopped by a read before it starts none). The hold is one of
+/// them, under [`HOLD`], with the read sockets before it and its own connection, and the read
+/// sockets after it are another, under [`AFTER_HOLD`].
+pub fn by_session(
+    reads: &[ReadSocket],
+    sessions: &[SessionRun],
+    hold: Option<&HoldRun>,
+) -> Vec<(&'static str, u64, bool)> {
     let mut by: Vec<(&'static str, u64, bool)> = Vec::new();
     let names = reads.iter().map(|r| r.before);
-    for name in names.chain(sessions.iter().map(|run| run.account)) {
+    let held = hold.map(|_| HOLD);
+    for name in (held.into_iter().chain(names)).chain(sessions.iter().map(|run| run.account)) {
         if by.iter().all(|(seen, ..)| *seen != name) {
             by.push((name, 0, false));
         }
@@ -195,9 +232,16 @@ pub fn by_session(reads: &[ReadSocket], sessions: &[SessionRun]) -> Vec<(&'stati
     for (name, met, ran) in &mut by {
         let read = reads.iter().filter(|r| r.before == *name);
         let read = read.map(|r| r.refusals.met()).fold(0, u64::saturating_add);
-        let run = sessions.iter().find(|run| run.account == *name);
-        *met = read.saturating_add(run.map_or(0, |run| run.refusals.met()));
-        *ran = run.is_some();
+        let (own, went) = match *name {
+            HOLD => (hold.map(|hold| hold.refusals.met()), hold.is_some()),
+            AFTER_HOLD => (None, hold.is_some()),
+            _ => {
+                let run = sessions.iter().find(|run| run.account == *name);
+                (run.map(|run| run.refusals.met()), run.is_some())
+            }
+        };
+        *met = read.saturating_add(own.unwrap_or(0));
+        *ran = went;
     }
     by
 }
@@ -234,7 +278,7 @@ fn written(ev: &Evidence, sessions: &[SessionRun]) -> bool {
 
 /// The report's line naming the evidence, when the run met any.
 pub fn headline(ev: &Evidence, sessions: &[SessionRun]) -> Option<String> {
-    let met = total(&ev.read_sockets, sessions);
+    let met = met(ev, sessions);
     (met > 0).then(|| {
         format!(
             "**Provider rate-limit evidence to record under {RECORD_UNDER}** (decision 0135 item \
@@ -249,10 +293,13 @@ fn sum(counts: impl Iterator<Item = u64>) -> u64 {
     counts.fold(0, u64::saturating_add)
 }
 
-/// The frames of the read sockets and `sessions` that were unread.
-fn unread(reads: &[ReadSocket], sessions: &[SessionRun]) -> u64 {
-    let reads = reads.iter().map(|r| r.refusals.unread);
-    sum(reads.chain(sessions.iter().map(|run| run.refusals.unread)))
+/// The frames of the read sockets, `sessions` and the hold's connection that were unread.
+fn unread(ev: &Evidence, sessions: &[SessionRun]) -> u64 {
+    let reads = ev.read_sockets.iter().map(|r| r.refusals.unread);
+    let hold = ev.hold.iter().map(|hold| hold.refusals.unread);
+    sum(reads
+        .chain(hold)
+        .chain(sessions.iter().map(|run| run.refusals.unread)))
 }
 
 /// The report's section on the provider rate refusals, `sessions` as the report shows them.
@@ -283,9 +330,20 @@ pub fn markdown(s: &mut String, ev: &Evidence, sessions: &[SessionRun]) {
          whose frame a partial capture lost, a frame the codec held no budget for), so the \
          larger is a lower bound, not a total.\n"
     );
+    if ev.hold_asked {
+        let _ = writeln!(
+            s,
+            "The liveness hold's connection (decision 0146) is counted as a read socket is, \
+             every data frame it received read the same way, and is listed under \"{HOLD}\" \
+             with the read sockets before it.\n"
+        );
+    }
+    let hold = ev.hold.as_ref();
+    let hold_met = hold.map_or(0, |hold| hold.refusals.met());
     let read_met = sum(reads.iter().map(|r| r.refusals.met()));
-    let whole = sum(reads.iter().map(|r| r.refusals.whole));
-    match total(reads, sessions) > 0 {
+    let hold_whole = hold.map(|hold| hold.refusals.whole);
+    let whole = sum(reads.iter().map(|r| r.refusals.whole).chain(hold_whole));
+    match met(ev, sessions) > 0 {
         true => {
             let mut said = format!(
                 "**This is provider rate-limit evidence, to record under {RECORD_UNDER}.** \
@@ -304,6 +362,12 @@ pub fn markdown(s: &mut String, ev: &Evidence, sessions: &[SessionRun]) {
                 said.push_str(
                     " A refusal met on a read socket has no frame in the journal, since the \
                      probe's reads are not journaled: only its count is here.",
+                );
+            }
+            if hold_met > 0 {
+                said.push_str(
+                    " A refusal met on the hold's connection has no frame in the journal either: \
+                     the hold is not journaled, and only its count is here.",
                 );
             }
             if whole > 0 {
@@ -325,12 +389,13 @@ pub fn markdown(s: &mut String, ev: &Evidence, sessions: &[SessionRun]) {
         s,
         "Frames unread, kept whole or not JSON: {}. A refusal in a session's unread frame would \
          not show in its counts.\n",
-        unread(reads, sessions)
+        unread(ev, sessions)
     );
-    let by: Vec<String> = (by_session(reads, sessions).into_iter())
-        .map(|(name, met, ran)| match ran {
-            true => format!("{name} {met}"),
-            false => format!("{name} {met} (its session did not run)"),
+    let by: Vec<String> = (by_session(reads, sessions, hold).into_iter())
+        .map(|(name, met, ran)| match (ran, name) {
+            (true, _) => format!("{name} {met}"),
+            (false, HOLD) => format!("{name} {met} (it did not run)"),
+            (false, _) => format!("{name} {met} (its session did not run)"),
         })
         .collect();
     let by = match by.is_empty() {
@@ -355,7 +420,7 @@ pub fn markdown(s: &mut String, ev: &Evidence, sessions: &[SessionRun]) {
             r.met()
         );
     };
-    for name in by_session(reads, sessions)
+    for name in by_session(reads, sessions, hold)
         .into_iter()
         .map(|(name, ..)| name)
     {
@@ -363,6 +428,11 @@ pub fn markdown(s: &mut String, ev: &Evidence, sessions: &[SessionRun]) {
             let on = format!("read socket: {}", r.label);
             let whole = r.refusals.whole.to_string();
             row(s, name, &on, &r.refusals, &whole, "not journaled");
+        }
+        if let Some(hold) = hold.filter(|_| name == HOLD) {
+            let on = format!("the hold's connection: {}", hold.account);
+            let whole = hold.refusals.whole.to_string();
+            row(s, name, &on, &hold.refusals, &whole, "not journaled");
         }
         for run in sessions.iter().filter(|run| run.account == name) {
             let on = match run.partial.is_empty() {
@@ -390,8 +460,9 @@ fn counts(r: &Refusals, whole: Option<u64>) -> Value {
 /// The evidence's entry for the provider rate refusals, `sessions` as the evidence shows them.
 pub fn to_json(ev: &Evidence, sessions: &[SessionRun]) -> Value {
     let reads = &ev.read_sockets[..];
-    let met = total(reads, sessions);
-    let by: Vec<Value> = (by_session(reads, sessions).into_iter())
+    let hold = ev.hold.as_ref();
+    let met = met(ev, sessions);
+    let by: Vec<Value> = (by_session(reads, sessions, hold).into_iter())
         .map(|(name, met, ran)| json!({"session": name, "met_at_least": met, "session_ran": ran}))
         .collect();
     let read_sockets: Vec<Value> = (reads.iter())
@@ -406,7 +477,11 @@ pub fn to_json(ev: &Evidence, sessions: &[SessionRun]) -> Value {
                 "counts": counts(&run.refusals, None), "frames": files(run, ev)})
         })
         .collect();
+    let hold = hold.map(|hold| {
+        let counts = counts(&hold.refusals, Some(hold.refusals.whole));
+        json!({"account": hold.account, "counts": counts})
+    });
     json!({"met_at_least": met, "record_under": (met > 0).then_some(RECORD_UNDER),
-        "frames_unread": unread(reads, sessions), "by_session": by,
-        "read_sockets": read_sockets, "sessions": shown})
+        "frames_unread": unread(ev, sessions), "by_session": by,
+        "read_sockets": read_sockets, "sessions": shown, "hold": hold})
 }

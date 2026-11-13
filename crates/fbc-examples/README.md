@@ -12,7 +12,7 @@ program's flags.
 | `testnet_quote` | A plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). Paradex TESTNET, or with `--mainnet` a supervised short session on Paradex MAINNET (FBC-tyft). See below. |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 | `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of `--order-usd`, the operator's own size, well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It Starts only after a trustworthy resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094) and the account is flat. See below. |
-| `qfex_preprod_probe` | QFEX PRE-PRODUCTION, or with `--production` QFEX PRODUCTION (decision 0143): stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing. See below. |
+| `qfex_preprod_probe` | QFEX PRE-PRODUCTION, or with `--production` QFEX PRODUCTION (decision 0143): stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing; with `--hold-secs` it first holds one trade connection that never arms and records each server ping and close (decision 0146). See below. |
 
 ## md_watch
 
@@ -285,7 +285,9 @@ PRE-PRODUCTION environment, with the credentials QFEX supplied for it, as a decl
 such declaration (decision 0143; below). It arms
 cancel-on-disconnect once per account and records what answers the arm. It places nothing, and
 it sends no command but each session's arm and its own reads. FBC-9sk2's place stages build on
-it once FBC-jxau has landed; they are not decided for production.
+it once FBC-jxau has landed; they are not decided for production. With `--hold-secs` it first
+holds one trade connection that never arms, to record how QFEX keeps it alive (the liveness
+hold, decision 0146; below), and a run may hold without arming.
 
 Before anything connects, it refuses:
 
@@ -300,10 +302,13 @@ Before anything connects, it refuses:
   whether or not a session arms on it;
 - a missing or empty credential, and a subaccount credential with one half set;
 - `--socks5` with loopback origins: the proxy would reach its own host's loopback;
-- a missing, zero or malformed `--registry-span`, `--ledger-max-age` or `--ledger-max-entries`
-  (each required, with no default; below), a ledger age not longer than the span bound, a span
-  bound not longer than `--connect-wait-ms`, QFEX's 60 s authentication deadline and
-  `--rpc-timeout-ms` together, and a ledger count not above the fill ceiling;
+- with `--arm`, a missing, zero or malformed `--registry-span`, `--ledger-max-age` or
+  `--ledger-max-entries` (each required with it, with no default; below), a ledger age not longer
+  than the span bound, a span bound not longer than `--connect-wait-ms`, QFEX's 60 s
+  authentication deadline and `--rpc-timeout-ms` together, and a ledger count not above the fill
+  ceiling; without `--arm`, any of the three;
+- a run with neither `--arm` nor `--hold-secs`, a `--hold-secs` outside 1 to 86400, and a
+  `--hold-account` without `--hold-secs`;
 - an `--evidence-dir` that is not empty.
 
 A refusal names the setting or the variable, never its value. Then:
@@ -497,9 +502,97 @@ could have lost a record, and says why. A partial session's report concludes
 nothing of what answered its arm and places none of its frames against the arm, and its fixture
 files are named `<account>-<n>-partial.json`.
 
-The exit status is 0 only when every session authenticated, wrote its arm, saw its outcome with
-one connection attempt and kept a whole capture, every registry's ledger bounds held, and every
-file was written. Agents never run this program against QFEX, pre-production or production; its
+**The liveness hold** (decision 0146, FBC-39ks). Nothing in this repository says how QFEX's
+trade WebSocket stays alive, whether QFEX closes an idle one, or how long one may live, and an
+armed connection that drops cancels every open order of the account. QFEX's
+[authenticate page](https://docs.qfex.com/websocket/channels/trade/authenticate) says only that
+the server pings an authenticated connection from time to time. The hold measures it on one
+connection that never arms.
+
+With `--hold-secs <S>` (whole seconds, 1 to 86400, no default), the run holds one trade
+connection before any session, while no other connection of the probe is open:
+
+1. It reads every account the configuration names, as before a session (decision 0144), and
+   holds only when each shows no open order and flat positions.
+2. It opens one trade connection on the account `--hold-account` names: `primary` unless it
+   says `subaccount` (the one `QFEX_SUBACCOUNT_ID` names). Its origin, authentication and rate
+   charges are the read sockets': the adapter's `account_reads` and the shared limiter.
+3. It sends its authentication and, once QFEX answers it with success, the three subscriptions a
+   session sends (`order_responses`, `fills`, `positions`), and reads their confirmations, all
+   within QFEX's 60 s authentication deadline. Then it sends nothing but the pongs and the close
+   reply the WebSocket layer writes to each server ping and server close, each recorded on the
+   shared limiter as a session records one (decision 0030). It never arms, places, cancels or
+   reads, and sends no ping of its own.
+4. It ends at `--hold-secs` from the connection's opening or at the owner's Ctrl-C, each with a
+   close (charged as a control frame, as a session's is: when the limiter has no room, none is
+   sent and the connection is dropped) and the server's echo read for at most `--read-wait-ms`;
+   at a server close; at the connection's end; or at a refusal (the authentication refused, a
+   confirmation missing at the deadline, an err such as `RateLimited`, which holds the shared
+   budget as on a read socket; an err a journal would keep whole is read in memory as it
+   arrived, for its code alone, and holds none), with a close as at its duration; whichever
+   comes first. Nothing reconnects.
+5. Once its connection is over, whatever ended it, it reads every named account again, as in
+   step 1; the report gives both reads (the accounts table's `before the hold` and `after the
+   hold` rows). A hold whose connection never opened held nothing and is not read after.
+
+A hold that did not authenticate and confirm its three subscriptions, an order or fill frame on
+it, an account read after it that shows an open order or a position, and Ctrl-C in a run that
+also arms each stop the run, so no session starts. Ctrl-C from the hold's connection's opening
+until its close and the read of the echo are over is the hold's: before the hold ended, it ends
+the hold; while the hold closes, it is recorded as the owner's interrupt as it closed; either
+way the reads and the report follow. At any other time Ctrl-C ends the program at once, writing
+no report, as it always has.
+
+It records each ping, pong and close it receives with its time since the connection opened, a
+payload or a close reason by its length only and a close code in full (decision 0041). It counts
+its data frames by kind (each kind's name read in memory from what a journal would keep of the
+frame: `auth`, `subscribed`, `position_response`, `order_response`, `fill_response`, an err or
+an ack, never a value), reads each for a provider rate refusal, and never keeps, prints or
+writes one; an `order_response`, `stop_order_response` or `fill_response` on it is reported as
+an order or fill frame. Its frames are not journaled. Its section of `report.md`, and `hold` in
+`evidence.json`, state the account, the duration and the environment; that it never armed or
+placed; each frame it wrote, as it recorded writing it (its authentication and three
+subscriptions when nothing refused it); whether any ping came before authentication; the
+intervals between the pings after it; each server close with its code and its time since the
+connection opened, or that none came within the hold; how it ended; its own close, a close read
+after it began one counted as the echo of it and flagged when its code is not an echo's (none,
+or 1000); the replies the WebSocket layer wrote for it; its data frames by kind and any order or
+fill frame; what the reads after it showed; and that a lifetime longer than the hold was not
+measured. It states as conditions of the run, which the probe cannot check, that the owner
+confirmed the user has no subaccount the configuration leaves out (decision 0144 item 2) and
+asserts that nothing traded on any account of the user from the first read to the last. Its
+provider rate refusals are reported under "the hold", beside the read sockets before it, and
+those of the reads after it under "after the hold".
+
+On production the owner runs it with no `--arm` (FBC-291a already captured the arm there), as an
+owner-assisted run, under its two conditions (decision 0146 item 3): the owner confirms in
+QFEX's app before the run that the user has no subaccount the configuration does not name, and
+nothing else connects to or trades on any account of the user from the first read to the last.
+Choose a `--hold-secs` long enough to show at least three server pings:
+
+```text
+export QFEX_PUBLIC_KEY=...             # the primary account's production key
+export QFEX_SECRET_KEY=...
+export QFEX_SUBACCOUNT_ID=...          # when set, read before and after the hold too
+export QFEX_SUBACCOUNT_PUBLIC_KEY=...
+export QFEX_SUBACCOUNT_SECRET_KEY=...
+cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
+    --evidence-dir "$HOME/fbc-qfex-probe/$(date -u +%Y%m%dT%H%M%SZ)" \
+    --hold-secs <SECONDS> --socks5 <HOST:PORT>
+```
+
+A run that only holds writes no frame: its `fixtures/` holds a README alone, and its journal
+holds nothing of the hold. Read `report.md` before committing it, then commit it as
+`fixtures/qfex/exec-recorded/hold-production/report.md` (a pre-production hold's as
+`fixtures/qfex/exec-recorded/hold/`) beside a README that records the result (decision 0146 item
+6). The result speaks for the environment it was measured on only.
+
+The exit status is 0 only when the hold, when asked for, authenticated, had its three
+subscriptions confirmed, received no order or fill frame and ended at its duration, the owner's
+Ctrl-C, a server close or the connection's end, with nothing refusing it, and every account read
+after it showed no open order and flat positions; every session authenticated, wrote its arm,
+saw its outcome with one connection attempt and kept a whole capture; every registry's ledger bounds held; and every file
+was written. Agents never run this program against QFEX, pre-production or production; its
 test (`tests/qfex_preprod_probe.rs`) runs it against a QFEX-shaped conformance stub.
 
 ## paradex_testnet_acceptance

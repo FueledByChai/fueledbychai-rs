@@ -19,7 +19,14 @@
 //!   every session it reads the accounts its configuration names, the primary account and the
 //!   subaccount `QFEX_SUBACCOUNT_ID` names, and its report, evidence and output say the accounts
 //!   came from the configuration and not from QFEX; a configured subaccount it cannot read stops
-//!   it before anything arms.
+//!   it before anything arms;
+//! - with `--hold-secs` (FBC-39ks, decision 0146), holds one trade connection that never arms,
+//!   on production too: refused as any run is before anything connects, it reads the named
+//!   accounts first, opens while no other connection of the probe is open, before the sessions,
+//!   sends its authentication and the three subscriptions and nothing after them, answers each
+//!   ping, and ends at its duration, at a server close (its code and time kept, the echo of its
+//!   own close never counted as one) or at the connection's end, a refusal ending it recorded;
+//!   its report and evidence say what it heard and pass scripts/privacy-check.sh.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -36,6 +43,10 @@ mod capture;
 #[allow(dead_code)]
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
+#[path = "../examples/qfex_preprod_probe/hold.rs"]
+mod hold;
+#[path = "../examples/qfex_preprod_probe/interrupt.rs"]
+mod interrupt;
 #[path = "../examples/qfex_preprod_probe/ledger.rs"]
 mod ledger;
 #[allow(dead_code)]
@@ -63,19 +74,25 @@ use fbc_conformance::{
     Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
 };
 use fbc_core::{
-    ConnKey, InboundSpans, MonoNs, RawFrame, RpcId, Stamp, TrafficClass, WallNs, WireSlice,
+    ConnKey, InboundSpans, MonoNs, RawFrame, RpcId, Stamp, TrafficClass, VenueConfig, VenueFactory,
+    WallNs, WireSlice,
 };
 use fbc_journal::{
     ControlEvent, JournalError, JournalSink, JournalWriter, Opcode, QueueSink, Record, Recorded,
     RedactionKey, SinkConfig, WriterThread, journal_queue,
 };
 use fbc_runtime::http::Method;
-use fbc_runtime::{ProxyConfig, RateUserKey};
+use fbc_runtime::ws::Message;
+use fbc_runtime::{BucketKey, ProxyConfig, RateLimiter, RateUserKey, SafetyReserve};
+use fbc_venue_qfex::auth::TRADE_URL;
 use fbc_venue_qfex::exec::ARM;
 use fbc_venue_qfex::probe::{
-    Environment, Origins, PREPROD_MDS, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS,
-    PRODUCTION_REST, PRODUCTION_TRADE,
+    Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
+    PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS, PRODUCTION_REST,
+    PRODUCTION_TRADE,
 };
+use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_URL, Qfex};
+use futures_util::FutureExt;
 use probe_args::{Options, Parsed};
 use refusals::Refusals;
 use serde_json::Value;
@@ -208,18 +225,21 @@ fn reply(frames: &[&str]) -> Responder {
     Responder::new(move |_| Ok(frames.clone()))
 }
 
-/// A responder confirming the subscription it read, as the AsyncAPI's `subscribed` reply does.
+/// The `subscribed` reply confirming the subscription `frame`, as the AsyncAPI's is.
+fn confirmation(frame: &Frame) -> Result<Vec<Frame>, String> {
+    let Frame::Text(text) = frame else {
+        return Err("a binary subscribe".to_owned());
+    };
+    let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let channel = v["params"]["channels"][0].as_str().ok_or("no channel")?;
+    Ok(vec![Frame::text(format!(
+        r#"{{"subscribed":"{channel}"}}"#
+    ))])
+}
+
+/// A responder confirming the subscription it read ([`confirmation`]).
 fn confirm() -> Responder {
-    Responder::new(|frame| {
-        let Frame::Text(text) = frame else {
-            return Err("a binary subscribe".to_owned());
-        };
-        let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
-        let channel = v["params"]["channels"][0].as_str().ok_or("no channel")?;
-        Ok(vec![Frame::text(format!(
-            r#"{{"subscribed":"{channel}"}}"#
-        ))])
-    })
+    Responder::new(confirmation)
 }
 
 /// Connection `conn`, a read socket: its authentication answered, then its page.
@@ -265,6 +285,7 @@ fn options(dir: &Path, server: &StubServer, arms: &[Armed]) -> Options {
     Options {
         evidence_dir: dir.join("evidence"),
         arms: arms.to_vec(),
+        hold: None,
         production: false,
         trade_url: server.ws_url(""),
         rest_url: server.http_url(""),
@@ -275,7 +296,7 @@ fn options(dir: &Path, server: &StubServer, arms: &[Armed]) -> Options {
         read_wait: Duration::from_secs(5),
         connect_wait: Duration::from_secs(5),
         session_wait: Duration::from_secs(30),
-        ledger: bounds(Duration::from_secs(60)),
+        ledger: Some(bounds(Duration::from_secs(60))),
         rate_user: user(),
     }
 }
@@ -303,6 +324,19 @@ async fn probe(
     let lookup = |var: &str| env.get(var).cloned();
     let printed = Rc::new(RefCell::new(Vec::<u8>::new()));
     let ran = stage::run(opts, &lookup, printed.clone()).await;
+    let printed = String::from_utf8(printed.borrow().clone()).unwrap();
+    (ran, printed)
+}
+
+/// Runs the probe as [`probe`] does, the owner's interrupt being `interrupt`.
+async fn probe_until(
+    opts: &Options,
+    env: &HashMap<&'static str, String>,
+    interrupt: stage::Interrupt,
+) -> (Result<stage::Outcome, String>, String) {
+    let lookup = |var: &str| env.get(var).cloned();
+    let printed = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let ran = stage::run_until(opts, &lookup, printed.clone(), interrupt).await;
     let printed = String::from_utf8(printed.borrow().clone()).unwrap();
     (ran, printed)
 }
@@ -640,7 +674,7 @@ async fn each_named_account_arms_once_in_turn_with_no_subaccount_listing_and_its
         .collect();
     assert_eq!(shown, [("primary", 1), ("subaccount", 1)]);
     for r in &ev.registries {
-        assert_eq!(r.bounds, opts.ledger);
+        assert_eq!(Some(r.bounds.clone()), opts.ledger);
         let end = &r.ends[0];
         assert_eq!(end.session, r.account);
         assert!(end.after < opts.session_wait, "{end:?}");
@@ -2420,7 +2454,7 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
         Duration::from_secs(61),
         &[],
     );
-    assert_eq!(opts.ledger, largest.unwrap());
+    assert_eq!(opts.ledger, Some(largest.unwrap()));
     assert_eq!(opts.arms, [Armed::Subaccount, Armed::Primary]);
     assert_eq!((opts.rpc_timeout_ms, opts.page_size), (501, 1));
     assert_eq!(opts.read_wait, Duration::from_millis(7));
@@ -2441,7 +2475,10 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
     assert_eq!(opts.proxy, proxy);
     let refused = [
         (vec!["--arm", "primary"], "--evidence-dir is required"),
-        (vec!["--evidence-dir", "/d"], "--arm is required"),
+        (
+            vec!["--evidence-dir", "/d"],
+            "--arm or --hold-secs is required",
+        ),
         (vec!["--evidence-dir", "relative"], "not an absolute path"),
         (vec!["--arm", "secret-ish"], "primary or subaccount"),
         (vec!["--arm", "primary", "--arm", "primary"], "given twice"),
@@ -2707,9 +2744,10 @@ fn the_ledger_flags_are_required_and_a_bound_that_cannot_outlast_the_registry_is
         panic!("not parsed");
     };
     let taken = ledger::Bounds::new(Duration::from_secs(82), 1, Duration::from_secs(81), &[]);
-    assert_eq!(opts.ledger, taken.unwrap());
-    assert_eq!(opts.ledger.config().max_age, Duration::from_secs(82));
-    assert_eq!(opts.ledger.config().max_entries, 1);
+    let taken = taken.unwrap();
+    assert_eq!(opts.ledger, Some(taken.clone()));
+    assert_eq!(taken.config().max_age, Duration::from_secs(82));
+    assert_eq!(taken.config().max_entries, 1);
 
     // The count must be above the fill ceiling: stage one's is zero, so every count the flag
     // takes is above it; over synthetic place limits whose ceiling is 7, a count of 7 is
@@ -3044,7 +3082,7 @@ async fn a_stage_one_session_at_its_span_bound_is_stopped_through_its_stop_contr
     // An age bound well past the span, so the moment the stopped session takes to end stays
     // within it however loaded the machine.
     let age = span + Duration::from_secs(20);
-    opts.ledger = ledger::Bounds::new(age, 1, span, &ledger::stage_one()).unwrap();
+    opts.ledger = Some(ledger::Bounds::new(age, 1, span, &ledger::stage_one()).unwrap());
     assert!(opts.session_wait > span * 10);
     let began = std::time::Instant::now();
     let (ran, printed) = probe(&opts, &environment()).await;
@@ -3903,4 +3941,2422 @@ fn a_provider_rate_refusal_is_a_rate_limited_err_or_a_rate_limited_order_respons
         "{report}"
     );
     assert!(report.contains("No provider rate refusal was counted."));
+}
+
+// ----- The liveness hold (FBC-39ks, decision 0146) -----
+
+/// The authenticate page's reply refusing a connection.
+const AUTH_FAILED: &str = r#"{"type":"auth","result":"failure"}"#;
+
+/// The environment of a run that names the primary account alone: its credential, and no
+/// subaccount.
+fn primary_only() -> HashMap<&'static str, String> {
+    let mut env = environment();
+    env.retain(|var, _| [PUBLIC_VAR, SECRET_VAR].contains(var));
+    env
+}
+
+/// The options of a run against `server` that arms on `arms` and holds on `account` for
+/// `duration` first; a run that arms on nothing takes no ledger bounds.
+fn holding(
+    dir: &Path,
+    server: &StubServer,
+    arms: &[Armed],
+    account: Armed,
+    duration: Duration,
+) -> Options {
+    let mut opts = options(dir, server, arms);
+    opts.hold = Some(probe_args::Hold { duration, account });
+    if arms.is_empty() {
+        opts.ledger = None;
+    }
+    opts
+}
+
+/// The hold's authentication on connection `conn` answered with success only once the stub has
+/// read the close of every connection before it, each a read socket; otherwise it fails the
+/// script, as a hold opened while another connection of the probe was open (decision 0146 item
+/// 3).
+fn opened_alone(view: &View, conn: usize) -> Responder {
+    let view = Arc::clone(view);
+    Responder::new(move |_| {
+        let conns = view.get().ok_or("no view")?.connections();
+        match conns[..conn].iter().all(|c| c.client_closed) {
+            true => Ok(vec![Frame::text(AUTH_OK)]),
+            false => Err("the hold's connection opened while a read socket was open".to_owned()),
+        }
+    })
+}
+
+/// Connection `conn`, the hold's, opened once every connection before it has closed
+/// ([`opened_alone`]): authenticated and its three subscriptions confirmed, then `then`.
+fn hold_socket(view: &View, conn: usize, then: Vec<Step>) -> Vec<Step> {
+    let mut steps = vec![
+        Step::Accept,
+        Step::Respond {
+            conn,
+            with: opened_alone(view, conn),
+        },
+    ];
+    for _ in 0..3 {
+        steps.push(Step::Respond {
+            conn,
+            with: confirm(),
+        });
+    }
+    steps.extend(then);
+    steps
+}
+
+/// `n` pings of the stub's to `conn`, each ending on its pong.
+fn pings(conn: usize, n: usize) -> Vec<Step> {
+    (0..n).map(|_| Step::Barrier { conn }).collect()
+}
+
+/// The stub's view of its connections, set once the stub has started, for responders that look
+/// at another connection.
+type View = Arc<std::sync::OnceLock<fbc_conformance::ConnectionsView>>;
+
+/// Connection `conn`, a read socket after the hold, reading `page`: its authentication answered
+/// only once the stub has read the close of the hold's connection, `hold`; otherwise it fails
+/// the script, as a read made while the hold's connection was open (decision 0146 item 3).
+fn read_after_hold(view: &View, hold: usize, conn: usize, page: &'static str) -> Vec<Step> {
+    let view = Arc::clone(view);
+    let closed = Responder::new(move |_| {
+        let conns = view.get().ok_or("no view")?.connections();
+        match conns[hold].client_closed {
+            true => Ok(vec![Frame::text(AUTH_OK)]),
+            false => Err("a read opened while the hold's connection was open".to_owned()),
+        }
+    });
+    vec![
+        Step::Accept,
+        Step::Respond { conn, with: closed },
+        Step::Respond {
+            conn,
+            with: reply(&[page]),
+        },
+    ]
+}
+
+/// Asserts `frames` are a hold's: the authentication of `account` with `public`, then the three
+/// subscriptions a session sends, and nothing after them: no arm, no read.
+fn assert_hold_socket(frames: &[String], account: Option<&str>, public: &str) {
+    assert_eq!(frames.len(), 4, "{frames:?}");
+    let auth = json(&frames[0]);
+    assert_eq!(auth["type"], "auth");
+    assert_eq!(auth["params"]["hmac"]["public_key"], public);
+    assert_eq!(auth["params"]["account_id"].as_str(), account);
+    for (frame, channel) in frames[1..]
+        .iter()
+        .zip(["order_responses", "fills", "positions"])
+    {
+        let sub = format!(r#"{{"type":"subscribe","params":{{"channels":["{channel}"]}}}}"#);
+        assert_eq!(*frame, sub);
+    }
+}
+
+/// How [`hold_only`] runs its probe.
+#[derive(Copy, Clone)]
+struct HoldOnly {
+    /// With `--production`, against the loopback stub, which `production_probe` admits.
+    production: bool,
+    /// On a paused clock its test froze ([`freeze`]): once the stub's script has played up to
+    /// the read after the hold, the clock moved on by this, past the hold's duration. `None`
+    /// runs on the real clock, for a hold the stub's script ends.
+    advance: Option<Duration>,
+    /// Interrupted once the stub's script has played up to the read after the hold, in place of
+    /// the clock moving on: the owner's Ctrl-C ([`stage::Interrupt`]).
+    interrupt: bool,
+    /// The page the read after the hold shows.
+    after_page: &'static str,
+}
+
+/// On pre-production, on the real clock, the account flat with no open order after the hold.
+const SCRIPTED: HoldOnly = HoldOnly {
+    production: false,
+    advance: None,
+    interrupt: false,
+    after_page: EMPTY_PAGE,
+};
+
+/// A run that holds on the primary account alone for `duration`, named alone by `primary_only`,
+/// against a stub whose connection 0 is the read socket before the hold, whose connection 1 is
+/// the hold's, played by the steps `hold` gives for the stub's view, and whose connection 2 is the read socket after it, opened only
+/// once the hold's connection was closed, run as `how` says: its directory's guard, options,
+/// outcome, output and stub.
+async fn hold_only(
+    what: &str,
+    hold: impl FnOnce(&View) -> Vec<Step>,
+    duration: Duration,
+    how: HoldOnly,
+) -> (Removed, Options, stage::Outcome, String, StubServer) {
+    let (dir, removed) = temp_dir(what);
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(hold(&view));
+    let all = steps.len();
+    steps.extend(read_after_hold(&view, 1, 2, how.after_page));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let mut opts = holding(&dir, &server, &[], Armed::Primary, duration);
+    opts.production = how.production;
+    let env = primary_only();
+    let (ran, printed) = match (how.advance, how.interrupt) {
+        (None, false) => {
+            let ran = tokio::time::timeout(Duration::from_secs(30), probe(&opts, &env)).await;
+            ran.expect("the hold ended")
+        }
+        (by, interrupt) => {
+            let server = &server;
+            let (press, pressed) = tokio::sync::oneshot::channel::<()>();
+            let drive = async {
+                until("the script", || server.played() >= all).await;
+                match by {
+                    Some(by) => tokio::time::advance(by).await,
+                    None => press.send(()).unwrap(),
+                }
+            };
+            let pressed: stage::Interrupt = match interrupt {
+                true => Box::pin(async move {
+                    let _ = pressed.await;
+                }),
+                false => Box::pin(std::future::pending()),
+            };
+            tokio::join!(probe_until(&opts, &env, pressed), drive).0
+        }
+    };
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    // The read socket, then the hold's connection, then the read socket after it, and nothing
+    // after that.
+    assert_eq!(server.connections().len(), 3, "{printed}");
+    assert_read_socket(&received(&server, 0), None, PUBLIC);
+    assert_read_socket(&received(&server, 2), None, PUBLIC);
+    assert_eq!(server.http_requests(), ["GET /user/positions"; 2]);
+    let labels: Vec<(&str, &str)> = (outcome.evidence.reads.iter())
+        .map(|r| (r.before, r.label.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("the hold", "primary (held)"),
+            ("after the hold", "primary (held)")
+        ]
+    );
+    assert!(outcome.evidence.sessions.is_empty());
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+    (removed, opts, outcome, printed, server)
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_production_a_run_that_only_holds_reads_the_named_accounts_then_holds_one_connection_to_its_duration()
+ {
+    let frozen = freeze();
+    let (dir, _removed) = temp_dir("hold-production");
+    // The primary account and the subaccount the environment names, each read on a socket that
+    // never arms; then the hold's connection on the primary account, pinged three times; then
+    // both accounts read again, each socket answered only once the hold's connection closed.
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    // The run's shared limiter, as the probe builds it for its provider user (decision 0123):
+    // each pong the WebSocket layer writes is recorded on it as a control frame, one unit in
+    // each of QFEX's two buckets (decision 0030), and nothing else is charged while it holds.
+    // Its use is read as the stub reads the third subscription, which was charged before it was
+    // written, and before the stub sends any ping.
+    let rate_user = user();
+    let limiter = shared_limiter(rate_user);
+    let used = {
+        let limiter = limiter.clone();
+        move || {
+            let now = tokio::time::Instant::now();
+            [0, 1].map(|limit| limiter.used(now, limit, BucketKey::Shared))
+        }
+    };
+    let before_pings: Arc<std::sync::Mutex<Option<[u64; 2]>>> = Arc::default();
+    let mut hold = hold_socket(&view, 2, Vec::new());
+    let read_use = {
+        let (used, before_pings) = (used.clone(), Arc::clone(&before_pings));
+        Responder::new(move |frame| {
+            *before_pings.lock().unwrap() = Some(used());
+            confirmation(frame)
+        })
+    };
+    *hold.last_mut().unwrap() = Step::Respond {
+        conn: 2,
+        with: read_use,
+    };
+    steps.extend(hold);
+    steps.extend(pings(2, 3));
+    let all = steps.len();
+    steps.extend(read_after_hold(&view, 2, 3, EMPTY_PAGE));
+    steps.extend(read_after_hold(&view, 2, 4, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    // The options the command line gives with --production, --hold-secs and no --arm, the
+    // stub's origins named in place of production's defaults.
+    let evidence_dir = dir.join("evidence");
+    let (ws, http) = (server.ws_url(""), server.http_url(""));
+    let argv = [
+        "--production",
+        "--evidence-dir",
+        evidence_dir.to_str().unwrap(),
+        "--hold-secs",
+        "1",
+        "--trade-url",
+        &ws,
+        "--rest-url",
+        &http,
+        "--mds-url",
+        &ws,
+        "--read-wait-ms",
+        "5000",
+        "--connect-wait-ms",
+        "5000",
+    ];
+    let Ok(Parsed::Run(parsed)) = probe_args::parse(argv.iter().map(|a| (*a).to_owned())) else {
+        panic!("not parsed");
+    };
+    let mut opts = *parsed;
+    assert!(opts.production && opts.arms.is_empty() && opts.ledger.is_none());
+    let hold = probe_args::Hold {
+        duration: Duration::from_secs(1),
+        account: Armed::Primary,
+    };
+    assert_eq!(opts.hold, Some(hold));
+    opts.rate_user = rate_user;
+
+    // Once the stub's script has played, the paused clock moves past the hold's second.
+    let drive = async {
+        // Once the third pong is read, nothing more is charged while it holds: one per ping.
+        until("the script", || server.played() >= all).await;
+        let [general, cancel] = before_pings.lock().unwrap().expect("read before the pings");
+        assert_eq!(used(), [general + 3, cancel + 3]);
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+    };
+    let env = environment();
+    let ((ran, printed), ()) = tokio::join!(probe(&opts, &env), drive);
+    drop(frozen);
+    let outcome = ran.unwrap();
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    server.finished().await.unwrap();
+
+    // Each named account read before the hold, flat with no open order; then one connection
+    // that sent its authentication and the three subscriptions, and nothing after them, and
+    // closed at its end; then each named account read again, once it had closed. No session,
+    // no arm, no listing.
+    let conns = server.connections();
+    assert_eq!(conns.len(), 5);
+    for (conn, account, public) in [
+        (0, None, PUBLIC),
+        (1, Some(SUB), SUB_PUBLIC),
+        (3, None, PUBLIC),
+        (4, Some(SUB), SUB_PUBLIC),
+    ] {
+        assert_read_socket(&received(&server, conn), account, public);
+    }
+    assert_hold_socket(&received(&server, 2), None, PUBLIC);
+    assert!(conns[2].client_closed);
+    assert_eq!(server.http_requests(), vec!["GET /user/positions"; 4]);
+    assert_no_listing(&server);
+    let ev = &outcome.evidence;
+    let labels: Vec<(&str, &str)> = (ev.reads.iter())
+        .map(|r| (r.before, r.label.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("the hold", "primary (held)"),
+            ("the hold", "subaccount"),
+            ("after the hold", "primary (held)"),
+            ("after the hold", "subaccount")
+        ]
+    );
+    assert!(ev.sessions.is_empty() && ev.registries.is_empty());
+    assert!(ev.arms.is_empty() && ev.hold_asked);
+
+    // What it heard: three pings after authentication, two intervals between them, no server
+    // close, its own close echoed, at its duration.
+    let held = ev.hold.as_ref().unwrap();
+    assert!(held.ok(), "{held:#?}");
+    assert_eq!(held.account, "primary");
+    assert_eq!(
+        (held.confirmed, held.ended_by.clone()),
+        (3, hold::End::Duration)
+    );
+    assert!(held.authenticated.unwrap() <= held.subscribed.unwrap());
+    assert!(held.ended_at.unwrap() >= Duration::from_secs(1));
+    assert_eq!(held.pings_before_auth(), 0);
+    assert_eq!(held.pings_after_auth().len(), 3);
+    assert_eq!(held.intervals().len(), 2);
+    assert!(held.server_closes().is_empty());
+    assert!(held.close_sent.is_some() && held.close_echoed());
+    // The authentication reply and the three confirmations, by kind; a pong to each ping.
+    assert_eq!(held.data_frames, 4);
+    let kinds: Vec<(&str, u64)> = held.kinds.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+    assert_eq!(kinds, [("auth", 1), ("subscribed", 3)]);
+    assert_eq!((held.orders_or_fills(), held.replies), (0, 3));
+    // It sent no ping of its own: the stub, which answers each with a pong, sent none.
+    assert_eq!(held.pongs(), 0);
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(held.refusals, Refusals::default());
+    assert_eq!(
+        held.sent,
+        [
+            "authentication",
+            "subscribe order_responses",
+            "subscribe fills",
+            "subscribe positions"
+        ]
+    );
+
+    // The report, the evidence and the fixtures' README name production and the hold.
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.starts_with(
+            "# QFEX production stage one: how a trade connection stays alive (the liveness hold)\n"
+        ),
+        "{report}"
+    );
+    for said in [
+        "The liveness hold: FBC-39ks and decision 0146. Environment: QFEX production, under the \
+         probe mode `production_probe`.",
+        "Result: complete.",
+        "## The liveness hold (FBC-39ks, decision 0146)",
+        "One trade connection on the primary account, on QFEX production, to be held for 1 s",
+        "It never armed, placed, cancelled or read. It wrote, in order: authentication, subscribe \
+         order_responses, subscribe fills, subscribe positions; then nothing but the pongs",
+        "- Subscriptions confirmed: 3 of 3",
+        "- Any ping before authentication: no",
+        "- Pings after authentication: 3, the first",
+        "- Server closes: none within the hold",
+        "- Ended by: its duration, --hold-secs, at",
+        "the server echoed it",
+        "A lifetime longer than the hold was not measured",
+        "| before the hold | primary (held) |",
+        "| before the hold | subaccount |",
+        "| after the hold | primary (held) |",
+        "| after the hold | subaccount |",
+        "read before the hold opened and again after it ended, whatever ended it",
+        "**Conditions of the run, which the probe cannot check** (decision 0146 item 3): the \
+         owner confirmed before the run that the user has no subaccount the configuration \
+         leaves out (decision 0144 item 2); and the owner asserts that nothing traded on any \
+         account of the user from the first read before the hold to the last read after it.",
+        "- Replies the WebSocket layer wrote for it, each recorded on the shared limiter: 3",
+        "- Data frames received, counted and never kept: 4; by kind, read from what a journal \
+         would keep of each: auth 1; subscribed 3",
+        "- Order or fill frames received: none",
+        "- Accounts read after it: every named account showed no open order and flat positions",
+        "None: the run asked for no session (no --arm).",
+        "Met by each session, at least, with the read sockets before it: the hold 0; after the \
+         hold 0.",
+        "The liveness hold's connection (decision 0146) is counted as a read socket is",
+        "| the hold | the hold's connection: primary | 0 | 0 | 0 | 0 | 0 | 0 | not journaled |",
+        "| after the hold | read socket: subaccount | 0 | 0 | 0 | 0 | 0 | 0 | not journaled |",
+    ] {
+        assert!(report.contains(said), "{said}\n{report}");
+    }
+    assert!(!report.contains("## The fill ledger of each registry"));
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["ok"], true);
+    assert_eq!(evidence["environment"], "production");
+    assert_eq!(evidence["asked"], json(r#"{"arms":[],"hold":true}"#));
+    let h = &evidence["hold"];
+    assert_eq!(
+        (&h["environment"], &h["account"], &h["duration_s"]),
+        (&json(r#""production""#), &json(r#""primary""#), &json("1"))
+    );
+    assert_eq!(
+        (&h["armed"], &h["placed"]),
+        (&json("false"), &json("false"))
+    );
+    assert_eq!(h["ended_by"], "its duration, --hold-secs");
+    assert_eq!(h["pings_before_authentication"], 0);
+    assert_eq!(
+        h["pings_after_authentication_ms"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(
+        h["intervals_after_authentication_ms"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(h["server_closes"], json("[]"));
+    assert_eq!(h["lifetime_longer_than_hold_measured"], false);
+    assert_eq!(h["subscriptions_confirmed"], 3);
+    assert_eq!(
+        h["data_frames_by_kind"],
+        json(r#"{"auth":1,"subscribed":3}"#)
+    );
+    assert_eq!(h["order_or_fill_frames"], 0);
+    assert_eq!(h["replies_recorded_on_limiter"], 3);
+    assert_eq!(h["accounts_read_after"], "clean");
+    assert_eq!(h["conditions_not_checked"].as_array().unwrap().len(), 2);
+    let reads: Vec<&str> = (evidence["reads"].as_array().unwrap().iter())
+        .map(|r| r["read"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        reads,
+        [
+            "before the hold",
+            "before the hold",
+            "after the hold",
+            "after the hold"
+        ]
+    );
+    assert_eq!(
+        h["sent"],
+        json(
+            r#"["authentication","subscribe order_responses","subscribe fills","subscribe positions"]"#
+        )
+    );
+    assert_eq!(
+        evidence["provider_rate_refusals"]["hold"]["counts"]["met_at_least"],
+        0
+    );
+    let readme = fs::read_to_string(opts.evidence_dir.join("fixtures/README.md")).unwrap();
+    assert!(
+        readme.starts_with("# QFEX trade-socket frames: none"),
+        "{readme}"
+    );
+    assert!(readme.contains("on QFEX production (the probe mode `production_probe`)"));
+    assert_eq!(ev.fixtures, ["README.md"]);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+    assert!(
+        printed.contains(
+            "PROBE stage one on QFEX production (production_probe), against a loopback test \
+             stub: arms on []; first holds one trade connection on primary for 1 s"
+        ),
+        "{printed}"
+    );
+    assert!(printed.contains("READ before the hold: primary (held)"));
+    assert!(printed.contains("READ after the hold: subaccount"));
+    assert!(printed.contains("HOLD primary: ended by its duration, --hold-secs; 3 pings"));
+    assert!(printed.contains("DONE ok"), "{printed}");
+}
+
+#[tokio::test]
+async fn a_hold_runs_before_the_sessions_and_the_session_opens_only_once_its_connection_closed() {
+    let (dir, _removed) = temp_dir("hold-then-arm");
+    // Each responder after the hold answers only once the stub has read the hold's close: a
+    // connection opened while the hold's was open fails the script.
+    let view: View = Arc::default();
+    let after_hold = |frames: &'static [&'static str]| {
+        let view = Arc::clone(&view);
+        Responder::new(move |_| {
+            let conns = view.get().ok_or("no view")?.connections();
+            match conns[1].client_closed {
+                true => Ok(frames.iter().map(|f| Frame::text(*f)).collect()),
+                false => Err("opened while the hold's connection was open".to_owned()),
+            }
+        })
+    };
+    // The hold's connection, pinged once, ends at QFEX's close, which the stub's script plays,
+    // so nothing waits on a clock.
+    let mut then = pings(1, 1);
+    then.push(Step::Close { conn: 1 });
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(hold_socket(&view, 1, then));
+    // After the hold, the primary account read again; before the session, read once more (the
+    // session's own read), then the session.
+    steps.extend(read_after_hold(&view, 1, 2, EMPTY_PAGE));
+    steps.push(Step::Accept);
+    steps.push(Step::Respond {
+        conn: 3,
+        with: after_hold(&[AUTH_OK]),
+    });
+    steps.push(Step::Respond {
+        conn: 3,
+        with: reply(&[EMPTY_PAGE]),
+    });
+    let mut session = session_socket(4, &[ARM_ACK]);
+    session[1] = Step::Respond {
+        conn: 4,
+        with: after_hold(&[AUTH_OK]),
+    };
+    steps.extend(session);
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let opts = holding(
+        &dir,
+        &server,
+        &[Armed::Primary],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    server.finished().await.unwrap();
+
+    // Read, hold, read after it, read before the session, session, in that order, each opened
+    // once the one before had closed.
+    assert_eq!(server.connections().len(), 5);
+    assert_read_socket(&received(&server, 0), None, PUBLIC);
+    assert_hold_socket(&received(&server, 1), None, PUBLIC);
+    assert_read_socket(&received(&server, 2), None, PUBLIC);
+    assert_read_socket(&received(&server, 3), None, PUBLIC);
+    assert_session_socket(&received(&server, 4), None, PUBLIC);
+    let ev = &outcome.evidence;
+    let labels: Vec<(&str, &str)> = (ev.reads.iter())
+        .map(|r| (r.before, r.label.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            ("the hold", "primary (held)"),
+            ("after the hold", "primary (held)"),
+            ("primary", "primary (armed)")
+        ]
+    );
+    let held = ev.hold.as_ref().unwrap();
+    assert!(
+        held.ok() && held.ended_by == hold::End::ServerClose,
+        "{held:#?}"
+    );
+    assert_eq!(held.pings_after_auth().len(), 1);
+    assert!(held.intervals().is_empty());
+    let [run] = ev.sessions.as_slice() else {
+        panic!("{:#?}", ev.sessions);
+    };
+    assert!(run.ok() && run.arm_sent);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.starts_with(
+        "# QFEX pre-production stage one: how a trade connection stays alive (the liveness \
+         hold), and what answers the cancel-on-disconnect arm\n"
+    ));
+    assert!(report.contains(
+        "- Intervals between the pings after authentication: none (fewer than two pings after \
+         authentication)"
+    ));
+    assert!(report.contains("## The fill ledger of each registry"));
+    assert!(!report.contains("None: the run asked for no session"));
+    assert!(report.contains(
+        "Met by each session, at least, with the read sockets before it: the hold 0; after the \
+         hold 0; primary 0."
+    ));
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(
+        evidence["asked"],
+        json(r#"{"arms":["primary"],"hold":true}"#)
+    );
+    let readme = fs::read_to_string(opts.evidence_dir.join("fixtures/README.md")).unwrap();
+    assert!(readme.starts_with("# QFEX trade-socket frames: what answered"));
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_ping_before_authentication_is_reported_and_the_hold_ends_at_a_server_close() {
+    // A ping before the authentication is answered, two after the subscriptions, then QFEX
+    // closes the connection with a code and a reason.
+    let mut hold = vec![
+        Step::Accept,
+        Step::Barrier { conn: 1 },
+        Step::Respond {
+            conn: 1,
+            with: reply(&[AUTH_OK]),
+        },
+    ];
+    for _ in 0..3 {
+        hold.push(Step::Respond {
+            conn: 1,
+            with: confirm(),
+        });
+    }
+    hold.extend(pings(1, 2));
+    hold.push(Step::CloseWith {
+        conn: 1,
+        code: 4001,
+        reason: "synthetic".to_owned(),
+    });
+    // On production, as the record has the server-close end shown on a --production run.
+    let production = HoldOnly {
+        production: true,
+        ..SCRIPTED
+    };
+    let (_removed, opts, outcome, printed, server) = hold_only(
+        "hold-server-close",
+        |_| hold,
+        Duration::from_secs(3600),
+        production,
+    )
+    .await;
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    assert_hold_socket(&received(&server, 1), None, PUBLIC);
+    // The close reply went out before the hold ended: the stub read it as the client's close.
+    assert!(server.connections()[1].client_closed);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::ServerClose);
+    assert_eq!(held.pings_before_auth(), 1);
+    assert_eq!(held.pings_after_auth().len(), 2);
+    assert_eq!(held.intervals().len(), 1);
+    let [close] = held.server_closes()[..] else {
+        panic!("{held:#?}");
+    };
+    assert_eq!(
+        close.control,
+        hold::Control::Close {
+            code: Some(4001),
+            reason_len: "synthetic".len(),
+            echo: false
+        }
+    );
+    // It sent no close of its own, so no close it heard is an echo.
+    assert!(held.close_sent.is_none() && !held.close_echoed());
+    // A pong to each of the three pings and a close reply to the server's close, each recorded
+    // on the shared limiter (decision 0030).
+    assert_eq!(held.replies, 4);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "One trade connection on the primary account, on QFEX production",
+        "- Any ping before authentication: yes, 1",
+        "- Server closes: code 4001, a reason of 9 bytes, at",
+        "- Ended by: the server's close, at",
+        "- Its own close: it sent none",
+        "| close, the server's | 9 | 4001 |",
+    ] {
+        assert!(report.contains(said), "{said}\n{report}");
+    }
+    assert!(
+        !report.contains("synthetic"),
+        "a close reason is kept by its length only"
+    );
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(
+        evidence["hold"]["server_closes"][0]["code"], 4001,
+        "{evidence}"
+    );
+    assert_eq!(evidence["hold"]["server_closes"][0]["reason_len"], 9);
+    assert_eq!(evidence["hold"]["pings_before_authentication"], 1);
+    assert_eq!(evidence["environment"], "production");
+
+    // A close with no body: no code.
+    let mut then = pings(1, 1);
+    then.push(Step::Close { conn: 1 });
+    let (_removed, opts, outcome, printed, _server) = hold_only(
+        "hold-server-close-bare",
+        move |view| hold_socket(view, 1, then),
+        Duration::from_secs(3600),
+        SCRIPTED,
+    )
+    .await;
+    assert!(outcome.ok, "{printed}");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::ServerClose);
+    let [close] = held.server_closes()[..] else {
+        panic!("{held:#?}");
+    };
+    assert!(matches!(
+        close.control,
+        hold::Control::Close {
+            code: None,
+            reason_len: 0,
+            echo: false
+        }
+    ));
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.contains("- Server closes: code no code (a close with no body)"));
+}
+
+/// A listener of the test's own in front of `server`'s trade origin, carrying each connection
+/// to it, but for the `cut`th (from 0), whose TCP streams it drops once `cut_now` resolves, with
+/// no close frame. Its origin.
+async fn front(
+    server: &StubServer,
+    cut: usize,
+    cut_now: tokio::sync::oneshot::Receiver<()>,
+) -> String {
+    let stub = server.ws_url("").trim_start_matches("ws://").to_owned();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("ws://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut cut_now = Some(cut_now);
+        for n in 0.. {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let mut carried = tokio::net::TcpStream::connect(&stub).await.unwrap();
+            let cut_now = if n == cut { cut_now.take() } else { None };
+            tokio::spawn(async move {
+                let copied = tokio::io::copy_bidirectional(&mut client, &mut carried);
+                match cut_now {
+                    Some(cut_now) => tokio::select! {
+                        _ = copied => {}
+                        _ = cut_now => {}
+                    },
+                    None => {
+                        let _ = copied.await;
+                    }
+                }
+            });
+        }
+    });
+    origin
+}
+
+#[tokio::test]
+async fn a_hold_whose_connection_ends_with_no_close_frame_records_that_end() {
+    let (dir, _removed) = temp_dir("hold-dropped");
+    // On the subaccount, which the environment names: both accounts read, then the hold's
+    // connection authenticated as the subaccount with its own credential, then its TCP stream
+    // dropped with no close frame, then both accounts read again.
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    steps.extend(hold_socket(&view, 2, pings(2, 1)));
+    let played = steps.len();
+    // The stub never sees a close on the dropped connection: the reads after it wait for none.
+    steps.extend(read_socket(3, EMPTY_PAGE));
+    steps.extend(read_socket(4, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let (cut, cut_now) = tokio::sync::oneshot::channel();
+    let origin = front(&server, 2, cut_now).await;
+    let mut opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Subaccount,
+        Duration::from_secs(3600),
+    );
+    opts.trade_url = origin.clone();
+    opts.mds_url = origin;
+    let env = environment();
+    let dropping = async {
+        until("the script", || server.played() >= played).await;
+        cut.send(()).unwrap();
+    };
+    let run = tokio::time::timeout(Duration::from_secs(30), probe(&opts, &env));
+    let (ran, ()) = tokio::join!(run, dropping);
+    let (ran, printed) = ran.expect("the hold ended");
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    assert_hold_socket(&received(&server, 2), Some(SUB), SUB_PUBLIC);
+    assert!(!server.connections()[2].client_closed);
+    assert_read_socket(&received(&server, 3), None, PUBLIC);
+    assert_read_socket(&received(&server, 4), Some(SUB), SUB_PUBLIC);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.account, "subaccount");
+    assert_eq!(held.ended_by, hold::End::NoCloseFrame);
+    assert!(held.server_closes().is_empty() && held.close_sent.is_none());
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    let labels: Vec<&str> = (outcome.evidence.reads.iter())
+        .map(|r| r.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "primary",
+            "subaccount (held)",
+            "primary",
+            "subaccount (held)"
+        ]
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.contains("- Ended by: the connection's end with no close frame"));
+    assert!(report.contains("- Server closes: none within the hold"));
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_refused_authentication_or_a_rate_limited_reply_ends_the_hold_recorded_and_stops_the_probe()
+ {
+    // QFEX refuses the authentication: the hold sends nothing more, closes, and stops the probe.
+    let refused = vec![
+        Step::Accept,
+        Step::Respond {
+            conn: 1,
+            with: reply(&[AUTH_FAILED]),
+        },
+    ];
+    let (_removed, opts, outcome, printed, server) = hold_only(
+        "hold-auth-refused",
+        |_| refused,
+        Duration::from_secs(3600),
+        SCRIPTED,
+    )
+    .await;
+    assert!(
+        !outcome.ok && printed.contains("DONE INCOMPLETE"),
+        "{printed}"
+    );
+    assert_eq!(received(&server, 1).len(), 1, "the authentication alone");
+    assert!(server.connections()[1].client_closed);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert!(!held.ok());
+    assert_eq!(held.ended_by, hold::End::Refused);
+    assert_eq!(
+        held.error.as_deref(),
+        Some("QFEX did not authenticate the hold's connection")
+    );
+    assert!(held.authenticated.is_none() && held.close_echoed());
+    let stopped = outcome.evidence.stopped.as_deref().unwrap_or_default();
+    assert_eq!(
+        stopped,
+        "the hold: QFEX did not authenticate the hold's connection"
+    );
+    // It records the authentication alone as sent, and says so.
+    assert_eq!(held.sent, ["authentication"]);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.contains("Result: INCOMPLETE."));
+    assert!(report.contains("- Authenticated: never since the connection opened"));
+    assert!(report.contains("- Ended by: a refusal, at"));
+    assert!(
+        report.contains("It wrote, in order: authentication; then nothing but the pongs"),
+        "{report}"
+    );
+    assert!(!report.contains("subscribe order_responses"), "{report}");
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["sent"], json(r#"["authentication"]"#));
+
+    // QFEX answers the authentication RateLimited: the hold holds the shared budget, as a read
+    // socket does, and counts one provider rate refusal for the hold. The budget held, its own
+    // close finds no room and is not sent, as a session's would not be, and the read after it
+    // opens its socket and is refused its authentication, nothing written.
+    let (dir, _removed) = temp_dir("hold-rate-limited");
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend([
+        Step::Accept,
+        Step::Respond {
+            conn: 1,
+            with: reply(&[LIMITED]),
+        },
+        Step::Accept,
+    ]);
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Primary,
+        Duration::from_secs(3600),
+    );
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    assert_eq!(server.connections().len(), 3);
+    assert!(received(&server, 2).is_empty(), "nothing written after it");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(
+        held.error.as_deref(),
+        Some("QFEX answered an err: RateLimited")
+    );
+    assert!(held.close_refused && held.close_begun.is_none() && held.close_sent.is_none());
+    let after = "primary (held) could not be read: not sent: the rate limit has no room";
+    assert_eq!(held.read_after, hold::ReadAfter::Stopped(after.to_owned()));
+    assert_eq!(
+        outcome.evidence.stopped.as_deref().unwrap(),
+        format!("the hold: QFEX answered an err: RateLimited; after the hold: {after}")
+    );
+    let one = Refusals {
+        limiter: 1,
+        errs: 1,
+        ..Refusals::default()
+    };
+    assert_eq!(held.refusals, one);
+    // The read socket before it met none; the hold is no session.
+    assert_eq!(outcome.evidence.read_sockets[0].before, "the hold");
+    assert_eq!(
+        outcome.evidence.read_sockets[0].refusals,
+        Refusals::default()
+    );
+    assert_eq!(
+        refusals::met(&outcome.evidence, &outcome.evidence.sessions),
+        1
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "provider rate refusals met, at least: 1.",
+        "A refusal met on the hold's connection has no frame in the journal either",
+        "Met by each session, at least, with the read sockets before it: the hold 1; after the \
+         hold 0.",
+        "- Its own close: the run's shared limiter had no room for it, charged as a control \
+         frame: it sent none and dropped the connection, as a session does (decision 0030)",
+        "- Accounts read after it: STOPPED: primary (held) could not be read",
+        "| the hold | the hold's connection: primary | 1 | 1 | 0 | 0 | 0 | 1 | not journaled |",
+    ] {
+        assert!(report.contains(said), "{said}\n{report}");
+    }
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    let rates = &evidence["provider_rate_refusals"];
+    assert_eq!(rates["met_at_least"], 1);
+    assert_eq!(rates["hold"]["counts"]["limiter_rejected"], 1);
+    assert_eq!(
+        rates["by_session"],
+        json(
+            r#"[{"session":"the hold","met_at_least":1,"session_ran":true},{"session":"after the hold","met_at_least":0,"session_ran":true}]"#
+        )
+    );
+    assert_eq!(evidence["hold"]["close_refused_by_limiter"], true);
+    assert_eq!(evidence["hold"]["accounts_read_after"]["stopped"], after);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_missing_at_the_holds_duration_ends_it_there_and_stops_the_probe() {
+    let frozen = freeze();
+    // A confirmation missing when the hold reaches its duration: it ends there, recorded, and
+    // stops the probe, though nothing refused it.
+    let mut short = vec![
+        Step::Accept,
+        Step::Respond {
+            conn: 1,
+            with: reply(&[AUTH_OK]),
+        },
+    ];
+    short.extend((0..2).map(|_| Step::Respond {
+        conn: 1,
+        with: confirm(),
+    }));
+    // The third subscription read and never answered, then a ping: the hold has read both
+    // confirmations before the clock moves past its duration.
+    short.extend([Step::Read { conn: 1 }, Step::Barrier { conn: 1 }]);
+    let past = HoldOnly {
+        advance: Some(Duration::from_millis(401)),
+        ..SCRIPTED
+    };
+    let (_removed, _opts, outcome, printed, _server) = hold_only(
+        "hold-unconfirmed",
+        |_| short,
+        Duration::from_millis(400),
+        past,
+    )
+    .await;
+    drop(frozen);
+    assert!(!outcome.ok, "{printed}");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(
+        (held.confirmed, held.ended_by.clone()),
+        (2, hold::End::Duration)
+    );
+    assert!(held.error.is_none() && held.subscribed.is_none() && !held.ok());
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some("the hold: its duration, --hold-secs before its three subscriptions were confirmed")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_owners_interrupt_ends_the_hold_as_its_duration_does_then_the_reads_and_the_report() {
+    let frozen = freeze();
+    // Held for an hour on a paused clock that never moves: once the stub has pinged it, the
+    // owner's interrupt ends it, with its close, the read after it and the report.
+    let interrupted = HoldOnly {
+        interrupt: true,
+        ..SCRIPTED
+    };
+    let (_removed, opts, outcome, printed, server) = hold_only(
+        "hold-interrupted",
+        move |view| hold_socket(view, 1, pings(1, 1)),
+        Duration::from_secs(3_600),
+        interrupted,
+    )
+    .await;
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    assert!(server.connections()[1].client_closed);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert!(held.ok(), "{held:#?}");
+    assert_eq!(held.ended_by, hold::End::Interrupted);
+    assert!(held.ended_at.unwrap() < Duration::from_secs(3_600));
+    assert!(held.close_sent.is_some() && held.close_echoed());
+    assert_eq!(held.pongs(), 0, "it sent no ping of its own");
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "Result: complete.",
+        "- Ended by: the owner's interrupt (Ctrl-C), at",
+        "the server echoed it",
+        "| after the hold | primary (held) |",
+    ] {
+        assert!(report.contains(said), "{said}\n{report}");
+    }
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(
+        evidence["hold"]["ended_by"],
+        "the owner's interrupt (Ctrl-C)"
+    );
+    assert!(printed.contains("HOLD primary: ended by the owner's interrupt (Ctrl-C)"));
+    assert!(printed.contains("READ after the hold: primary (held)"));
+
+    // In a run that also arms, the interrupt ends the hold the same way, the read after it
+    // follows, and no session starts.
+    let (dir, _removed) = temp_dir("hold-interrupted-arm");
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(hold_socket(&view, 1, pings(1, 1)));
+    let all = steps.len();
+    steps.extend(read_after_hold(&view, 1, 2, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let opts = holding(
+        &dir,
+        &server,
+        &[Armed::Primary],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+    let (press, pressed) = tokio::sync::oneshot::channel::<()>();
+    let interrupt: stage::Interrupt = Box::pin(async move {
+        let _ = pressed.await;
+    });
+    let server = &server;
+    let drive = async {
+        until("the script", || server.played() >= all).await;
+        press.send(()).unwrap();
+    };
+    let env = primary_only();
+    let ((ran, printed), ()) = tokio::join!(probe_until(&opts, &env, interrupt), drive);
+    drop(frozen);
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    assert_eq!(
+        server.connections().len(),
+        3,
+        "no session's read, no session"
+    );
+    let ev = &outcome.evidence;
+    assert!(ev.sessions.is_empty());
+    let held = ev.hold.as_ref().unwrap();
+    assert!(held.ok() && held.ended_by == hold::End::Interrupted);
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some("the owner's interrupt (Ctrl-C) ended the hold: no session starts")
+    );
+}
+
+/// Presses of the owner's Ctrl-C for [`interrupt::wire`], each sent on the returned sender, and
+/// how many the wiring has taken: it hands each on before it takes the next.
+fn presses() -> (
+    tokio::sync::mpsc::UnboundedSender<()>,
+    Arc<AtomicU64>,
+    impl futures_util::Stream<Item = ()> + Send + 'static,
+) {
+    let (press, pressed) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let taken = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&taken);
+    let stream = futures_util::stream::unfold(pressed, move |mut pressed| {
+        let counted = Arc::clone(&counted);
+        async move {
+            pressed.recv().await?;
+            counted.fetch_add(1, Ordering::SeqCst);
+            Some(((), pressed))
+        }
+    });
+    (press, taken, stream)
+}
+
+#[tokio::test]
+async fn the_owners_interrupt_goes_to_the_hold_from_its_first_poll_until_it_is_dropped() {
+    // main.rs's wiring, with presses of the test's own and a count in place of the program's
+    // end (status 130, no report).
+    let (press, taken, stream) = presses();
+    let ended = Arc::new(AtomicU64::new(0));
+    let outside = {
+        let ended = Arc::clone(&ended);
+        move || {
+            ended.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let (task, mut interrupt) = interrupt::wire(stream, outside);
+    tokio::spawn(task);
+    let pressed = |n: u64| {
+        press.send(()).unwrap();
+        let taken = Arc::clone(&taken);
+        async move { until("the press taken", || taken.load(Ordering::SeqCst) == n).await }
+    };
+    // Before the hold's connection polls it: a press ends the program.
+    pressed(1).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 1);
+    // Polled once, as the hold's connection opens: a press is the hold's from then on.
+    assert!(interrupt.as_mut().now_or_never().is_none());
+    pressed(2).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 1);
+    assert!(interrupt.as_mut().now_or_never().is_some());
+    // Still the hold's after it took one, while its close is under way, until it is dropped.
+    assert!(interrupt.as_mut().now_or_never().is_none());
+    pressed(3).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 1);
+    assert!(interrupt.as_mut().now_or_never().is_some());
+    drop(interrupt);
+    // Once it is dropped, with the hold's connection over, a press ends the program again.
+    pressed(4).await;
+    assert_eq!(ended.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_owners_interrupt_while_the_hold_closes_stops_a_run_that_also_arms() {
+    let frozen = freeze();
+    let (dir, _removed) = temp_dir("hold-interrupted-closing");
+    // The hold's connection, pinged once, then read no more: its close at its duration is not
+    // echoed, so it reads for the echo for --read-wait-ms, on the paused clock. Then the read
+    // after it, and no session.
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    let then = vec![Step::Barrier { conn: 1 }, Step::Silent { conn: 1 }];
+    steps.extend(hold_socket(&view, 1, then));
+    let all = steps.len();
+    steps.extend(read_socket(2, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let rate_user = user();
+    let limiter = shared_limiter(rate_user);
+    let mut opts = holding(
+        &dir,
+        &server,
+        &[Armed::Primary],
+        Armed::Primary,
+        Duration::from_secs(1),
+    );
+    opts.rate_user = rate_user;
+    // main.rs's wiring, with presses of the test's own.
+    let (press, taken, stream) = presses();
+    let ended = Arc::new(AtomicU64::new(0));
+    let outside = {
+        let ended = Arc::clone(&ended);
+        move || {
+            ended.fetch_add(1, Ordering::SeqCst);
+        }
+    };
+    let (task, interrupt) = interrupt::wire(stream, outside);
+    tokio::spawn(task);
+    let used = || limiter.used(tokio::time::Instant::now(), 0, BucketKey::Shared);
+    let (server, read_wait) = (&server, opts.read_wait);
+    let drive = async {
+        until("the script", || server.played() >= all).await;
+        let before = used();
+        // Past its duration: its close is charged as a control frame, so it is closing.
+        tokio::time::advance(Duration::from_millis(1_001)).await;
+        until("the close charged", || used() == before + 1).await;
+        press.send(()).unwrap();
+        until("the press taken", || taken.load(Ordering::SeqCst) == 1).await;
+        tokio::time::advance(read_wait + Duration::from_millis(1)).await;
+    };
+    let env = primary_only();
+    // A session that started would wait on the frozen clock: a minute of wall-clock time fails
+    // the test instead of hanging it.
+    let (late, hung) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(60));
+        let _ = late.send(());
+    });
+    let ((ran, printed), ()) = tokio::select! {
+        ran = async { tokio::join!(probe_until(&opts, &env, interrupt), drive) } => ran,
+        _ = hung => panic!("the run did not stop within 60 s: a session started"),
+    };
+    drop(frozen);
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    // The press went to the hold, not to the program's end; it stopped the run with no session.
+    assert_eq!(ended.load(Ordering::SeqCst), 0);
+    assert!(!outcome.ok, "{printed}");
+    assert_eq!(
+        server.connections().len(),
+        3,
+        "no session's read, no session"
+    );
+    let ev = &outcome.evidence;
+    assert!(ev.sessions.is_empty());
+    let held = ev.hold.as_ref().unwrap();
+    assert!(held.ok(), "{held:#?}");
+    assert_eq!(held.ended_by, hold::End::Duration);
+    assert!(held.interrupted_closing);
+    assert!(held.close_sent.is_some() && !held.close_echoed());
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some("the owner's interrupt (Ctrl-C) came as the hold closed: no session starts")
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains(
+            "- Ended by: its duration, --hold-secs; the owner's interrupt (Ctrl-C) came as it \
+             closed, at"
+        ),
+        "{report}"
+    );
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["interrupted_as_it_closed"], true);
+}
+
+#[tokio::test]
+async fn the_owners_interrupt_is_polled_as_the_holds_connection_opens_before_it_writes() {
+    let (dir, _removed) = temp_dir("hold-interrupted-at-open");
+    // An interrupt ready at its first poll: the hold takes it as its connection opens, before
+    // it writes its authentication, and closes; the read after it follows.
+    let view: View = Arc::default();
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.push(Step::Accept);
+    steps.extend(read_after_hold(&view, 1, 2, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+    let ready: stage::Interrupt = Box::pin(std::future::ready(()));
+    let env = primary_only();
+    let ran = probe_until(&opts, &env, ready);
+    let (ran, printed) = tokio::time::timeout(Duration::from_secs(30), ran)
+        .await
+        .expect("the hold ended");
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(received(&server, 1).is_empty(), "it wrote nothing");
+    assert!(server.connections()[1].client_closed);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::Interrupted);
+    assert!(held.sent.is_empty() && held.authenticated.is_none());
+    assert!(held.close_sent.is_some() && held.close_echoed());
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some(
+            "the hold: the owner's interrupt (Ctrl-C) before its three subscriptions were \
+             confirmed"
+        ),
+        "{printed}"
+    );
+}
+
+#[tokio::test]
+async fn the_websocket_layer_answers_a_ping_on_the_hold_only_before_either_side_closes() {
+    let limiter = shared_limiter(user());
+    let used = || limiter.used(tokio::time::Instant::now(), 0, BucketKey::Shared);
+    let ms = Duration::from_millis;
+    let ping = || Message::Ping(vec![7u8; 3].into());
+    // A ping while the connection is open both ways is answered with a pong, recorded.
+    let mut run = hold::HoldRun::default();
+    let before = used();
+    assert!(stage::hear(&mut run, ms(1), ping(), &limiter).is_none());
+    assert_eq!((run.replies, used()), (1, before + 1));
+    // Once the hold began its own close, the WebSocket layer answers no ping, and the echo of
+    // its close takes no reply.
+    run.close_begun = Some(ms(2));
+    assert!(stage::hear(&mut run, ms(3), ping(), &limiter).is_none());
+    assert!(stage::hear(&mut run, ms(4), Message::Close(None), &limiter).is_none());
+    assert_eq!((run.replies, used()), (1, before + 1));
+    assert_eq!((run.pings().len(), run.close_echoed()), (2, true));
+    // A close of the server's takes a close reply, and a ping after it none.
+    let mut run = hold::HoldRun::default();
+    assert!(stage::hear(&mut run, ms(1), Message::Close(None), &limiter).is_none());
+    assert!(stage::hear(&mut run, ms(2), ping(), &limiter).is_none());
+    assert_eq!((run.replies, used()), (1, before + 2));
+    assert_eq!(run.server_closes().len(), 1);
+}
+
+#[tokio::test]
+async fn an_order_or_fill_frame_on_the_hold_is_counted_by_kind_reported_and_stops_the_probe() {
+    // After its subscriptions, an order and a fill of the account (`fixtures/qfex/private/`'s),
+    // then a ping, then QFEX's close: the hold keeps their kinds and nothing else, and reports
+    // them as what decision 0146 says would show it wrong.
+    let then = vec![
+        Step::Push {
+            conn: 1,
+            frame: Frame::text(fixture("order_response.json")),
+        },
+        Step::Push {
+            conn: 1,
+            frame: Frame::text(fixture("fill_response.json")),
+        },
+        Step::Barrier { conn: 1 },
+        Step::Close { conn: 1 },
+    ];
+    let (_removed, opts, outcome, printed, _server) = hold_only(
+        "hold-order-fill",
+        move |view| hold_socket(view, 1, then),
+        Duration::from_secs(3_600),
+        SCRIPTED,
+    )
+    .await;
+    assert!(!outcome.ok, "{printed}");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::ServerClose);
+    assert_eq!(held.orders_or_fills(), 2);
+    assert!(held.error.is_none() && !held.ok());
+    let kinds: Vec<&str> = held.kinds.keys().map(String::as_str).collect();
+    assert_eq!(
+        kinds,
+        ["auth", "fill_response", "order_response", "subscribed"]
+    );
+    // The accounts were still read after it.
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    let stopped = "the hold received 2 order or fill frames: an order or a fill of the account \
+                   while it held, which decision 0146 says would show it wrong";
+    assert_eq!(outcome.evidence.stopped.as_deref(), Some(stopped));
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "- Order or fill frames received: **2**: an order or a fill of the account while it \
+         held, which decision 0146 says would show it wrong",
+        "auth 1; fill_response 1; order_response 1; subscribed 3",
+    ] {
+        assert!(report.contains(said), "{said}\n{report}");
+    }
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["order_or_fill_frames"], 2);
+    assert_eq!(evidence["hold"]["data_frames_by_kind"]["fill_response"], 1);
+    // Their values are kept nowhere: no id, symbol or price of theirs.
+    for text in [&report, &evidence.to_string(), &printed] {
+        for value in ["11111111-1111", "55555555-5555", "AAPL-USD"] {
+            assert!(!text.contains(value), "{value}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_err_frame_on_the_hold_ends_it_at_a_refusal_and_the_accounts_are_read_after_it() {
+    let then = vec![Step::Push {
+        conn: 1,
+        frame: Frame::text(OTHER_ERR),
+    }];
+    let (_removed, _opts, outcome, printed, server) = hold_only(
+        "hold-err",
+        move |view| hold_socket(view, 1, then),
+        Duration::from_secs(3_600),
+        SCRIPTED,
+    )
+    .await;
+    assert!(!outcome.ok, "{printed}");
+    assert_hold_socket(&received(&server, 1), None, PUBLIC);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::Refused);
+    assert_eq!(
+        held.error.as_deref(),
+        Some("QFEX answered an err: InvalidParameter")
+    );
+    assert_eq!(held.kinds.get("err"), Some(&1));
+    assert!(held.close_sent.is_some() && held.close_echoed());
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some("the hold: QFEX answered an err: InvalidParameter")
+    );
+}
+
+#[tokio::test]
+async fn an_err_the_journal_would_keep_whole_still_ends_the_hold_at_a_refusal() {
+    // An err whose message escapes a quote: a journal keeps it whole (decision 0134 item 2), so
+    // it reads as no JSON from what is kept. Read in memory as it arrived, it is still an err,
+    // and it ends the hold at a refusal naming its code, holding no budget.
+    let whole = r#"{"type":"Err","error_code":"InvalidParameter","message":"unknown channel \"x\"","incoming_message":{"type":"subscribe","params":{"channels":["x"]}}}"#;
+    let then = vec![Step::Push {
+        conn: 1,
+        frame: Frame::text(whole),
+    }];
+    let (_removed, opts, outcome, printed, server) = hold_only(
+        "hold-err-whole",
+        move |view| hold_socket(view, 1, then),
+        Duration::from_secs(3_600),
+        SCRIPTED,
+    )
+    .await;
+    assert!(!outcome.ok, "{printed}");
+    assert_hold_socket(&received(&server, 1), None, PUBLIC);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::Refused);
+    let said =
+        "QFEX answered an err the journal would keep whole, read in memory: InvalidParameter";
+    assert_eq!(held.error.as_deref(), Some(said));
+    assert_eq!(held.kinds.get("err (kept whole, read in memory)"), Some(&1));
+    assert_eq!((held.refusals.unread, held.refusals.whole), (1, 0));
+    assert_eq!(held.refusals.limiter, 0);
+    assert!(held.close_sent.is_some() && held.close_echoed());
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some(format!("the hold: {said}").as_str())
+    );
+    // Nothing of it is kept but its code.
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(!report.contains("unknown channel"), "{report}");
+    // A code that is no word is not shown; a frame in no err envelope is none.
+    assert_eq!(
+        hold::whole_err(r#"{"type":"Err","error_code":"a-1"}"#).as_deref(),
+        Some(
+            "QFEX answered an err the journal would keep whole, read in memory, its code not shown"
+        )
+    );
+    assert_eq!(hold::whole_err(AUTH_OK), None);
+    assert_eq!(hold::whole_err("not json"), None);
+}
+
+#[tokio::test]
+async fn an_account_read_after_the_hold_showing_an_open_order_stops_the_probe() {
+    let page: &'static str = Box::leak(fixture("all_orders_response.json").into_boxed_str());
+    let after = HoldOnly {
+        after_page: page,
+        ..SCRIPTED
+    };
+    let mut then = pings(1, 1);
+    then.push(Step::Close { conn: 1 });
+    let (_removed, opts, outcome, printed, _server) = hold_only(
+        "hold-order-after",
+        move |view| hold_socket(view, 1, then),
+        Duration::from_secs(3_600),
+        after,
+    )
+    .await;
+    assert!(!outcome.ok, "{printed}");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert!(held.ok(), "the hold itself did what the record asks");
+    let why = "primary (held) holds an open order, a TWAP or a position that is not flat: read \
+               after the hold, though every account showed none before it: what decision 0146 \
+               says would show it wrong; no session starts";
+    assert_eq!(held.read_after, hold::ReadAfter::Stopped(why.to_owned()));
+    assert_eq!(
+        outcome.evidence.stopped.as_deref().unwrap(),
+        format!("after the hold: {why}")
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains("- Accounts read after it: STOPPED: primary (held) holds an open order")
+    );
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["accounts_read_after"]["stopped"], why);
+}
+
+#[test]
+fn a_data_frame_is_counted_by_its_kind_name_only() {
+    let kind = |text: &str| hold::kind_of(text, text);
+    assert_eq!(kind(AUTH_OK), "auth");
+    assert_eq!(kind(r#"{"subscribed":"fills"}"#), "subscribed");
+    assert_eq!(kind(OTHER_ERR), "err");
+    assert_eq!(kind(ARM_ACK), "ack");
+    assert_eq!(kind(&fixture("order_response.json")), "order_response");
+    assert_eq!(kind(r#"{"a_b":1,"c":2}"#), "{a_b, c}");
+    // A `type`, a member name or a key that is no word (an id, an amount) is never shown.
+    assert_eq!(kind(r#"{"type":"x-1","n":2}"#), "{n, type}");
+    assert_eq!(
+        kind(&format!(r#"{{"{SUB}":1}}"#)),
+        "an object whose member names are not shown"
+    );
+    assert_eq!(
+        kind(r#"{"user_id":1,"5a5a":2}"#),
+        "an object whose member names are not shown"
+    );
+    assert_eq!(kind("[1]"), hold::UNREAD);
+    assert_eq!(kind("not json"), hold::UNREAD);
+    // A frame the journal would keep whole is unread, unless as it arrived it is an order or a
+    // fill, which is counted as one, read in memory.
+    let order = fixture("order_response.json");
+    let blank = "2".repeat(order.len());
+    assert_eq!(
+        hold::kind_of(&blank, &order),
+        "order_response (kept whole, read in memory)"
+    );
+    assert!(hold::is_order_or_fill(&hold::kind_of(&blank, &order)));
+    assert_eq!(hold::kind_of(&blank, AUTH_OK), hold::UNREAD);
+    assert!(!hold::is_order_or_fill("position_response"));
+    assert!(hold::is_order_or_fill("stop_order_response"));
+}
+
+/// Stops tokio's paused clock from jumping while socket I/O is under way: it moves only by
+/// `advance`, until the returned sender drops.
+fn freeze() -> std::sync::mpsc::Sender<()> {
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    thaw
+}
+
+/// Lets every task run, without moving the clock, until `done`; panics after a minute of
+/// wall-clock time, so a regression fails instead of hanging.
+async fn until(what: &str, done: impl Fn() -> bool) {
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = expired.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(60));
+        flag.store(true, Ordering::SeqCst);
+    });
+    while !done() {
+        assert!(!expired.load(Ordering::SeqCst), "{what}: not within 60 s");
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_confirmation_missing_at_qfexs_authentication_deadline_ends_the_hold_recorded() {
+    let frozen = freeze();
+    let (dir, _removed) = temp_dir("hold-deadline");
+    // Two of the three subscriptions confirmed, the third read and never answered; a ping then
+    // shows the hold has read everything sent before it.
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend([
+        Step::Accept,
+        Step::Respond {
+            conn: 1,
+            with: reply(&[AUTH_OK]),
+        },
+        Step::Respond {
+            conn: 1,
+            with: confirm(),
+        },
+        Step::Respond {
+            conn: 1,
+            with: confirm(),
+        },
+        Step::Read { conn: 1 },
+        Step::Barrier { conn: 1 },
+    ]);
+    let all = steps.len();
+    // Then the read after the hold, once its connection closed.
+    let view: View = Arc::default();
+    steps.extend(read_after_hold(&view, 1, 2, EMPTY_PAGE));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let _ = view.set(server.connections_view());
+    let opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Primary,
+        Duration::from_secs(3600),
+    );
+    let env = primary_only();
+    let server = &server;
+    let deadline = async {
+        until("the script", || server.played() >= all).await;
+        // Past QFEX's 60 s from the connection's opening, on the paused clock.
+        tokio::time::advance(Duration::from_secs(61)).await;
+    };
+    let ((ran, printed), ()) = tokio::join!(probe(&opts, &env), deadline);
+    drop(frozen);
+    let outcome = ran.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    assert_hold_socket(&received(server, 1), None, PUBLIC);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(
+        (held.confirmed, held.ended_by.clone()),
+        (2, hold::End::Refused)
+    );
+    assert_eq!(
+        held.error.as_deref(),
+        Some(
+            "QFEX did not authenticate the hold's connection and confirm its three \
+             subscriptions within 60 s"
+        )
+    );
+    assert!(held.ended_at.unwrap() >= Duration::from_secs(60));
+    assert!(held.close_echoed());
+    assert_eq!(held.pings_after_auth().len(), 1);
+    // The accounts read again after it, though it ended at a refusal.
+    assert_eq!(held.read_after, hold::ReadAfter::Clean);
+    assert_read_socket(&received(server, 2), None, PUBLIC);
+}
+
+/// Amounts the account frames below carry, none of which a report, an evidence file or a line
+/// printed may hold: the hold counts a data frame and keeps nothing of it.
+const AMOUNTS: [&str; 4] = ["98765.4321", "4321.0987", "1357.2468", "8642.1357"];
+
+/// A `position_response` and a `balance_response` in the shapes of `fixtures/qfex/private/`,
+/// each carrying the subaccount's id as `user_id` and amounts that are not zero.
+fn account_frames() -> [String; 2] {
+    let mut position = json(&fixture("position_response.json"));
+    let row = &mut position["position_response"];
+    row["user_id"] = SUB.into();
+    row["position"] = json(AMOUNTS[0]);
+    row["margin_alloc"] = json(AMOUNTS[1]);
+    let mut balance = json(&fixture("balance_response.json"));
+    let row = &mut balance["balance_response"];
+    row["user_id"] = SUB.into();
+    row["deposit"] = json(AMOUNTS[2]);
+    row["available_balance"] = json(AMOUNTS[3]);
+    [position.to_string(), balance.to_string()]
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_holds_data_frames_after_its_subscriptions_are_counted_never_kept_and_it_holds_on() {
+    let frozen = freeze();
+    // After the three confirmations: a position and a balance of the account, a confirmation
+    // repeated, and a binary frame; then two pings, each answered once the hold has read
+    // everything before it. None of it ends the hold, which reaches its duration.
+    let [position, balance] = account_frames();
+    let mut then: Vec<Step> = [position, balance, r#"{"subscribed":"fills"}"#.to_owned()]
+        .into_iter()
+        .map(|frame| Step::Push {
+            conn: 1,
+            frame: Frame::text(frame),
+        })
+        .collect();
+    then.push(Step::Push {
+        conn: 1,
+        frame: Frame::Binary(vec![7; 5]),
+    });
+    then.extend(pings(1, 2));
+    let past = HoldOnly {
+        advance: Some(Duration::from_secs(3_601)),
+        ..SCRIPTED
+    };
+    let (_removed, opts, outcome, printed, server) = hold_only(
+        "hold-data-frames",
+        move |view| hold_socket(view, 1, then),
+        Duration::from_secs(3_600),
+        past,
+    )
+    .await;
+    drop(frozen);
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    assert_hold_socket(&received(&server, 1), None, PUBLIC);
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.ended_by, hold::End::Duration);
+    // The authentication reply, the three confirmations and the four frames after them: every
+    // one counted, the repeated confirmation among them and not confirming a fourth time.
+    assert_eq!((held.data_frames, held.confirmed), (8, 3));
+    // Counted by kind, the name of each read from what a journal would keep of it.
+    let kinds: Vec<(&str, u64)> = held.kinds.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+    assert_eq!(
+        kinds,
+        [
+            ("auth", 1),
+            ("balance_response", 1),
+            ("binary", 1),
+            ("position_response", 1),
+            ("subscribed", 4)
+        ]
+    );
+    assert_eq!(held.orders_or_fills(), 0);
+    assert_eq!(held.pings_after_auth().len(), 2);
+    assert!(held.error.is_none() && held.close_echoed());
+    assert_eq!((held.refusals.limiter, held.refusals.errs), (0, 0));
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.contains(
+        "- Data frames received, counted and never kept: 8; by kind, read from what a journal \
+         would keep of each: auth 1; balance_response 1; binary 1; position_response 1; \
+         subscribed 4"
+    ));
+    let evidence = fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap();
+    assert_eq!(json(&evidence)["hold"]["data_frames"], 8);
+    assert_eq!(
+        json(&evidence)["hold"]["data_frames_by_kind"]["position_response"],
+        1
+    );
+    // Nothing of what they held but their kinds' names is in the report, the evidence, a
+    // fixture or the lines printed (`hold_only` ran the privacy check and the credential check
+    // over the outputs).
+    for text in [&report, &evidence, &printed] {
+        for held in AMOUNTS
+            .iter()
+            .copied()
+            .chain([SUB, "margin_alloc", "deposit"])
+        {
+            assert!(!text.contains(held), "{held}");
+        }
+    }
+    for (path, text) in files(&opts.evidence_dir) {
+        if path.starts_with(opts.evidence_dir.join("journal")) {
+            continue;
+        }
+        for amount in AMOUNTS {
+            assert!(!text.contains(amount), "{}", path.display());
+        }
+    }
+}
+
+/// The run's shared limiter for provider user `user`, as the probe builds it: QFEX's trade
+/// limits under the probe's mode (which the loopback origins here do not change), and a reserve
+/// of 10%. A user's budget is process-wide (decision 0123), so a hold made on it here holds the
+/// probe's.
+fn shared_limiter(user: RateUserKey) -> RateLimiter {
+    let mut cfg = VenueConfig::new();
+    cfg.insert(KEY_EXEC_MODE, PREPROD_PROBE);
+    cfg.insert(TRADE_URL, "ws://127.0.0.1:9");
+    cfg.insert(KEY_REST_URL, "http://127.0.0.1:9");
+    cfg.insert(KEY_MDS_URL, "ws://127.0.0.1:9");
+    cfg.insert(KEY_PAGE_SIZE, "1000");
+    cfg.insert(KEY_RESYNC_TIMEOUT, "30s");
+    cfg.insert(KEY_RPC_TIMEOUT, "600ms");
+    let limits = Qfex.caps(&cfg).unwrap().exec_limits.unwrap();
+    let reserve = SafetyReserve::percent(10).unwrap();
+    RateLimiter::for_user(user, &limits, reserve).unwrap()
+}
+
+/// A responder sending `frames` once it has held every frame of `limiter`'s budget for an
+/// hour, as a provider refusal echoing no request holds it.
+fn holding_the_budget(limiter: &RateLimiter, frames: &'static [&'static str]) -> Responder {
+    let limiter = limiter.clone();
+    Responder::new(move |_| {
+        let any = ConnKey {
+            conn: u16::MAX,
+            epoch: 0,
+        };
+        let hour = Some(Duration::from_secs(3_600));
+        limiter.provider_rejected(tokio::time::Instant::now(), any, None, hour);
+        Ok(frames.iter().map(|f| Frame::text(*f)).collect())
+    })
+}
+
+#[tokio::test]
+async fn the_holds_frames_are_charged_to_the_runs_shared_limiter_and_refused_with_no_room() {
+    // The budget held as the read socket's page is answered: the hold's connection opens, and
+    // its authentication is refused before it is written; nothing goes out on it.
+    let (dir, _removed) = temp_dir("hold-no-room");
+    let rate_user = user();
+    let limiter = shared_limiter(rate_user);
+    let refused_before = limiter.counts().refused.user;
+    let steps = vec![
+        Step::Accept,
+        Step::Respond {
+            conn: 0,
+            with: reply(&[AUTH_OK]),
+        },
+        Step::Respond {
+            conn: 0,
+            with: holding_the_budget(&limiter, &[EMPTY_PAGE]),
+        },
+        Step::Accept,
+        // The read after the hold, whose authentication the held budget refuses too.
+        Step::Accept,
+    ];
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let mut opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+    opts.rate_user = rate_user;
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    assert_eq!(server.connections().len(), 3);
+    assert!(
+        received(&server, 1).is_empty(),
+        "nothing written on the hold's"
+    );
+    assert!(received(&server, 2).is_empty(), "nothing written after it");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert!(held.opened && held.sent.is_empty() && held.authenticated.is_none());
+    assert_eq!(held.ended_by, hold::End::Refused);
+    assert_eq!(
+        held.error.as_deref(),
+        Some("not sent: the rate limit has no room")
+    );
+    // Nor its close, charged as a control frame, which the held budget refuses too: the
+    // connection is dropped with none, as a session's is.
+    assert!(held.close_refused && held.close_begun.is_none());
+    assert!(!server.connections()[1].client_closed);
+    assert_eq!(
+        outcome.evidence.stopped.as_deref(),
+        Some(
+            "the hold: not sent: the rate limit has no room; after the hold: primary (held) \
+             could not be read: not sent: the rate limit has no room"
+        )
+    );
+    // The limiter refused it: the write was charged to it.
+    assert!(limiter.counts().refused.user > refused_before);
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(report.contains("It wrote no frame of its own (the error below says why)."));
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["sent"], json("[]"));
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+
+    // The budget held as the hold's authentication is answered: its authentication went out,
+    // its subscriptions are refused before any is written.
+    let (dir, _removed) = temp_dir("hold-no-room-to-subscribe");
+    let rate_user = user();
+    let limiter = shared_limiter(rate_user);
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend([
+        Step::Accept,
+        Step::Respond {
+            conn: 1,
+            with: holding_the_budget(&limiter, &[AUTH_OK]),
+        },
+        Step::Accept,
+    ]);
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let mut opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+    opts.rate_user = rate_user;
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    assert_eq!(received(&server, 1).len(), 1, "the authentication alone");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert_eq!(held.sent, ["authentication"]);
+    assert!(held.authenticated.is_some() && held.confirmed == 0);
+    assert_eq!(
+        held.error.as_deref(),
+        Some("not sent: the rate limit has no room")
+    );
+    // The hold made on the budget while it ran is counted for it.
+    assert_eq!(held.refusals.limiter, 1);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_hold_whose_connection_never_opens_is_recorded_unopened_and_stops_the_probe() {
+    let (dir, _removed) = temp_dir("hold-unopened");
+    // The read socket's connection is carried to the stub; the hold's is closed before its
+    // upgrade, by a listener of the test's own in front of the stub's trade origin.
+    let server = StubServer::start(WsScript::new(read_socket(0, EMPTY_PAGE)), rest(flat()))
+        .await
+        .unwrap();
+    let stub = server.ws_url("").trim_start_matches("ws://").to_owned();
+    let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("ws://{}", front.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut read, _) = front.accept().await.unwrap();
+        let mut carried = tokio::net::TcpStream::connect(stub).await.unwrap();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut read, &mut carried).await;
+        });
+        let (hold, _) = front.accept().await.unwrap();
+        drop(hold);
+    });
+    let mut opts = holding(
+        &dir,
+        &server,
+        &[],
+        Armed::Primary,
+        Duration::from_secs(3_600),
+    );
+    opts.trade_url = origin.clone();
+    opts.mds_url = origin;
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    let held = outcome.evidence.hold.as_ref().unwrap();
+    assert!(!held.opened && held.sent.is_empty() && held.heard.is_empty());
+    assert_eq!(held.ended_by, hold::End::Unopened);
+    assert!(held.close_begun.is_none() && held.ended_at.is_none());
+    // A hold that never opened held nothing, and is not read after: one positions read, the
+    // one before it.
+    assert_eq!(held.read_after, hold::ReadAfter::NotRead);
+    assert_eq!(server.http_requests(), ["GET /user/positions"]);
+    // Its error names the hold's connection, never a read socket.
+    let error = held.error.as_deref().unwrap();
+    assert!(error.starts_with("the hold's connection: "), "{error}");
+    let stopped = outcome.evidence.stopped.as_deref().unwrap();
+    assert!(
+        stopped.starts_with("the hold: the hold's connection: "),
+        "{stopped}"
+    );
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    for said in [
+        "- Connection opened: no",
+        "It wrote no frame of its own (the error below says why).",
+        "- Ended by: the connection never opened, at never",
+        "- Its own close: it sent none",
+    ] {
+        assert!(report.contains(said), "{said}\n{report}");
+    }
+    assert!(
+        report.contains("- Error: the hold's connection: "),
+        "{report}"
+    );
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"]["opened"], false);
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_hold_is_refused_before_anything_connects_as_any_run_is() {
+    let (dir, _removed) = temp_dir("hold-refused");
+    let server = StubServer::start(WsScript::new(Vec::new()), rest(flat()))
+        .await
+        .unwrap();
+    let base = holding(&dir, &server, &[], Armed::Primary, Duration::from_secs(5));
+    let with = |f: &dyn Fn(&mut Options)| {
+        let mut opts = base.clone();
+        f(&mut opts);
+        opts
+    };
+    let no_sub = primary_only();
+    let cases: Vec<(Options, HashMap<&'static str, String>, &str)> = vec![
+        // With --production, a pre-production origin; without it, a production one (decision
+        // 0143 item 3, as decision 0146 item 1 keeps it for the hold).
+        (
+            with(&|o| {
+                o.production = true;
+                o.trade_url = PREPROD_TRADE.into();
+            }),
+            environment(),
+            "qfex.trade_url: a pre-production qfex.io host",
+        ),
+        (
+            with(&|o| o.rest_url = PRODUCTION_REST.into()),
+            environment(),
+            "qfex.rest_url: a production qfex.com host",
+        ),
+        // A hold on the subaccount needs the variable that names it.
+        (
+            with(&|o| {
+                o.hold = Some(probe_args::Hold {
+                    duration: Duration::from_secs(5),
+                    account: Armed::Subaccount,
+                })
+            }),
+            no_sub,
+            "QFEX_SUBACCOUNT_ID is not set",
+        ),
+        // Nothing to run.
+        (
+            with(&|o| o.hold = None),
+            environment(),
+            "--arm or --hold-secs is required: nothing to run",
+        ),
+    ];
+    for (opts, env, refused) in cases {
+        let (ran, printed) = probe(&opts, &env).await;
+        let err = ran
+            .err()
+            .unwrap_or_else(|| panic!("not refused: {refused}"));
+        assert!(err.contains(refused), "{err} (expected {refused})");
+        for value in [PUBLIC, SECRET, SUB, PREPROD_TRADE, PRODUCTION_REST] {
+            assert!(!err.contains(value), "{err}");
+        }
+        assert!(printed.is_empty(), "{printed}");
+        assert!(!opts.evidence_dir.exists(), "{refused}");
+    }
+    assert!(server.connections().is_empty());
+    assert!(server.http_requests().is_empty());
+}
+
+#[tokio::test]
+async fn an_open_order_on_a_named_account_refuses_the_hold_before_it_opens() {
+    let (dir, _removed) = temp_dir("hold-open-order");
+    let page = fixture("all_orders_response.json");
+    let server = StubServer::start(WsScript::new(read_socket(0, &page)), rest(flat()))
+        .await
+        .unwrap();
+    let opts = holding(
+        &dir,
+        &server,
+        &[Armed::Primary],
+        Armed::Primary,
+        Duration::from_secs(5),
+    );
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    let ev = &outcome.evidence;
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some(
+            "primary (held) holds an open order, a TWAP or a position that is not flat: no hold \
+             starts (decision 0146 item 3)"
+        )
+    );
+    // Nothing but the read opened: no hold, no session.
+    assert_eq!(server.connections().len(), 1);
+    assert!(ev.hold.is_none() && ev.sessions.is_empty());
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    assert!(
+        report.contains(
+            "The run asked for a hold, but it did not start: the probe stopped before it."
+        )
+    );
+    assert!(report.contains(
+        "Met by each session, at least, with the read sockets before it: the hold 0 (it did not \
+         run)."
+    ));
+    let evidence = json(&fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap());
+    assert_eq!(evidence["hold"], Value::Null);
+    assert_no_secret(&opts.evidence_dir);
+
+    // The same for a position that is not flat, with no open order on the page.
+    let (dir, _removed) = temp_dir("hold-position");
+    let mut positions = flat();
+    positions.insert(None, ok(&fixture("positions.json")));
+    let server = StubServer::start(WsScript::new(read_socket(0, EMPTY_PAGE)), rest(positions))
+        .await
+        .unwrap();
+    let opts = holding(&dir, &server, &[], Armed::Primary, Duration::from_secs(5));
+    let (ran, printed) = probe(&opts, &primary_only()).await;
+    let outcome = ran.unwrap();
+    server.finished().await.unwrap();
+    assert!(!outcome.ok, "{printed}");
+    let ev = &outcome.evidence;
+    assert!(!ev.reads[0].flat && ev.reads[0].page_orders == 0);
+    assert_eq!(
+        ev.stopped.as_deref(),
+        Some(
+            "primary (held) holds an open order, a TWAP or a position that is not flat: no hold \
+             starts (decision 0146 item 3)"
+        )
+    );
+    assert_eq!(server.connections().len(), 1);
+    assert!(ev.hold.is_none() && ev.sessions.is_empty());
+}
+
+#[test]
+fn the_hold_flags_are_bounded_never_show_a_value_and_make_arm_optional() {
+    let parse = |args: &[&str]| probe_args::parse(args.iter().map(|a| (*a).to_owned()));
+    let run = |args: &[&str]| match parse(args) {
+        Ok(Parsed::Run(opts)) => *opts,
+        other => panic!("{args:?}: {other:?}"),
+    };
+    // A hold alone: on the primary account, no ledger bounds, no session's waits judged.
+    let opts = run(&[
+        "--evidence-dir",
+        "/d",
+        "--hold-secs",
+        "1",
+        "--session-wait",
+        "61",
+    ]);
+    let hold = |secs, account| {
+        Some(probe_args::Hold {
+            duration: Duration::from_secs(secs),
+            account,
+        })
+    };
+    assert_eq!(opts.hold, hold(1, Armed::Primary));
+    assert!(opts.arms.is_empty() && opts.ledger.is_none());
+    // Its largest, on the subaccount, beside an arm, which still takes the ledger's bounds.
+    let both = [
+        &[
+            "--evidence-dir",
+            "/d",
+            "--hold-secs",
+            "86400",
+            "--hold-account",
+            "subaccount",
+        ][..],
+        &["--arm", "primary"],
+        &LEDGER,
+    ]
+    .concat();
+    let opts = run(&both);
+    assert_eq!(opts.hold, hold(86_400, Armed::Subaccount));
+    assert_eq!(opts.arms, [Armed::Primary]);
+    assert!(opts.ledger.is_some());
+    let opts = run(&[
+        "--evidence-dir",
+        "/d",
+        "--hold-account",
+        "primary",
+        "--hold-secs",
+        "9",
+    ]);
+    assert_eq!(opts.hold, hold(9, Armed::Primary));
+    let hold_only = ["--evidence-dir", "/d", "--hold-secs", "5"];
+    let refused = [
+        (
+            vec!["--hold-secs", "0"],
+            "--hold-secs: not a whole number from 1 to 86400",
+        ),
+        (
+            vec!["--hold-secs", "86401"],
+            "--hold-secs: not a whole number from 1 to 86400",
+        ),
+        (
+            vec!["--hold-secs", "x7"],
+            "--hold-secs: not a whole number from 1 to 86400",
+        ),
+        (
+            vec!["--hold-secs", "-9"],
+            "--hold-secs: not a whole number from 1 to 86400",
+        ),
+        (
+            vec!["--hold-account", "secret-ish"],
+            "--hold-account: primary or subaccount",
+        ),
+        (vec!["--hold-account"], "--hold-account needs a value"),
+        (vec!["--hold-secs"], "--hold-secs needs a value"),
+    ];
+    for (args, expected) in refused {
+        let args: Vec<&str> = ["--evidence-dir", "/d", "--arm", "primary"]
+            .into_iter()
+            .chain(LEDGER)
+            .chain(args)
+            .collect();
+        let err = parse(&args).unwrap_err();
+        assert!(err.contains(expected), "{args:?}: {err}");
+        for typed in ["86401", "x7", "secret-ish"] {
+            assert!(!err.contains(typed), "{err}");
+        }
+    }
+    // --hold-account names the hold's account, so takes --hold-secs; the ledger's flags bound
+    // the registries --arm builds, so a run with no --arm takes none of them.
+    let err = parse(&[
+        "--evidence-dir",
+        "/d",
+        "--arm",
+        "primary",
+        "--hold-account",
+        "primary",
+    ])
+    .unwrap_err();
+    assert!(err.contains("give --hold-secs too"), "{err}");
+    // With neither --hold-secs nor --arm, nothing is asked: refused.
+    let err = parse(&["--evidence-dir", "/d", "--hold-account", "primary"]).unwrap_err();
+    assert!(err.contains("give --hold-secs too"), "{err}");
+    let err = parse(&["--evidence-dir", "/d"]).unwrap_err();
+    assert!(err.contains("--arm or --hold-secs is required"), "{err}");
+    for flag in LEDGER.chunks(2) {
+        let args: Vec<&str> = hold_only
+            .iter()
+            .copied()
+            .chain(flag.iter().copied())
+            .collect();
+        let err = parse(&args).unwrap_err();
+        assert!(
+            err.contains("a run with no --arm takes none of them"),
+            "{err}"
+        );
+    }
+    let usage = probe_args::usage();
+    let flat = usage.split_whitespace().collect::<Vec<_>>().join(" ");
+    for said in [
+        "--hold-secs <S>",
+        "--hold-account <ACCOUNT>",
+        "required unless --hold-secs is given",
+        "required with --arm, no default, refused without it",
+        "(the liveness hold, decision 0146, FBC-39ks)",
+        "never arms, places, cancels or reads",
+    ] {
+        assert!(flat.contains(said), "{said}: {usage}");
+    }
+}
+
+/// A hold that authenticated at 100 ms and heard `heard`, ended by `end`.
+fn held_with(heard: Vec<hold::Heard>, end: hold::End) -> hold::HoldRun {
+    hold::HoldRun {
+        account: "primary",
+        duration: Duration::from_secs(60),
+        opened: true,
+        authenticated: Some(Duration::from_millis(100)),
+        confirmed: 3,
+        subscribed: Some(Duration::from_millis(130)),
+        heard,
+        data_frames: 4,
+        ended_by: end,
+        ended_at: Some(Duration::from_secs(60)),
+        ..hold::HoldRun::default()
+    }
+}
+
+fn ping(at_ms: u64) -> hold::Heard {
+    hold::Heard {
+        at: Duration::from_millis(at_ms),
+        control: hold::Control::Ping { len: 4 },
+    }
+}
+
+#[test]
+fn the_holds_summary_reads_pings_around_authentication_intervals_pongs_and_closes() {
+    let ms = Duration::from_millis;
+    let close = |at_ms, code, echo| hold::Heard {
+        at: ms(at_ms),
+        control: hold::Control::Close {
+            code,
+            reason_len: 3,
+            echo,
+        },
+    };
+    let pong = hold::Heard {
+        at: ms(20_500),
+        control: hold::Control::Pong { len: 2 },
+    };
+    // A ping before authentication, three after it 10 s apart, an unsolicited pong, its own
+    // close's echo at the end.
+    let mut run = held_with(
+        vec![
+            ping(40),
+            ping(10_100),
+            ping(20_100),
+            pong,
+            ping(30_100),
+            close(60_010, Some(1000), true),
+        ],
+        hold::End::Duration,
+    );
+    run.close_begun = Some(ms(60_000));
+    run.close_sent = Some(ms(60_000));
+    assert!(run.ok());
+    assert_eq!(run.pings_before_auth(), 1);
+    assert_eq!(run.pings_after_auth(), [ms(10_100), ms(20_100), ms(30_100)]);
+    assert_eq!(run.intervals(), [ms(10_000), ms(10_000)]);
+    assert_eq!(run.first_after_auth(), Some(ms(10_000)));
+    assert_eq!(run.pongs(), 1);
+    // The echo of its own close is no server close.
+    assert!(run.server_closes().is_empty() && run.close_echoed());
+    let mut s = String::new();
+    hold::markdown(&mut s, &run, "pre-production");
+    for said in [
+        "- Any ping before authentication: yes, 1",
+        "- Pings after authentication: 3, the first 10000 ms after it",
+        "- Intervals between the pings after authentication: 10000 ms, 10000 ms (shortest \
+         10000 ms, longest 10000 ms)",
+        "- Pings in all: 4; pongs received: 1",
+        "- Server closes: none within the hold",
+        "- Its own close: sent at 60000 ms; the server echoed it",
+        "| 4 | 20500 | pong | 2 |  |",
+        "| 6 | 60010 | close, the echo of its own | 3 | 1000 |",
+        "The result speaks for QFEX pre-production only",
+    ] {
+        assert!(s.contains(said), "{said}\n{s}");
+    }
+    let v = hold::to_json(&run, "pre-production");
+    assert_eq!(v["pongs_received"], 1);
+    assert_eq!(
+        v["intervals_after_authentication_ms"],
+        json("[10000,10000]")
+    );
+    assert_eq!(v["heard"][5]["echo_of_ours"], true);
+    assert_eq!(v["heard"][3]["frame"], "pong");
+
+    // A server close, then the echo-less end; an end with no close frame, with the stream's
+    // error; a close sent but never echoed.
+    let run = held_with(
+        vec![ping(5_000), close(9_000, Some(4002), false)],
+        hold::End::ServerClose,
+    );
+    assert_eq!(run.server_closes().len(), 1);
+    assert!(run.ok() && run.intervals().is_empty());
+    let mut dropped = held_with(vec![ping(5_000)], hold::End::NoCloseFrame);
+    dropped.dropped = Some("reset".to_owned());
+    assert!(dropped.ok() && dropped.server_closes().is_empty());
+    let mut s = String::new();
+    hold::markdown(&mut s, &dropped, "production");
+    assert!(s.contains("- Ended by: the connection's end with no close frame (reset), at"));
+    assert_eq!(
+        hold::to_json(&dropped, "production")["ended_without_close_frame"],
+        "reset"
+    );
+    let mut unechoed = held_with(Vec::new(), hold::End::Duration);
+    unechoed.close_begun = Some(ms(60_000));
+    unechoed.close_sent = Some(ms(60_000));
+    let mut s = String::new();
+    hold::markdown(&mut s, &unechoed, "production");
+    assert!(s.contains("no echo of it was read within --read-wait-ms"));
+    assert!(s.contains("- Pings after authentication: 0, no ping came after it"));
+
+    // A close begun and not written within --read-wait-ms: a close read after it is still its
+    // echo, never a server close. One whose code is not an echo's is flagged as one that may
+    // have crossed its own.
+    let mut unwritten = held_with(vec![close(60_200, None, true)], hold::End::Duration);
+    unwritten.close_begun = Some(ms(60_000));
+    assert!(unwritten.server_closes().is_empty() && unwritten.close_echoed());
+    let mut s = String::new();
+    hold::markdown(&mut s, &unwritten, "production");
+    assert!(
+        s.contains(
+            "- Its own close: begun at 60000 ms and not written within --read-wait-ms; the server \
+             echoed it"
+        ),
+        "{s}"
+    );
+    assert_eq!(
+        hold::to_json(&unwritten, "production")["close_begun_ms"],
+        60_000
+    );
+    assert_eq!(
+        hold::to_json(&unwritten, "production")["close_sent_ms"],
+        Value::Null
+    );
+    let mut crossed = held_with(vec![close(60_010, Some(4003), true)], hold::End::Duration);
+    crossed.close_begun = Some(ms(60_000));
+    crossed.close_sent = Some(ms(60_001));
+    assert_eq!(crossed.echo_code(), Some(Some(4003)));
+    let mut s = String::new();
+    hold::markdown(&mut s, &crossed, "production");
+    assert!(
+        s.contains(
+            "- Its own close: sent at 60001 ms; the close read after it carries code 4003, not \
+             an echo's (none, or 1000): it may be a close of the server's that crossed its own"
+        ),
+        "{s}"
+    );
+    // What it wrote is what it recorded writing: nothing, here.
+    assert!(s.contains("It wrote no frame of its own (the error below says why)."));
+    assert_eq!(hold::to_json(&crossed, "production")["sent"], json("[]"));
+
+    // Never authenticated: every ping is before authentication, none after, and it is not ok.
+    let mut never = held_with(vec![ping(5), ping(70)], hold::End::Refused);
+    never.authenticated = None;
+    never.confirmed = 0;
+    never.error = Some("QFEX did not authenticate the hold's connection".to_owned());
+    assert!(!never.ok());
+    assert_eq!(never.pings_before_auth(), 2);
+    assert!(never.pings_after_auth().is_empty() && never.first_after_auth().is_none());
+    let mut s = String::new();
+    hold::markdown(&mut s, &never, "production");
+    assert!(s.contains(
+        "- Any ping before authentication: 2, all before any authentication: it never \
+         authenticated"
+    ));
+    assert!(s.contains("Result: INCOMPLETE."));
+    // Fewer than three confirmations, or a connection that never opened, is not ok either.
+    let mut short = held_with(Vec::new(), hold::End::Duration);
+    short.confirmed = 2;
+    assert!(!short.ok());
+    let unopened = hold::HoldRun::default();
+    assert!(!unopened.ok());
+    assert_eq!(unopened.ended_by.says(), "the connection never opened");
+    assert_eq!(hold::ms(Duration::from_micros(1_999)), 1);
+}
+
+#[test]
+fn a_run_that_holds_is_complete_only_when_its_hold_is() {
+    let hold_only = |held: Option<hold::HoldRun>| Evidence {
+        hold_asked: true,
+        hold: held,
+        ..Evidence::default()
+    };
+    let good = held_with(vec![ping(5_000)], hold::End::Duration);
+    assert!(hold_only(Some(good.clone())).ok());
+    let mut bad = good.clone();
+    bad.error = Some("x".to_owned());
+    assert!(!hold_only(Some(bad)).ok());
+    // A hold asked for that never started did nothing.
+    let mut stopped = hold_only(None);
+    assert!(!stopped.ok());
+    stopped.stopped = Some("stopped before the hold".to_owned());
+    let report = capture::markdown(&stopped);
+    assert!(report.contains("The run asked for a hold, but it did not start"));
+    assert!(report.contains("None: the run asked for no session (no --arm)."));
+    // A run that asked for no hold reads as stage one always did.
+    let report = capture::markdown(&Evidence::default());
+    assert!(report.contains(": what answers the cancel-on-disconnect arm\n"));
+    assert!(!report.contains("liveness hold"));
 }
