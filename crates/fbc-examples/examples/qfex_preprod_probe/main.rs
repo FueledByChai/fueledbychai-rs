@@ -3,14 +3,16 @@
 //! owner-assisted run (on pre-production a declared testnet run, decision 0067; on production
 //! with no such declaration) that arms cancel-on-disconnect once per account and records what
 //! answers the arm, in a report, a machine-readable evidence file and a scrubbed slice of its
-//! journal. It places nothing and sends no command but each session's arm and its own reads. An
-//! owner-run program: CI builds it, and its wiring is tested against the conformance stub
-//! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
+//! journal. It places nothing and sends no command but each session's arm and its own reads,
+//! which cover the accounts its configuration names and never ask QFEX for a list of them
+//! (decision 0144): confirm in QFEX's app before each run that the user has no other
+//! subaccount. An owner-run program: CI builds it, and its wiring is tested against the
+//! conformance stub (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
 //! ```text
-//! export QFEX_PUBLIC_KEY=...       # the primary credential, for the environment run on
+//! export QFEX_PUBLIC_KEY=...       # the primary account's credential, for the environment run on
 //! export QFEX_SECRET_KEY=...
-//! export QFEX_SUBACCOUNT_ID=...    # the subaccount to arm on
+//! export QFEX_SUBACCOUNT_ID=...    # the subaccount to read, and to arm on
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- [--production] \
 //!     --evidence-dir /abs/new/dir --arm primary --arm subaccount \
 //!     --registry-span <S> --ledger-max-age <S> --ledger-max-entries <N>

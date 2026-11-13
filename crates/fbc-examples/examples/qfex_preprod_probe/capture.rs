@@ -52,8 +52,8 @@ use crate::refusals::{self, ReadSocket, Refusals};
 pub struct AccountRead {
     /// The account the session after them arms on.
     pub before: &'static str,
-    /// `primary`, or `subaccount N` in the listing's order, `(armed)` when the session arms on
-    /// it: never an id.
+    /// `primary` or `subaccount`, as the run's configuration names the account (decision 0144),
+    /// `(armed)` when the session arms on it: never an id.
     pub label: String,
     /// The rows `GET /user/positions` listed, and whether every one was flat.
     pub rows: usize,
@@ -274,8 +274,10 @@ pub struct Evidence {
     pub mode: &'static str,
     /// Where the origins pointed: QFEX pre-production, QFEX production, or a loopback test stub.
     pub target: &'static str,
-    /// How many subaccounts `GET /user/subaccounts` listed.
-    pub listed: Option<usize>,
+    /// The accounts the run reads before every session, `primary` then `subaccount`, as its
+    /// configuration names them (decision 0144): never a list QFEX gave, since the probe sends
+    /// no `GET /user/subaccounts`, and never an id.
+    pub accounts: Vec<&'static str>,
     pub reads: Vec<AccountRead>,
     pub sessions: Vec<SessionRun>,
     /// Each registry's fill ledger: its bounds, and its horizon and replay counts at each of its
@@ -319,6 +321,12 @@ impl Evidence {
             && self.sessions.iter().all(SessionRun::ok)
     }
 }
+
+/// Where the accounts read came from, as `evidence.json` says it (decision 0144 item 3).
+const ACCOUNTS_NOTE: &str = "named by the run's configuration, not listed by QFEX: the probe \
+     sends no GET /user/subaccounts. The owner must confirm in QFEX's app before the run that the \
+     user has no other subaccount; the probe records no such confirmation and cannot check it \
+     (decision 0144)";
 
 /// What a frame is, from the bytes the journal kept: an err or an ack named by what it echoes
 /// (the arm, as decision 0132 item 1 compares it, or another request), with an err's code as
@@ -708,7 +716,8 @@ pub fn readme(ev: &Evidence) -> String {
         "# QFEX trade-socket frames: what answered the cancel-on-disconnect arm\n\n\
          Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
          `qfex_preprod_probe` (crates/fbc-examples, FBC-l931; decision 0143 for production), \
-         stage one of decision 0132 item 7: one session per account ({}), each arming \
+         stage one of decision 0132 item 7: one session per account ({}, each named by the \
+         run's configuration, not listed by QFEX: decision 0144), each arming \
          cancel-on-disconnect once and placing nothing. These are recorded frames, not \
          synthetic ones: this directory carries no SYNTHETIC marker.\n\n\
          Each file is one frame QFEX sent on a session's trade socket, in the order received, \
@@ -855,16 +864,19 @@ pub fn markdown(ev: &Evidence) -> String {
         "{gap}Records the journal's sink dropped: {normal} Normal, {safety} Safety. Sessions \
          whose capture is partial: {partial}.{writer}\n"
     );
-    let listed = ev
-        .listed
-        .map_or_else(|| "not read".to_owned(), |n| n.to_string());
+    let (n, names) = (ev.accounts.len(), ev.accounts.join(", "));
     let _ = writeln!(
         s,
         "## The accounts before each session\n\n\
-         `GET /user/subaccounts` listed: {listed} (ids not shown). A session starts only when \
-         every account shows no open order on `get_user_orders` (a socket that never arms) and \
-         flat REST positions (decision 0132 item 7), and, reading that strictly, no REST \
-         `open_orders` either.\n\n\
+         Accounts named by the run's configuration, to be read before every session: {n} \
+         ({names}; ids not shown), not a list QFEX gave: the probe sends no \
+         `GET /user/subaccounts` (decision 0144). The table below lists the reads made. Before \
+         the run the owner must confirm in QFEX's app that the user has no subaccount the \
+         configuration does not name; the probe records no such confirmation and cannot check \
+         it, so the checks below, and what they show of the user's other accounts, cover the \
+         named accounts only. A session starts only when every account it reads shows no open \
+         order on `get_user_orders` (a socket that never arms) and flat REST positions \
+         (decision 0132 item 7), and, reading that strictly, no REST `open_orders` either.\n\n\
          | before | account | position rows | flat | REST open_orders | page orders | page TWAPs | page full |\n\
          | --- | --- | --- | --- | --- | --- | --- | --- |"
     );
@@ -937,7 +949,9 @@ pub fn markdown(ev: &Evidence) -> String {
          email, a user name, an address in another form) before committing it.\n\n\
          Not measured by stage one (FBC-9sk2's stages): whether arming cancels open orders (a \
          session starts only on accounts whose reads above show none), whether a graceful close \
-         or a drop cancels, and everything decision 0132 asks of a place.",
+         or a drop cancels, and everything decision 0132 asks of a place. Not checked by the \
+         probe: whether the user has a subaccount the configuration does not name (the owner \
+         must confirm none before the run, which the probe does not record: decision 0144).",
         list(&ev.fixtures),
         list(&ev.withheld),
         list(&ev.errors),
@@ -980,7 +994,10 @@ pub fn to_json(ev: &Evidence) -> Value {
         "exec_mode": ev.mode, "target": ev.target, "ok": ev.ok(),
         "journal_dropped": {"normal": normal, "safety": safety},
         "journal_writer_failed": ev.writer_failed,
-        "stopped": ev.stopped, "subaccounts_listed": ev.listed, "reads": reads,
+        "stopped": ev.stopped,
+        "accounts": {"source": "configuration", "named": ev.accounts,
+            "count": ev.accounts.len(), "others_checked": false, "note": ACCOUNTS_NOTE},
+        "reads": reads,
         "sessions": sessions,
         "provider_rate_refusals": refusals::to_json(ev, &shown),
         "registries": ledger::to_json(&ev.registries),

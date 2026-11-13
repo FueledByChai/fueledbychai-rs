@@ -1,6 +1,7 @@
 //! The probe's account reads (decision 0132 item 7, FBC-h3z1): what the probe sends, outside an
-//! order-entry session, to read every account of the provider user before it starts and to
-//! check, before every session, that each holds no open order and a flat position.
+//! order-entry session, to check, before every session, that each account it reads holds no
+//! open order and a flat position; and the account listing, which it no longer sends, since it
+//! reads the accounts its configuration names (decision 0144).
 //!
 //! - **The requests.** `GET /user/subaccounts` ([`subaccounts`]) and `GET /user/positions`
 //!   ([`positions`]) on `qfex.rest_url`; and, on `qfex.trade_url` ([`trade_url`]), the
@@ -11,8 +12,9 @@
 //!   admits ([`probe::connections`]): without a probe mode, or under a configuration the guard
 //!   refuses, nothing is built. Every signed part, and every account identifier, comes from
 //!   `src/auth`'s [`ReadAuth`], which the caller builds for an account it
-//!   names, the primary or an id the decoded listing returned ([`Subaccounts::accounts`]), with
-//!   that account's credentials; nothing here reads or holds a credential. `ReadAuth` signs and
+//!   names, the primary or a subaccount id (the probe's from its configuration, decision 0144;
+//!   a listing's from [`Subaccounts::accounts`]), with that account's credentials; nothing here
+//!   reads or holds a credential. `ReadAuth` signs and
 //!   names its spans for this crate only, so these functions are the one way to them.
 //! - **The decoders.** [`decode_subaccounts`], [`decode_positions`], [`orders_page`] and
 //!   [`authenticated`]. Every number is read from its own JSON text exactly (`exec::exact`, FBC-zeb0),
@@ -35,10 +37,11 @@
 //! `orders` and active `twaps`), and the [rate page](https://docs.qfex.com/websocket/rate)
 //! (`get_user_orders` weighs 5.0, so 50 in this crate's tenths).
 //!
-//! FBC-l931 sends these through fbc-runtime, charged to the run's shared limiter, and judges
-//! the answers. FBC-jxau's resync, inside this crate, can reuse the positions request with its
-//! order-entry handle's signed headers (`positions_request`) and the page decoder on the bytes
-//! its codec keeps of a frame (`decode_page`), without a `ReadAuth`.
+//! FBC-l931 sends these but the listing (decision 0144) through fbc-runtime, charged to the
+//! run's shared limiter, and judges the answers. FBC-jxau's resync, inside this crate, can
+//! reuse the positions request with its order-entry handle's signed headers
+//! (`positions_request`) and the page decoder on the bytes its codec keeps of a frame
+//! (`decode_page`), without a `ReadAuth`.
 
 use core::fmt;
 use core::ops::Range;
@@ -358,9 +361,10 @@ impl Subaccounts {
         self.ids.is_empty()
     }
 
-    /// Every account of the provider user, the probe reads each before it starts (decision 0132
-    /// item 7): the primary account first, which the listing leaves out, then each listed
-    /// subaccount in the listing's order.
+    /// Every account of the provider user the listing shows (decision 0132 item 7 had the probe
+    /// read each; it reads the accounts its configuration names, decision 0144): the primary
+    /// account first, which the listing leaves out, then each listed subaccount in the listing's
+    /// order.
     pub fn accounts(&self) -> impl Iterator<Item = AccountSelection<'_>> {
         core::iter::once(AccountSelection::Primary).chain(
             self.ids
@@ -369,8 +373,9 @@ impl Subaccounts {
         )
     }
 
-    /// Whether `account`, decision 0122's selection of the account the probe trades, is the
-    /// primary account or a listed subaccount (decision 0132 item 7).
+    /// Whether `account`, decision 0122's selection of an account to trade, is the primary
+    /// account or a listed subaccount (decision 0132 item 7; the probe no longer asks, decision
+    /// 0144).
     pub fn admits(&self, account: AccountSelection<'_>) -> bool {
         match account {
             AccountSelection::Primary => true,

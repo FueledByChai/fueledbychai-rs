@@ -295,8 +295,9 @@ Before anything connects, it refuses:
   `wss://trade.qfex.io`, `https://api.qfex.io`, `wss://mds.qfex.io`), and any `qfex.com` host is
   refused. With it, QFEX's production origins (the defaults then: `wss://trade.qfex.com`,
   `https://api.qfex.com`, `wss://mds.qfex.com`), and any `qfex.io` host is refused;
-- an account decision 0122 item 1 refuses: `QFEX_SUBACCOUNT_ID` must be a lowercase subaccount
-  UUID, as QFEX writes one;
+- an account decision 0122 item 1 refuses, and a `QFEX_SUBACCOUNT_ID` that selects the primary
+  account (decision 0144): when set, it must be a lowercase subaccount UUID, as QFEX writes one,
+  whether or not a session arms on it;
 - a missing or empty credential, and a subaccount credential with one half set;
 - `--socks5` with loopback origins: the proxy would reach its own host's loopback;
 - a missing, zero or malformed `--registry-span`, `--ledger-max-age` or `--ledger-max-entries`
@@ -307,13 +308,17 @@ Before anything connects, it refuses:
 
 A refusal names the setting or the variable, never its value. Then:
 
-1. It reads `GET /user/subaccounts` with the primary credential. The subaccount armed on must be
-   listed.
-2. Before each session, for the primary account and every listed subaccount, it reads
-   `GET /user/positions` (a subaccount selected by `x-qfex-requested-account-id`) and one
-   `get_user_orders` page, on a trade socket of that account's own that sends only its
-   authentication and that read, and never arms. A subaccount is read with its own credential
-   when it is the one `QFEX_SUBACCOUNT_ID` names and that credential is set, and with the
+1. It reads the accounts its configuration names, and no others (decision 0144): the primary
+   account, and the subaccount `QFEX_SUBACCOUNT_ID` names when it is set. It sends no
+   `GET /user/subaccounts`, which QFEX refused with HTTP 403 to the primary account's
+   single-account key in FBC-291a's first production run; its docs suggest only an All-accounts
+   key may list (decision 0144). So before each run, confirm in QFEX's app that the user has no
+   subaccount the configuration does not name: the probe neither checks nor records it, and its
+   report says so. `--arm subaccount` arms the subaccount `QFEX_SUBACCOUNT_ID` names.
+2. Before each session, for each of those accounts, it reads `GET /user/positions` (a
+   subaccount selected by `x-qfex-requested-account-id`) and one `get_user_orders` page, on a
+   trade socket of that account's own that sends only its authentication and that read, and
+   never arms. The subaccount is read with its own credential when that is set, and with the
    primary credential otherwise. A session starts only when every account can be read and holds
    no open order, no TWAP and only flat positions; otherwise the run stops there and writes its
    report. Decision 0132 item 7 asks only an empty page and flat positions. The run also refuses
@@ -389,19 +394,35 @@ incomplete.
 
 Prerequisites, which the run cannot check (decision 0132 item 2, asserted by the
 `AccountWideCodAuthority` it gives): nothing else is connected to or trades on any account of the
-user. No QFEX web session, no other program, no other API client. The accounts must also be flat
-with no open order; the run checks that.
+user. No QFEX web session, no other program, no other API client. And the user has no subaccount
+the configuration does not name (decision 0144): confirm it in QFEX's app before each run, then
+close that session. The accounts read must also be flat with no open order; the run checks that.
+
+**The keys** (decision 0144). One key per account, each scoped to that account alone ("A
+specific account" on QFEX's [API keys page](https://docs.qfex.com/api-reference/api-keys)), so
+each can be revoked alone:
+
+- the primary account's as `QFEX_PUBLIC_KEY` and `QFEX_SECRET_KEY`, and the subaccount's as
+  `QFEX_SUBACCOUNT_PUBLIC_KEY` and `QFEX_SUBACCOUNT_SECRET_KEY`;
+- each with Execute orders, View orders, View positions and View balance. `GET /user/positions`
+  answers with the account's `balance` object, so a key without View balance is untested;
+- never Deposit and withdraw, and no All-accounts key: the run lists no subaccounts, so it needs
+  no key that reaches every account.
+
+A subaccount with no pair of its own is read with the primary account's key. A key scoped to the
+primary account is not expected to reach it: QFEX then refuses the read, and the run stops before
+any session.
 
 **On production** (`--production`, decision 0143, FBC-3prm). The owner chose on 2026-11-10 to
 run stage one on QFEX production, keeping a minimal balance on the accounts it reads and arms:
 QFEX supplies pre-production credentials, and a production key is refused there (HTTP 401 at
-`GET /user/subaccounts`, FBC-291a's first run).
+the first request of FBC-291a's first run, on pre-production).
 
 - `--production` sets the adapter's `production_probe` mode, and `--trade-url`, `--rest-url` and
   `--mds-url` default to QFEX's production origins. A pre-production origin is then refused, and
   a production origin without `--production` is refused too, before anything connects.
-- Every check above runs unchanged: the listing, the reads before every session, one session at
-  a time, one arm each, the stop with no second attempt.
+- Every check above runs unchanged: the reads of the accounts the configuration names before
+  every session, one session at a time, one arm each, the stop with no second attempt.
 - Each registry is built with no testnet declaration (decision 0067: a consumer trading a live
   venue never makes it). Stage one seeds and arms no market, so it needs none. With none, and
   QFEX's resync seeding nothing (decision 0132 item 5), no market of the probe's can arm, so it
@@ -409,22 +430,18 @@ QFEX supplies pre-production credentials, and a production key is refused there 
 - `report.md`, `evidence.json` (`environment`, `exec_mode`, and each registry's `testnet_run`)
   and the fixtures' README name the environment. The fixtures are scrubbed exactly as a
   pre-production run's (decision 0009): read every file before committing it, as below.
-- The keys: the same variables as on pre-production, set to production keys. Give each account
-  its own key, the primary account's as `QFEX_PUBLIC_KEY` and `QFEX_SECRET_KEY` and the
-  subaccount's as `QFEX_SUBACCOUNT_PUBLIC_KEY` and `QFEX_SUBACCOUNT_SECRET_KEY`, each with
-  Execute orders, View orders and View positions, and none with Deposit and withdraw. The
-  primary key reads the listing and every listed subaccount with no key of its own, so it must
-  reach them, or the run stops before any session.
+- The keys: the same variables as on pre-production, set to production keys, one per account
+  as **The keys** above says.
 - If an order of ours is ever left resting, decision 0132 item 7's hand cancel is on QFEX's
   production site, outside any session and while nothing of the user is armed. Stage one places
   nothing, so it should never be needed.
 
 ```text
-export QFEX_PUBLIC_KEY=...             # the primary credential, for the environment run on
+export QFEX_PUBLIC_KEY=...             # the primary account's key, for the environment run on
 export QFEX_SECRET_KEY=...
-export QFEX_SUBACCOUNT_ID=...          # the subaccount to arm on, lowercase
-export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # only if a credential is scoped to that subaccount
-export QFEX_SUBACCOUNT_SECRET_KEY=...  # (both or neither)
+export QFEX_SUBACCOUNT_ID=...          # the subaccount to read and arm on, lowercase
+export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # the key scoped to that subaccount
+export QFEX_SUBACCOUNT_SECRET_KEY=...  # (both or neither; neither reads it with the primary's)
 # pre-production:
 cargo run -p fbc-examples --example qfex_preprod_probe -- \
     --evidence-dir "$HOME/fbc-qfex-probe/$(date -u +%Y%m%dT%H%M%SZ)" \
@@ -440,6 +457,7 @@ cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
 `--help` lists every flag. The evidence directory holds:
 
 - `report.md`: the accounts as each check read them (counts only, never an id or an amount),
+  how many the configuration named, and that they came from it and not from QFEX,
   and for each session whether the stream authenticated, whether the arm was written, its
   outcome, every frame QFEX sent placed against the arm (before it, in its window, after it),
   and what that shows under decision 0132 item 1. An ack echoing the arm is the shape 0132 reads
