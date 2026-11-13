@@ -11,23 +11,25 @@
 //! only the test moves: a blocking task that never ends keeps tokio from jumping it while socket
 //! I/O is under way. The stub confirms each of the three subscriptions, so the codec reports the
 //! stream authenticated (FBC-bsou) and the session sends its cancel-on-disconnect arm (decisions
-//! 0058 and 0121), which the stub answers with the ack QFEX production sent (FBC-291a). Then the
-//! stub pings it several times (`Step::Barrier`, which ends only on the pong to its own ping),
-//! the test moving virtual time between two pings past the codec's 60 s authentication deadline.
-//! The test shows:
+//! 0058 and 0121), which the stub answers with the ack QFEX production sent (FBC-291a), and the
+//! codec accepts at Final (FBC-jxau, decision 0132 item 1). The session then asks for its resync
+//! (decision 0132 item 5), which the stub answers: the flat positions on its HTTP route and one
+//! short `get_user_orders` page, so the resync ends before the first ping. Then the stub pings
+//! it several times (`Step::Barrier`, which ends only on the pong to its own ping), the test
+//! moving virtual time between two pings past the resync's 30 s deadline and the codec's 60 s
+//! authentication deadline. The test shows:
 //!
 //! - each ping is answered with a pong, and the session stays in its one epoch: one connection
 //!   attempt, no epoch ended until the test stops it;
-//! - once its open has settled (authentication, three subscriptions and the arm), its codec
-//!   writes no frame of its own while the stub pings it, the deadline's timer firing in between;
+//! - once its open has settled (authentication, three subscriptions, the arm and the resync's
+//!   page), its codec writes no frame of its own while the stub pings it, the two deadlines'
+//!   timers firing in between;
 //! - its journal holds each ping on that epoch, at the virtual instant it arrived, by length
 //!   only (decision 0041), and no frame written after the first.
 //!
-//! The probe's arm is answered by no frame the codec reads as its outcome: it ends `Unknown` at
-//! `qfex.exec.rpc_timeout` and the session then ends the epoch (decision 0058; FBC-jxau decodes
-//! the answer). The configuration sets that deadline far past the virtual time the test moves,
-//! so the arm's own deadline never ends the epoch the pings are measured on. The probe's liveness
-//! hold never arms (decision 0146): it is `qfex_preprod_probe`'s, tested in crates/fbc-examples.
+//! The configuration sets `qfex.exec.rpc_timeout` far past the virtual time the test moves, so
+//! no request's deadline falls on the epoch the pings are measured on. The probe's liveness hold
+//! never arms (decision 0146): it is `qfex_preprod_probe`'s, tested in crates/fbc-examples.
 //!
 //! Every key here is synthetic, and every wait is for something the test can observe, bounded by
 //! wall-clock time from another thread, so a regression fails instead of hanging.
@@ -37,18 +39,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use fbc_conformance::{Frame, HttpRouter, Responder, Step, StubServer, WsScript};
+use fbc_conformance::{
+    Frame, HttpReply, HttpRouter, PathPattern, Responder, Step, StubServer, WsScript,
+};
 use fbc_core::{
-    AccountKey, ConnKey, ConnState, Envelope, ExecEvent, Namespace, Secret, Secrets, SpecTable,
-    VenueConfig, VenueFactory,
+    AccountKey, AckLevel, ConnKey, ConnState, Envelope, ExecEvent, Namespace, Secret, Secrets,
+    SpecTable, SubmitOutcome, VenueConfig, VenueFactory,
 };
 use fbc_journal::{
     ControlEvent, JournalReader, JournalWriter, NonceSourceId, Record, RedactionKey, SinkConfig,
     WsControl, journal_queue,
 };
+use fbc_runtime::http::Method;
 use fbc_runtime::{
     AccountWideCodAuthority, Connector, ExecHandler, ExecSession, ExecSessionConfig, InFlight,
     IngestClock, Journal, ProxyConfig, RateLimiter, RateUserKey, ReconnectPacing, ReservedBound,
@@ -71,16 +76,27 @@ const SECRET: &str = "synthetic-qfex-secret-0001";
 /// The authenticate page's success reply.
 const AUTH_OK: &str = r#"{"type":"auth","result":"success"}"#;
 /// The arm's echo in the AsyncAPI's generic `ack`, as QFEX production answered the arm
-/// (`fixtures/qfex/exec-recorded/arm-production/README.md`): counted, settling nothing.
+/// (`fixtures/qfex/exec-recorded/arm-production/README.md`): the arm's acceptance at Final.
 const ARM_ACK: &str = r#"{"ack":{"incoming_message":{"type":"cancel_on_disconnect","params":{"cancel_on_disconnect":true}}}}"#;
+/// The resync's one page: empty, so short at any page size, and the resync's last.
+const PAGE: &str = r#"{"all_orders_response":{"orders":[],"twaps":[]}}"#;
+/// The resync's page read, as the codec asks for it at the configured size.
+const PAGE_ASK: &str = r#"{"type":"get_user_orders","params":{"limit":1000,"offset":0}}"#;
+/// The account's positions on the stub's REST route: flat, holding none.
+const FLAT: &str = r#"{"balance":{},"positions":[]}"#;
+/// What the session writes on its socket before the first ping: its authentication, the three
+/// subscriptions, the arm and the resync's page read.
+const OPENING: usize = 6;
 
 /// The stub's pings, after the session's open has settled.
 const PINGS: usize = 4;
 /// The virtual time between two of them: three intervals pass the codec's 60 s authentication
 /// deadline, and each is longer than the 20 s client ping one of QFEX's code samples sets.
 const INTERVAL: Duration = Duration::from_secs(25);
-/// The arm's deadline, far past the virtual time the test moves.
+/// The requests' deadline, far past the virtual time the test moves.
 const RPC_TIMEOUT: &str = "3600s";
+/// The resync's deadline: its timer fires between two pings, the resync long ended.
+const RESYNC_TIMEOUT: Duration = Duration::from_secs(30);
 /// The session's connection number and the journal's shard.
 const CONN: u16 = 7;
 const SHARD: u16 = 0;
@@ -96,7 +112,10 @@ fn config(server: &StubServer) -> VenueConfig {
     cfg.insert(KEY_MDS_URL, &server.ws_url(""));
     cfg.insert(KEY_REST_TIMEOUT, "5000ms");
     cfg.insert(KEY_PAGE_SIZE, "1000");
-    cfg.insert(KEY_RESYNC_TIMEOUT, "30s");
+    cfg.insert(
+        KEY_RESYNC_TIMEOUT,
+        &format!("{}s", RESYNC_TIMEOUT.as_secs()),
+    );
     cfg.insert(KEY_RPC_TIMEOUT, RPC_TIMEOUT);
     cfg.insert(auth::ACCOUNT_ID, "primary");
     cfg.insert(auth::ACCOUNT_KEY, "4");
@@ -203,10 +222,26 @@ impl ExecHandler for Watch {
     }
 }
 
+/// The stub's REST route: [`FLAT`] for every positions read, each counted in `reads`.
+fn positions_route(reads: Arc<AtomicUsize>) -> HttpRouter {
+    HttpRouter::new().route_fn(
+        Method::GET,
+        PathPattern::exact("/user/positions"),
+        move |_| {
+            reads.fetch_add(1, Ordering::SeqCst);
+            HttpReply {
+                status: 200,
+                body: FLAT.as_bytes().to_vec(),
+            }
+        },
+    )
+}
+
 /// The script: the session's socket (connection 0) authenticated, its three subscriptions
-/// confirmed and its arm acknowledged, then pinged [`PINGS`] times, each ping after the first
-/// played only once the test has opened a connection of its own (a gate, connections 1 on): the
-/// test moves virtual time before opening each. The steps played once each ping's pong came.
+/// confirmed, its arm acknowledged and its resync's page answered, then pinged [`PINGS`] times,
+/// each ping played only once the test has opened a connection of its own (a gate, connections 1
+/// on): the test sees the resync end before opening the first, and moves virtual time before
+/// opening each other. The steps played once each ping's pong came.
 fn script() -> (Vec<Step>, Vec<usize>) {
     let mut steps = vec![
         Step::Accept,
@@ -225,11 +260,13 @@ fn script() -> (Vec<Step>, Vec<usize>) {
         conn: 0,
         with: reply(&[ARM_ACK]),
     });
+    steps.push(Step::Respond {
+        conn: 0,
+        with: reply(&[PAGE]),
+    });
     let mut marks = Vec::new();
-    for k in 0..PINGS {
-        if k > 0 {
-            steps.push(Step::Accept);
-        }
+    for _ in 0..PINGS {
+        steps.push(Step::Accept);
         steps.push(Step::Barrier { conn: 0 });
         marks.push(steps.len());
     }
@@ -239,9 +276,11 @@ fn script() -> (Vec<Step>, Vec<usize>) {
 #[tokio::test(start_paused = true)]
 async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_nothing_of_its_own() {
     assert!(INTERVAL * (PINGS as u32 - 1) > AUTH_DEADLINE);
+    assert!(INTERVAL < RESYNC_TIMEOUT && RESYNC_TIMEOUT < INTERVAL * 2);
     let frozen = freeze();
     let (steps, marks) = script();
-    let server = StubServer::start(WsScript::new(steps), HttpRouter::new())
+    let reads = Arc::new(AtomicUsize::new(0));
+    let server = StubServer::start(WsScript::new(steps), positions_route(Arc::clone(&reads)))
         .await
         .unwrap();
     let cfg = config(&server);
@@ -294,23 +333,32 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
     let sent = || server.connections()[0].received.len();
     let drive = async {
         let mut gates = Vec::new();
+        // The resync ends, its positions read and its one page answered, before any ping.
+        until("the resync's end", || {
+            heard.borrow().events.contains(&ExecEvent::ResyncEnd)
+        })
+        .await;
         for (k, mark) in marks.iter().enumerate() {
             if k > 0 {
                 // Virtual time passes with nothing written: no keepalive of the codec's own.
                 advance(INTERVAL).await;
                 churn().await;
-                assert_eq!(sent(), 5, "a frame of the codec's own after {k} intervals");
+                assert_eq!(
+                    sent(),
+                    OPENING,
+                    "a frame of the codec's own after {k} intervals"
+                );
                 assert!(heard.borrow().ended.is_empty(), "the epoch ended");
-                let gate = Connector::new(ProxyConfig::Direct);
-                gates.push(gate.websocket(&server.ws_url("/gate")).await.unwrap());
             }
+            let gate = Connector::new(ProxyConfig::Direct);
+            gates.push(gate.websocket(&server.ws_url("/gate")).await.unwrap());
             // The ping's pong came: the barrier played to its end.
             until(&format!("ping {k}"), || server.played() >= *mark).await;
             let heard = heard.borrow();
             assert_eq!(heard.authenticated.len(), 1);
             assert!(heard.ended.is_empty(), "the epoch ended at ping {k}");
             assert!(server.connections()[0].open);
-            assert_eq!(sent(), 5, "a frame of the codec's own at ping {k}");
+            assert_eq!(sent(), OPENING, "a frame of the codec's own at ping {k}");
         }
         server.finished().await.unwrap();
         churn().await;
@@ -334,20 +382,38 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
         panic!("{:?}", heard.authenticated);
     };
     assert_eq!(epoch.conn, CONN);
-    assert!(matches!(
-        heard.events.as_slice(),
-        [ExecEvent::Conn {
-            state: ConnState::Authenticated,
-            ..
-        }]
-    ));
+    // Authenticated, the arm accepted at Final by its ack, and one resync showing nothing.
+    assert!(
+        matches!(
+            heard.events.as_slice(),
+            [
+                ExecEvent::Conn {
+                    state: ConnState::Authenticated,
+                    ..
+                },
+                ExecEvent::Outcome {
+                    outcome: SubmitOutcome::Accepted {
+                        ack: AckLevel::Final
+                    },
+                    item: None,
+                    ..
+                },
+                ExecEvent::ResyncBegin { .. },
+                ExecEvent::ResyncEnd,
+            ]
+        ),
+        "{:?}",
+        heard.events
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "one positions read");
     // The one epoch ended once, at the test's stop.
     assert_eq!(heard.ended, [epoch]);
 
-    // What the session sent: its authentication, the three subscriptions and the arm, nothing
-    // else, on one connection; the others are the test's gates, which sent nothing.
+    // What the session sent: its authentication, the three subscriptions, the arm and the
+    // resync's page read, nothing else, on one connection; the others are the test's gates,
+    // which sent nothing.
     let conns = server.connections();
-    assert_eq!(conns.len(), PINGS);
+    assert_eq!(conns.len(), 1 + PINGS);
     assert!(conns[1..].iter().all(|c| c.received.is_empty()));
     let text: Vec<&str> = (conns[0].received.iter())
         .map(|f| match f {
@@ -355,7 +421,7 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
             Frame::Binary(_) => "<binary>",
         })
         .collect();
-    assert_eq!(text.len(), 5, "{text:?}");
+    assert_eq!(text.len(), OPENING, "{text:?}");
     let auth: Value = serde_json::from_str(text[0]).unwrap();
     assert_eq!(auth["params"]["hmac"]["public_key"], PUBLIC);
     assert!(auth["params"].get("account_id").is_none());
@@ -364,11 +430,12 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
         assert_eq!(*frame, sub);
     }
     assert_eq!(text[4], ARM);
+    assert_eq!(text[5], PAGE_ASK);
 
     // The journal: each ping on the epoch, by length only, at least an interval after the one
-    // before; the five frames written before the first; the authentication deadline's timer
-    // firing between two pings with nothing written after it; no close received and no
-    // request's deadline.
+    // before; the six frames written and the positions read sent before the first; the resync's
+    // and the authentication's deadlines' timers firing between two pings with nothing written
+    // after them; no close received and no request's deadline.
     let records: Vec<Record> = JournalReader::open(&root, SHARD)
         .unwrap()
         .entries()
@@ -397,14 +464,25 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
         .filter(|(_, record)| matches!(record, Record::Outbound { conn, .. } if *conn == epoch))
         .map(|(at, _)| at)
         .collect();
-    assert_eq!(written.len(), 5);
+    assert_eq!(written.len(), OPENING);
     assert!(written.iter().all(|at| *at < first_ping));
+    let requests: Vec<usize> = (records.iter().enumerate())
+        .filter(|(_, record)| matches!(record, Record::HttpRequest { .. }))
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0] < first_ping);
     let timers: Vec<usize> = (records.iter().enumerate())
         .filter(|(_, record)| matches!(record, Record::Timer { stamp, .. } if stamp.conn == epoch))
         .map(|(at, _)| at)
         .collect();
-    assert_eq!(timers.len(), 1, "the authentication deadline, once");
-    assert!(timers[0] > pings[2].0 && timers[0] < pings[3].0);
+    assert_eq!(
+        timers.len(),
+        2,
+        "the resync's deadline, then the authentication's, once each"
+    );
+    assert!(timers[0] > pings[1].0 && timers[0] < pings[2].0);
+    assert!(timers[1] > pings[2].0 && timers[1] < pings[3].0);
     assert!(!records.iter().any(|record| matches!(
         record,
         Record::InboundControl {

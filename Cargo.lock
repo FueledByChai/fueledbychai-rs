@@ -683,6 +683,7 @@ dependencies = [
  "fbc-conformance",
  "fbc-core",
  "fbc-journal",
+ "fbc-oms",
  "fbc-runtime",
  "getrandom 0.3.4",
  "hmac",

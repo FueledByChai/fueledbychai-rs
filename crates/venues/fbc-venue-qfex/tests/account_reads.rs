@@ -1165,10 +1165,7 @@ impl ExecSink for Sink {
 /// A probe codec for the traded subaccount, opened.
 fn opened_codec() -> QfexExec {
     let cfg = preprod(SUB);
-    let mut codec = QfexExec::probe(
-        TradeAuth::new(&cfg, creds()).unwrap(),
-        probe::mode(&cfg).unwrap().unwrap(),
-    );
+    let mut codec = QfexExec::probe(TradeAuth::new(&cfg, creds()).unwrap(), &cfg).unwrap();
     codec.on_open(TRADE, &ctx(1), &mut Effects::new());
     codec
 }

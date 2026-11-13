@@ -284,10 +284,10 @@ PRE-PRODUCTION environment, with the credentials QFEX supplied for it, as a decl
 (decision 0067), or, with `--production`, on QFEX PRODUCTION with your production keys and no
 such declaration (decision 0143; below). It arms
 cancel-on-disconnect once per account and records what answers the arm. It places nothing, and
-it sends no command but each session's arm and its own reads. FBC-9sk2's place stages build on
-it once FBC-jxau has landed; they are not decided for production. With `--hold-secs` it first
-holds one trade connection that never arms, to record how QFEX keeps it alive (the liveness
-hold, decision 0146; below), and a run may hold without arming.
+it sends no command but each session's arm, its resync's reads and its own reads. FBC-9sk2's
+place stages build on it now that FBC-jxau has landed; they are not decided for production. With
+`--hold-secs` it first holds one trade connection that never arms, to record how QFEX keeps it
+alive (the liveness hold, decision 0146; below), and a run may hold without arming.
 
 Before anything connects, it refuses:
 
@@ -305,8 +305,8 @@ Before anything connects, it refuses:
 - with `--arm`, a missing, zero or malformed `--registry-span`, `--ledger-max-age` or
   `--ledger-max-entries` (each required with it, with no default; below), a ledger age not longer
   than the span bound, a span bound not longer than `--connect-wait-ms`, QFEX's 60 s
-  authentication deadline and `--rpc-timeout-ms` together, and a ledger count not above the fill
-  ceiling; without `--arm`, any of the three;
+  authentication deadline and the longer of `--rpc-timeout-ms` and the resync's 30 s deadline
+  together, and a ledger count not above the fill ceiling; without `--arm`, any of the three;
 - a run with neither `--arm` nor `--hold-secs`, a `--hold-secs` outside 1 to 86400, and a
   `--hold-account` without `--hold-secs`;
 - an `--evidence-dir` that is not empty.
@@ -335,15 +335,25 @@ A refusal names the setting or the variable, never its value. Then:
    ever in flight across the user. Each is fbc-runtime's `ExecSession`, unchanged, with the
    `AccountWideCodAuthority` for the account it arms on (decision 0121). The session sends the
    arm itself once QFEX has authenticated the stream and confirmed its three subscriptions.
-   The program stops the session at the arm's outcome (its answer, or `Unknown` at
-   `--rpc-timeout-ms`), at the connection's end, at `--session-wait`, or at its registry's span
-   bound (`--registry-span`), whichever comes first, always through the session's stop control.
+   With the arm it asks for its resync, whose reads the adapter's probe codec sends (decision
+   0132 item 5): one signed `GET /user/positions` of the session's account, on the REST origin,
+   and `get_user_orders` pages on the session's own socket until a short page. It sends no
+   `get_user_trades`, since the session places nothing and so has no start time. The program
+   stops the session once the arm has its outcome (its answer, or `Unknown` at
+   `--rpc-timeout-ms`) and the resync has ended, in either order, so the journal holds each read
+   with its answer; or at the connection's end (the codec ends the epoch on a read that fails or
+   outlasts the resync's 30 s deadline), at `--session-wait`, or at its registry's span bound
+   (`--registry-span`), whichever comes first, always through the session's stop control.
    `--session-wait` and `--registry-span` must each be longer than `--connect-wait-ms`, QFEX's
-   60 s authentication deadline and `--rpc-timeout-ms` together, so neither stops a session
-   with its arm in flight.
+   60 s authentication deadline and the longer of `--rpc-timeout-ms` and the resync's 30 s
+   deadline together, so neither stops a session with its arm or its resync in flight.
    Its reconnect pacing allows one attempt a day, so no second attempt starts meanwhile.
-   Until FBC-jxau decodes an answer, every arm ends `Unknown` at its deadline (decision 0132
-   item 1).
+   The codec answers the arm from its own echo (FBC-jxau, decision 0132 item 1): an ack
+   accepts it at Final, as FBC-291a's capture of QFEX production shows, and an err rejects it
+   unless its code is `RateLimited`, which answers nothing; an arm nothing answers, a
+   `RateLimited` one included, ends `Unknown` at its deadline.
+   Under `--production` an accepted arm opens decision 0058's gate, and the codec still refuses
+   every place unsent (decision 0145).
 
 Every request takes its origin from the guarded configuration, through the adapter's
 `account_reads`, and is charged first to the one rate limiter the sessions share for the
@@ -467,9 +477,10 @@ cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
   and for each session whether the stream authenticated, whether the arm was written, its
   outcome, every frame QFEX sent placed against the arm (before it, in its window, after it),
   and what that shows under decision 0132 item 1. An ack echoing the arm is the shape 0132 reads
-  as its Final acceptance, which FBC-jxau then decodes. Frames in the window that echo nothing
-  of the arm are listed by kind, and an echo of the arm after the window is named late; neither,
-  nor an empty window, is read as the arm's answer: a new record decides what answers the arm.
+  as its Final acceptance, which the codec reports (FBC-jxau). Frames in the window that echo
+  nothing of the arm are listed by kind (the resync's `{all_orders_response}` page among them),
+  and an echo of the arm after the window is named late; neither, nor an empty window, is read
+  as the arm's answer: a new record decides what answers the arm.
   It also names every member whose string value a fixture keeps, gives each registry's
   fill-ledger bounds, its horizon and replay counts at each session's end, and whether the
   bounds held, and states the provider rate refusals each read socket and session met, at least.

@@ -1,7 +1,9 @@
 //! QFEX's trade WebSocket codec (FBC-zeb0, BT-702): [`QfexExec`] authenticates each connection,
 //! subscribes to the account's private channels, feeds every rate refusal back to the shared
-//! provider-user budgets, inspects the private state QFEX sends, and encodes the v1 order
-//! commands (FBC-blcw, `order.rs`). It normalizes nothing, and no reply settles a command.
+//! provider-user budgets, reads the private state QFEX sends, and encodes the v1 order
+//! commands (FBC-blcw, `order.rs`). Recording-only it normalizes nothing and settles no
+//! command; in a probe mode it decodes the private state into events, and settles the arm by
+//! its own echo and a cancel by the `order_response` naming its order (FBC-jxau).
 //!
 //! It runs in one of two modes:
 //!
@@ -11,19 +13,28 @@
 //!   the factory builds no order-entry codec (decisions 0117, 0122).
 //! - **The probe** ([`QfexExec::probe`], decision 0132 item 6, FBC-mfey), which the factory
 //!   builds under `preprod_probe` or `production_probe` alone (decision 0143 item 2), its caps
-//!   [`probe_exec_caps`] in both. Under `production_probe` alone, loopback origins included,
-//!   it refuses every place, batch place and amend `NotSent(Unsupported)`, whatever the epoch
-//!   and the order, though its caps declare places, until a record admits places on
-//!   production (FBC-5d7x, decision 0145); in every other way it is alike in both. It encodes
-//!   one cancel-on-disconnect arm per epoch, and refuses unsent every later arm on that epoch
-//!   and every disarm (item 1), so at most one arm is in flight on a connection. No frame
-//!   answers the arm yet: every arm ends `Unknown` at its deadline, and the session ends the
-//!   epoch (decision 0058). The journal keeps the arm's echo and, while the arm is the only
-//!   request in flight, the shape of every other echo (item 3, as 0134 item 7 narrows it;
-//!   `echo.rs`), so a capture shows whatever answers the arm. Its epoch stays open on the
-//!   private state frames stage one brings, which it still inspects and normalizes into
-//!   nothing, and its resync asks for nothing, so the session places nothing (0058) until
-//!   FBC-jxau lands item 5's resync.
+//!   [`probe_exec_caps`] in both. Under `production_probe` alone, loopback origins included, it
+//!   refuses every place, batch place and amend `NotSent(Unsupported)`, whatever the epoch and the
+//!   order, though its caps declare places, until a record admits places on production (FBC-5d7x,
+//!   decision 0145); in every other way it is alike in both. It encodes one cancel-on-disconnect
+//!   arm per epoch, and refuses unsent every later arm on that epoch and every disarm (item 1), so
+//!   at most one arm is in flight on a connection. Only the arm's own echo answers it
+//!   (`echo::arm_echo`), on its epoch, while it is in flight on the authenticated stream: an ack
+//!   accepts it at `AckLevel::Final`, as FBC-291a's capture of QFEX production shows
+//!   (`fixtures/qfex/exec-recorded/arm-production/`, decision 0143 item 4), and an err rejects it
+//!   unless its code is `RateLimited`, which holds every frame budget for its kept hint and answers
+//!   nothing, the arm then failing at its deadline whatever echoes it later (decision 0132 item 1,
+//!   as 0147 item 1 reads 0134 item 5). An echo with a member added or a value of another type, a
+//!   cancelled order and a position answer nothing; an arm nothing answers ends `Unknown` at its
+//!   deadline, and the session ends a rejected or unknown arm's epoch (decision 0058). The journal
+//!   keeps the arm's echo and, while the arm is the only request in flight, the shape of every
+//!   other echo (item 3, as 0134 item 7 narrows it; `echo.rs`); an answered arm is in flight no
+//!   more, so its answer closes that window, as a page of its resync in flight does. The codec
+//!   decides the answer on the bytes the journal keeps, so replay answers the arm where live did.
+//!   Its epoch stays open on private state, which it decodes (below), and its resync is decision
+//!   0132 item 5's (`resync.rs`): a signed positions read, the open orders' pages and the trades of
+//!   the orders it placed, pushed in one bracket once every read has answered, or a reconnect at
+//!   its own deadline; its caps declare the snapshot untrustworthy, so no resync seeds a position.
 //!
 //! - **Authentication.** On opening, the authentication frame from `src/auth` (its two nonces
 //!   reserved for the open, `nonces_for`) and a timer for QFEX's deadline: the server closes a
@@ -58,15 +69,25 @@
 //!   is authenticated every other err ends the epoch. Once it is, an err with a request's code
 //!   is counted and settles nothing, its request left to end `Unknown` at its deadline, and one
 //!   with a code about the session ([`ErrCode::ends_session`]) or an undocumented one ends the
-//!   epoch. An ack is counted and settles nothing.
+//!   epoch. An ack is counted and settles nothing. The one exception to both is the arm's own
+//!   echo, which answers the arm as the probe's paragraph says, and is then read as every err
+//!   or ack is.
 //! - **A frame that is not a JSON object**, a frame kept whole among them (which replay reads
 //!   as a run of `2`s), is refused (`DecodeError::Malformed`) and ends the epoch, in every state
 //!   (0134 item 6). So does a frame that repeats a member or matches two envelopes.
 //! - **Private state.** An `order_response` whose status is `RATE_LIMITED` holds every frame
-//!   budget, as an echo naming no bucket does. Every other private state frame is inspected,
-//!   each number exactly ([`PrivateState`]), with no order, fill, position or resync event:
-//!   nothing is normalized until FBC-jxau. Recording-only, it ends the epoch, and a resync asks
-//!   to reconnect; in the probe, the epoch stays open and a resync asks for nothing.
+//!   budget, as an echo naming no bucket does. Recording-only, every other private state frame
+//!   is inspected, each number exactly ([`PrivateState`]), with no event, and ends the epoch
+//!   (FBC-zeb0), and a resync asks to reconnect. In a probe mode, where FBC-zeb0's rule no
+//!   longer holds (decision 0143 item 4), each is decoded (`private.rs`, decision 0132 items 5
+//!   and 8) with the epoch kept open: an `order_response` into an order update, a live `FILLED`
+//!   ending the order only when its `quantity_remaining` is zero; a `fill_response` into a
+//!   fill keyed by its `trade_id`; a `position_response` into the account's position; a page no
+//!   read asked for into nothing; and one on a symbol the spec table does not hold into
+//!   nothing, counted (decision 0147 item 2). Each event carries no venue time. A frame not as
+//!   documented, an unmapped status among them, is a decode error and pushes nothing; only a
+//!   frame the codec does not recognise ends the epoch. A page the resync asked for is read by
+//!   the resync (`resync.rs`).
 //! - **Commands.** A limit GTC, ALO (post-only) or limit IOC place, and a cancel or an order
 //!   query by the venue's order UUID, each one frame naming its request with the consumer's
 //!   deadline and labelled with its command's traffic class, sent only on an authenticated
@@ -74,11 +95,16 @@
 //!   and under `production_probe` every place too, before the epoch is read (decision 0145),
 //!   but the probe's one arm per epoch, [`ARM`], charged as the rate page's 0.1 for
 //!   `cancel_on_disconnect` under `Control`, which charges both buckets since the page names
-//!   none for it.
-//!   No reply settles a request, whatever it names: an `order_response`, a fill, a page, an err
-//!   or an ack is read as above, and each sent request ends `Unknown` at its deadline. Reply
-//!   correlation stays candidate-only (`tests/correlation.rs`) until a decision, on evidence,
-//!   says otherwise.
+//!   none for it. While the resync's open-order pages run, a query, answered in the same kind
+//!   of frame, is refused `NotSent(Backpressure)` with nothing written (item 5).
+//!   No reply settles a request but the probe's arm, as above, and its cancels (decision 0132
+//!   item 8): a `CANCELLED` `order_response` naming a cancel's order accepts it at
+//!   `AckLevel::Final`, pushed before the order's update, and a `NO_SUCH_ORDER` one rejects it
+//!   `RejectKind::NotFound` and ends nothing, each only while that cancel is the one request in
+//!   flight naming the order, a query of it counted, and the order id compared exactly. An err
+//!   or an ack settles no cancel, whatever it echoes, and nothing settles a place, whose
+//!   client-id echo no capture shows yet: each other request ends `Unknown` at its deadline.
+//!   Recording-only, no reply settles anything but its deadline.
 //!
 //! Each frame and its rate charge: the authentication as one tenth of a weight unit under
 //! `Control` (the rate page lists no weight for it, and `Control` charges both buckets), each
@@ -91,21 +117,26 @@ mod ids;
 pub(crate) mod json;
 mod order;
 mod private;
+mod resync;
 
 use core::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fbc_core::{
-    ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects, EncodeCtx, EncodeReceipt,
-    ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpResponse, HttpTag, Inbound, InboundSpans,
-    NotSentReason, OpKind, PathStamps, RateCharge, RawFrame, RpcCall, RpcId, SpecTable, StreamId,
-    SubmitOutcome, TimerTag, TrafficClass, VenueCommand, VenueMeta, WireSlice,
+    AckLevel, ConfigError, ConnState, CtxCall, DecodeError, DecodeScope, Effect, Effects,
+    EncodeCtx, EncodeReceipt, ExecCodec, ExecEvent, ExecSink, HttpFailure, HttpResponse, HttpTag,
+    Inbound, InboundSpans, ItemRef, NotSentReason, OpKind, PathStamps, RateCharge, RawFrame,
+    Reject, RejectKind, RpcCall, RpcId, SpecTable, StreamId, SubmitOutcome, TimerTag, TrafficClass,
+    VenueCommand, VenueConfig, VenueMeta, VenueOrderId, WireSlice,
 };
 
 use self::echo::Envelope;
 use self::json::{Kind, Member, Node};
+use self::private::{Decoded, Misread, Status};
+use crate::account_reads;
 use crate::auth::TradeAuth;
-use crate::probe::{Environment, Probe};
+use crate::probe::{Environment, KEY_EXEC_MODE, Probe};
 use crate::rate;
 
 pub use self::caps::{RISK_REJECT_WINDOW, probe_exec_caps};
@@ -113,6 +144,7 @@ pub use self::echo::{ARM, ErrCode};
 pub use self::ids::{CLIENT_ID_FORMAT, is_venue_order_id};
 pub(crate) use self::private::exact;
 pub use self::private::{OrderStatus, PrivateState};
+pub use self::resync::{ResyncEvidence, TRADES_WEIGHT};
 
 /// The trade WebSocket, the codec's one stream.
 pub const TRADE: StreamId = StreamId(0);
@@ -137,18 +169,56 @@ pub struct QfexExecCounts {
     errs: [u64; 10],
     /// Errs whose `error_code` is absent, spanned, or not one of the documented ten.
     pub undocumented_errs: u64,
-    /// Acks, each settling nothing.
+    /// Acks, each counted; only an ack echoing the arm in flight answers anything, the arm
+    /// (decision 0132 item 1).
     pub acks: u64,
+    /// Arms accepted, each by an ack echoing it (decision 0132 item 1).
+    pub arm_accepted: u64,
+    /// Arms rejected, each by an err echoing it whose code is not `RateLimited` (decision 0147
+    /// item 1).
+    pub arm_rejected: u64,
     /// `Effect::RateLimited` holds asked for, by RateLimited errs and `RATE_LIMITED` orders.
     pub rate_holds: u64,
     /// `subscribed` replies naming one of [`CHANNELS`], repeats included.
     pub subscribed: u64,
     /// `unsubscribed` replies naming one of [`CHANNELS`]; each ended its epoch.
     pub unsubscribed: u64,
-    /// Private state frames inspected, valid or not; each ended its epoch, but in the probe.
+    /// Private state frames inspected or decoded, valid or not; recording-only, each ended its
+    /// epoch.
     pub private_state: u64,
+    /// `order_response` frames, in a probe mode, whose status it does not map (decision 0132
+    /// item 8); each was a decode error with the epoch open.
+    pub unmapped_statuses: u64,
+    /// Order, fill and position frames, in a probe mode, on a symbol the spec table does not
+    /// hold: each pushed nothing (decision 0147 item 2).
+    pub unheld: u64,
+    /// Pages of open orders and of trades, in a probe mode, that no read of the codec asked
+    /// for: each was inspected and pushed nothing.
+    pub pages_unasked: u64,
+    /// Cancels accepted, each by a `CANCELLED` `order_response` naming its order (decision
+    /// 0132 item 8).
+    pub cancels_accepted: u64,
+    /// Cancels rejected, each by a `NO_SUCH_ORDER` `order_response` naming its order (decision
+    /// 0132 item 8).
+    pub cancels_not_found: u64,
+    /// `CANCELLED` and `NO_SUCH_ORDER` frames naming an order more than one request in flight
+    /// names, a cancel or a query: each settled nothing (decision 0132 item 8).
+    pub replies_naming_several: u64,
     /// Frames refused as not a JSON object, a repeated member, or two envelopes at once.
     pub undecodable: u64,
+    /// Resyncs that pushed their `ResyncEnd` (decision 0132 item 5).
+    pub resyncs: u64,
+    /// Resyncs whose epoch ended before their `ResyncEnd`, by the codec or the connection.
+    pub resyncs_unfinished: u64,
+    /// Full `get_user_orders` pages a resync read.
+    pub full_pages: u64,
+    /// Order rows and trade rows a resync's pages listed again, by `order_id` or `trade_id`.
+    pub duplicate_rows: u64,
+    /// Trade rows a resync read for an order this codec did not place: none was pushed.
+    pub unplaced_trades: u64,
+    /// Order rows and positions a resync read on a symbol the spec table does not hold: none
+    /// was pushed (decision 0147 item 2).
+    pub unheld_rows: u64,
 }
 
 impl QfexExecCounts {
@@ -175,6 +245,16 @@ enum Phase {
 /// Every channel confirmed.
 const ALL_CONFIRMED: u8 = (1 << CHANNELS.len()) - 1;
 
+/// What a request in flight on the current epoch was sent as: the arm, a place, or a cancel or
+/// a query naming the venue's order id.
+#[derive(Clone, Debug)]
+enum Sent {
+    Arm,
+    Place,
+    Cancel(VenueOrderId),
+    Query(VenueOrderId),
+}
+
 /// The order-entry codec for one QFEX account's trade WebSocket, recording-only or in a probe
 /// mode.
 pub struct QfexExec {
@@ -186,25 +266,54 @@ pub struct QfexExec {
     phase: Phase,
     /// How many times a stream opened: the current epoch's number.
     opens: u32,
-    /// The request the current epoch's arm was encoded as, once it was.
+    /// The request the current epoch's arm was encoded as, once it was. It stays set once the
+    /// arm is answered, so a later arm on the epoch is still refused and the arm's echo is still
+    /// kept as its own.
     ///
     /// Both this and `in_flight` are set when a request is encoded, which is the last the codec
-    /// hears of it before its deadline: a session that then finds no room in its buckets
-    /// (`ExecSession`'s charge after `encode`) writes nothing and tells the codec nothing. A
-    /// request refused there stays in `in_flight` until the epoch ends, which only closes the
-    /// arm's window early (decision 0132 item 3), the cautious side. An arm refused there
-    /// leaves `armed` set, so the frames that arrive before the epoch ends are journaled under
-    /// the arm's rules though no arm was written; the session fails that epoch at once (its
-    /// gate's `arm_not_sent`), so this lasts only until it closes. The session journals each
-    /// encode's context before that charge, so a replay that re-runs the journaled encodes
-    /// redacts alike. A runtime callback for an encoded request left unwritten would make both
-    /// exact.
+    /// hears of it before its deadline or its answer: a session that then finds no room in its
+    /// buckets (`ExecSession`'s charge after `encode`) writes nothing and tells the codec
+    /// nothing. A request refused there stays in `in_flight` until the epoch ends, which only
+    /// closes the arm's window early (decision 0132 item 3), the cautious side. An arm refused
+    /// there leaves `armed` set, so the frames that arrive before the epoch ends are journaled
+    /// under the arm's rules though no arm was written, and an ack echoing it would answer an
+    /// arm the session never sent; the session fails that epoch at once (its gate's
+    /// `arm_not_sent`, which then reads no answer), so this lasts only until it closes. The
+    /// session journals each encode's context before that charge, so a replay that re-runs the
+    /// journaled encodes redacts and answers alike. A runtime callback for an encoded request
+    /// left unwritten would make both exact.
     armed: Option<RpcId>,
-    /// The requests encoded on the current epoch whose deadline has not fired, in order: no
-    /// reply settles one yet.
-    in_flight: Vec<RpcId>,
+    /// Whether a `RateLimited` err echoed the current epoch's arm: QFEX refused it for rate, so
+    /// nothing answers it after, and it ends `Unknown` at its deadline (decision 0132 item 1).
+    /// It stays in `in_flight` until then, so the arm's window is what it was.
+    arm_rate_refused: bool,
+    /// The requests encoded on the current epoch that neither their deadline nor an answer has
+    /// ended, in order, each with what it was sent as: the arm is answered by its own echo
+    /// (decision 0132 item 1), and a cancel by an `order_response` naming its order while no
+    /// other request in flight names it (item 8). Nothing else settles here.
+    ///
+    /// As `armed` says, a request the session's buckets refused after it was encoded stays here
+    /// until the epoch ends: a `CANCELLED` or `NO_SUCH_ORDER` naming its order would then answer
+    /// a cancel the consumer was told was not sent (fbc-oms reads that answer as changing
+    /// nothing), and a second cancel of that order would leave each unsettled until its
+    /// deadline. A runtime callback for an encoded request left unwritten would make it exact.
+    in_flight: Vec<(RpcId, Sent)>,
     counts: QfexExecCounts,
     last: Option<PrivateState>,
+    /// The REST origin the probe's guard admitted, without a trailing `/`; empty for the
+    /// recording-only codec, which reads nothing over REST.
+    rest: String,
+    /// The orders this codec placed and has not seen end, across its epochs (decision 0132
+    /// item 5): each leaves on an order update showing it ended. As `armed` says, a place the
+    /// session's buckets refused after it was encoded is recorded all the same; it only moves
+    /// the trades read's start time earlier, the cautious side.
+    placed: Vec<resync::Placed>,
+    /// The latest `fill_response` time this codec decoded, in whole Unix seconds.
+    latest_fill_secs: Option<u64>,
+    /// The resync in flight on the current epoch.
+    resync: Option<resync::Resync>,
+    /// What the last resync showed, finished or not.
+    last_resync: Option<ResyncEvidence>,
 }
 
 impl QfexExec {
@@ -212,19 +321,42 @@ impl QfexExec {
     /// awaiting its reply for `rpc_timeout`, the consumer's request deadline. It refuses the
     /// cancel-on-disconnect arm, and the factory never builds it.
     pub fn new(auth: TradeAuth, rpc_timeout: Duration) -> QfexExec {
-        QfexExec::with(auth, rpc_timeout, None)
+        QfexExec::with(auth, rpc_timeout, None, String::new())
     }
 
-    /// The codec in a probe mode (decision 0132 item 6, decision 0143 item 2), alike in both but
-    /// for `production_probe`'s refusal of every place, batch place and amend (decision 0145),
-    /// for the account `auth` authenticates as, under the settings `probe` the mode's guard
-    /// admitted ([`crate::probe::mode`]): each command it sends, its one arm per epoch included,
-    /// awaits its reply for `qfex.exec.rpc_timeout`.
-    pub fn probe(auth: TradeAuth, probe: Probe) -> QfexExec {
-        QfexExec::with(auth, probe.rpc_timeout(), Some(probe))
+    /// The codec in the probe mode `cfg` sets (decision 0132 item 6, decision 0143 item 2),
+    /// alike in both but for `production_probe`'s refusal of every place, batch place and amend
+    /// (decision 0145), for the account `auth` authenticates as: each command it sends, its one
+    /// arm per epoch included, awaits its reply for `qfex.exec.rpc_timeout`. Its settings are
+    /// those the mode's guard admitted ([`crate::probe::mode`]), and its resync reads positions
+    /// from the REST origin that same guard admitted ([`crate::probe::connections`]), so the
+    /// signed read never leaves the environment the mode names. Refused, naming the key and
+    /// never a value, when `qfex.exec.mode` is absent, for everything `probe::connections`
+    /// refuses, and when `auth` was built for another account key than `cfg` binds, or for the
+    /// primary account where `cfg` selects a subaccount or the other way round.
+    pub fn probe(auth: TradeAuth, cfg: &VenueConfig) -> Result<QfexExec, ConfigError> {
+        let probe = crate::probe::mode(cfg)?.ok_or(ConfigError::Missing(KEY_EXEC_MODE))?;
+        let connections = crate::probe::connections(cfg)?;
+        let subaccount = matches!(
+            crate::auth::account_selection(cfg)?,
+            crate::auth::AccountSelection::Subaccount(_)
+        );
+        if auth.account() != connections.account || auth.is_subaccount() != subaccount {
+            return Err(ConfigError::Invalid {
+                key: crate::auth::ACCOUNT_KEY,
+                reason: "the trade handle was built for another account",
+            });
+        }
+        let rest = connections.rest.to_owned();
+        Ok(QfexExec::with(auth, probe.rpc_timeout(), Some(probe), rest))
     }
 
-    fn with(auth: TradeAuth, rpc_timeout: Duration, probe: Option<Probe>) -> QfexExec {
+    fn with(
+        auth: TradeAuth,
+        rpc_timeout: Duration,
+        probe: Option<Probe>,
+        rest: String,
+    ) -> QfexExec {
         QfexExec {
             auth,
             rpc_timeout,
@@ -232,9 +364,15 @@ impl QfexExec {
             phase: Phase::Closed,
             opens: 0,
             armed: None,
+            arm_rate_refused: false,
             in_flight: Vec::new(),
             counts: QfexExecCounts::default(),
             last: None,
+            rest,
+            placed: Vec::new(),
+            latest_fill_secs: None,
+            resync: None,
+            last_resync: None,
         }
     }
 
@@ -248,10 +386,16 @@ impl QfexExec {
         self.counts
     }
 
-    /// The last private state frame it read whole, before that frame ended its epoch: what a
-    /// later ticket normalizes, for the tests and the probe meanwhile.
+    /// The last private state frame the recording-only codec read whole, before that frame
+    /// ended its epoch; a probe codec decodes its frames instead, and leaves this `None`.
     pub fn last_private(&self) -> Option<&PrivateState> {
         self.last.as_ref()
+    }
+
+    /// What the last resync showed, whether it pushed its `ResyncEnd` or its epoch ended first:
+    /// decision 0132 item 5's evidence for the probe.
+    pub fn last_resync(&self) -> Option<&ResyncEvidence> {
+        self.last_resync.as_ref()
     }
 
     /// The current epoch's authentication deadline.
@@ -266,15 +410,18 @@ impl QfexExec {
         let account = self.auth.inbound_spans(Inbound::Frame(frame));
         match (self.armed, frame) {
             (Some(arm), RawFrame::Text(text)) if rate::can_echo(frame.bytes()) => {
-                echo::armed_spans(text, account.body(), self.in_flight == [arm])
+                let only = matches!(self.in_flight.as_slice(), [(rpc, Sent::Arm)] if *rpc == arm)
+                    && !self.resync_reading();
+                echo::armed_spans(text, account.body(), only)
             }
             _ => frame_spans(account.body(), frame),
         }
     }
 
-    /// Asks to end the epoch, and reads nothing more of it.
+    /// Asks to end the epoch, and reads nothing more of it: a resync in flight ends unfinished.
     fn end(&mut self, fx: &mut Effects, reason: &'static str) {
         self.phase = Phase::Closed;
+        self.drop_resync();
         fx.push(Effect::Reconnect {
             stream: TRADE,
             reason,
@@ -315,7 +462,101 @@ impl QfexExec {
         Ok(order::Request {
             frame: ARM.as_bytes().to_vec(),
             charge: RateCharge::one(OpKind::Control, None),
+            target: None,
         })
+    }
+
+    /// The epoch's arm, when `top`, the frame as the journal keeps it, is the arm's own echo
+    /// (`echo::arm_echo`) and the arm is still in flight on this authenticated epoch: neither
+    /// answered, refused for rate nor past its deadline (decision 0132 item 1). Decided on the
+    /// kept bytes, so replay answers the arm where live did.
+    fn arm_echoed(&self, top: &[Member<'_>]) -> Option<RpcId> {
+        let rpc = self.armed.filter(|_| !self.arm_rate_refused)?;
+        let in_flight = self
+            .in_flight
+            .iter()
+            .any(|(sent, what)| *sent == rpc && matches!(what, Sent::Arm));
+        (self.phase == Phase::Authenticated && in_flight && echo::arm_echo(top).is_some())
+            .then_some(rpc)
+    }
+
+    /// Answers the request `rpc`, once: the runtime clears its deadline on the answer
+    /// (`ExecEvent::answers`), so it leaves `in_flight` here.
+    fn answer(
+        &mut self,
+        rpc: RpcId,
+        item: Option<ItemRef>,
+        outcome: SubmitOutcome,
+        sink: &mut dyn ExecSink,
+    ) {
+        self.in_flight.retain(|(sent, _)| *sent != rpc);
+        sink.push(VenueMeta::NONE, ExecEvent::Outcome { rpc, item, outcome });
+    }
+
+    /// Settles the cancel in flight naming `order` with `outcome`, when it is the one request
+    /// in flight that names the order (decision 0132 item 8): the venue's order id compared
+    /// exactly, nothing matched by arrival order. A reply naming an order that more than one
+    /// request in flight names, a cancel and a query of it included, settles nothing and is
+    /// counted; one naming only a query, or nothing in flight, settles nothing. Whether it
+    /// settled.
+    fn settle_cancel(
+        &mut self,
+        order: &VenueOrderId,
+        outcome: SubmitOutcome,
+        sink: &mut dyn ExecSink,
+    ) -> bool {
+        let naming: Vec<(RpcId, bool)> = self
+            .in_flight
+            .iter()
+            .filter_map(|(rpc, sent)| match sent {
+                Sent::Cancel(vid) if vid == order => Some((*rpc, true)),
+                Sent::Query(vid) if vid == order => Some((*rpc, false)),
+                _ => None,
+            })
+            .collect();
+        match naming.as_slice() {
+            [(rpc, true)] => {
+                let item = ItemRef {
+                    idx: 0,
+                    cid: None,
+                    vid: Some(order.clone()),
+                };
+                self.answer(*rpc, Some(item), outcome, sink);
+                true
+            }
+            [_, _, ..] => {
+                self.counts.replies_naming_several += 1;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// An err: the arm's rejection when it echoes the arm in flight (`arm`) with a code other
+    /// than `RateLimited` (decision 0132 item 1, as 0147 item 1 reads 0134 item 5), decided
+    /// before the err is read as every err is, which may end the epoch. The rejection carries
+    /// the documented code alone: the message is a span (0132 item 3), which the codec reads
+    /// as absent (0134 item 5). A `RateLimited` one settles nothing, and leaves the arm to fail
+    /// at its deadline (0132 item 1): no later echo answers it.
+    fn on_err_frame(
+        &mut self,
+        err: echo::Err<'_>,
+        arm: Option<RpcId>,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) {
+        if arm.is_some() && err.code == Some(ErrCode::RateLimited) {
+            self.arm_rate_refused = true;
+        } else if let Some(rpc) = arm {
+            self.counts.arm_rejected += 1;
+            let reject = Reject {
+                kind: RejectKind::Other,
+                venue_code: err.code.map(|code| code.wire().into()),
+                raw: Arc::from(""),
+            };
+            self.answer(rpc, None, SubmitOutcome::Rejected(reject), sink);
+        }
+        self.on_err(err, fx);
     }
 
     fn on_err(&mut self, err: echo::Err<'_>, fx: &mut Effects) {
@@ -384,6 +625,7 @@ impl QfexExec {
         &mut self,
         top: &[Member<'_>],
         scope: &DecodeScope<'_>,
+        specs: &SpecTable,
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
@@ -413,19 +655,103 @@ impl QfexExec {
             self.hold(None, None, fx);
             return Ok(());
         }
+        if self.probe.is_some() {
+            if let Some(read) = self.on_resync_page(top, scope, specs, sink, fx) {
+                return read;
+            }
+            return self.on_decoded(top, scope, specs, sink, fx);
+        }
         let Some(read) = private::inspect(top, scope) else {
             self.end(fx, "an unrecognised QFEX trade frame");
             return Err(DecodeError::Malformed("unrecognised QFEX trade frame"));
         };
         self.counts.private_state += 1;
-        // The probe keeps its epoch open on what stage one brings: a position snapshot on
-        // subscribing, an order the arm cancels (decision 0132 items 1 and 7).
-        if self.probe.is_none() {
-            self.end(fx, "QFEX private state is not normalized yet");
-        }
+        // Recording-only, private state is not normalized, and ends the epoch (FBC-zeb0).
+        self.end(fx, "QFEX private state is not normalized yet");
         let state = read.map_err(|_| DecodeError::Malformed("invalid QFEX private state"))?;
         self.last = Some(state);
         Ok(())
+    }
+
+    /// A private state frame in a probe mode (FBC-jxau, decision 0132 items 5 and 8, decision
+    /// 0143 item 4), decoded into its events with the epoch kept open: a frame not as
+    /// documented is a decode error, and only one the codec does not recognise ends the epoch.
+    /// A `CANCELLED` order settles the cancel naming it before its update is pushed, and a
+    /// `NO_SUCH_ORDER` settles it and is no update; nothing settles a place, which ends
+    /// `Unknown` at its deadline (item 8).
+    fn on_decoded(
+        &mut self,
+        top: &[Member<'_>],
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
+    ) -> Result<(), DecodeError> {
+        let Some(read) = private::decode(top, scope, specs) else {
+            self.end(fx, "an unrecognised QFEX trade frame");
+            return Err(DecodeError::Malformed("unrecognised QFEX trade frame"));
+        };
+        self.counts.private_state += 1;
+        let decoded = match read {
+            Ok(decoded) => decoded,
+            Err(Misread::Status) => {
+                self.counts.unmapped_statuses += 1;
+                return Err(DecodeError::Malformed("unmapped QFEX order status"));
+            }
+            Err(Misread::Shape) => {
+                return Err(DecodeError::Malformed("invalid QFEX private state"));
+            }
+        };
+        match decoded {
+            Decoded::Order { update, status } => {
+                self.track_update(&update);
+                if status == Status::Cancelled
+                    && let Some(vid) = update.vid.clone()
+                    && self.settle_cancel(&vid, accepted(), sink)
+                {
+                    self.counts.cancels_accepted += 1;
+                }
+                sink.push(VenueMeta::NONE, ExecEvent::Order(update));
+            }
+            Decoded::NoSuchOrder(vid) => {
+                let reject = Reject {
+                    kind: RejectKind::NotFound,
+                    venue_code: Some("NO_SUCH_ORDER".into()),
+                    raw: Arc::from("NO_SUCH_ORDER"),
+                };
+                if self.settle_cancel(&vid, SubmitOutcome::Rejected(reject), sink) {
+                    self.counts.cancels_not_found += 1;
+                }
+            }
+            Decoded::Fill { fill, secs } => {
+                self.latest_fill_secs = self.latest_fill_secs.max(Some(secs));
+                sink.push(VenueMeta::NONE, ExecEvent::Fill(fill));
+            }
+            Decoded::Position {
+                inst,
+                qty,
+                avg_entry,
+            } => sink.push(
+                VenueMeta::NONE,
+                ExecEvent::Position {
+                    inst,
+                    qty,
+                    avg_entry,
+                },
+            ),
+            Decoded::Page => self.counts.pages_unasked += 1,
+            Decoded::Unheld => self.counts.unheld += 1,
+        }
+        Ok(())
+    }
+}
+
+/// A request accepted at `AckLevel::Final`: the arm by its ack, a cancel by a `CANCELLED`
+/// naming its order. Final, since fbc-oms ends a tombstone order only on a cancel accepted at
+/// Final (decision 0132 items 1 and 8).
+fn accepted() -> SubmitOutcome {
+    SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
     }
 }
 
@@ -494,6 +820,7 @@ impl ExecCodec for QfexExec {
     fn nonces_for(&self, call: CtxCall) -> u16 {
         match call {
             CtxCall::Open(TRADE) => TradeAuth::NONCES,
+            CtxCall::Resync if self.probe.is_some() => TradeAuth::REST_NONCES,
             _ => 0,
         }
     }
@@ -501,8 +828,11 @@ impl ExecCodec for QfexExec {
     fn on_open(&mut self, stream: StreamId, ctx: &EncodeCtx, fx: &mut Effects) {
         self.opens = self.opens.wrapping_add(1);
         self.phase = Phase::Closed;
-        // A new connection: nothing sent on it, and no arm (QFEX's flag is per connection).
+        // A new connection: nothing sent on it, no arm (QFEX's flag is per connection), and no
+        // resync; the orders placed and the latest fill time span epochs.
+        self.drop_resync();
         self.armed = None;
+        self.arm_rate_refused = false;
         self.in_flight.clear();
         if stream != TRADE {
             return;
@@ -534,7 +864,7 @@ impl ExecCodec for QfexExec {
         cmd: &VenueCommand,
         rpc: RpcId,
         specs: &SpecTable,
-        _ctx: &EncodeCtx,
+        ctx: &EncodeCtx,
         _t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
@@ -550,10 +880,21 @@ impl ExecCodec for QfexExec {
         if self.phase != Phase::Authenticated {
             return Err(NotSentReason::Disconnected);
         }
-        if matches!(cmd, VenueCommand::ArmCancelOnDisconnect(_)) {
-            self.armed = Some(rpc);
+        // One reply of a kind in flight: a query answers in the resync's pages' frame.
+        if matches!(cmd, VenueCommand::Query(_)) && self.orders_paging() {
+            return Err(NotSentReason::Backpressure);
         }
-        self.in_flight.push(rpc);
+        self.record_place(cmd, ctx);
+        let sent = match (cmd, request.target) {
+            (VenueCommand::ArmCancelOnDisconnect(_), _) => {
+                self.armed = Some(rpc);
+                Sent::Arm
+            }
+            (VenueCommand::Cancel(_), Some(vid)) => Sent::Cancel(vid),
+            (VenueCommand::Query(_), Some(vid)) => Sent::Query(vid),
+            _ => Sent::Place,
+        };
+        self.in_flight.push((rpc, sent));
         fx.push(Effect::Send {
             stream: TRADE,
             frame: WireSlice::plain(request.frame),
@@ -572,7 +913,7 @@ impl ExecCodec for QfexExec {
         stream: StreamId,
         frame: RawFrame<'_>,
         scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
+        specs: &SpecTable,
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
@@ -591,14 +932,20 @@ impl ExecCodec for QfexExec {
         if root.repeats() {
             return self.undecodable(fx, "QFEX trade frame repeats a member");
         }
+        // Whether the frame is the arm's own echo, the arm in flight (decision 0132 item 1).
+        let arm = self.arm_echoed(top);
         match echo::envelope(top) {
             Envelope::Ambiguous => self.undecodable(fx, "QFEX trade frame is two envelopes"),
             Envelope::FlatErr(body) | Envelope::NestedErr(body) => {
-                self.on_err(echo::err(body), fx);
+                self.on_err_frame(echo::err(body), arm, sink, fx);
                 Ok(())
             }
             Envelope::Ack(_) => {
                 self.counts.acks += 1;
+                if let Some(rpc) = arm {
+                    self.counts.arm_accepted += 1;
+                    self.answer(rpc, None, accepted(), sink);
+                }
                 Ok(())
             }
             Envelope::Other => match self.phase {
@@ -607,7 +954,7 @@ impl ExecCodec for QfexExec {
                     Ok(())
                 }
                 Phase::Subscribing(_) | Phase::Authenticated => {
-                    self.on_private(top, scope, sink, fx)
+                    self.on_private(top, scope, specs, sink, fx)
                 }
                 Phase::Closed => {
                     self.end(fx, "a QFEX trade frame after the epoch ended");
@@ -617,24 +964,23 @@ impl ExecCodec for QfexExec {
         }
     }
 
+    /// The resync's positions read (`resync.rs`); every other answer is refused.
     fn on_http(
         &mut self,
-        _tag: HttpTag,
-        _resp: Result<HttpResponse<'_>, HttpFailure>,
-        _scope: &DecodeScope<'_>,
-        _specs: &SpecTable,
-        _sink: &mut dyn ExecSink,
-        _fx: &mut Effects,
+        tag: HttpTag,
+        resp: Result<HttpResponse<'_>, HttpFailure>,
+        scope: &DecodeScope<'_>,
+        specs: &SpecTable,
+        sink: &mut dyn ExecSink,
+        fx: &mut Effects,
     ) -> Result<(), DecodeError> {
-        Err(DecodeError::Malformed(
-            "unexpected QFEX private HTTP response",
-        ))
+        self.on_positions(tag, resp, scope, specs, sink, fx)
     }
 
     /// QFEX's authentication deadline, which runs from the opening until the last subscription
-    /// is confirmed: past it, the epoch ends.
+    /// is confirmed, and the resync's own: past either, the epoch ends.
     fn on_timer(&mut self, tag: TimerTag, _ctx: &EncodeCtx, fx: &mut Effects) {
-        if tag != self.deadline() {
+        if self.on_resync_timer(tag, fx) || tag != self.deadline() {
             return;
         }
         match self.phase {
@@ -646,10 +992,10 @@ impl ExecCodec for QfexExec {
         }
     }
 
-    /// Every sent command ends `Unknown` at its deadline, the probe's arm included: no reply
-    /// settles one.
+    /// A sent command no reply answered ends `Unknown` at its deadline: every place, and the
+    /// probe's arm and cancels when nothing answered them.
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
-        self.in_flight.retain(|sent| *sent != rpc);
+        self.in_flight.retain(|(sent, _)| *sent != rpc);
         sink.push(
             VenueMeta::NONE,
             ExecEvent::Outcome {
@@ -660,20 +1006,22 @@ impl ExecCodec for QfexExec {
         );
     }
 
-    /// No resync can be read yet, and a session must never believe one was. Recording-only,
-    /// the epoch ends. In the probe it asks for nothing and pushes no `ResyncBegin` or
-    /// `ResyncEnd`, so the session places and amends nothing on the epoch (decision 0058)
-    /// while it stays open for whatever answers the arm, until FBC-jxau lands decision 0132
-    /// item 5's resync and its own deadline.
-    fn resync(&mut self, _ctx: &EncodeCtx, fx: &mut Effects) {
-        if self.probe.is_none() {
-            self.end(fx, "QFEX resync is not implemented: recording only");
-        }
+    /// In a probe mode, decision 0132 item 5's resync (`resync.rs`): its positions read, signed
+    /// with the two nonces `nonces_for` asks, its first page and its own deadline. Recording-only,
+    /// the epoch ends, since a session must never believe it resynced.
+    fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
+        self.start_resync(ctx, fx);
     }
 
+    /// A frame's spans as [`QfexExec`]'s `spans` gives them; an HTTP answer's, the account's
+    /// (`TradeAuth::inbound_spans`, the positions' `balance` values among them), or its whole
+    /// body for a status outside 2xx, which nothing decodes.
     fn redact_inbound(&self, input: Inbound<'_>) -> InboundSpans {
         match input {
             Inbound::Frame(frame) => InboundSpans::frame(self.spans(frame)),
+            Inbound::Http(_, resp) if !account_reads::success(resp.status) => {
+                InboundSpans::response(Vec::new(), account_reads::whole(resp.body))
+            }
             Inbound::Http(..) => self.auth.inbound_spans(input),
         }
     }

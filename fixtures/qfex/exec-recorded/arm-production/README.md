@@ -13,7 +13,7 @@ Both sessions authenticated, had their three subscriptions (`order_responses`, `
 - **primary:** the ack is `primary-016-in-window.json`, the last of the window's 12 frames. The 11 before it are `position_response` frames, one for each of the account's 11 position rows, all flat. The probe's REST read before the session counted 11 rows as well.
 - **subaccount:** the ack is `subaccount-005-in-window.json`, the window's only frame. The subaccount has no position row.
 
-Each session still reported the arm's outcome as `Unknown`. Stage one's codec settles no reply (`on_rpc_timeout` in crates/venues/fbc-venue-qfex/src/exec/mod.rs), so every arm ends `Unknown` at its deadline, 10 s in this run, whatever answered it. That deadline ended each session, so no `after-window` frame was written. FBC-jxau decodes the ack from these files (decision 0132 item 1, decision 0143 item 4).
+Each session still reported the arm's outcome as `Unknown`. At the time of this run, before FBC-jxau, stage one's codec settled no reply (`on_rpc_timeout` in crates/venues/fbc-venue-qfex/src/exec/mod.rs), so every arm ended `Unknown` at its deadline, 10 s in this run, whatever answered it. That deadline ended each session, so no `after-window` frame was written. FBC-jxau decodes the ack from these files (decision 0132 item 1, decision 0143 item 4).
 
 `report.md` beside these files is the run's report, committed as the probe wrote it at the owner's choice (FBC-291a). It says "Result: complete", its journal's sink dropped no record, and no session's capture was partial. The run's `evidence.json` and journal stay with the owner.
 

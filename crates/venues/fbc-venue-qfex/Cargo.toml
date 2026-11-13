@@ -1,6 +1,6 @@
 [package]
 name = "fbc-venue-qfex"
-description = "QFEX public market-data adapter, the trade socket's offline HMAC signer and authentication, and its trade-socket codec with an offline order encoder; order entry and the probe's own account reads only under a host-guarded probe mode (pre-production or production)."
+description = "QFEX public market-data adapter, the trade socket's offline HMAC signer and authentication, and its trade-socket codec with an offline order encoder; order entry, the arm's answer, the resync, cancel settlement and the probe's own account reads only under a host-guarded probe mode (pre-production or production)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -29,6 +29,10 @@ fbc-conformance = { path = "../../fbc-conformance" }
 # (decisions 0006 and 0028), and tests/liveness.rs runs fbc-runtime's order-entry session and
 # reads its journal (FBC-39ks). scripts/check-deps.sh does not count dev-dependencies.
 fbc-journal = { path = "../../fbc-journal" }
+# tests/probe_resync.rs hands the probe's resync to fbc-oms's registry, which seeds no position
+# from an untrustworthy snapshot (FBC-jxau, decision 0132 item 5). scripts/check-deps.sh does not
+# count dev-dependencies.
+fbc-oms = { path = "../../fbc-oms" }
 fbc-runtime = { path = "../../fbc-runtime" }
 # The tests' runtime; tests/liveness.rs runs on a paused clock (test-util).
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }

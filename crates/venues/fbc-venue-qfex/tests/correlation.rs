@@ -4,8 +4,11 @@
 //! compiled only where this test included it by path. It is test code here, and nothing in the
 //! crate uses it, for two reasons:
 //!
-//! - No reply settles a request: each sent command ends `Unknown` at its deadline (FBC-blcw,
-//!   decisions 0005 and 0132), so a correlation candidate decides nothing yet.
+//! - The recording-only codec settles no request: each sent command ends `Unknown` at its
+//!   deadline (FBC-blcw, decisions 0005 and 0132). The probe codec settles only the arm, by its
+//!   own echo, and a cancel, by the `order_response` naming its order (FBC-jxau, decision 0132
+//!   items 1 and 8; `tests/probe_settle.rs`), and every place still ends `Unknown`, so a
+//!   correlation candidate decides nothing yet.
 //! - Its command-echo evidence reads an echo's `params`, which the journal keeps only as spans
 //!   (decision 0134 item 4). The codec may decide only from bytes the journal keeps in clear
 //!   (item 5), and the last test here shows a candidate found live is gone from the journaled

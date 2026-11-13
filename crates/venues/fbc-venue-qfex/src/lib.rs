@@ -1,7 +1,8 @@
 //! QFEX public market data and instrument discovery, with the trade socket's offline HMAC
 //! signer and authentication (`sign` and `auth`, review paths, decision 0009) and its
 //! order-entry codec ([`exec::QfexExec`]: authentication, private subscriptions, rate feedback,
-//! inspected private state and the offline v1 order encoder, whose commands no reply settles).
+//! the private state, the offline v1 order encoder and, under a probe mode, the arm's answer,
+//! decision 0132 item 5's resync and item 8's cancel settlement; FBC-jxau).
 //!
 //! Order entry is off unless the configuration sets a probe mode ([`probe`]): decision 0132
 //! item 6's `preprod_probe`, or decision 0143 item 2's `production_probe`, each for the
@@ -10,7 +11,11 @@
 //! whose guard admits only the origins of the environment it names or loopback stubs, the
 //! factory declares the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade
 //! socket and builds the codec in its probe mode, which under `production_probe` refuses every
-//! place, batch place and amend unsent (decision 0145). Readiness stays `Record` in every mode,
+//! place, batch place and amend unsent (decision 0145). In either probe mode the codec decodes
+//! the private state into events, answers the cancel-on-disconnect arm from its own echo, settles
+//! a cancel by the `order_response` naming its order, and resyncs over a signed
+//! `GET /user/positions` and the trade socket's own pages, while every place ends `Unknown` at
+//! its deadline (decisions 0132, 0143 item 4 and 0147). Readiness stays `Record` in every mode,
 //! and a configuration with no probe mode stays `exec: None`. Under a probe mode alone,
 //! [`account_reads`] builds and decodes the probe's own account reads (decision 0132 item 7):
 //! each account's positions and its open orders on a trade socket of its own, and the account
@@ -248,15 +253,17 @@ impl VenueFactory for Qfex {
         cfg: &VenueConfig,
         creds: Secrets,
     ) -> Option<Result<Box<dyn ExecCodec>, VenueError>> {
-        let probe = match probe::mode(cfg) {
-            Ok(None) => return None,
-            Ok(Some(probe)) => probe,
-            Err(err) => return Some(Err(err.into())),
-        };
-        Some(
-            auth::TradeAuth::new(cfg, creds)
-                .map(|auth| Box::new(exec::QfexExec::probe(auth, probe)) as Box<dyn ExecCodec>),
-        )
+        match probe::mode(cfg) {
+            Ok(None) => None,
+            // The codec reads its settings and the REST origin of its resync's positions read
+            // from the configuration the guard admitted.
+            Ok(Some(_)) => Some(
+                auth::TradeAuth::new(cfg, creds)
+                    .and_then(|auth| Ok(exec::QfexExec::probe(auth, cfg)?))
+                    .map(|codec| Box::new(codec) as Box<dyn ExecCodec>),
+            ),
+            Err(err) => Some(Err(err.into())),
+        }
     }
 
     fn test_connection(
