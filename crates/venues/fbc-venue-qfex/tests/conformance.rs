@@ -8,6 +8,10 @@
 //! authentication and subscription replies as its bootstrap, so each codec the check builds is
 //! authenticated before it encodes, and venue order ids written as UUIDs, the only form QFEX's
 //! encoder names an order by. Every key, account, id and frame here is synthetic.
+//!
+//! FBC-5d7x (decision 0145 item 3): on a `production_probe` configuration, whose codec refuses
+//! every place, batch place and amend unsent, `caps_truthful` breaches exactly the placement
+//! checks that refusal accounts for, and nothing else.
 
 use fbc_conformance::suite::{self, BootReply, Bootstrap, Setup, Subject, Verdict};
 use fbc_core::{
@@ -18,7 +22,8 @@ use fbc_core::{
 use fbc_venue_qfex::exec::{CHANNELS, TRADE};
 use fbc_venue_qfex::probe::{
     KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, PREPROD_MDS, PREPROD_PROBE,
-    PREPROD_REST, PREPROD_TRADE,
+    PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS, PRODUCTION_PROBE, PRODUCTION_REST,
+    PRODUCTION_TRADE,
 };
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex, auth};
 
@@ -173,4 +178,46 @@ fn without_uuid_venue_order_ids_the_cancel_and_query_controls_fail() {
             "{failure}"
         );
     }
+}
+
+/// The probe on QFEX's production origins, under `production_probe` (decision 0143 item 2).
+fn production() -> Setup {
+    let mut cfg = probe_config();
+    cfg.insert(KEY_EXEC_MODE, PRODUCTION_PROBE);
+    cfg.insert(auth::TRADE_URL, PRODUCTION_TRADE);
+    cfg.insert(KEY_REST_URL, PRODUCTION_REST);
+    cfg.insert(KEY_MDS_URL, PRODUCTION_MDS);
+    Setup { cfg, ..probe() }
+}
+
+/// FBC-5d7x (decision 0145 item 3): under `production_probe` the codec refuses every place its
+/// caps declare, so `caps_truthful` breaches exactly the two checks a sent place answers: the
+/// placement control, and the declared flag conflict, a post-only IOC place that is refused
+/// `Unsupported` before its flags are read. Every other probe passes as under `preprod_probe`:
+/// the arm, the disarm, the cancel and query controls, and every absence, the batch place and
+/// amend among them, refused `Unsupported` as the caps leave them out.
+#[test]
+fn under_production_probe_caps_truthful_breaches_exactly_the_refused_placements() {
+    let subject = Subject::new(&Qfex, FIXTURES, production).unwrap();
+    let failure = suite::caps_truthful(&subject).unwrap_err();
+    let found: Vec<(&str, &str)> = failure
+        .breaches
+        .iter()
+        .map(|b| (b.capability.as_str(), b.what.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "control: a placement",
+                "refused as NotSent(Unsupported) though the caps declare it, so the probes \
+                 beside it prove nothing"
+            ),
+            (
+                "OrderCaps.flag_conflicts has (PostOnly, Ioc)",
+                "refused as NotSent(Unsupported), not NotSent(FlagConflict)"
+            ),
+        ],
+        "{failure}"
+    );
 }

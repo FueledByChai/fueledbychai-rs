@@ -6,7 +6,9 @@
 //!   other value is a configuration error. Absent, the factory declares `exec: None` and builds
 //!   no order-entry codec, as before these modes existed. Readiness stays `Record` in every mode.
 //!   Each mode names its [`Environment`]; it is not the admission of QFEX order entry on
-//!   production (decision 0143 item 5).
+//!   production (decision 0143 item 5). Under [`PRODUCTION_PROBE`], whose environment is
+//!   [`Environment::Production`] on loopback origins too, the codec refuses every place, batch
+//!   place and amend unsent (decision 0145).
 //! - **The guard.** Under a mode, every QFEX origin the configuration names is required and must
 //!   pass it: either each is exactly its origin in the mode's environment, a trailing `/` ignored
 //!   ([`Environment::origins`]: [`PREPROD_TRADE`], [`PREPROD_REST`] and [`PREPROD_MDS`], or
@@ -85,8 +87,9 @@ pub const EXEC_MODE_FIELD: FieldSpec = FieldSpec {
     unit: FieldUnit::Dimensionless,
     doc: "absent (market data only, no order entry); preprod_probe: order entry against \
           QFEX's pre-production origins or a loopback stub only (decision 0132); or \
-          production_probe: the same against QFEX's production origins or a loopback stub \
-          only, for the owner-assisted probe alone (decision 0143)",
+          production_probe: the same, with every place, batch place and amend refused \
+          unsent (decision 0145), against QFEX's production origins or a loopback stub only, \
+          for the owner-assisted probe alone (decision 0143)",
 };
 
 /// The page size's schema entry.

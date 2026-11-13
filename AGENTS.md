@@ -204,8 +204,11 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   and its production ones under `production_probe` (0143 item 2), or all three loopback,
   refusing the other environment's domain; its caps in `src/exec/caps.rs`, alike in both,
   account-wide cancel-on-disconnect offering no disarm, which `caps_truthful` holds it to in
-  `tests/conformance.rs`, 0141; its REST reads' headers from `src/auth`,
-  `TradeAuth::rest_headers`) and the probe's own account reads (`src/account_reads.rs`:
+  `tests/conformance.rs`, 0141; under `production_probe` alone its codec refusing every place,
+  batch place and amend unsent, `NotSent(Unsupported)` before the epoch is read, until a record
+  admits places on production, so `caps_truthful` there breaches exactly the placement checks
+  (FBC-5d7x, 0145, `tests/probe_mode.rs`, `tests/conformance.rs`); its REST reads' headers
+  from `src/auth`, `TradeAuth::rest_headers`) and the probe's own account reads (`src/account_reads.rs`:
   `GET /user/positions` and a `get_user_orders` page after that account's authentication, and
   `GET /user/subaccounts`, which the probe no longer sends (0144), each built only under the guard
   and signed by `src/auth`'s `ReadAuth` for an account and credentials the caller names, and

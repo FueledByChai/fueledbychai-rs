@@ -11,13 +11,16 @@
 //!   the factory builds no order-entry codec (decisions 0117, 0122).
 //! - **The probe** ([`QfexExec::probe`], decision 0132 item 6, FBC-mfey), which the factory
 //!   builds under `preprod_probe` or `production_probe` alone (decision 0143 item 2), its caps
-//!   [`probe_exec_caps`] in both. It encodes one cancel-on-disconnect arm per epoch, and
-//!   refuses unsent every later arm on that epoch and every disarm (item 1), so at most one arm
-//!   is in flight on a connection. No frame answers the arm yet: every arm ends `Unknown` at
-//!   its deadline, and the session ends the epoch (decision 0058). The journal keeps the arm's
-//!   echo and, while the arm is the only request in flight, the shape of every other echo
-//!   (item 3, as 0134 item 7 narrows it; `echo.rs`), so a capture shows whatever answers the
-//!   arm. Its epoch stays open on the
+//!   [`probe_exec_caps`] in both. Under `production_probe` alone, loopback origins included,
+//!   it refuses every place, batch place and amend `NotSent(Unsupported)`, whatever the epoch
+//!   and the order, though its caps declare places, until a record admits places on
+//!   production (FBC-5d7x, decision 0145); in every other way it is alike in both. It encodes
+//!   one cancel-on-disconnect arm per epoch, and refuses unsent every later arm on that epoch
+//!   and every disarm (item 1), so at most one arm is in flight on a connection. No frame
+//!   answers the arm yet: every arm ends `Unknown` at its deadline, and the session ends the
+//!   epoch (decision 0058). The journal keeps the arm's echo and, while the arm is the only
+//!   request in flight, the shape of every other echo (item 3, as 0134 item 7 narrows it;
+//!   `echo.rs`), so a capture shows whatever answers the arm. Its epoch stays open on the
 //!   private state frames stage one brings, which it still inspects and normalizes into
 //!   nothing, and its resync asks for nothing, so the session places nothing (0058) until
 //!   FBC-jxau lands item 5's resync.
@@ -68,6 +71,7 @@
 //!   query by the venue's order UUID, each one frame naming its request with the consumer's
 //!   deadline and labelled with its command's traffic class, sent only on an authenticated
 //!   epoch (`NotSent(Disconnected)` otherwise); everything else is refused unsent (`order.rs`),
+//!   and under `production_probe` every place too, before the epoch is read (decision 0145),
 //!   but the probe's one arm per epoch, [`ARM`], charged as the rate page's 0.1 for
 //!   `cancel_on_disconnect` under `Control`, which charges both buckets since the page names
 //!   none for it.
@@ -101,7 +105,7 @@ use fbc_core::{
 use self::echo::Envelope;
 use self::json::{Kind, Member, Node};
 use crate::auth::TradeAuth;
-use crate::probe::Probe;
+use crate::probe::{Environment, Probe};
 use crate::rate;
 
 pub use self::caps::{RISK_REJECT_WINDOW, probe_exec_caps};
@@ -211,7 +215,8 @@ impl QfexExec {
         QfexExec::with(auth, rpc_timeout, None)
     }
 
-    /// The codec in a probe mode (decision 0132 item 6, decision 0143 item 2), alike in both,
+    /// The codec in a probe mode (decision 0132 item 6, decision 0143 item 2), alike in both but
+    /// for `production_probe`'s refusal of every place, batch place and amend (decision 0145),
     /// for the account `auth` authenticates as, under the settings `probe` the mode's guard
     /// admitted ([`crate::probe::mode`]): each command it sends, its one arm per epoch included,
     /// awaits its reply for `qfex.exec.rpc_timeout`.
@@ -290,6 +295,14 @@ impl QfexExec {
             charge: op.map(|op| RateCharge::one(op, None)),
             retry_after,
         });
+    }
+
+    /// Whether this codec refuses every place, batch place and amend unsent, whatever the epoch
+    /// and the order: the probe under `production_probe`, loopback origins included, until a
+    /// record admits places on production (FBC-5d7x, decision 0145).
+    fn refuses_places(&self) -> bool {
+        self.probe
+            .is_some_and(|p| p.environment() == Environment::Production)
     }
 
     /// The request the probe's arm is sent as: `on`, in the probe, on an epoch that has not
@@ -492,7 +505,9 @@ impl ExecCodec for QfexExec {
 
     /// One frame for a command `order.rs` sends, or the probe's one arm per epoch, once the
     /// stream is authenticated; a command it refuses is refused for what it is, whatever the
-    /// epoch. QFEX signs no order and takes no nonce, so the receipt is empty.
+    /// epoch, and under `production_probe` that is every place, batch place and amend, refused
+    /// first, with nothing changed (decision 0145). QFEX signs no order and takes no nonce, so
+    /// the receipt is empty.
     fn encode(
         &mut self,
         cmd: &VenueCommand,
@@ -503,6 +518,11 @@ impl ExecCodec for QfexExec {
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
         let request = match cmd {
+            VenueCommand::Place(_) | VenueCommand::PlaceBatch(_) | VenueCommand::Amend(_)
+                if self.refuses_places() =>
+            {
+                return Err(NotSentReason::Unsupported);
+            }
             VenueCommand::ArmCancelOnDisconnect(on) => self.arm(*on)?,
             _ => order::request(cmd, specs)?,
         };
