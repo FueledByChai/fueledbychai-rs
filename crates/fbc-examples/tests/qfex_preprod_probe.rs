@@ -28,7 +28,10 @@
 //!   sends its authentication and the three subscriptions and nothing after them, answers each
 //!   ping, and ends at its duration, at a server close (its code and time kept, the echo of its
 //!   own close never counted as one) or at the connection's end, a refusal ending it recorded;
-//!   its report and evidence say what it heard and pass scripts/privacy-check.sh.
+//!   its report and evidence say what it heard and pass scripts/privacy-check.sh;
+//! - records in its report and evidence, for each session (FBC-4h1p, decision 0132 item 5), each
+//!   full `get_user_orders` page its resync read, by its page size and offset, read from the
+//!   session's journal, and none for a session whose pages were all short.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -56,6 +59,8 @@ mod ledger;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+#[path = "../examples/qfex_preprod_probe/pages.rs"]
+mod pages;
 #[path = "../examples/qfex_preprod_probe/probe_args.rs"]
 mod probe_args;
 #[path = "../examples/qfex_preprod_probe/refusals.rs"]
@@ -1597,6 +1602,236 @@ async fn a_session_that_never_arms_is_stopped_with_no_second_attempt() {
     assert_eq!(session.ended_by, "--session-wait");
     assert_eq!(session.attempts, 1);
     assert!(session.frames.is_empty());
+}
+
+// ----- The resync's get_user_orders pages (FBC-4h1p) -----
+
+/// A page of one order, `id` its synthetic `order_id`, on a symbol the session's spec table does
+/// not hold, so the codec skips and counts it (decision 0147 item 2).
+fn one_order_page(id: &str) -> String {
+    format!(
+        r#"{{"all_orders_response":{{"orders":[{{"order_id":"{id}","symbol":"AAPL-USD","side":"SELL","type":"LIMIT"}}],"twaps":[]}}}}"#
+    )
+}
+
+/// A page of one TWAP and no order: a TWAP counts toward a page's fullness (decision 0132 item
+/// 5).
+const ONE_TWAP_PAGE: &str = r#"{"all_orders_response":{"orders":[],"twaps":[{"twap_id":"44444444-4444-4444-8444-444444444444"}]}}"#;
+
+/// Connection `conn`, a session at page size 1 whose arm its ack answers and whose resync's
+/// `get_user_orders` pages are each answered in turn by `pages`.
+fn paged_session_socket(conn: usize, pages: &[&str]) -> Vec<Step> {
+    let mut steps = session_socket(conn, &[ARM_ACK]);
+    steps.pop();
+    for page in pages {
+        steps.push(Step::Respond {
+            conn,
+            with: reply(&[page]),
+        });
+    }
+    steps
+}
+
+/// The `get_user_orders` request of page size 1 from `offset`, as the codec writes it.
+fn page_ask(offset: u32) -> String {
+    format!(r#"{{"type":"get_user_orders","params":{{"limit":1,"offset":{offset}}}}}"#)
+}
+
+#[tokio::test]
+async fn each_full_page_a_sessions_resync_reads_is_recorded_with_its_size_and_offset_and_a_short_page_as_none()
+ {
+    let (dir, _removed) = temp_dir("pages");
+    let order = one_order_page("22222222-2222-4222-8222-222222222222");
+    let mut steps = read_socket(0, EMPTY_PAGE);
+    steps.extend(read_socket(1, EMPTY_PAGE));
+    // The primary account's resync at page size 1: an order, a TWAP, then an empty page.
+    steps.extend(paged_session_socket(
+        2,
+        &[&order, ONE_TWAP_PAGE, EMPTY_PAGE],
+    ));
+    steps.extend(read_socket(3, EMPTY_PAGE));
+    steps.extend(read_socket(4, EMPTY_PAGE));
+    // The subaccount's resync: its first page is short, so no page of it is full.
+    steps.extend(paged_session_socket(5, &[EMPTY_PAGE]));
+    let server = StubServer::start(WsScript::new(steps), rest(flat()))
+        .await
+        .unwrap();
+    let mut opts = options(&dir, &server, &[Armed::Primary, Armed::Subaccount]);
+    opts.page_size = 1;
+
+    let (ran, printed) = probe(&opts, &environment()).await;
+    let outcome = ran.unwrap();
+    assert!(outcome.ok, "{printed}\n{:#?}", outcome.evidence);
+    server.finished().await.unwrap();
+
+    // The primary session asked for each page at the next offset, until the short one.
+    let frames = received(&server, 2);
+    assert_eq!(frames[4], ARM);
+    assert_eq!(frames[5..], [page_ask(0), page_ask(1), page_ask(2)]);
+    assert_eq!(received(&server, 5)[5..], [page_ask(0)]);
+
+    let ev = &outcome.evidence;
+    let full = |offsets: &[u32]| -> Vec<pages::Page> {
+        (offsets.iter())
+            .map(|&offset| pages::Page { size: 1, offset })
+            .collect()
+    };
+    let (primary, sub) = (&ev.sessions[0].pages, &ev.sessions[1].pages);
+    assert_eq!((primary.asked, primary.read), (3, 3));
+    assert_eq!(primary.full, full(&[0, 1]));
+    assert_eq!((sub.asked, sub.read), (1, 1));
+    assert!(sub.full.is_empty());
+
+    let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+    let said = |asked: u64, listed: &str| {
+        format!(
+            "- Its resync's `get_user_orders` pages (decision 0132 item 5), as its journal kept \
+             them (a partial capture may miss one): asked {asked}, answered by a page {asked}; \
+             full pages, each by its page size and offset: {listed}\n"
+        )
+    };
+    let primary_said = said(3, "page size 1 at offset 0; page size 1 at offset 1");
+    assert!(report.contains(&primary_said), "{report}");
+    assert!(report.contains(&said(1, "none")), "{report}");
+    let evidence = fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap();
+    let evidence = json(&evidence);
+    assert_eq!(
+        evidence["sessions"][0]["orders_pages"],
+        json(
+            r#"{"asked":3,"read":3,"full_pages":[{"page_size":1,"offset":0},{"page_size":1,"offset":1}]}"#
+        )
+    );
+    assert_eq!(
+        evidence["sessions"][1]["orders_pages"],
+        json(r#"{"asked":1,"read":1,"full_pages":[]}"#)
+    );
+    // No id or amount of a page is kept in the report or the evidence, and both pass the
+    // privacy check.
+    for text in [&report, &evidence.to_string()] {
+        for id in ["22222222-2222", "44444444-4444", "AAPL-USD"] {
+            assert!(!text.contains(id), "{id}");
+        }
+    }
+    assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
+    assert_no_secret(&opts.evidence_dir);
+}
+
+#[tokio::test]
+async fn a_full_page_the_codec_refuses_is_counted_asked_and_not_read() {
+    // Each a full page at page size 1 that the codec refuses on the probe's sessions: an order
+    // row naming no symbol, and a row repeating a member.
+    for (n, refused) in [
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","type":"LIMIT"}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":"X","symbol":"X"}],"twaps":[]}}"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (dir, _removed) = temp_dir(&format!("refused-page-{n}"));
+        let mut steps = read_socket(0, EMPTY_PAGE);
+        steps.extend(read_socket(1, EMPTY_PAGE));
+        steps.extend(paged_session_socket(2, &[refused]));
+        let server = StubServer::start(WsScript::new(steps), rest(flat()))
+            .await
+            .unwrap();
+        let mut opts = options(&dir, &server, &[Armed::Primary]);
+        opts.page_size = 1;
+
+        let (ran, printed) = probe(&opts, &environment()).await;
+        let outcome = ran.unwrap();
+        server.finished().await.unwrap();
+        assert_eq!(received(&server, 2)[5..], [page_ask(0)], "{printed}");
+        let run = &outcome.evidence.sessions[0];
+        assert_eq!(run.decode_errors, 1, "{refused}\n{printed}");
+        assert_eq!((run.pages.asked, run.pages.read), (1, 0), "{refused}");
+        assert!(run.pages.full.is_empty(), "{refused}");
+    }
+}
+
+#[test]
+fn a_page_is_read_as_the_codec_reads_one_and_paired_with_the_ask_it_answers() {
+    // The asks: a get_user_orders request naming its page size and offset, nothing else.
+    let ask = |text: &str| pages::ask(text.as_bytes());
+    assert_eq!(ask(&page_ask(7)), Some(pages::Page { size: 1, offset: 7 }));
+    for not_an_ask in [
+        ARM,
+        r#"{"type":"get_order","params":{"limit":1,"offset":0}}"#,
+        r#"{"type":"get_user_orders","params":{"limit":0,"offset":0}}"#,
+        r#"{"type":"get_user_orders","params":{"limit":65536,"offset":0}}"#,
+        r#"{"type":"get_user_orders","params":{"limit":1,"offset":4294967296}}"#,
+        r#"{"type":"get_user_orders","params":{"offset":0}}"#,
+        r#"{"type":"get_user_orders"}"#,
+        "not json",
+    ] {
+        assert_eq!(ask(not_an_ask), None, "{not_an_ask}");
+    }
+    // The answers: the orders and TWAPs a page lists together, at most its page size, in the
+    // shape the codec reads; any other frame is none.
+    let order = one_order_page("22222222-2222-4222-8222-222222222222");
+    assert_eq!(pages::rows(&order, 1), Some(1));
+    assert_eq!(pages::rows(ONE_TWAP_PAGE, 2), Some(1));
+    assert_eq!(pages::rows(EMPTY_PAGE, 1), Some(0));
+    // A stop order's row, which the resync leaves out unread, needs no symbol; a member name
+    // repeated in another object, or an escaped quote in a string, is no repeat.
+    for page in [
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","type":"TAKE_PROFIT"}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","type":"STOP_LOSS","symbol":""}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":"X"},{"order_id":"b","symbol":"X"}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a\"x","symbol":"X","p":{},"q":[{}]}],"twaps":[]}}"#,
+    ] {
+        assert!(pages::rows(page, 2).is_some_and(|n| n > 0), "{page}");
+    }
+    for not_a_page in [
+        // More than the page size, an undocumented member, a missing array, a row naming no
+        // order_id, a row of another kind than a stop order naming no symbol, an empty one or
+        // one that is no string, a member repeated at the top, in a row or under an escape, a
+        // TWAP that is no object, a second member, another envelope, a frame the journal keeps
+        // whole, and no JSON object at all.
+        order.as_str(),
+        r#"{"all_orders_response":{"orders":[],"twaps":[],"stop_orders":[]}}"#,
+        r#"{"all_orders_response":{"orders":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":7}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a"}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","type":"LIMIT"}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":""}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":7}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[],"twaps":[]},"all_orders_response":{"orders":[],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":"X","symbol":"X"}],"twaps":[]}}"#,
+        r#"{"all_orders_response":{"orders":[],"twaps":[{"a":1,"\u0061":2}]}}"#,
+        r#"{"all_orders_response":{"orders":[],"twaps":[7]}}"#,
+        r#"{"all_orders_response":{"orders":[],"twaps":[]},"type":"x"}"#,
+        r#"{"all_orders_response":[]}"#,
+        ARM_ACK,
+        "2222222222",
+        "[]",
+    ] {
+        let size = if not_a_page == order { 0 } else { 1 };
+        assert_eq!(pages::rows(not_a_page, size), None, "{not_a_page}");
+    }
+    // The pairing: a frame before any ask is no answer; a frame between an ask and its page is
+    // passed over; a full page is recorded, a short one is not; an ask no page answered is
+    // counted asked alone.
+    let mut seen = pages::Pages::default();
+    seen.heard(&order);
+    seen.sent(ARM.as_bytes());
+    seen.sent(page_ask(0).as_bytes());
+    seen.heard(ARM_ACK);
+    seen.heard(&order);
+    seen.heard(&order);
+    seen.sent(page_ask(1).as_bytes());
+    seen.heard(EMPTY_PAGE);
+    seen.sent(page_ask(1).as_bytes());
+    assert_eq!((seen.asked, seen.read), (3, 2));
+    assert_eq!(seen.full, [pages::Page { size: 1, offset: 0 }]);
+    assert_eq!(seen.listed(), "page size 1 at offset 0");
+    let line = seen.markdown();
+    assert!(line.contains("asked 3, answered by a page 2;"), "{line}");
+    assert!(line.ends_with(": page size 1 at offset 0"), "{line}");
+    assert_eq!(
+        seen.to_json(),
+        json(r#"{"asked":3,"read":2,"full_pages":[{"page_size":1,"offset":0}]}"#)
+    );
+    assert_eq!(pages::Pages::default().listed(), "none");
 }
 
 // ----- The capture's parts -----

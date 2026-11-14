@@ -380,6 +380,21 @@ its status named where it stopped. A refusal does not fail a run by itself; a co
 is named in the report as provider rate-limit evidence to record under FBC-s5ox, which records a
 session's refusal from its journal; a refusal met on a read socket has only its count.
 
+**The resync's full pages** (decision 0132 item 5, FBC-4h1p). The codec counts every full
+`get_user_orders` page its resync reads, one listing as many orders and TWAPs together as the
+page size (`--page-size`), and the probe records each one with its page size and offset. The
+codec's own record of them cannot be reached from outside an unchanged `ExecSession`, so the
+probe reads them from the session's journal, as it reads its frames: each `get_user_orders`
+request the session wrote, with its `limit` and `offset`, paired with the first page that
+answered it on that connection, its orders and TWAPs counted from the bytes the journal kept.
+A frame is read as a page only where the codec reads one on the probe's sessions, whose spec
+table is empty: no member repeated, the page's shape, and each order row naming an `order_id`
+and, unless it is a stop order, a non-empty `symbol`. A frame the codec refuses ends the session
+with a decode error, and its ask is counted asked and not answered. For each session the report and the evidence state how many pages it
+asked for, how many a page answered, and each full page by its page size and offset; a session
+whose pages were all short records none. Nothing of a page's rows is recorded: no id, no
+amount. A partial capture may miss a page.
+
 **The fill ledger's bounds** (decision 0132 item 5, FBC-5hif). Each session runs on a registry
 of its own (each arms its own account, and a registry is for one account), built as decision
 0132 item 7 says on pre-production and with no testnet declaration on production (decision
@@ -483,7 +498,9 @@ cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
   as the arm's answer: a new record decides what answers the arm.
   It also names every member whose string value a fixture keeps, gives each registry's
   fill-ledger bounds, its horizon and replay counts at each session's end, and whether the
-  bounds held, and states the provider rate refusals each read socket and session met, at least.
+  bounds held, states the provider rate refusals each read socket and session met, at least,
+  and, for each session, its resync's full `get_user_orders` pages by page size and offset
+  (none when every page was short).
 - `evidence.json`: the same, machine-readable.
 - `journal/`: the sessions' journal. Credentials and account ids appear in it only as keyed
   hashes under a key the run draws and never writes. Keep it local.

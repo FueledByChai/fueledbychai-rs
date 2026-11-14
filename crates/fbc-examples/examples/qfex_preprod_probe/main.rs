@@ -42,6 +42,7 @@ mod interrupt;
 #[allow(dead_code)]
 #[path = "../../src/link.rs"]
 mod link;
+mod pages;
 mod probe_args;
 mod refusals;
 mod stage;
