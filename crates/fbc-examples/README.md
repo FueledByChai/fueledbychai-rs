@@ -388,12 +388,13 @@ probe reads them from the session's journal, as it reads its frames: each `get_u
 request the session wrote, with its `limit` and `offset`, paired with the first page that
 answered it on that connection, its orders and TWAPs counted from the bytes the journal kept.
 A frame is read as a page only where the codec reads one on the probe's sessions, whose spec
-table is empty: no member repeated, the page's shape, and each order row naming an `order_id`
-and, unless it is a stop order, a non-empty `symbol`. A frame the codec refuses ends the session
-with a decode error, and its ask is counted asked and not answered. For each session the report and the evidence state how many pages it
-asked for, how many a page answered, and each full page by its page size and offset; a session
-whose pages were all short records none. Nothing of a page's rows is recorded: no id, no
-amount. A partial capture may miss a page.
+table is empty: a text frame (the codec refuses a binary one as no JSON object), no member
+repeated, the page's shape, and each order row naming an `order_id` and, unless it is a stop
+order, a non-empty `symbol`. A frame the codec refuses ends the session with a decode error, and
+its ask is counted asked and not answered. For each session the report and the evidence state
+how many pages it asked for, how many a page answered, and each full page by its page size and
+offset; a session whose pages were all short records none. Nothing of a page's rows is recorded:
+no id, no amount. A partial capture may miss a page.
 
 **The fill ledger's bounds** (decision 0132 item 5, FBC-5hif). Each session runs on a registry
 of its own (each arms its own account, and a registry is for one account), built as decision

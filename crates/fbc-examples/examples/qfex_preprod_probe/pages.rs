@@ -12,17 +12,19 @@
 //!   request, `{"type":"get_user_orders","params":{"limit":N,"offset":M}}`, as the codec writes
 //!   each page of its resync ([`ask`]). The journal keeps an outbound frame as written: the
 //!   codec names no span in a page's request;
-//! - **its answer** is the first frame after it on that connection that is a page as the codec
-//!   reads one on the probe's sessions ([`rows`]), read from the bytes the journal kept: JSON in
-//!   which no object names a member twice (the codec refuses any frame that does), holding one
-//!   `all_orders_response` with exactly an `orders` and a `twaps` array
-//!   (`account_reads::page_rows`), no more of them together than the page size, each TWAP an
-//!   object and each order row an object naming a string `order_id` and, unless its `type` is
-//!   one of the two stop kinds the resync leaves out, a non-empty string `symbol`
-//!   (`Resync::orders_page` and `private::snapshot`). The probe's sessions run on an empty spec
-//!   table, so every symbol is one the table does not hold and the codec reads nothing more of a
-//!   row. The codec sends a page only while no other is in flight and reads the first such frame
-//!   as its answer, so the pairing is the codec's own;
+//! - **its answer** is the first text frame after it on that connection that is a page as the
+//!   codec reads one on the probe's sessions ([`rows`]), read from the bytes the journal kept. The
+//!   codec reads a page only from a text frame: a binary one it refuses as no JSON object, ending
+//!   its epoch, whatever its bytes hold, so `capture.rs` offers [`Pages::heard`] only the frames
+//!   the journal kept as text. A page is JSON in which no object names a member twice (the codec
+//!   refuses any frame that does), holding one `all_orders_response` with exactly an `orders`
+//!   and a `twaps` array (`account_reads::page_rows`), no more of them together than the page
+//!   size, each TWAP an object and each order row an object naming a string `order_id` and,
+//!   unless its `type` is one of the two stop kinds the resync leaves out, a non-empty string
+//!   `symbol` (`Resync::orders_page` and `private::snapshot`). The probe's sessions run on an
+//!   empty spec table, so every symbol is one the table does not hold and the codec reads nothing
+//!   more of a row. The codec sends a page only while no other is in flight and reads the first
+//!   such frame as its answer, so the pairing is the codec's own;
 //! - **a full page** is one whose orders and TWAPs together are as many as its page size, as the
 //!   codec counts it; a shorter one, an empty one included, ends the paging and is recorded as
 //!   no full page.
@@ -71,8 +73,9 @@ impl Pages {
         }
     }
 
-    /// Reads `text`, a frame QFEX sent the session as its journal kept it: the answer to the
-    /// page waiting, when it is a page ([`rows`]), recorded when it is full.
+    /// Reads `text`, a text frame QFEX sent the session as its journal kept it: the answer to the
+    /// page waiting, when it is a page ([`rows`]), recorded when it is full. A binary frame is
+    /// never offered, since the codec reads no page from one.
     pub fn heard(&mut self, text: &str) {
         let Some(page) = self.waiting else {
             return;
