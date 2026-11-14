@@ -1,0 +1,5 @@
+error[E0599]: no method named `clone` found for struct `CodProbeRun` in the current scope
+ --> tests/ui_cod_probe/clone.rs:9:51
+  |
+9 |     let first = Registry::new().for_cod_probe(run.clone());
+  |                                                   ^^^^^ method not found in `CodProbeRun`

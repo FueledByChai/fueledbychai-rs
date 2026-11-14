@@ -15,6 +15,15 @@ fn amends_and_cancels_are_built_only_through_their_permits() {
     cases.compile_fail("tests/ui_permits/*.rs");
 }
 
+/// Decision 0140 item 6: a `CodProbeRun` is made only by `CodProbeRun::owner_supervised` and
+/// cannot be cloned or copied into a second registry. Cases under `tests/ui_cod_probe/`,
+/// regenerated as above.
+#[test]
+fn a_probe_declaration_is_made_only_by_its_constructor_and_never_copied() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_cod_probe/*.rs");
+}
+
 #[test]
 fn order_entry_needs_an_authorization_only_fbc_oms_issues() {
     let cases = trybuild::TestCases::new();

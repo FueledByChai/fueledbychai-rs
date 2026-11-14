@@ -311,6 +311,9 @@ pub(crate) struct Seed {
     /// The snapshot that seeded it; `None` when the consumer seeded it by hand
     /// ([`Registry::seed_position`]), so every later fill counts.
     reference: Option<Box<SeedRef>>,
+    /// The position the consumer seeded by hand, as it was seeded: `Some` exactly when
+    /// `reference` is `None` (decisions 0067, 0140 item 6).
+    hand: Option<SignedLots>,
     /// The inventory as of `folded_to`.
     base: i128,
     /// Every fill counted on the inventory since then arrived after it.
@@ -325,6 +328,7 @@ impl Seed {
     pub(crate) fn by_hand(pos: SignedLots) -> Seed {
         Seed {
             reference: None,
+            hand: Some(pos),
             base: i128::from(pos.0),
             folded_to: MonoNs(0),
             log: Vec::new(),
@@ -458,8 +462,17 @@ impl Registry {
     pub(crate) fn seeded_by_hand(&self, inst: InstrumentId) -> bool {
         matches!(
             self.markets.get(&inst),
+            Some(MarketState::Seeded(Seed { hand: Some(_), .. }))
+        )
+    }
+
+    /// Whether `inst` was seeded flat by hand ([`Registry::seed_position`] with `SignedLots(0)`),
+    /// as it was seeded, whatever the fills moved it to since (decision 0140 item 6).
+    pub(crate) fn flat_hand_seed(&self, inst: InstrumentId) -> bool {
+        matches!(
+            self.markets.get(&inst),
             Some(MarketState::Seeded(Seed {
-                reference: None,
+                hand: Some(SignedLots(0)),
                 ..
             }))
         )
@@ -1023,6 +1036,7 @@ impl Registry {
             inst,
             MarketState::Seeded(Seed {
                 reference: Some(Box::new(reference)),
+                hand: None,
                 base: i128::from(pos.0),
                 folded_to,
                 log: Vec::new(),

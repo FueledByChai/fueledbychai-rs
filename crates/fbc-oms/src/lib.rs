@@ -131,7 +131,9 @@
 //! per account, checked against the consumer's [`LeaseKeys`], and each refused, changing
 //! nothing, for a Killed market, while the market's position is unknown, and for a market
 //! seeded by hand outside a declared testnet run ([`ArmRefusal`], decision 0067,
-//! `tests/hand_seed.rs`);
+//! `tests/hand_seed.rs`), but for a flat hand seed on the one market a declared
+//! owner-supervised probe run names ([`CodProbeRun`], [`Registry::for_cod_probe`], decision 0140
+//! item 6, `tests/cod_probe.rs`);
 //! [`Registry::disarm`] (to Cancel-only, the leases dropped), [`Registry::kill`] and
 //! [`Registry::lift_kill`] (to Cancel-only, never further). Every change advances the market's
 //! [`StateGeneration`]; no resync, fill or timer changes a market's state.
@@ -249,8 +251,8 @@ mod common;
 pub use audit::{AuditEntry, AuditSink};
 pub use caps::{CapRefusal, CapsConfigError, MarketCaps, MarketCapsConfig, PreTradeCaps};
 pub use entry::{
-    ArmRefusal, CancelOnlyTrip, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases, MarketEntry,
-    StateRefusal, TestnetRun,
+    ArmRefusal, CancelOnlyTrip, CodProbeRun, EntryState, ExitKind, ExitRefusal, LeaseKeys, Leases,
+    MarketEntry, StateRefusal, TestnetRun,
 };
 pub use gates::{Batching, PlanVenue, RateScope, RateView};
 pub use gateway::{ControlCommand, ManagedGateway, OrderGateway};

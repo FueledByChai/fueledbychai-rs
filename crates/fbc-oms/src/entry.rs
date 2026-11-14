@@ -34,9 +34,11 @@
 //! has seeded it yet, or a fill since could not be placed against the seed), and for a market
 //! seeded by hand ([`Registry::seed_position`](crate::Registry::seed_position)) unless the
 //! registry was built for a declared owner-assisted testnet run ([`Registry::for_testnet_run`],
-//! decision 0067). A refused call changes nothing. The registry holds the leases while the
-//! market is armed and drops them when it is disarmed; the account lease while any market is
-//! armed.
+//! decision 0067) and not for a probe run, or the seed was flat on the one market a declared
+//! owner-supervised probe run names ([`Registry::for_cod_probe`], decision 0140 item 6). A
+//! refused call changes nothing.
+//! The registry holds the leases while the market is armed and drops them when it is disarmed;
+//! the account lease while any market is armed.
 //!
 //! Every change of a market's armed flag or state advances its [`StateGeneration`], which an
 //! [`Authorization`](crate::Authorization) carries; a call that changes nothing does not. Lease
@@ -241,14 +243,43 @@ impl TestnetRun {
     }
 }
 
+/// The consumer's declaration that this registry is an owner-supervised cancel-on-disconnect
+/// probe's, on one market (decision 0140 item 6, the owner's option B of 2026-10-21): on that
+/// market alone a flat hand seed (`Registry::seed_position(market, SignedLots(0))`) may be armed.
+/// Given to [`Registry::for_cod_probe`] when the registry is built. It is not a testnet run
+/// ([`TestnetRun`]): a hand seed of any other position, or on any other market, is still refused
+/// ([`ArmRefusal::SeededByHand`]), on a registry declared a testnet run too. It is neither
+/// `Clone` nor `Copy`, so one declaration goes into one registry; a registry keeps the first it
+/// is given, so it names one market for its life; and only [`CodProbeRun::owner_supervised`]
+/// makes one.
+#[derive(Eq, PartialEq, Hash, Debug)]
+pub struct CodProbeRun {
+    market: InstrumentId,
+}
+
+impl CodProbeRun {
+    /// Declares an owner-supervised probe run on `market`: the owner is present, the account is
+    /// one no other process trades, and its own reads showed no open order on the account and no
+    /// position in `market` before the consumer seeds it flat by hand (decision 0140 item 6).
+    pub fn owner_supervised(market: InstrumentId) -> CodProbeRun {
+        CodProbeRun { market }
+    }
+
+    /// The one market the declaration names.
+    pub fn market(&self) -> InstrumentId {
+        self.market
+    }
+}
+
 /// How a market's position stands for arming (decision 0067).
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(crate) enum Seeding {
-    /// Seeded by a trustworthy resync, or by hand in a declared testnet run.
+    /// Seeded by a trustworthy resync, by hand in a declared testnet run, or flat by hand on a
+    /// declared probe's market (decision 0140 item 6).
     Armable,
     /// Not known ([`ArmRefusal::PositionUnknown`]).
     Unknown,
-    /// Seeded by hand outside a declared testnet run ([`ArmRefusal::SeededByHand`]).
+    /// Seeded by hand otherwise ([`ArmRefusal::SeededByHand`]).
     ByHand,
 }
 
@@ -262,9 +293,11 @@ pub enum ArmRefusal {
     /// could not be placed against the seed (decision 0055).
     PositionUnknown(InstrumentId),
     /// The market's position was seeded by hand ([`Registry::seed_position`]), not by a
-    /// trustworthy resync, and the registry was not built for a declared owner-assisted testnet
-    /// run ([`Registry::for_testnet_run`]): a hand seed never arms a live market (decision
-    /// 0067). A later resync only compares the seed, so this holds for the process's life.
+    /// trustworthy resync, the registry was not built for a declared owner-assisted testnet
+    /// run ([`Registry::for_testnet_run`]) or was declared a probe's too, and the seed is not a
+    /// flat one on the market a declared probe names ([`Registry::for_cod_probe`]): a hand seed
+    /// never arms a live market otherwise (decisions 0067, 0140 item 6). A later resync only
+    /// compares the seed, so this holds for the process's life.
     SeededByHand(InstrumentId),
     /// The registry has no [`LeaseKeys`] naming the market, so no lease can be checked.
     NotNamed(InstrumentId),
@@ -294,7 +327,8 @@ impl fmt::Display for ArmRefusal {
             ArmRefusal::SeededByHand(inst) => write!(
                 f,
                 "the position on {inst:?} was seeded by hand, not by a trustworthy resync: \
-                 only a declared owner-assisted testnet run arms such a market"
+                 only a declared owner-assisted testnet run not declared a probe run's, or a \
+                 flat seed on the market a declared probe run names, arms such a market"
             ),
             ArmRefusal::NotNamed(inst) => {
                 write!(f, "no lease names are configured for {inst:?}")
@@ -854,7 +888,9 @@ impl Registry {
     /// by hand ([`Registry::seed_position`]) may then be armed by Start, Flatten and Wind-down,
     /// which otherwise refuse it ([`ArmRefusal::SeededByHand`]). Given when the registry is
     /// built, for the owner's testnet runs only (the `testnet_trade` sample, FBC-x69b); it
-    /// changes nothing else, and never arms a market whose position is unknown.
+    /// changes nothing else, and never arms a market whose position is unknown. On a registry
+    /// also declared a probe run ([`Registry::for_cod_probe`]) it arms no hand seed: the probe's
+    /// narrowing governs, in whichever order the two are given (decision 0140 item 6).
     pub fn for_testnet_run(mut self, run: TestnetRun) -> Registry {
         self.reap_dropped();
         self.testnet_run = Some(run);
@@ -866,15 +902,50 @@ impl Registry {
         self.testnet_run.is_some()
     }
 
-    /// How `market`'s position stands for arming: known and seeded by a trustworthy resync, or
-    /// by hand in a declared testnet run (decision 0067).
+    /// This registry for a declared owner-supervised cancel-on-disconnect probe (decision 0140
+    /// item 6): on the one market `run` names, a flat hand seed
+    /// ([`Registry::seed_position`] with `SignedLots(0)`) may then be armed by Start, Flatten and
+    /// Wind-down, which otherwise refuse it ([`ArmRefusal::SeededByHand`]). Given when the
+    /// registry is built, for the owner's probe runs only. A hand seed of any other position, or
+    /// on any other market, is still refused, a declared testnet run's included
+    /// ([`Registry::for_testnet_run`]); it changes nothing else, is not a testnet run
+    /// ([`Registry::testnet_run`] stays as it was), and never arms a market whose position is
+    /// unknown. Given once: a registry already declared a probe's keeps its first declaration,
+    /// and a later one, on whatever market, changes nothing ([`Registry::cod_probe`] says which
+    /// market it names), so a registry never arms a hand seed on two markets.
+    pub fn for_cod_probe(mut self, run: CodProbeRun) -> Registry {
+        self.reap_dropped();
+        self.cod_probe.get_or_insert(run);
+        self
+    }
+
+    /// The market a declared probe run names, if the registry was built for one
+    /// ([`Registry::for_cod_probe`]).
+    pub fn cod_probe(&self) -> Option<InstrumentId> {
+        self.cod_probe.as_ref().map(CodProbeRun::market)
+    }
+
+    /// How `market`'s position stands for arming: known and seeded by a trustworthy resync, by
+    /// hand in a declared testnet run not declared a probe run's (decision 0067), or flat by hand
+    /// on the market a declared probe run names (decision 0140 item 6).
     fn seeding(&self, market: InstrumentId) -> Seeding {
         if !self.position_known(market) {
             Seeding::Unknown
-        } else if self.seeded_by_hand(market) && !self.testnet_run() {
+        } else if self.seeded_by_hand(market) && !self.hand_seed_armable(market) {
             Seeding::ByHand
         } else {
             Seeding::Armable
+        }
+    }
+
+    /// Whether `market`'s hand seed may be armed: on a registry declared a probe run's, only when
+    /// it is the market the probe names and the seed, as seeded, was flat, whatever the fills
+    /// moved it to since, a testnet declaration widening nothing (decision 0140 item 6, "not a
+    /// testnet run"); otherwise only in a declared testnet run (decision 0067).
+    fn hand_seed_armable(&self, market: InstrumentId) -> bool {
+        match self.cod_probe() {
+            Some(probe) => probe == market && self.flat_hand_seed(market),
+            None => self.testnet_run(),
         }
     }
 
@@ -902,9 +973,10 @@ impl Registry {
     /// The owner's Start (decision 0012): arms a disarmed market with `leases` and moves it to
     /// Quoting; on an armed market, moves it to Quoting. The only call that reaches Quoting.
     /// Refused, changing nothing, for a Killed market, while the market's position is unknown,
-    /// for a market seeded by hand outside a declared testnet run (decision 0067), and, on a
-    /// disarmed market, without the market's lease, or without the account's lease
-    /// where the venue's nonce scope is per account and the registry does not hold it.
+    /// for a market seeded by hand outside a declared testnet run (decision 0067) but for a flat
+    /// seed on a declared probe's market (decision 0140 item 6), and, on a disarmed market,
+    /// without the market's lease, or without the account's lease where the venue's nonce scope
+    /// is per account and the registry does not hold it.
     pub fn start(
         &mut self,
         market: InstrumentId,
