@@ -386,7 +386,9 @@ page size (`--page-size`), and the probe records each one with its page size and
 codec's own record of them cannot be reached from outside an unchanged `ExecSession`, so the
 probe reads them from the session's journal, as it reads its frames: each `get_user_orders`
 request the session wrote, with its `limit` and `offset`, paired with the first page that
-answered it on that connection, its orders and TWAPs counted from the bytes the journal kept.
+answered it on that connection before its epoch closed, its orders and TWAPs counted from the
+bytes the journal kept. A frame the journal holds after the close, one waiting as the probe
+stopped the session, reached no codec and answers no request.
 A frame is read as a page only where the codec reads one on the probe's sessions, whose spec
 table is empty: a text frame (the codec refuses a binary one as no JSON object), no member
 repeated, the page's shape, and each order row naming an `order_id` and, unless it is a stop

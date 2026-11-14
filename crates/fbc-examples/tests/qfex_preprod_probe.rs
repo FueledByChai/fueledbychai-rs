@@ -2563,6 +2563,40 @@ fn a_partial_sessions_frames_are_named_and_listed_with_no_position_against_its_a
 }
 
 #[test]
+fn a_page_journaled_after_its_epoch_closed_answers_no_ask() {
+    // A session the probe stops mid-resync: the runtime journals its epoch closed, then the
+    // frame waiting, which reaches no codec (`ExecSession`'s `take_stopped`). A full page at page
+    // size 1 journaled after the close answers no ask; the same page before it is read as full.
+    let page = one_order_page("22222222-2222-4222-8222-222222222222");
+    for (n, after_close) in [false, true].into_iter().enumerate() {
+        let (dir, _removed) = temp_dir(&format!("page-after-close-{n}"));
+        let asked = Offer::Keep(Record::Outbound {
+            at: MonoNs(0),
+            conn: conn(0),
+            rpc: None,
+            opcode: Opcode::Text,
+            frame: WireSlice::plain(page_ask(0).into_bytes()),
+        });
+        let answer = Offer::Keep(Record::inbound(stamp(0), RawFrame::Text(&page)));
+        let mut offers = session_records(0, vec![ack(0), asked]);
+        match after_close {
+            true => offers.push(answer),
+            false => offers.insert(offers.len() - 2, answer),
+        }
+        let sink = journal(&dir, offers);
+        let (ev, files) = sliced(&dir, &sink, Ok(()));
+        files.unwrap();
+        let pages = &ev.sessions[0].pages;
+        assert_eq!((pages.asked, pages.read), (1, u64::from(!after_close)));
+        let full: &[pages::Page] = match after_close {
+            true => &[],
+            false => &[pages::Page { size: 1, offset: 0 }],
+        };
+        assert_eq!(pages.full, full);
+    }
+}
+
+#[test]
 fn a_gap_placed_on_no_session_is_never_shown_beside_a_whole_capture() {
     // The slice places what it finds of every gap, so only a run with no session, or one whose
     // journal was never sliced, has a gap on no session. Its report never says, beside the

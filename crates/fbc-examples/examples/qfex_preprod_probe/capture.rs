@@ -703,10 +703,17 @@ fn read(
         // The arm is the only request with a deadline a session sends: its deadline ends the
         // window.
         Record::RpcTimeout { stamp, .. } => close(window, stamp.conn.conn),
+        // An epoch's close also ends the page its session waits for: a frame journaled after it
+        // reached no codec.
         Record::Control {
             ev: ControlEvent::Closed(key),
             ..
-        } => close(window, key.conn),
+        } => {
+            close(window, key.conn);
+            if let Some(run) = sessions.get_mut(usize::from(key.conn)) {
+                run.pages.closed();
+            }
+        }
         Record::Inbound {
             stamp,
             opcode,
