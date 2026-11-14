@@ -711,8 +711,12 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     2, FBC-m9rj: the shared limiter's `counts().rejected`, the `RateLimited` errs and `RATE_LIMITED`
     order responses among its frames as a journal keeps them, and its frames unread (kept whole by
     0134 item 2, or not JSON), a read socket's read once more in memory for a refusal kept whole, a
-    count above zero named as evidence for FBC-s5ox; `refusals.rs`), its journal and
-    a scrubbed fixture slice for `fixtures/qfex/exec-recorded/arm/` (a production run's for
+    count above zero named as evidence for FBC-s5ox; `refusals.rs`; and each full
+    `get_user_orders` page each session's resync read, by its page size and offset, none for a
+    session whose pages were all short, read from the session's journal, each request paired with
+    the page answering it, since the codec's own count is not reachable outside an `ExecSession`,
+    0132 item 5, FBC-4h1p, `pages.rs`), its journal and a scrubbed fixture slice for
+    `fixtures/qfex/exec-recorded/arm/` (a production run's for
     `arm-production/`, 0143 item 4) (`tests/qfex_preprod_probe.rs`, against a QFEX-shaped
     conformance stub).
     With `--hold-secs` (FBC-39ks, 0146), on either environment, it first holds one trade

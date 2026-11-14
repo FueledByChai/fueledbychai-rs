@@ -16,6 +16,10 @@
 //! margin, a balance) is published (decision 0009); its member names, strings and nesting are as
 //! received. No frame we wrote is kept.
 //!
+//! **The resync's pages.** The same read of the journal pairs each `get_user_orders` request a
+//! session wrote with the page that answered it, and records each full page with its page size
+//! and offset ([`crate::pages`], decision 0132 item 5): counts, never a row.
+//!
 //! **Gaps.** The journal's sink never blocks: a record it has no room for is dropped and counted,
 //! and the gap is marked `Degraded` once space returns or at its close (decision 0006). This
 //! program is the evidence, so a gap is never assumed away. A session's capture is whole only
@@ -48,6 +52,7 @@ use serde_json::{Map, Value, json};
 use crate::evidence::privacy_hits;
 use crate::hold::{self, HoldRun};
 use crate::ledger::{self, RegistryRun};
+use crate::pages::Pages;
 use crate::refusals::{self, ReadSocket, Refusals};
 
 /// What one account's reads showed before a session or the hold, or after the hold.
@@ -156,6 +161,9 @@ pub struct SessionRun {
     pub refusals: Refusals,
     /// Which of [`SessionRun::frames`] were provider rate refusals, by index.
     pub refusal_frames: Vec<usize>,
+    /// Its resync's `get_user_orders` pages, each full one with its page size and offset
+    /// (decision 0132 item 5), as its journal kept them ([`crate::pages`]).
+    pub pages: Pages,
     /// Why its capture is partial: each way the journal could be missing its records ([`Gaps`]).
     /// Empty when the journal was written and read whole and kept every record it could hold.
     pub partial: Vec<String>,
@@ -686,6 +694,12 @@ fn read(
                 window[at] = When::InWindow;
             }
         }
+        // Any other frame a session wrote: one of its resync's pages, or no page.
+        Record::Outbound { conn, frame, .. } => {
+            if let Some(run) = sessions.get_mut(usize::from(conn.conn)) {
+                run.pages.sent(frame.bytes());
+            }
+        }
         // The arm is the only request with a deadline a session sends: its deadline ends the
         // window.
         Record::RpcTimeout { stamp, .. } => close(window, stamp.conn.conn),
@@ -700,6 +714,7 @@ fn read(
                 if run.refusals.count(&text) {
                     run.refusal_frames.push(run.frames.len());
                 }
+                run.pages.heard(&text);
                 texts.push((at, run.frames.len(), scrub(&text)));
                 run.frames.push(Arrived {
                     kind: kind(&text),
@@ -991,7 +1006,8 @@ pub fn markdown(ev: &Evidence) -> String {
              - Ended by: {}; connection attempts {} (failed {}), arm failures {}, frames the \
                codec could not decode {}\n\
              - Error: {}\n\
-             - Capture: {capture}\n\n\
+             - Capture: {capture}\n\
+             {}\n\n\
              **What it shows:** {}\n\n\
              | n | when | what | file |\n| --- | --- | --- | --- |",
             run.account,
@@ -1003,6 +1019,7 @@ pub fn markdown(ev: &Evidence) -> String {
             run.arm_failures,
             run.decode_errors,
             run.error.as_deref().unwrap_or("none"),
+            run.pages.markdown(),
             run.answer(),
         );
         for (n, f) in run.frames.iter().enumerate() {
@@ -1068,7 +1085,8 @@ pub fn to_json(ev: &Evidence) -> Value {
                 "arm_failures": run.arm_failures, "decode_errors": run.decode_errors,
                 "error": run.error, "answer": run.answer(), "ok": run.ok(),
                 "capture": if run.partial.is_empty() { "whole" } else { "partial" },
-                "partial_because": run.partial, "frames": frames})
+                "partial_because": run.partial, "orders_pages": run.pages.to_json(),
+                "frames": frames})
         })
         .collect();
     let [normal, safety] = ev.dropped;

@@ -89,6 +89,9 @@
 //!   counted as decision 0135 item 2 says, for the report: the limiter's count while it ran
 //!   ([`Run::rejected`]), and its frames that were refusals or unread, a read socket's two as it
 //!   reads them and a session's from its journal.
+//! - **The resync's full pages** ([`crate::pages`]): each full `get_user_orders` page a session's
+//!   resync read, with its page size and offset (decision 0132 item 5, FBC-4h1p), from the
+//!   session's journal, since its codec's own count cannot be reached from outside the session.
 //! - **The files** ([`crate::capture`]): the report, the evidence, the journal and the scrubbed
 //!   fixture slice, which scripts/privacy-check.sh must pass. A record the journal dropped,
 //!   marked in it or only counted by its sink, one its writer never wrote, and a journal that
