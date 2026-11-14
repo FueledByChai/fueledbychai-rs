@@ -16,6 +16,9 @@
 //!   the fills; and fbc-oms seeds no position from it.
 //! - Replaying the redacted journal gives the same events and effects, and the journal holds
 //!   no credential, subaccount id or balance value.
+//! - FBC-qnv1 (decision 0148 item 4): under `production_probe` with
+//!   `qfex.exec.production_places`, a staged place, a post-only GTC or a limit IOC at the
+//!   minimum, sets the trades read's start time as a place under `preprod_probe` does.
 //!
 //! Every key, account, id and frame here is synthetic, built from the shapes QFEX's pages show
 //! or read from `fixtures/qfex/private` (its `SYNTHETIC` file).
@@ -34,10 +37,10 @@ use fbc_conformance::{
 };
 use fbc_core::{
     CidMatch, CtxCall, Effect, Effects, EncodeCtx, ExecCodec, ExecEvent, FillEvent, FillIdent,
-    FillOrigin, HttpFailure, HttpMethod, HttpRequest, HttpTag, Inbound, Lots, MonoNs, NonceBlock,
-    NotSentReason, OpKind, RateCharge, RawFrame, Side, SignedLots, SnapshotReads, SnapshotSource,
-    Ticks, TimerTag, TrafficClass, VenueCommand, VenueConfig, VenueMeta, VenueOrderSnapshot,
-    VenueOrderState, WireSlice, WireUrl,
+    FillOrigin, HttpFailure, HttpMethod, HttpRequest, HttpTag, Inbound, Lots, MonoNs, NewOrder,
+    NonceBlock, NotSentReason, OpKind, RateCharge, RawFrame, Side, SignedLots, SnapshotReads,
+    SnapshotSource, Ticks, Tif, TimerTag, TrafficClass, VenueCommand, VenueConfig, VenueMeta,
+    VenueOrderSnapshot, VenueOrderState, WireSlice, WireUrl,
 };
 use fbc_core::{ConnKey, Envelope, NonceSource, VenueFactory};
 use fbc_journal::{
@@ -52,7 +55,9 @@ use fbc_runtime::{
 use fbc_venue_qfex::account_reads::PAGE_WEIGHT;
 use fbc_venue_qfex::auth::TradeAuth;
 use fbc_venue_qfex::exec::{ARM, CHANNELS, QfexExec, TRADE, TRADES_WEIGHT, probe_exec_caps};
-use fbc_venue_qfex::probe::{self, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT};
+use fbc_venue_qfex::probe::{
+    self, KEY_PAGE_SIZE, KEY_PRODUCTION_PLACES, KEY_RESYNC_TIMEOUT, PROBE_PLACE_STAGES,
+};
 
 use probe_harness::*;
 
@@ -973,6 +978,39 @@ fn the_start_time_is_the_oldest_unended_place_or_the_latest_fill_and_neither_rea
     resync(&mut codec, 9);
     assert_eq!(codec.last_resync(), None);
     assert_eq!(text(&mut codec, &page(&[], &[])), Out::quiet());
+}
+
+#[test]
+fn with_production_places_a_staged_place_bounds_the_trades_read_as_under_preprod_probe() {
+    // The harness spec's minimum is one lot, so each staged place is one lot: a post-only GTC
+    // and a limit IOC, each sent at 3 and read from its send time, live and in decoder replay.
+    let at_minimum = |post_only, tif| {
+        VenueCommand::Place(NewOrder {
+            qty: Lots::new(1).unwrap(),
+            post_only,
+            tif,
+            ..gtc()
+        })
+    };
+    let from = Out::effects(vec![trades_ask(1_760_000_003, 1000, 0)]);
+    for cfg in [
+        preprod(SUB),
+        with(production(SUB), KEY_PRODUCTION_PLACES, PROBE_PLACE_STAGES),
+    ] {
+        for place in [at_minimum(true, Tif::Gtc), at_minimum(false, Tif::Ioc)] {
+            let mut steps = epoch(1);
+            steps.push(Step::Encode(place, 3));
+            steps.push(Step::Resync(9));
+            steps.push(Step::Http {
+                nth: 0,
+                status: 200,
+                body: flat(),
+            });
+            steps.push(Step::Frame(page(&[], &[])));
+            let (_, outs, _) = run_twice(|| probe_on(&cfg), &steps);
+            assert_eq!(outs.last().unwrap(), &from);
+        }
+    }
 }
 
 // ----- What is pushed, and when -----

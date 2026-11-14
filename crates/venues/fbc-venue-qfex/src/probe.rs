@@ -8,7 +8,11 @@
 //!   Each mode names its [`Environment`]; it is not the admission of QFEX order entry on
 //!   production (decision 0143 item 5). Under [`PRODUCTION_PROBE`], whose environment is
 //!   [`Environment::Production`] on loopback origins too, the codec refuses every place, batch
-//!   place and amend unsent (decision 0145).
+//!   place and amend unsent (decision 0145), unless [`KEY_PRODUCTION_PLACES`] is
+//!   [`PROBE_PLACE_STAGES`]: then it encodes a single place only as a post-only GTC or a limit
+//!   IOC at exactly the instrument's `min_size`, for the probe's place stages (decision 0148
+//!   item 4). That key under [`PREPROD_PROBE`] or with no mode is a configuration error naming
+//!   the key, never its value.
 //! - **The guard.** Under a mode, every QFEX origin the configuration names is required and must
 //!   pass it: either each is exactly its origin in the mode's environment, a trailing `/` ignored
 //!   ([`Environment::origins`]: [`PREPROD_TRADE`], [`PREPROD_REST`] and [`PREPROD_MDS`], or
@@ -59,6 +63,12 @@ pub const KEY_PAGE_SIZE: &str = "qfex.exec.page_size";
 pub const KEY_RESYNC_TIMEOUT: &str = "qfex.exec.resync_timeout";
 /// Each request's deadline, after which it ends `Unknown`: longer than [`SPEED_BUMP`].
 pub const KEY_RPC_TIMEOUT: &str = "qfex.exec.rpc_timeout";
+/// Under [`PRODUCTION_PROBE`] alone, optional: absent, or [`PROBE_PLACE_STAGES`] (decision 0148
+/// item 4).
+pub const KEY_PRODUCTION_PLACES: &str = "qfex.exec.production_places";
+/// The one value of [`KEY_PRODUCTION_PLACES`]: the codec encodes a single place only as a
+/// post-only GTC or a limit IOC at exactly the instrument's `min_size` (decision 0148 item 4).
+pub const PROBE_PLACE_STAGES: &str = "probe_place_stages";
 
 /// The pre-production Trade WebSocket.
 pub const PREPROD_TRADE: &str = "wss://trade.qfex.io";
@@ -88,8 +98,9 @@ pub const EXEC_MODE_FIELD: FieldSpec = FieldSpec {
     doc: "absent (market data only, no order entry); preprod_probe: order entry against \
           QFEX's pre-production origins or a loopback stub only (decision 0132); or \
           production_probe: the same, with every place, batch place and amend refused \
-          unsent (decision 0145), against QFEX's production origins or a loopback stub only, \
-          for the owner-assisted probe alone (decision 0143)",
+          unsent (decision 0145) unless qfex.exec.production_places admits the place stages' \
+          two shapes (decision 0148), against QFEX's production origins or a loopback stub \
+          only, for the owner-assisted probe alone (decision 0143)",
 };
 
 /// The page size's schema entry.
@@ -116,6 +127,23 @@ pub const RPC_TIMEOUT_FIELD: FieldSpec = FieldSpec {
     unit: FieldUnit::Duration,
     doc: "either probe mode only, required: each request's deadline as <n>ms or <n>s, longer \
           than the 500 ms speed bump",
+};
+
+/// The production place stages' schema entry: per account, since the probe sets it on each
+/// place stage's sessions alone.
+pub const PRODUCTION_PLACES_FIELD: FieldSpec = FieldSpec {
+    key: KEY_PRODUCTION_PLACES,
+    scope: ConfigScope::Account,
+    unit: FieldUnit::Dimensionless,
+    doc: "production_probe only, optional: probe_place_stages, under which the codec encodes \
+          a single place only as a post-only GTC or a limit IOC at exactly the instrument's \
+          min_size (decision 0148); absent, every place is refused unsent (decision 0145)",
+};
+
+/// [`KEY_PRODUCTION_PLACES`] under [`PREPROD_PROBE`] or with no mode.
+const PLACES_OUTSIDE_PRODUCTION: ConfigError = ConfigError::Invalid {
+    key: KEY_PRODUCTION_PLACES,
+    reason: "admitted only under production_probe",
 };
 
 /// The environment a probe mode names: its guard admits that environment's origins, or a
@@ -203,6 +231,7 @@ pub struct Probe {
     page_size: u16,
     resync_timeout: Duration,
     rpc_timeout: Duration,
+    place_stages: bool,
 }
 
 impl Probe {
@@ -230,14 +259,24 @@ impl Probe {
     pub fn rpc_timeout(&self) -> Duration {
         self.rpc_timeout
     }
+
+    /// Whether [`KEY_PRODUCTION_PLACES`] is [`PROBE_PLACE_STAGES`]: only ever under
+    /// [`PRODUCTION_PROBE`] (decision 0148 item 4).
+    pub fn place_stages(&self) -> bool {
+        self.place_stages
+    }
 }
 
 /// The mode `cfg` sets: `None` when [`KEY_EXEC_MODE`] is absent, the guarded probe when it is
 /// [`PREPROD_PROBE`] or [`PRODUCTION_PROBE`]. Refused, naming the key and never its value, for
-/// any other mode, an origin the mode's guard refuses, origins that mix the two sides, and a
-/// setting missing or out of range. The factory asks this before it plans or builds anything.
+/// any other mode, an origin the mode's guard refuses, origins that mix the two sides, a
+/// setting missing or out of range, and [`KEY_PRODUCTION_PLACES`] with any value but
+/// [`PROBE_PLACE_STAGES`] or under any mode but [`PRODUCTION_PROBE`], none included, whatever
+/// the origins (decision 0148 item 4). The factory asks this before it plans or builds anything.
 pub fn mode(cfg: &VenueConfig) -> Result<Option<Probe>, ConfigError> {
+    let places = cfg.get(KEY_PRODUCTION_PLACES);
     let environment = match cfg.get(KEY_EXEC_MODE) {
+        None if places.is_some() => return Err(PLACES_OUTSIDE_PRODUCTION),
         None => return Ok(None),
         Some(PREPROD_PROBE) => Environment::PreProduction,
         Some(PRODUCTION_PROBE) => Environment::Production,
@@ -245,6 +284,17 @@ pub fn mode(cfg: &VenueConfig) -> Result<Option<Probe>, ConfigError> {
             return Err(ConfigError::Invalid {
                 key: KEY_EXEC_MODE,
                 reason: "expected preprod_probe, production_probe, or no value",
+            });
+        }
+    };
+    let place_stages = match (environment, places) {
+        (_, None) => false,
+        (Environment::PreProduction, Some(_)) => return Err(PLACES_OUTSIDE_PRODUCTION),
+        (Environment::Production, Some(PROBE_PLACE_STAGES)) => true,
+        (Environment::Production, Some(_)) => {
+            return Err(ConfigError::Invalid {
+                key: KEY_PRODUCTION_PLACES,
+                reason: "expected probe_place_stages or no value",
             });
         }
     };
@@ -264,6 +314,7 @@ pub fn mode(cfg: &VenueConfig) -> Result<Option<Probe>, ConfigError> {
         page_size,
         resync_timeout,
         rpc_timeout,
+        place_stages,
     }))
 }
 

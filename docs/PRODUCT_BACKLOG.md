@@ -392,9 +392,9 @@ private trading path is enabled.
 **Status:** Proposed  
 **User story:** As the owner, I want to place and cancel QFEX orders from an explicitly chosen
 primary account or subaccount through fbc-oms and the one runtime, but only once owner-assisted
-runs on QFEX's pre-production environment have shown what its replies, its cancel-on-disconnect
-and its resync actually do, so that no QFEX order reaches production on behaviour its pages
-leave open.
+runs on QFEX's pre-production environment, or on production under its host-guarded probe mode
+(0143, 0148), have shown what its replies, its cancel-on-disconnect and its resync actually do,
+so that no QFEX order reaches production on behaviour its pages leave open.
 
 Depends on BT-701 and BT-502: QFEX discovery (FBC-e3g7, under BT-701) gives order entry its
 instruments, and BT-502's conformance suite runs on its factory.
@@ -433,7 +433,13 @@ instruments, and BT-502's conformance suite runs on its factory.
   capture from either environment then decides how the arm is answered, where the criterion
   above names the pre-production capture, and production stays `exec: None` under every
   configuration but that probe mode, which is no admission of QFEX order entry (0143 item 4).
-  The place stages on production are not decided yet.
+  Stages two and three, which place, may also run on production under that mode, behind
+  `--production` and `--sole-trader`, with `qfex.exec.production_places` set to
+  `probe_place_stages`: each place is a post-only GTC or a limit IOC at the instrument's minimum
+  size, and their registries are declared `CodProbeRun::owner_supervised_places` on a flat hand
+  seed (0148). Where the criteria above name pre-production runs, the drop test and the place
+  stages' evidence may then come from either environment. That too admits no QFEX order entry
+  (0148 item 1).
 - Every `ExecCaps` value cites a QFEX page or a captured fixture (0054), and the named
   conformance suite passes on the QFEX factory (0025).
 - Production stays `exec: None` and `Readiness::Record` until a merged record admits QFEX order

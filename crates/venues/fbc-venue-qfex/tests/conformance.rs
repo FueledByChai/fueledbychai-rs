@@ -12,6 +12,10 @@
 //! FBC-5d7x (decision 0145 item 3): on a `production_probe` configuration, whose codec refuses
 //! every place, batch place and amend unsent, `caps_truthful` breaches exactly the placement
 //! checks that refusal accounts for, and nothing else.
+//!
+//! FBC-qnv1 (decision 0148 item 4): with `qfex.exec.production_places` on that configuration,
+//! whose codec then encodes only a post-only GTC or a limit IOC at the minimum, `caps_truthful`
+//! breaches the same two placement checks, and nothing else.
 
 use fbc_conformance::suite::{self, BootReply, Bootstrap, Setup, Subject, Verdict};
 use fbc_core::{
@@ -19,11 +23,12 @@ use fbc_core::{
     OrderShapes, PriceGrid, Secret, Secrets, SizeStep, SpecTable, TagSet, Tif, TradingStatus,
     UnderlyingId, VenueConfig, VenueFactory, VenueId, WallNs, dispatch_market_data,
 };
-use fbc_venue_qfex::exec::{CHANNELS, TRADE};
+use fbc_venue_qfex::auth::TradeAuth;
+use fbc_venue_qfex::exec::{CHANNELS, QfexExec, TRADE};
 use fbc_venue_qfex::probe::{
-    KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, PREPROD_MDS, PREPROD_PROBE,
-    PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS, PRODUCTION_PROBE, PRODUCTION_REST,
-    PRODUCTION_TRADE,
+    KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_PRODUCTION_PLACES, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT,
+    PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, PROBE_PLACE_STAGES, PRODUCTION_MDS,
+    PRODUCTION_PROBE, PRODUCTION_REST, PRODUCTION_TRADE,
 };
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex, auth};
 
@@ -199,6 +204,63 @@ fn production() -> Setup {
 #[test]
 fn under_production_probe_caps_truthful_breaches_exactly_the_refused_placements() {
     let subject = Subject::new(&Qfex, FIXTURES, production).unwrap();
+    let failure = suite::caps_truthful(&subject).unwrap_err();
+    let found: Vec<(&str, &str)> = failure
+        .breaches
+        .iter()
+        .map(|b| (b.capability.as_str(), b.what.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (
+                "control: a placement",
+                "refused as NotSent(Unsupported) though the caps declare it, so the probes \
+                 beside it prove nothing"
+            ),
+            (
+                "OrderCaps.flag_conflicts has (PostOnly, Ioc)",
+                "refused as NotSent(Unsupported), not NotSent(FlagConflict)"
+            ),
+        ],
+        "{failure}"
+    );
+}
+
+/// The probe on QFEX's production origins with `qfex.exec.production_places` (decision 0148
+/// item 4).
+fn staged() -> Setup {
+    let mut setup = production();
+    setup.cfg.insert(KEY_PRODUCTION_PLACES, PROBE_PLACE_STAGES);
+    setup
+}
+
+/// FBC-qnv1 (decision 0148 item 4): with `qfex.exec.production_places` the codec encodes only a
+/// post-only GTC or a limit IOC at the minimum, and `caps_truthful` asks neither. Its probes are
+/// sized at the least size the spec admits, so size decides none of them. Its placement control
+/// is a limit GTC on the public book with no flag, which the key does not admit, refused
+/// `Unsupported`; its declared flag conflict is a post-only IOC, refused `Unsupported` before its
+/// flags are read, not `FlagConflict`. So it breaches the same two checks as without the key, and
+/// every other probe passes: each absence it builds on the limit GTC wants `Unsupported` and gets
+/// it, the batch place and amend among them, and the cancels, queries, arm and disarm are
+/// untouched.
+///
+/// Those breaches alone would be the same were the key ignored, so the test first holds the
+/// setup's configuration to a codec that reads the key, and [`production`]'s to one that reads
+/// none; that the key admits the two shapes, through the factory too, is `tests/probe_mode.rs`'s
+/// proof.
+#[test]
+fn with_production_places_caps_truthful_breaches_the_same_two_placement_probes() {
+    let reads_stages = |setup: Setup| {
+        QfexExec::probe(TradeAuth::new(&setup.cfg, secrets()).unwrap(), &setup.cfg)
+            .unwrap()
+            .probe_settings()
+            .unwrap()
+            .place_stages()
+    };
+    assert!(reads_stages(staged()));
+    assert!(!reads_stages(production()));
+    let subject = Subject::new(&Qfex, FIXTURES, staged).unwrap();
     let failure = suite::caps_truthful(&subject).unwrap_err();
     let found: Vec<(&str, &str)> = failure
         .breaches
