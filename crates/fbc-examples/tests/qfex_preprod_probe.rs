@@ -1719,10 +1719,15 @@ async fn each_full_page_a_sessions_resync_reads_is_recorded_with_its_size_and_of
 #[tokio::test]
 async fn a_full_page_the_codec_refuses_is_counted_asked_and_not_read() {
     // Each a full page at page size 1 that the codec refuses on the probe's sessions: an order
-    // row naming no symbol, and a row repeating a member.
+    // row naming no symbol, a row repeating a member, and a page it would read sent as a binary
+    // frame, which the codec reads as no JSON object (Codex r5900693910's finding).
+    let order = one_order_page("22222222-2222-4222-8222-222222222222");
     for (n, refused) in [
-        r#"{"all_orders_response":{"orders":[{"order_id":"a","type":"LIMIT"}],"twaps":[]}}"#,
-        r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":"X","symbol":"X"}],"twaps":[]}}"#,
+        Frame::text(r#"{"all_orders_response":{"orders":[{"order_id":"a","type":"LIMIT"}],"twaps":[]}}"#),
+        Frame::text(
+            r#"{"all_orders_response":{"orders":[{"order_id":"a","symbol":"X","symbol":"X"}],"twaps":[]}}"#,
+        ),
+        Frame::Binary(order.clone().into_bytes()),
     ]
     .into_iter()
     .enumerate()
@@ -1730,7 +1735,12 @@ async fn a_full_page_the_codec_refuses_is_counted_asked_and_not_read() {
         let (dir, _removed) = temp_dir(&format!("refused-page-{n}"));
         let mut steps = read_socket(0, EMPTY_PAGE);
         steps.extend(read_socket(1, EMPTY_PAGE));
-        steps.extend(paged_session_socket(2, &[refused]));
+        steps.extend(paged_session_socket(2, &[]));
+        let answer = refused.clone();
+        steps.push(Step::Respond {
+            conn: 2,
+            with: Responder::new(move |_| Ok(vec![answer.clone()])),
+        });
         let server = StubServer::start(WsScript::new(steps), rest(flat()))
             .await
             .unwrap();
@@ -1742,9 +1752,21 @@ async fn a_full_page_the_codec_refuses_is_counted_asked_and_not_read() {
         server.finished().await.unwrap();
         assert_eq!(received(&server, 2)[5..], [page_ask(0)], "{printed}");
         let run = &outcome.evidence.sessions[0];
-        assert_eq!(run.decode_errors, 1, "{refused}\n{printed}");
-        assert_eq!((run.pages.asked, run.pages.read), (1, 0), "{refused}");
-        assert!(run.pages.full.is_empty(), "{refused}");
+        assert_eq!(run.decode_errors, 1, "{refused:?}\n{printed}");
+        assert_eq!((run.pages.asked, run.pages.read), (1, 0), "{refused:?}");
+        assert!(run.pages.full.is_empty(), "{refused:?}");
+
+        let report = fs::read_to_string(opts.evidence_dir.join("report.md")).unwrap();
+        let said = "asked 1, answered by a page 0; full pages, each by its page size and offset: \
+                    none\n";
+        assert!(report.contains(said), "{refused:?}\n{report}");
+        let evidence = fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap();
+        assert_eq!(
+            json(&evidence)["sessions"][0]["orders_pages"],
+            json(r#"{"asked":1,"read":0,"full_pages":[]}"#),
+            "{refused:?}"
+        );
+        assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
     }
 }
 

@@ -45,7 +45,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
-use fbc_journal::{ControlEvent, JournalReader, Marker, Record};
+use fbc_journal::{ControlEvent, JournalReader, Marker, Opcode, Record};
 use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value, json};
 
@@ -707,14 +707,23 @@ fn read(
             ev: ControlEvent::Closed(key),
             ..
         } => close(window, key.conn),
-        Record::Inbound { stamp, bytes, .. } => {
+        Record::Inbound {
+            stamp,
+            opcode,
+            bytes,
+            ..
+        } => {
             let at = usize::from(stamp.conn.conn);
             if let Some(run) = sessions.get_mut(at) {
                 let text = String::from_utf8_lossy(&bytes.0).into_owned();
                 if run.refusals.count(&text) {
                     run.refusal_frames.push(run.frames.len());
                 }
-                run.pages.heard(&text);
+                // The codec reads a page only from a text frame: a binary one it refuses as no
+                // JSON object, ending its epoch, whatever its bytes hold.
+                if opcode == Opcode::Text {
+                    run.pages.heard(&text);
+                }
                 texts.push((at, run.frames.len(), scrub(&text)));
                 run.frames.push(Arrived {
                     kind: kind(&text),
