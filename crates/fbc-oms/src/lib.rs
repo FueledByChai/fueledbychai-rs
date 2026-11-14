@@ -133,7 +133,10 @@
 //! seeded by hand outside a declared testnet run ([`ArmRefusal`], decision 0067,
 //! `tests/hand_seed.rs`), but for a flat hand seed on the one market a declared
 //! owner-supervised probe run names ([`CodProbeRun`], [`Registry::for_cod_probe`], decision 0140
-//! item 6, `tests/cod_probe.rs`);
+//! item 6, `tests/cod_probe.rs`), where Start, Flatten and Wind-down arm it after a fill moved
+//! the position off it, but under a place stages' declaration
+//! ([`CodProbeRun::owner_supervised_places`]) Start arms only while it is flat (decision 0148
+//! item 3);
 //! [`Registry::disarm`] (to Cancel-only, the leases dropped), [`Registry::kill`] and
 //! [`Registry::lift_kill`] (to Cancel-only, never further). Every change advances the market's
 //! [`StateGeneration`]; no resync, fill or timer changes a market's state.

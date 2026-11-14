@@ -47,6 +47,11 @@
 //!   `order_id` by too), and a client id that does not fit the client-id format
 //!   ([`super::CLIENT_ID_FORMAT`], in which every `client_order_id` is written).
 //!
+//! Under `production_probe` with `qfex.exec.production_places` (decision 0148 item 4), the codec
+//! first asks [`staged`], which refuses `Unsupported` every place but a post-only GTC or a limit
+//! IOC on the public book, not reduce-only, of no more than the instrument's `min_size`; what it
+//! admits is then built as above, so one below the minimum stays `Unencodable`.
+//!
 //! Each frame's charge is in tenths of QFEX's weight unit ([rate
 //! page](https://docs.qfex.com/websocket/rate)), on the provider user's shared buckets
 //! ([`crate::trade_rate`], decisions 0123 and 0128): `add_order` 1.0 and `get_order` 2.0 on
@@ -109,6 +114,28 @@ fn shape(o: &NewOrder) -> Result<(&'static str, &'static str, Ticks), NotSentRea
         (true, Tif::Ioc) => Err(FlagConflict),
         (_, Tif::Fok) => Err(Unsupported),
     }
+}
+
+/// Decision 0148 item 4's fence under `production_probe` with `qfex.exec.production_places`:
+/// `Ok` only for a post-only GTC or a limit IOC on the public book, not reduce-only, of no more
+/// than the instrument's `min_size`; every other place is `Unsupported`, its flags read no
+/// further, so a post-only IOC is not `FlagConflict` here. One below `min_size` goes on to
+/// [`place`], which refuses it `Unencodable` as it does in every mode, and so does an
+/// instrument the spec table does not hold. Whether the order reduces is not read: the flatten
+/// IOC 0148 item 5 builds is reducing with no reduce-only flag. The minimum is the spec table's,
+/// so the fence is only as good as that table, which the probe takes from this adapter's
+/// discovery in the same run (0148 item 4). Its kind, channel and reduce-only checks repeat
+/// refusals [`shape`] makes later, so the fence does not depend on `shape` staying as it is; the
+/// unit tests below pin each check on its own, before the table is read.
+pub(crate) fn staged(o: &NewOrder, specs: &SpecTable) -> Result<(), NotSentReason> {
+    let shape = matches!(o.kind, OrderKind::Limit { .. })
+        && o.channel == Channel::Public
+        && !o.reduce_only
+        && matches!((o.post_only, o.tif), (true, Tif::Gtc) | (false, Tif::Ioc));
+    if !shape || o.qty.get() > spec(specs, o.inst)?.min_size.get() {
+        return Err(Unsupported);
+    }
+    Ok(())
 }
 
 fn place(o: &NewOrder, specs: &SpecTable) -> Result<Request, NotSentReason> {
@@ -258,4 +285,108 @@ fn venue_order_id(target: &OrderRef) -> Result<&VenueOrderId, NotSentReason> {
 /// `value` as a JSON string, escaped: a venue symbol comes from the venue.
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).expect("a string serializes")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fbc_core::{AccountKey, CidMint, Namespace, NamespaceLease, WallNs};
+
+    /// One client id minted under a held namespace lease in a directory of its own.
+    fn cid() -> ClientOrderId {
+        let dir = std::env::temp_dir().join(format!("fbc-qfex-staged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lease = NamespaceLease::acquire(&dir, AccountKey::new(4), Namespace::new(7)).unwrap();
+        let mut mint = CidMint::new(lease, 0, 0, WallNs(1_760_000_000_000_000_000));
+        let cid = mint.mint().unwrap();
+        drop(mint);
+        let _ = std::fs::remove_dir_all(&dir);
+        cid
+    }
+
+    /// A limit IOC on the public book, not reduce-only: a shape the fence admits.
+    fn ioc(cid: ClientOrderId) -> NewOrder {
+        NewOrder {
+            cid,
+            inst: InstrumentId::new(7),
+            side: Side::Buy,
+            qty: Lots::new(1).unwrap(),
+            kind: OrderKind::Limit { px: Ticks(1) },
+            tif: Tif::Ioc,
+            channel: Channel::Public,
+            post_only: false,
+            reduce_only: false,
+            reducing: false,
+        }
+    }
+
+    /// On an empty spec table, an admitted shape reaches the table and is `Unencodable`, so each
+    /// shape the fence refuses `Unsupported` there is refused by the fence's own check, whatever
+    /// [`shape`] would answer it with later (decision 0148 item 4).
+    #[test]
+    fn the_fence_refuses_each_shape_by_its_own_check_before_the_table_is_read() {
+        let cid = cid();
+        let empty = SpecTable::new();
+        let alo = NewOrder {
+            tif: Tif::Gtc,
+            post_only: true,
+            ..ioc(cid)
+        };
+        assert_eq!(staged(&ioc(cid), &empty), Err(Unencodable));
+        assert_eq!(staged(&alo, &empty), Err(Unencodable));
+        for (what, o) in [
+            (
+                "market IOC",
+                NewOrder {
+                    kind: OrderKind::Market,
+                    ..ioc(cid)
+                },
+            ),
+            (
+                "RPI limit IOC",
+                NewOrder {
+                    channel: Channel::Rpi,
+                    ..ioc(cid)
+                },
+            ),
+            (
+                "RPI ALO GTC",
+                NewOrder {
+                    channel: Channel::Rpi,
+                    ..alo
+                },
+            ),
+            (
+                "reduce-only limit IOC",
+                NewOrder {
+                    reduce_only: true,
+                    ..ioc(cid)
+                },
+            ),
+            (
+                "reduce-only ALO GTC",
+                NewOrder {
+                    reduce_only: true,
+                    ..alo
+                },
+            ),
+            (
+                "limit GTC",
+                NewOrder {
+                    tif: Tif::Gtc,
+                    ..ioc(cid)
+                },
+            ),
+            (
+                "post-only IOC",
+                NewOrder {
+                    post_only: true,
+                    ..ioc(cid)
+                },
+            ),
+        ] {
+            assert_eq!(staged(&o, &empty), Err(Unsupported), "{what}");
+        }
+    }
 }

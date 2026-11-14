@@ -8,18 +8,19 @@
 //! item 6's `preprod_probe`, or decision 0143 item 2's `production_probe`, each for the
 //! owner-assisted probe alone. With `qfex.exec.mode` absent, `caps.exec` is `None`, `plan_exec`
 //! plans nothing and `exec_codec` builds nothing (decisions 0117 and 0122). Under a probe mode,
-//! whose guard admits only the origins of the environment it names or loopback stubs, the
-//! factory declares the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade
-//! socket and builds the codec in its probe mode, which under `production_probe` refuses every
-//! place, batch place and amend unsent (decision 0145). In either probe mode the codec decodes
-//! the private state into events, answers the cancel-on-disconnect arm from its own echo, settles
-//! a cancel by the `order_response` naming its order, and resyncs over a signed
-//! `GET /user/positions` and the trade socket's own pages, while every place ends `Unknown` at
-//! its deadline (decisions 0132, 0143 item 4 and 0147). Readiness stays `Record` in every mode,
-//! and a configuration with no probe mode stays `exec: None`. Under a probe mode alone,
-//! [`account_reads`] builds and decodes the probe's own account reads (decision 0132 item 7):
-//! each account's positions and its open orders on a trade socket of its own, and the account
-//! listing, which the probe no longer sends (decision 0144).
+//! whose guard admits only the origins of the environment it names or loopback stubs, the factory
+//! declares the probe's `ExecCaps` ([`exec::probe_exec_caps`]), plans the one trade socket and
+//! builds the codec in its probe mode, which under `production_probe` refuses every place, batch
+//! place and amend unsent (decision 0145), unless `qfex.exec.production_places` admits the place
+//! stages' post-only GTC or limit IOC at the minimum (decision 0148). In either probe mode the
+//! codec decodes the private state into events, answers the cancel-on-disconnect arm from its own
+//! echo, settles a cancel by the `order_response` naming its order, and resyncs over a signed `GET
+//! /user/positions` and the trade socket's own pages, while every place ends `Unknown` at its
+//! deadline (decisions 0132, 0143 item 4 and 0147). Readiness stays `Record` in every mode, and a
+//! configuration with no probe mode stays `exec: None`. Under a probe mode alone, [`account_reads`]
+//! builds and decodes the probe's own account reads (decision 0132 item 7): each account's
+//! positions and its open orders on a trade socket of its own, and the account listing, which the
+//! probe no longer sends (decision 0144).
 //!
 //! The public WebSocket and its `bbo`, `level2`, `trade`, `mark_price`, `underlier` and
 //! `funding` messages are documented at <https://docs.qfex.com/websocket/main> and the
@@ -90,6 +91,7 @@ const SCHEMA: &[FieldSpec] = &[
     probe::PAGE_SIZE_FIELD,
     probe::RESYNC_TIMEOUT_FIELD,
     probe::RPC_TIMEOUT_FIELD,
+    probe::PRODUCTION_PLACES_FIELD,
 ];
 
 fn mds_url(cfg: &VenueConfig) -> Result<&str, ConfigError> {

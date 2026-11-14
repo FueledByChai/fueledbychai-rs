@@ -60,7 +60,8 @@ pub struct Registry {
     pub(crate) testnet_run: Option<TestnetRun>,
     /// The consumer's declaration of an owner-supervised probe run, under which a flat hand seed
     /// on the one market it names may be armed (decision 0140 item 6;
-    /// [`Registry::for_cod_probe`]).
+    /// [`Registry::for_cod_probe`]), Start only while its position is flat under a place stages'
+    /// declaration (decision 0148 item 3).
     pub(crate) cod_probe: Option<CodProbeRun>,
     /// Per market, how many times its inventory moved: an Exit command's authorization is
     /// refused at submit once it moved since the build (decision 0066).
@@ -774,7 +775,10 @@ impl Registry {
     /// unless the registry was built for a declared testnet run ([`Registry::for_testnet_run`],
     /// decision 0067), or the seed is flat on the one market a declared probe run names
     /// ([`Registry::for_cod_probe`], decision 0140 item 6), so nothing is placed or amended on
-    /// it.
+    /// it. On that market, under a place stages' declaration
+    /// ([`CodProbeRun::owner_supervised_places`]), Start also refuses while a fill has moved the
+    /// position off the flat seed, while Flatten and Wind-down still reach Exit (decision 0148
+    /// item 3).
     ///
     /// [`ArmRefusal::SeededByHand`]: crate::ArmRefusal::SeededByHand
     pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {

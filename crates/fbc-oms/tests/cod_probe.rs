@@ -4,13 +4,18 @@
 //! A registry built with [`Registry::for_cod_probe`] from
 //! [`CodProbeRun::owner_supervised`]`(market)` no longer refuses Start, Flatten and Wind-down on
 //! that market as [`ArmRefusal::SeededByHand`] when its hand seed, as seeded, was flat, whatever
-//! the fills moved it to since. Nothing else changes: a hand seed of any other position, or on
-//! any other market, is still refused, on a registry declared a testnet run too ("not a testnet
-//! run"); a registry keeps its first declaration, so it names one market; an unknown position,
-//! the kill switch and the leases refuse as before; a registry without the declaration refuses a
-//! flat hand seed; [`Registry::for_testnet_run`] alone arms as it did; and a later resync only
-//! compares the seed, reporting a desync, under a trustworthy source and under the
-//! untrustworthy, separate reads the probe's codec declares (decisions 0055, 0140 item 7).
+//! the fills moved it to since. Under [`CodProbeRun::owner_supervised_places`]`(market)`, the
+//! declaration of a probe's place stages, the same holds but for Start, which arms the flat seed
+//! only while the position is flat, while Flatten and Wind-down reach Exit after a fill moved it
+//! (decision 0148 item 3; the owner kept Start's rule to the place stages, so
+//! `owner_supervised`'s Start is as decision 0140 has it). Nothing else changes, under either: a
+//! hand seed of any other position, or on any other market, is still refused, on a registry
+//! declared a testnet run too ("not a testnet run"); a registry keeps its first declaration, so it
+//! names one market and one Start; an unknown position, the kill switch and the leases refuse as
+//! before; a registry without the declaration refuses a flat hand seed;
+//! [`Registry::for_testnet_run`] alone arms as it did; and a later resync only compares the seed,
+//! reporting a desync, under a trustworthy source and under the untrustworthy, separate reads the
+//! probe's codec declares (decisions 0055, 0140 item 7).
 
 #[path = "common/arm.rs"]
 mod arm;
@@ -74,6 +79,19 @@ fn probe() -> Registry {
     named(Registry::with_caps(caps()).for_cod_probe(CodProbeRun::owner_supervised(INST)))
 }
 
+/// A named registry declared a probe's place stages', on `INST` (decision 0148 item 3).
+fn places() -> Registry {
+    named(Registry::with_caps(caps()).for_cod_probe(CodProbeRun::owner_supervised_places(INST)))
+}
+
+/// A probe declaration's name, its registry and whether its Start arms only while flat.
+type Probe = (&'static str, fn() -> Registry, bool);
+
+/// Each probe declaration's registry, with whether its Start arms only while flat.
+fn probes() -> [Probe; 2] {
+    [("probe", probe, false), ("places", places, true)]
+}
+
 /// A named registry with no declaration.
 fn live() -> Registry {
     named(Registry::with_caps(caps()))
@@ -116,6 +134,17 @@ fn arms(reg: &mut Registry, market: InstrumentId, name: &str, call: Arm, to: Ent
     let entry = call(reg, market, now).unwrap();
     assert!(entry.armed(), "{name}");
     assert_eq!(entry.state(), to, "{name}");
+}
+
+/// Calls `call` on the armed `market` with no lease, which it holds, and asserts it moved the
+/// market into `to`, advancing its generation.
+fn moves(reg: &mut Registry, market: InstrumentId, name: &str, call: Arm, to: EntryState) {
+    let before = reg.entry(market).generation().get();
+    assert!(reg.entry(market).armed(), "{name}");
+    let entry = call(reg, market, Leases::none()).unwrap();
+    assert!(entry.armed(), "{name}");
+    assert_eq!(entry.state(), to, "{name}");
+    assert!(entry.generation().get() > before, "{name}");
 }
 
 /// The probe codec's snapshot caps (decision 0140 item 7): untrustworthy, read separately.
@@ -172,16 +201,25 @@ fn liquidation(fid: &str, side: Side, qty: i64) -> fbc_core::FillEvent {
     )
 }
 
-/// Hands `fill` to a fresh ledger at `now` and applies it, asserting it moved the inventory.
-fn apply_venue_fill(reg: &mut Registry, fill: &fbc_core::FillEvent, now: u64) {
-    let mut ledger = FillLedger::new(
+/// A fresh fill ledger, which binds to the first registry it hands a fill to.
+fn ledger() -> FillLedger {
+    FillLedger::new(
         LedgerConfig {
             max_age: Duration::from_secs(3600),
             max_entries: 1_000,
         },
         WallNs(0),
     )
-    .unwrap();
+    .unwrap()
+}
+
+/// Hands `fill` to a fresh ledger at `now` and applies it, asserting it moved the inventory.
+fn apply_venue_fill(reg: &mut Registry, fill: &fbc_core::FillEvent, now: u64) {
+    apply_on(reg, &mut ledger(), fill, now);
+}
+
+/// Hands `fill` to `ledger` at `now` and applies it, asserting it moved the inventory.
+fn apply_on(reg: &mut Registry, ledger: &mut FillLedger, fill: &fbc_core::FillEvent, now: u64) {
     match ledger.admit(fill, None, MonoNs(now)) {
         Admission::Apply(a) => assert!(matches!(
             reg.apply_fill(a).unwrap(),
@@ -212,132 +250,178 @@ fn on_inst(report: &ResyncReport) -> Vec<PositionCheck> {
 fn the_declaration_names_one_market_and_is_not_a_testnet_run() {
     let run = CodProbeRun::owner_supervised(INST);
     assert_eq!(run.market(), INST);
+    assert!(!run.starts_only_flat());
     assert_eq!(run, CodProbeRun::owner_supervised(INST));
     assert_ne!(run, CodProbeRun::owner_supervised(OTHER));
-    let reg = probe();
-    assert_eq!(reg.cod_probe(), Some(INST));
-    assert!(!reg.testnet_run());
+    let stages = CodProbeRun::owner_supervised_places(INST);
+    assert_eq!(stages.market(), INST);
+    assert!(stages.starts_only_flat());
+    assert_ne!(run, stages);
+    for (decl, make, _) in probes() {
+        let reg = make();
+        assert_eq!(reg.cod_probe(), Some(INST), "{decl}");
+        assert!(!reg.testnet_run(), "{decl}");
+    }
     assert_eq!(live().cod_probe(), None);
     assert_eq!(testnet().cod_probe(), None);
 }
 
 #[test]
 fn a_flat_hand_seed_on_the_declared_market_arms_at_start_flatten_and_wind_down() {
-    for (name, call, to) in arming_calls() {
-        let mut reg = probe();
-        reg.seed_position(INST, SignedLots(0)).unwrap();
-        assert_eq!(reg.position(INST), Some(SignedLots(0)), "{name}");
-        arms(&mut reg, INST, name, call, to);
-        assert_eq!(reg.position(INST), Some(SignedLots(0)), "{name}");
+    for (decl, make, _) in probes() {
+        for (name, call, to) in arming_calls() {
+            let name = format!("{decl} {name}");
+            let mut reg = make();
+            reg.seed_position(INST, SignedLots(0)).unwrap();
+            assert_eq!(reg.position(INST), Some(SignedLots(0)), "{name}");
+            arms(&mut reg, INST, &name, call, to);
+            assert_eq!(reg.position(INST), Some(SignedLots(0)), "{name}");
+        }
     }
 }
 
 #[test]
 fn a_hand_seed_on_the_declared_market_that_is_not_flat_is_refused() {
-    for (name, call, _) in arming_calls() {
-        for pos in [1, -1, 20] {
-            let mut reg = probe();
-            reg.seed_position(INST, SignedLots(pos)).unwrap();
-            refused(&mut reg, INST, name, call, ArmRefusal::SeededByHand(INST));
+    for (decl, make, _) in probes() {
+        for (name, call, _) in arming_calls() {
+            let name = format!("{decl} {name}");
+            for pos in [1, -1, 20] {
+                let mut reg = make();
+                reg.seed_position(INST, SignedLots(pos)).unwrap();
+                refused(&mut reg, INST, &name, call, ArmRefusal::SeededByHand(INST));
+            }
         }
     }
 }
 
 #[test]
 fn a_flat_hand_seed_on_another_market_is_refused() {
-    for (name, call, to) in arming_calls() {
-        let mut reg = probe();
-        reg.seed_position(OTHER, SignedLots(0)).unwrap();
-        refused(&mut reg, OTHER, name, call, ArmRefusal::SeededByHand(OTHER));
-        // The declared market arms on its own flat seed; the other stays refused.
-        reg.seed_position(INST, SignedLots(0)).unwrap();
-        arms(&mut reg, INST, name, call, to);
-        refused(&mut reg, OTHER, name, call, ArmRefusal::SeededByHand(OTHER));
+    for (decl, make, _) in probes() {
+        for (name, call, to) in arming_calls() {
+            let name = format!("{decl} {name}");
+            let mut reg = make();
+            reg.seed_position(OTHER, SignedLots(0)).unwrap();
+            refused(
+                &mut reg,
+                OTHER,
+                &name,
+                call,
+                ArmRefusal::SeededByHand(OTHER),
+            );
+            // The declared market arms on its own flat seed; the other stays refused.
+            reg.seed_position(INST, SignedLots(0)).unwrap();
+            arms(&mut reg, INST, &name, call, to);
+            refused(
+                &mut reg,
+                OTHER,
+                &name,
+                call,
+                ArmRefusal::SeededByHand(OTHER),
+            );
+        }
     }
 }
 
+/// A market a trustworthy resync seeded arms as before under either declaration, at a position
+/// that is not flat too: a place stages' Start refuses only a flat hand seed a fill moved
+/// (decision 0148 item 3).
 #[test]
 fn a_market_a_trustworthy_resync_seeded_arms_as_before_under_the_declaration() {
-    for (name, call, to) in arming_calls() {
-        let mut reg = probe();
-        seed(&mut reg, &[(INST, 20), (OTHER, -4)]);
-        arms(&mut reg, INST, name, call, to);
-        arms(&mut reg, OTHER, name, call, to);
+    for (decl, make, _) in probes() {
+        for (name, call, to) in arming_calls() {
+            let name = format!("{decl} {name}");
+            let mut reg = make();
+            seed(&mut reg, &[(INST, 20), (OTHER, -4)]);
+            arms(&mut reg, INST, &name, call, to);
+            arms(&mut reg, OTHER, &name, call, to);
+        }
     }
 }
 
 #[test]
 fn an_unknown_position_is_refused_as_before() {
-    for (name, call, _) in arming_calls() {
-        let mut reg = probe();
-        refused(
-            &mut reg,
-            INST,
-            name,
-            call,
-            ArmRefusal::PositionUnknown(INST),
-        );
+    for (decl, make, _) in probes() {
+        for (name, call, _) in arming_calls() {
+            let name = format!("{decl} {name}");
+            let mut reg = make();
+            refused(
+                &mut reg,
+                INST,
+                &name,
+                call,
+                ArmRefusal::PositionUnknown(INST),
+            );
+        }
     }
 }
 
 #[test]
 fn the_kill_switch_refuses_a_flat_probe_seed_as_before() {
-    for (name, call, _) in arming_calls() {
-        let mut reg = probe();
-        reg.seed_position(INST, SignedLots(0)).unwrap();
-        reg.kill(INST);
-        refused(&mut reg, INST, name, call, ArmRefusal::Killed(INST));
-        assert_eq!(reg.entry(INST).state(), EntryState::Killed, "{name}");
+    for (decl, make, _) in probes() {
+        for (name, call, _) in arming_calls() {
+            let name = format!("{decl} {name}");
+            let mut reg = make();
+            reg.seed_position(INST, SignedLots(0)).unwrap();
+            reg.kill(INST);
+            refused(&mut reg, INST, &name, call, ArmRefusal::Killed(INST));
+            assert_eq!(reg.entry(INST).state(), EntryState::Killed, "{name}");
+        }
     }
 }
 
 #[test]
 fn missing_or_wrong_leases_refuse_a_flat_probe_seed_as_before() {
-    for (name, call, _) in arming_calls() {
-        // No lease names at all.
-        let mut reg =
-            Registry::with_caps(caps()).for_cod_probe(CodProbeRun::owner_supervised(INST));
-        reg.seed_position(INST, SignedLots(0)).unwrap();
-        refused_with(
-            &mut reg,
-            INST,
-            name,
-            call,
-            Leases::none(),
-            ArmRefusal::NotNamed(INST),
-        );
+    let declare: [fn(InstrumentId) -> CodProbeRun; 2] = [
+        CodProbeRun::owner_supervised,
+        CodProbeRun::owner_supervised_places,
+    ];
+    for ((decl, make, _), declare) in probes().into_iter().zip(declare) {
+        for (name, call, _) in arming_calls() {
+            let name = format!("{decl} {name}");
+            // No lease names at all.
+            let mut reg = Registry::with_caps(caps()).for_cod_probe(declare(INST));
+            reg.seed_position(INST, SignedLots(0)).unwrap();
+            refused_with(
+                &mut reg,
+                INST,
+                &name,
+                call,
+                Leases::none(),
+                ArmRefusal::NotNamed(INST),
+            );
 
-        let mut reg = probe();
-        reg.seed_position(INST, SignedLots(0)).unwrap();
-        // No market lease.
-        refused_with(
-            &mut reg,
-            INST,
-            name,
-            call,
-            Leases::none(),
-            ArmRefusal::NoMarketLease(INST),
-        );
-        // Another market's lease.
-        let other = Leases::market(market_lease(&reg, OTHER));
-        refused_with(
-            &mut reg,
-            INST,
-            name,
-            call,
-            other,
-            ArmRefusal::WrongMarketLease(INST),
-        );
-        // The market's lease without the account's, which per-account nonces need.
-        let alone = Leases::market(market_lease(&reg, INST));
-        refused_with(
-            &mut reg,
-            INST,
-            name,
-            call,
-            alone,
-            ArmRefusal::NoAccountLease(INST),
-        );
+            let mut reg = make();
+            reg.seed_position(INST, SignedLots(0)).unwrap();
+            // No market lease.
+            refused_with(
+                &mut reg,
+                INST,
+                &name,
+                call,
+                Leases::none(),
+                ArmRefusal::NoMarketLease(INST),
+            );
+            // Another market's lease.
+            let other = Leases::market(market_lease(&reg, OTHER));
+            refused_with(
+                &mut reg,
+                INST,
+                &name,
+                call,
+                other,
+                ArmRefusal::WrongMarketLease(INST),
+            );
+            // The market's lease without the account's, which per-account nonces need.
+            let alone = Leases::market(market_lease(&reg, INST));
+            refused_with(
+                &mut reg,
+                INST,
+                &name,
+                call,
+                alone,
+                ArmRefusal::NoAccountLease(INST),
+            );
+        }
     }
 }
 
@@ -438,24 +522,74 @@ fn a_second_declaration_changes_nothing() {
     }
 }
 
-/// "Flat" is the hand seed as it was seeded, not the inventory now: a fill since moves the
-/// inventory and leaves the seed's origin as it was (decision 0067).
+/// A registry keeps the first declaration's Start too: a place stages' declaration given after
+/// `owner_supervised` leaves Start arming a moved flat seed, and `owner_supervised` given after a
+/// place stages' leaves it refused (decision 0148 item 3).
 #[test]
-fn the_seed_is_judged_as_it_was_seeded_whatever_the_fills_moved_it_to() {
-    for (name, call, to) in arming_calls() {
-        // Seeded flat, then a liquidation of one lot: still armable.
-        let mut reg = probe();
+fn a_second_declaration_keeps_the_first_ones_start() {
+    let declared = |first: CodProbeRun, second: CodProbeRun| {
+        let mut reg = named(
+            Registry::with_caps(caps())
+                .for_cod_probe(first)
+                .for_cod_probe(second),
+        );
         reg.seed_position(INST, SignedLots(0)).unwrap();
         apply_venue_fill(&mut reg, &liquidation("liq-1", Side::Buy, 1), 10);
-        assert_eq!(reg.position(INST), Some(SignedLots(1)), "{name}");
-        arms(&mut reg, INST, name, call, to);
+        assert_eq!(reg.position(INST), Some(SignedLots(1)));
+        reg
+    };
+    let mut reg = declared(
+        CodProbeRun::owner_supervised(INST),
+        CodProbeRun::owner_supervised_places(INST),
+    );
+    arms(
+        &mut reg,
+        INST,
+        "start",
+        Registry::start,
+        EntryState::Quoting,
+    );
+    let mut reg = declared(
+        CodProbeRun::owner_supervised_places(INST),
+        CodProbeRun::owner_supervised(INST),
+    );
+    refused(
+        &mut reg,
+        INST,
+        "start",
+        Registry::start,
+        ArmRefusal::SeededByHand(INST),
+    );
+}
 
-        // Seeded at one lot, then a liquidation back to flat: still refused.
-        let mut reg = probe();
-        reg.seed_position(INST, SignedLots(1)).unwrap();
-        apply_venue_fill(&mut reg, &liquidation("liq-2", Side::Sell, 1), 10);
-        assert_eq!(reg.position(INST), Some(SignedLots(0)), "{name}");
-        refused(&mut reg, INST, name, call, ArmRefusal::SeededByHand(INST));
+/// "Flat" is the hand seed as it was seeded, not the inventory now: a fill since moves the
+/// inventory and leaves the seed's origin as it was (decision 0067). Under a place stages'
+/// declaration Start alone also asks the position as it stands, and arms only while it is flat
+/// (decision 0148 item 3); under `owner_supervised` it arms as decision 0140 item 6 has it.
+#[test]
+fn the_seed_is_judged_as_it_was_seeded_whatever_the_fills_moved_it_to() {
+    for (decl, make, starts_only_flat) in probes() {
+        for (name, call, to) in arming_calls() {
+            let name = format!("{decl} {name}");
+            // Seeded flat, then a liquidation of one lot: still armable, but for a place
+            // stages' Start (decision 0148 item 3).
+            let mut reg = make();
+            reg.seed_position(INST, SignedLots(0)).unwrap();
+            apply_venue_fill(&mut reg, &liquidation("liq-1", Side::Buy, 1), 10);
+            assert_eq!(reg.position(INST), Some(SignedLots(1)), "{name}");
+            if starts_only_flat && to == EntryState::Quoting {
+                refused(&mut reg, INST, &name, call, ArmRefusal::SeededByHand(INST));
+            } else {
+                arms(&mut reg, INST, &name, call, to);
+            }
+
+            // Seeded at one lot, then a liquidation back to flat: still refused.
+            let mut reg = make();
+            reg.seed_position(INST, SignedLots(1)).unwrap();
+            apply_venue_fill(&mut reg, &liquidation("liq-2", Side::Sell, 1), 10);
+            assert_eq!(reg.position(INST), Some(SignedLots(0)), "{name}");
+            refused(&mut reg, INST, &name, call, ArmRefusal::SeededByHand(INST));
+        }
     }
 }
 
@@ -560,6 +694,172 @@ fn a_later_resync_compares_a_flat_probe_seed_and_reports_a_desync() {
     );
 }
 
+/// Decision 0148 item 3: on the declared market, a fill that moved the position off the flat
+/// hand seed, either way, leaves Flatten and Wind-down reaching Exit, from a disarmed market and
+/// from an armed Quoting one, under either declaration.
+#[test]
+fn flatten_and_wind_down_reach_exit_after_a_fill_moved_the_declared_markets_position() {
+    let exits = [
+        (
+            "flatten",
+            Registry::flatten as Arm,
+            EntryState::Exit(ExitKind::Flatten),
+        ),
+        (
+            "wind-down",
+            Registry::wind_down,
+            EntryState::Exit(ExitKind::WindDown),
+        ),
+    ];
+    for (decl, make, _) in probes() {
+        for (name, call, to) in exits {
+            let name = format!("{decl} {name}");
+            for (side, pos) in [(Side::Buy, 1), (Side::Sell, -1)] {
+                // Disarmed.
+                let mut reg = make();
+                reg.seed_position(INST, SignedLots(0)).unwrap();
+                apply_venue_fill(&mut reg, &liquidation("liq-1", side, 1), 10);
+                assert_eq!(reg.position(INST), Some(SignedLots(pos)), "{name}");
+                arms(&mut reg, INST, &name, call, to);
+                assert_eq!(reg.position(INST), Some(SignedLots(pos)), "{name}");
+
+                // Armed and Quoting before the fill: the call moves it to Exit.
+                let mut reg = make();
+                reg.seed_position(INST, SignedLots(0)).unwrap();
+                arms(
+                    &mut reg,
+                    INST,
+                    "start",
+                    Registry::start,
+                    EntryState::Quoting,
+                );
+                apply_venue_fill(&mut reg, &liquidation("liq-2", side, 1), 20);
+                assert_eq!(reg.position(INST), Some(SignedLots(pos)), "{name}");
+                moves(&mut reg, INST, &name, call, to);
+            }
+        }
+    }
+}
+
+/// Decision 0148 item 3: under a place stages' declaration, on the declared market Start arms a
+/// flat hand seed only while the position is flat. Refused `SeededByHand` off flat, changing
+/// nothing, from a disarmed market, an armed Exit one and an armed Quoting one, which a fill
+/// leaves Quoting (decision 0012); it arms again once a fill brings the position back to flat;
+/// and the kill switch answers first.
+#[test]
+fn a_place_stages_start_is_refused_while_the_declared_markets_position_is_not_flat() {
+    let start: Arm = Registry::start;
+    let refused_armed = |reg: &mut Registry, state: EntryState| {
+        let before = seen(reg.entry(INST));
+        assert!(before.0);
+        assert_eq!(before.1, state);
+        assert_eq!(
+            Registry::start(reg, INST, Leases::none()),
+            Err(ArmRefusal::SeededByHand(INST))
+        );
+        assert_eq!(seen(reg.entry(INST)), before);
+    };
+    for (side, back, pos) in [(Side::Buy, Side::Sell, 1), (Side::Sell, Side::Buy, -1)] {
+        // Disarmed.
+        let mut reg = places();
+        let mut fills = ledger();
+        reg.seed_position(INST, SignedLots(0)).unwrap();
+        apply_on(&mut reg, &mut fills, &liquidation("liq-1", side, 1), 10);
+        assert_eq!(reg.position(INST), Some(SignedLots(pos)));
+        refused(
+            &mut reg,
+            INST,
+            "start",
+            start,
+            ArmRefusal::SeededByHand(INST),
+        );
+
+        // Armed in Exit: still refused, Exit unchanged; back to flat, Start arms Quoting.
+        arms(
+            &mut reg,
+            INST,
+            "flatten",
+            Registry::flatten,
+            EntryState::Exit(ExitKind::Flatten),
+        );
+        refused_armed(&mut reg, EntryState::Exit(ExitKind::Flatten));
+        apply_on(&mut reg, &mut fills, &liquidation("liq-2", back, 1), 20);
+        assert_eq!(reg.position(INST), Some(SignedLots(0)));
+        moves(&mut reg, INST, "start", start, EntryState::Quoting);
+
+        // Armed and Quoting: a fill leaves it Quoting, and Start again is refused.
+        let mut reg = places();
+        reg.seed_position(INST, SignedLots(0)).unwrap();
+        arms(&mut reg, INST, "start", start, EntryState::Quoting);
+        apply_venue_fill(&mut reg, &liquidation("liq-3", side, 1), 30);
+        assert_eq!(reg.position(INST), Some(SignedLots(pos)));
+        refused_armed(&mut reg, EntryState::Quoting);
+
+        // The kill switch answers before the seed.
+        let mut reg = places();
+        reg.seed_position(INST, SignedLots(0)).unwrap();
+        apply_venue_fill(&mut reg, &liquidation("liq-4", side, 1), 40);
+        reg.kill(INST);
+        refused(&mut reg, INST, "start", start, ArmRefusal::Killed(INST));
+    }
+}
+
+/// Under `owner_supervised` Start arms a moved flat seed as decision 0140 item 6 has it: from a
+/// disarmed market and from an armed Exit one, either way; the owner kept 0148 item 3's Start
+/// to the place stages' declaration.
+#[test]
+fn owner_supervised_start_arms_a_moved_flat_seed_as_before() {
+    for (side, pos) in [(Side::Buy, 1), (Side::Sell, -1)] {
+        let mut reg = probe();
+        reg.seed_position(INST, SignedLots(0)).unwrap();
+        apply_venue_fill(&mut reg, &liquidation("liq-1", side, 1), 10);
+        assert_eq!(reg.position(INST), Some(SignedLots(pos)));
+        arms(
+            &mut reg,
+            INST,
+            "start",
+            Registry::start,
+            EntryState::Quoting,
+        );
+
+        let mut reg = probe();
+        reg.seed_position(INST, SignedLots(0)).unwrap();
+        apply_venue_fill(&mut reg, &liquidation("liq-2", side, 1), 20);
+        arms(
+            &mut reg,
+            INST,
+            "flatten",
+            Registry::flatten,
+            EntryState::Exit(ExitKind::Flatten),
+        );
+        moves(
+            &mut reg,
+            INST,
+            "start",
+            Registry::start,
+            EntryState::Quoting,
+        );
+        assert_eq!(reg.position(INST), Some(SignedLots(pos)));
+    }
+}
+
+/// Start's rule is the place stages' alone: a declared testnet run's flat hand seed, moved by a
+/// fill, still arms at Start (decision 0067).
+#[test]
+fn a_testnet_run_arms_start_on_a_moved_hand_seed_as_before() {
+    let mut reg = testnet();
+    reg.seed_position(INST, SignedLots(0)).unwrap();
+    apply_venue_fill(&mut reg, &liquidation("liq-1", Side::Buy, 1), 10);
+    assert_eq!(reg.position(INST), Some(SignedLots(1)));
+    arms(
+        &mut reg,
+        INST,
+        "start",
+        Registry::start,
+        EntryState::Quoting,
+    );
+}
+
 #[test]
 fn the_refusal_names_the_probe_run_as_a_way_out() {
     let text = ArmRefusal::SeededByHand(INST).to_string();
@@ -567,4 +867,13 @@ fn the_refusal_names_the_probe_run_as_a_way_out() {
     assert!(text.contains("testnet"), "{text}");
     assert!(text.contains("flat seed"), "{text}");
     assert!(text.contains("probe run"), "{text}");
+    // A place stages' Start refusal once a fill moved the position off the flat seed (decision
+    // 0148 item 3).
+    assert!(
+        text.contains(
+            "under a place stages' declaration Start arms that flat seed only while the position \
+             is still flat"
+        ),
+        "{text}"
+    );
 }

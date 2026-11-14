@@ -28,6 +28,15 @@
 //!   the arm the only request in flight; it sends every other command as a `preprod_probe` codec
 //!   does at the same rpc, its arm, deadlines and resync included. A `preprod_probe` codec
 //!   encodes every command as before, and the recording-only codec still sends places.
+//! - FBC-qnv1 (decision 0148 item 4): `qfex.exec.production_places` is admitted only under
+//!   `production_probe`, with the one value `probe_place_stages`; under `preprod_probe`, with no
+//!   mode, or with any other value it is refused in every factory method and in the probe's own
+//!   connections, naming the key and never its value. With it, a single post-only GTC and a
+//!   limit IOC at exactly the instrument's `min_size` are encoded as a `preprod_probe` codec
+//!   encodes them, a reducing one included, and every other place, batch place and amend is
+//!   refused `NotSent(Unsupported)` with nothing written, before and after authentication; one
+//!   below the minimum stays `Unencodable`, as under `preprod_probe`. Without the key the very
+//!   same commands are refused as decision 0145 says, and the rest is sent as before either way.
 //!
 //! Every key, account, id and frame here is synthetic: the frames are built from the shapes
 //! QFEX's pages show (each test names the page), or are `fixtures/qfex/private` (its
@@ -55,9 +64,10 @@ use fbc_journal::{JournalReader, JournalWriter, Record, RedactionKey};
 use fbc_venue_qfex::auth::{self, TradeAuth};
 use fbc_venue_qfex::exec::{ARM, CHANNELS, ErrCode, QfexExec, TRADE, probe_exec_caps};
 use fbc_venue_qfex::probe::{
-    self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
-    PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS, PRODUCTION_PROBE,
-    PRODUCTION_REST, PRODUCTION_TRADE, SPEED_BUMP,
+    self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_PRODUCTION_PLACES, KEY_RESYNC_TIMEOUT,
+    KEY_RPC_TIMEOUT, Origins, PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE,
+    PROBE_PLACE_STAGES, PRODUCTION_MDS, PRODUCTION_PROBE, PRODUCTION_REST, PRODUCTION_TRADE,
+    SPEED_BUMP,
 };
 use fbc_venue_qfex::sign::HmacKey;
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex};
@@ -129,6 +139,13 @@ fn production(account: &str) -> VenueConfig {
 /// The probe in its production mode on a loopback stub.
 fn production_loopback(account: &str) -> VenueConfig {
     with(loopback(account), KEY_EXEC_MODE, PRODUCTION_PROBE)
+}
+
+/// `cfg` with `qfex.exec.production_places` set to `probe_place_stages` (decision 0148 item 4).
+/// Applied last: [`dropped`] and [`without`] rebuild a configuration from a fixed key list that
+/// leaves this key out.
+fn staged(cfg: VenueConfig) -> VenueConfig {
+    with(cfg, KEY_PRODUCTION_PLACES, PROBE_PLACE_STAGES)
 }
 
 fn with(mut cfg: VenueConfig, key: &str, value: &str) -> VenueConfig {
@@ -265,11 +282,15 @@ fn open(codec: &mut dyn ExecCodec, n: u64) -> Vec<Effect> {
 }
 
 fn encode(codec: &mut dyn ExecCodec, cmd: &VenueCommand, rpc: u64) -> Out {
+    encode_on(codec, cmd, rpc, &specs())
+}
+
+fn encode_on(codec: &mut dyn ExecCodec, cmd: &VenueCommand, rpc: u64, specs: &SpecTable) -> Out {
     let mut fx = Effects::new();
     let sent = codec.encode(
         cmd,
         RpcId(rpc),
-        &specs(),
+        specs,
         &ctx(rpc),
         &mut PathStamps::off(),
         &mut fx,
@@ -422,6 +443,29 @@ fn specs() -> SpecTable {
     let mut specs = SpecTable::new();
     specs.insert(spec());
     specs
+}
+
+/// The minimum of [`stage_specs`], made up so that [`order`]'s 100 lots sit exactly at it. It
+/// is no venue's number: the probe reads the venue's minimum from discovery (decision 0148 item
+/// 4).
+const STAGE_MIN: i64 = 100;
+
+/// [`spec`] with a minimum of [`STAGE_MIN`] lots.
+fn stage_specs() -> SpecTable {
+    let mut specs = SpecTable::new();
+    specs.insert(InstrumentSpec {
+        min_size: Lots::new(STAGE_MIN).unwrap(),
+        ..spec()
+    });
+    specs
+}
+
+/// `order` with `lots` lots.
+fn sized(order: NewOrder, lots: i64) -> NewOrder {
+    NewOrder {
+        qty: Lots::new(lots).unwrap(),
+        ..order
+    }
 }
 
 /// Client ids minted under a held namespace lease, once per test binary.
@@ -1093,6 +1137,113 @@ fn production_probe_refuses_a_preproduction_origin_a_mix_and_any_other_origin() 
     refused_everywhere(&cfg, want, "every production origin under preprod_probe");
 }
 
+// ----- The production place stages' key (decision 0148 item 4, FBC-qnv1) -----
+
+#[test]
+fn production_places_is_admitted_only_under_production_probe_and_names_the_key_only() {
+    // Admitted under production_probe, on production origins and on loopback ones, for either
+    // account, and read by the settings and by a codec built directly.
+    for (cfg, side) in [
+        (staged(production(SUB)), Origins::Production),
+        (staged(production("primary")), Origins::Production),
+        (staged(production_loopback(SUB)), Origins::Loopback),
+    ] {
+        admitted(&cfg, side, "production places");
+        assert!(settings(&cfg).place_stages());
+        let codec = probe_on(&cfg);
+        assert!(codec.probe_settings().unwrap().place_stages());
+    }
+    assert!(!settings(&production(SUB)).place_stages());
+    assert!(!settings(&preprod(SUB)).place_stages());
+
+    // Outside production_probe: under preprod_probe, on its origins or loopback ones, and with
+    // no mode at all, whatever the origins.
+    let outside = ConfigError::Invalid {
+        key: KEY_PRODUCTION_PLACES,
+        reason: "admitted only under production_probe",
+    };
+    let handle = |cfg: &VenueConfig| TradeAuth::new(cfg, secrets()).unwrap();
+    for (cfg, what) in [
+        (staged(preprod(SUB)), "pre-production"),
+        (staged(loopback(SUB)), "pre-production loopback"),
+        (staged(without(SUB, KEY_EXEC_MODE)), "no mode"),
+        (
+            staged(dropped(&production(SUB), KEY_EXEC_MODE)),
+            "no mode, production origins",
+        ),
+    ] {
+        refused_everywhere(&cfg, outside, what);
+        assert!(
+            matches!(QfexExec::probe(handle(&preprod(SUB)), &cfg), Err(e) if e == outside),
+            "{what}"
+        );
+        let text = probe::mode(&cfg).unwrap_err().to_string();
+        assert_eq!(
+            text,
+            "invalid configuration key qfex.exec.production_places: admitted only under \
+             production_probe",
+            "{what}"
+        );
+        assert!(!text.contains(PROBE_PLACE_STAGES), "{what}");
+    }
+
+    // Any other value under production_probe.
+    let other = ConfigError::Invalid {
+        key: KEY_PRODUCTION_PLACES,
+        reason: "expected probe_place_stages or no value",
+    };
+    let sentence = "invalid configuration key qfex.exec.production_places: expected \
+                    probe_place_stages or no value";
+    for value in [
+        "every_place",
+        "PROBE_PLACE_STAGES",
+        "probe-place-stages",
+        "probe_place_stages_all",
+        "",
+        "probe_place_stages ",
+    ] {
+        for base in [production(SUB), production_loopback(SUB)] {
+            let cfg = with(base, KEY_PRODUCTION_PLACES, value);
+            refused_everywhere(&cfg, other, value);
+            assert!(
+                matches!(QfexExec::probe(handle(&cfg), &cfg), Err(e) if e == other),
+                "{value:?}"
+            );
+            let text = probe::mode(&cfg).unwrap_err().to_string();
+            assert_eq!(text, sentence, "{value:?}");
+            // The empty value is in every text, and the trailing-space one in the sentence
+            // itself, so only the others can be looked for.
+            if !value.is_empty() && !sentence.contains(value) {
+                assert!(!text.contains(value), "{value:?}");
+            }
+        }
+    }
+
+    // With an unknown mode, the mode's own refusal answers first, naming its key alone.
+    let cfg = with(staged(production(SUB)), KEY_EXEC_MODE, "bogus");
+    let bad_mode = ConfigError::Invalid {
+        key: KEY_EXEC_MODE,
+        reason: "expected preprod_probe, production_probe, or no value",
+    };
+    refused_everywhere(&cfg, bad_mode, "unknown mode");
+    let text = probe::mode(&cfg).unwrap_err().to_string();
+    assert!(
+        !text.contains("bogus") && !text.contains(KEY_PRODUCTION_PLACES),
+        "{text}"
+    );
+
+    // The schema lists it.
+    assert!(
+        Qfex.config_schema()
+            .iter()
+            .any(|field| field.key == KEY_PRODUCTION_PLACES)
+    );
+    assert_eq!(
+        (KEY_PRODUCTION_PLACES, PROBE_PLACE_STAGES),
+        ("qfex.exec.production_places", "probe_place_stages")
+    );
+}
+
 #[test]
 fn an_absent_mode_gives_market_data_only_and_no_codec() {
     // Production's origins, probe settings the mode would refuse, and no mode: as before the
@@ -1732,10 +1883,6 @@ fn a_refused_production_place_leaves_the_codec_counts_unchanged() {
 /// deadline, then the resync's effects but its positions read, whose URL is the configuration's
 /// REST origin (`tests/probe_resync.rs` holds that read to its origin and headers).
 fn script(codec: &mut dyn ExecCodec, rest: bool, places: bool) -> Vec<Out> {
-    let mut outs = Vec::new();
-    authenticate(codec, 1);
-    let mut rpc = FIRST_RPC;
-    let mut sent = Vec::new();
     let mut cmds: Vec<VenueCommand> = Vec::new();
     if places {
         cmds.extend(placements().into_iter().map(|(_, cmd, _)| cmd));
@@ -1743,9 +1890,18 @@ fn script(codec: &mut dyn ExecCodec, rest: bool, places: bool) -> Vec<Out> {
     if rest {
         cmds.extend(the_rest());
     }
-    for cmd in &cmds {
+    script_on(codec, &cmds, &specs())
+}
+
+/// [`script`]'s run of `cmds` on `specs`.
+fn script_on(codec: &mut dyn ExecCodec, cmds: &[VenueCommand], specs: &SpecTable) -> Vec<Out> {
+    let mut outs = Vec::new();
+    authenticate(codec, 1);
+    let mut rpc = FIRST_RPC;
+    let mut sent = Vec::new();
+    for cmd in cmds {
         rpc += 1;
-        let out = encode(codec, cmd, rpc);
+        let out = encode_on(codec, cmd, rpc, specs);
         if out.result.is_ok() {
             sent.push(rpc);
         }
@@ -1899,6 +2055,319 @@ fn the_recording_codec_still_sends_places() {
         encode(&mut off, &amend(), 2),
         refused(NotSentReason::Unsupported)
     );
+}
+
+// ----- Places under production_probe with production_places (decision 0148 item 4) -----
+
+/// Every place, batch place and amend the production place stages' tests send, on
+/// [`stage_specs`], each with what a `production_probe` codec with `qfex.exec.production_places`
+/// answers it with once authenticated (`None`: sent, one frame): the two shapes it admits at the
+/// minimum and a reducing one (the flatten IOC of 0148 item 5); every other shape, a size above
+/// the minimum, reduce-only, a batch and an amend, `Unsupported`; and, `Unencodable` as in every
+/// mode, a size below the minimum, no lots, an instrument the table does not hold and a price
+/// that is not positive.
+fn stage_placements() -> Vec<(&'static str, VenueCommand, Option<NotSentReason>)> {
+    use NotSentReason::{Unencodable, Unsupported};
+    let alo = || order(limit(), Tif::Gtc, Channel::Public, true, false);
+    let ioc = || order(limit(), Tif::Ioc, Channel::Public, false, false);
+    let place = |kind, tif, channel, post_only, reduce| {
+        VenueCommand::Place(order(kind, tif, channel, post_only, reduce))
+    };
+    let flatten = NewOrder {
+        reducing: true,
+        side: Side::Sell,
+        ..ioc()
+    };
+    let unknown = |o: NewOrder| {
+        VenueCommand::Place(NewOrder {
+            inst: InstrumentId::new(99),
+            ..o
+        })
+    };
+    let at_zero = |o: NewOrder| {
+        VenueCommand::Place(NewOrder {
+            kind: OrderKind::Limit { px: Ticks(0) },
+            ..o
+        })
+    };
+    let sized_place = |o: NewOrder, lots| VenueCommand::Place(sized(o, lots));
+    vec![
+        ("ALO GTC at the minimum", VenueCommand::Place(alo()), None),
+        ("limit IOC at the minimum", VenueCommand::Place(ioc()), None),
+        ("reducing limit IOC", VenueCommand::Place(flatten), None),
+        (
+            "limit GTC",
+            place(limit(), Tif::Gtc, Channel::Public, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "post-only IOC",
+            place(limit(), Tif::Ioc, Channel::Public, true, false),
+            Some(Unsupported),
+        ),
+        (
+            "market IOC",
+            place(OrderKind::Market, Tif::Ioc, Channel::Public, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "limit FOK",
+            place(limit(), Tif::Fok, Channel::Public, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "post-only FOK",
+            place(limit(), Tif::Fok, Channel::Public, true, false),
+            Some(Unsupported),
+        ),
+        (
+            "RPI limit GTC",
+            place(limit(), Tif::Gtc, Channel::Rpi, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "RPI ALO GTC",
+            place(limit(), Tif::Gtc, Channel::Rpi, true, false),
+            Some(Unsupported),
+        ),
+        (
+            "RPI limit IOC",
+            place(limit(), Tif::Ioc, Channel::Rpi, false, false),
+            Some(Unsupported),
+        ),
+        (
+            "reduce-only limit IOC",
+            place(limit(), Tif::Ioc, Channel::Public, false, true),
+            Some(Unsupported),
+        ),
+        (
+            "reduce-only ALO GTC",
+            place(limit(), Tif::Gtc, Channel::Public, true, true),
+            Some(Unsupported),
+        ),
+        (
+            "ALO GTC above the minimum",
+            sized_place(alo(), STAGE_MIN + 1),
+            Some(Unsupported),
+        ),
+        (
+            "limit IOC above the minimum",
+            sized_place(ioc(), STAGE_MIN + 1),
+            Some(Unsupported),
+        ),
+        (
+            "limit IOC well above the minimum",
+            sized_place(ioc(), 250),
+            Some(Unsupported),
+        ),
+        (
+            "batch of one admitted place",
+            VenueCommand::PlaceBatch(vec![ioc()]),
+            Some(Unsupported),
+        ),
+        (
+            "empty batch",
+            VenueCommand::PlaceBatch(vec![]),
+            Some(Unsupported),
+        ),
+        ("amend", amend(), Some(Unsupported)),
+        (
+            "ALO GTC below the minimum",
+            sized_place(alo(), STAGE_MIN - 1),
+            Some(Unencodable),
+        ),
+        (
+            "limit IOC below the minimum",
+            sized_place(ioc(), STAGE_MIN - 1),
+            Some(Unencodable),
+        ),
+        (
+            "limit IOC of no lots",
+            sized_place(ioc(), 0),
+            Some(Unencodable),
+        ),
+        ("unknown instrument", unknown(ioc()), Some(Unencodable)),
+        ("price zero", at_zero(alo()), Some(Unencodable)),
+    ]
+}
+
+/// The production place stages' configurations: either account, production and loopback.
+fn stage_configs() -> [VenueConfig; 3] {
+    [
+        staged(production(SUB)),
+        staged(production("primary")),
+        staged(production_loopback(SUB)),
+    ]
+}
+
+#[test]
+fn with_production_places_only_a_post_only_gtc_or_a_limit_ioc_at_the_minimum_is_encoded() {
+    let specs = stage_specs();
+    let cases = stage_placements();
+    assert_eq!(cases.iter().filter(|(_, _, why)| why.is_none()).count(), 3);
+    // Once authenticated, a pre-production codec answers each case the same way but for what
+    // the fence refuses, and sends the admitted ones as the same frame.
+    let mut preprod_codec = probe_on(&preprod(SUB));
+    authenticate(&mut preprod_codec, 1);
+    let mut want = Vec::new();
+    for (at, (what, cmd, why)) in cases.iter().enumerate() {
+        let out = encode_on(&mut preprod_codec, cmd, FIRST_RPC + at as u64, &specs);
+        match why {
+            None => {
+                let [Effect::Send { rpc, charge, .. }] = out.effects.as_slice() else {
+                    panic!("{what}: {out:?}");
+                };
+                assert_eq!(rpc.map(|call| call.id), Some(RpcId(FIRST_RPC + at as u64)));
+                assert_eq!(charge.op, OpKind::Place, "{what}");
+                assert_eq!(out.result, Ok(()), "{what}");
+            }
+            // One below the minimum stays Unencodable: the key does not change that answer.
+            Some(NotSentReason::Unencodable) => {
+                assert_eq!(out, refused(NotSentReason::Unencodable), "{what}");
+            }
+            Some(_) => {}
+        }
+        want.push(out);
+    }
+    for cfg in stage_configs() {
+        for mut codec in both_ways(&cfg) {
+            let codec = codec.as_mut();
+            // Before the stream is authenticated: the refusals as they are, the admitted ones
+            // not sent for want of an epoch.
+            open(codec, 1);
+            for (what, cmd, why) in &cases {
+                let reason = why.unwrap_or(NotSentReason::Disconnected);
+                let out = encode_on(codec, cmd, 1, &specs);
+                assert_eq!(out, refused(reason), "{what}, opening");
+            }
+            // Once it is, on two epochs: each answered as above at its rpc, the arm still sent
+            // once after them.
+            for epoch in [1, 2] {
+                authenticate(codec, epoch);
+                for (at, (what, cmd, why)) in cases.iter().enumerate() {
+                    let out = encode_on(codec, cmd, FIRST_RPC + at as u64, &specs);
+                    match why {
+                        None => assert_eq!(out, want[at], "{what}, epoch {epoch}"),
+                        Some(why) => assert_eq!(out, refused(*why), "{what}, epoch {epoch}"),
+                    }
+                }
+                assert_eq!(encode(codec, &ARM_ON, epoch), sent(arm_sent(epoch)));
+            }
+        }
+        assert!(settings(&cfg).place_stages());
+    }
+}
+
+#[test]
+fn with_production_places_a_refusal_changes_nothing() {
+    // Each refusal leaves the counts as they were, before the stream is authenticated and once
+    // it is; and a refused place leaves the arm the only request in flight, so the journal keeps
+    // an err in the arm's window as its shape, as decision 0145's refusal does.
+    let specs = stage_specs();
+    let refusals: Vec<_> = stage_placements()
+        .into_iter()
+        .filter(|(_, _, why)| why.is_some())
+        .collect();
+    for cfg in stage_configs() {
+        let mut codec = probe_on(&cfg);
+        open(&mut codec, 1);
+        let before = codec.counts();
+        for (what, cmd, _) in &refusals {
+            encode_on(&mut codec, cmd, 1, &specs);
+            assert_eq!(codec.counts(), before, "{what}, opening");
+        }
+        authenticate(&mut codec, 1);
+        let before = codec.counts();
+        for (at, (what, cmd, _)) in refusals.iter().enumerate() {
+            encode_on(&mut codec, cmd, FIRST_RPC + at as u64, &specs);
+            assert_eq!(codec.counts(), before, "{what}");
+        }
+    }
+    let frame = nested("InvalidOrder", r#""a \"quoted\" reason""#, "{}");
+    let spans = |codec: &QfexExec| {
+        codec
+            .redact_inbound(Inbound::Frame(RawFrame::Text(&frame)))
+            .body()
+            .to_vec()
+    };
+    let mut armed_only = probe_on(&preprod(SUB));
+    authenticate(&mut armed_only, 1);
+    assert_eq!(encode(&mut armed_only, &ARM_ON, 2), sent(arm_sent(2)));
+    let gtc = VenueCommand::Place(order(limit(), Tif::Gtc, Channel::Public, false, false));
+    let mut staged_codec = probe_on(&staged(production(SUB)));
+    authenticate(&mut staged_codec, 1);
+    assert_eq!(
+        encode_on(&mut staged_codec, &gtc, 1, &specs),
+        refused(NotSentReason::Unsupported)
+    );
+    assert_eq!(encode(&mut staged_codec, &ARM_ON, 2), sent(arm_sent(2)));
+    assert_eq!(spans(&staged_codec), spans(&armed_only));
+}
+
+#[test]
+fn with_production_places_the_rest_and_the_staged_places_are_sent_as_under_preprod_probe() {
+    let specs = stage_specs();
+    let admitted: Vec<VenueCommand> = stage_placements()
+        .into_iter()
+        .filter(|(_, _, why)| why.is_none())
+        .map(|(_, cmd, _)| cmd)
+        .collect();
+    let mut staged_script = admitted.clone();
+    staged_script.extend(the_rest());
+    for (staged_cfg, preprod_cfg) in [
+        (staged(production(SUB)), preprod(SUB)),
+        (staged(production_loopback(SUB)), loopback(SUB)),
+    ] {
+        // The rest alone: cancels, queries, the arm, the deadlines and the resync unchanged.
+        let want = script(&mut probe_on(&preprod_cfg), true, false);
+        for mut codec in both_ways(&staged_cfg) {
+            assert_eq!(script(codec.as_mut(), true, false), want);
+        }
+        // The admitted places first: each sent, its deadline Unknown, as under preprod_probe.
+        let want = script_on(&mut probe_on(&preprod_cfg), &staged_script, &specs);
+        let sends = want.iter().filter(|out| out.effects.len() == 1).count();
+        assert_eq!(
+            sends,
+            3 + 5,
+            "three places, two cancels, two queries and the arm"
+        );
+        let unknowns = want
+            .iter()
+            .filter(|out| matches!(out.events.as_slice(), [e] if *e == unknown(FIRST_RPC + 1)))
+            .count();
+        assert_eq!(unknowns, 1, "the first place ends Unknown at its deadline");
+        for mut codec in both_ways(&staged_cfg) {
+            assert_eq!(script_on(codec.as_mut(), &staged_script, &specs), want);
+        }
+    }
+}
+
+#[test]
+fn without_production_places_0145_stands() {
+    // The very commands the key admits, and every other, are refused unsent as decision 0145
+    // says, on the same specs, before the stream is authenticated and once it is.
+    let specs = stage_specs();
+    let unsupported = refused(NotSentReason::Unsupported);
+    for cfg in [production(SUB), production_loopback(SUB)] {
+        assert!(!settings(&cfg).place_stages());
+        for mut codec in both_ways(&cfg) {
+            let codec = codec.as_mut();
+            open(codec, 1);
+            for (what, cmd, _) in stage_placements() {
+                assert_eq!(
+                    encode_on(codec, &cmd, 1, &specs),
+                    unsupported,
+                    "{what}, opening"
+                );
+            }
+            authenticate(codec, 1);
+            for (at, (what, cmd, _)) in stage_placements().into_iter().enumerate() {
+                let out = encode_on(codec, &cmd, FIRST_RPC + at as u64, &specs);
+                assert_eq!(out, unsupported, "{what}");
+            }
+            assert_eq!(encode(codec, &ARM_ON, 1), sent(arm_sent(1)));
+        }
+    }
 }
 
 // ----- What stage one brings -----

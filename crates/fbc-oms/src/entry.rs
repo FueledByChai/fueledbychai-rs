@@ -35,8 +35,12 @@
 //! seeded by hand ([`Registry::seed_position`](crate::Registry::seed_position)) unless the
 //! registry was built for a declared owner-assisted testnet run ([`Registry::for_testnet_run`],
 //! decision 0067) and not for a probe run, or the seed was flat on the one market a declared
-//! owner-supervised probe run names ([`Registry::for_cod_probe`], decision 0140 item 6). A
-//! refused call changes nothing.
+//! owner-supervised probe run names ([`Registry::for_cod_probe`], decision 0140 item 6). On
+//! that market Start arms the flat seed into Quoting, and Flatten and Wind-down into Exit,
+//! whatever a fill since moved the position to (decision 0140 item 6), but under a place stages'
+//! declaration ([`CodProbeRun::owner_supervised_places`]) Start arms only while the position is
+//! flat, while Flatten and Wind-down still reach Exit (decision 0148 item 3). A refused call
+//! changes nothing.
 //! The registry holds the leases while the market is armed and drops them when it is disarmed;
 //! the account lease while any market is armed.
 //!
@@ -70,7 +74,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountLease, InstrumentId, Lots, MarketLease, NonceScope, OrderCaps, Side, VenueSymbol,
+    AccountLease, InstrumentId, Lots, MarketLease, NonceScope, OrderCaps, Side, SignedLots,
+    VenueSymbol,
 };
 
 use crate::caps::Exposure;
@@ -251,10 +256,20 @@ impl TestnetRun {
 /// ([`ArmRefusal::SeededByHand`]), on a registry declared a testnet run too. It is neither
 /// `Clone` nor `Copy`, so one declaration goes into one registry; a registry keeps the first it
 /// is given, so it names one market for its life; and only [`CodProbeRun::owner_supervised`]
-/// makes one.
+/// and [`CodProbeRun::owner_supervised_places`] make one.
+///
+/// On that market Start, Flatten and Wind-down arm the flat seed whatever the fills since moved
+/// the position to (decision 0140 item 6), but under [`CodProbeRun::owner_supervised_places`],
+/// the declaration of a probe's place stages (decision 0148 items 3 and 11), Start arms only
+/// while the position is flat, while Flatten and Wind-down still reach Exit; a fill leaves a
+/// Quoting market Quoting, so a place stage whose position moved there Flattens. fbc-oms names
+/// no venue (decision 0003): which declaration a probe makes is the consumer's, and the owner
+/// kept Start's rule to the place stages' (decision 0148).
 #[derive(Eq, PartialEq, Hash, Debug)]
 pub struct CodProbeRun {
     market: InstrumentId,
+    /// Whether Start arms only while the position is flat (decision 0148 item 3).
+    flat_start: bool,
 }
 
 impl CodProbeRun {
@@ -262,12 +277,32 @@ impl CodProbeRun {
     /// one no other process trades, and its own reads showed no open order on the account and no
     /// position in `market` before the consumer seeds it flat by hand (decision 0140 item 6).
     pub fn owner_supervised(market: InstrumentId) -> CodProbeRun {
-        CodProbeRun { market }
+        CodProbeRun {
+            market,
+            flat_start: false,
+        }
+    }
+
+    /// Declares an owner-supervised probe run's place stages on `market`, as
+    /// [`CodProbeRun::owner_supervised`] does, but Start then arms the flat seed only while the
+    /// position is flat, while Flatten and Wind-down reach Exit after a fill moved it (decision
+    /// 0148 item 3).
+    pub fn owner_supervised_places(market: InstrumentId) -> CodProbeRun {
+        CodProbeRun {
+            market,
+            flat_start: true,
+        }
     }
 
     /// The one market the declaration names.
     pub fn market(&self) -> InstrumentId {
         self.market
+    }
+
+    /// Whether Start arms the flat seed only while the position is flat: a place stages'
+    /// declaration ([`CodProbeRun::owner_supervised_places`], decision 0148 item 3).
+    pub fn starts_only_flat(&self) -> bool {
+        self.flat_start
     }
 }
 
@@ -296,8 +331,10 @@ pub enum ArmRefusal {
     /// trustworthy resync, the registry was not built for a declared owner-assisted testnet
     /// run ([`Registry::for_testnet_run`]) or was declared a probe's too, and the seed is not a
     /// flat one on the market a declared probe names ([`Registry::for_cod_probe`]): a hand seed
-    /// never arms a live market otherwise (decisions 0067, 0140 item 6). A later resync only
-    /// compares the seed, so this holds for the process's life.
+    /// never arms a live market otherwise (decisions 0067, 0140 item 6). On that market, under a
+    /// place stages' declaration ([`CodProbeRun::owner_supervised_places`]), Start also refuses
+    /// it while a fill has moved the position off the flat seed (decision 0148 item 3). A later
+    /// resync only compares the seed, so this holds for the process's life.
     SeededByHand(InstrumentId),
     /// The registry has no [`LeaseKeys`] naming the market, so no lease can be checked.
     NotNamed(InstrumentId),
@@ -328,7 +365,9 @@ impl fmt::Display for ArmRefusal {
                 f,
                 "the position on {inst:?} was seeded by hand, not by a trustworthy resync: \
                  only a declared owner-assisted testnet run not declared a probe run's, or a \
-                 flat seed on the market a declared probe run names, arms such a market"
+                 flat seed on the market a declared probe run names, arms such a market, and \
+                 under a place stages' declaration Start arms that flat seed only while the \
+                 position is still flat"
             ),
             ArmRefusal::NotNamed(inst) => {
                 write!(f, "no lease names are configured for {inst:?}")
@@ -912,7 +951,11 @@ impl Registry {
     /// ([`Registry::testnet_run`] stays as it was), and never arms a market whose position is
     /// unknown. Given once: a registry already declared a probe's keeps its first declaration,
     /// and a later one, on whatever market, changes nothing ([`Registry::cod_probe`] says which
-    /// market it names), so a registry never arms a hand seed on two markets.
+    /// market it names), so a registry never arms a hand seed on two markets, and keeps that
+    /// declaration's Start: Start, Flatten and Wind-down reach their states there after a fill
+    /// moved the position off the flat seed, but under a place stages' declaration
+    /// ([`CodProbeRun::owner_supervised_places`]) Start arms only while it is flat (decision
+    /// 0148 item 3).
     pub fn for_cod_probe(mut self, run: CodProbeRun) -> Registry {
         self.reap_dropped();
         self.cod_probe.get_or_insert(run);
@@ -927,7 +970,8 @@ impl Registry {
 
     /// How `market`'s position stands for arming: known and seeded by a trustworthy resync, by
     /// hand in a declared testnet run not declared a probe run's (decision 0067), or flat by hand
-    /// on the market a declared probe run names (decision 0140 item 6).
+    /// on the market a declared probe run names (decision 0140 item 6). Start also asks
+    /// [`Registry::probe_seed_moved`] (decision 0148 item 3).
     fn seeding(&self, market: InstrumentId) -> Seeding {
         if !self.position_known(market) {
             Seeding::Unknown
@@ -941,7 +985,10 @@ impl Registry {
     /// Whether `market`'s hand seed may be armed: on a registry declared a probe run's, only when
     /// it is the market the probe names and the seed, as seeded, was flat, whatever the fills
     /// moved it to since, a testnet declaration widening nothing (decision 0140 item 6, "not a
-    /// testnet run"); otherwise only in a declared testnet run (decision 0067).
+    /// testnet run"); otherwise only in a declared testnet run (decision 0067). Whatever the
+    /// fills holds for Start, Flatten and Wind-down; Start also asks
+    /// [`Registry::probe_seed_moved`], which refuses a moved seed under a place stages'
+    /// declaration alone (decision 0148 item 3).
     fn hand_seed_armable(&self, market: InstrumentId) -> bool {
         match self.cod_probe() {
             Some(probe) => probe == market && self.flat_hand_seed(market),
@@ -974,22 +1021,43 @@ impl Registry {
     /// Quoting; on an armed market, moves it to Quoting. The only call that reaches Quoting.
     /// Refused, changing nothing, for a Killed market, while the market's position is unknown,
     /// for a market seeded by hand outside a declared testnet run (decision 0067) but for a flat
-    /// seed on a declared probe's market (decision 0140 item 6), and, on a disarmed market,
-    /// without the market's lease, or without the account's lease where the venue's nonce scope
-    /// is per account and the registry does not hold it.
+    /// seed on a declared probe's market (decision 0140 item 6), and on that market, under a
+    /// place stages' declaration, while its position is not flat ([`ArmRefusal::SeededByHand`],
+    /// decision 0148 item 3, on an armed market too), and, on a disarmed market, without the
+    /// market's lease, or without the account's lease where the venue's nonce scope is per
+    /// account and the registry does not hold it.
     pub fn start(
         &mut self,
         market: InstrumentId,
         leases: Leases,
     ) -> Result<MarketEntry, ArmRefusal> {
         self.reap_dropped();
-        let seeding = self.seeding(market);
+        let seeding = match self.seeding(market) {
+            Seeding::Armable if self.probe_seed_moved(market) => Seeding::ByHand,
+            seeding => seeding,
+        };
         self.entries
             .arm(market, EntryState::Quoting, leases, seeding)
     }
 
+    /// Whether `market` is the one a declared place stages' probe run names
+    /// ([`CodProbeRun::owner_supervised_places`]), seeded flat by hand, and its position is not
+    /// flat now: Start then arms nothing, while Flatten and Wind-down still reach Exit (decision
+    /// 0148 item 3).
+    fn probe_seed_moved(&self, market: InstrumentId) -> bool {
+        self.cod_probe
+            .as_ref()
+            .is_some_and(|run| run.market == market && run.flat_start)
+            && self.flat_hand_seed(market)
+            && self.position(market) != Some(SignedLots(0))
+    }
+
     /// The owner's Flatten (decision 0012): arms a disarmed market straight into Exit, never
-    /// through Quoting; moves an armed one to Exit. Refused as [`Registry::start`] is.
+    /// through Quoting; moves an armed one to Exit. Refused as [`Registry::start`] is, but under a
+    /// place stages' declaration ([`CodProbeRun::owner_supervised_places`]), where Start refuses
+    /// a flat hand seed a fill has moved, it still reaches Exit on the declared market (decision
+    /// 0148 item 3); under [`CodProbeRun::owner_supervised`] it arms that seed whatever the
+    /// fills, as Start does (decision 0140 item 6).
     pub fn flatten(
         &mut self,
         market: InstrumentId,

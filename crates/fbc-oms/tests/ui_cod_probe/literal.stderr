@@ -1,7 +1,9 @@
-error[E0451]: field `market` of struct `CodProbeRun` is private
- --> tests/ui_cod_probe/literal.rs:8:9
-  |
-7 |     let run = CodProbeRun {
-  |               ----------- in this type
-8 |         market: InstrumentId::new(1),
-  |         ^^^^^^ private field
+error[E0451]: fields `market` and `flat_start` of struct `CodProbeRun` are private
+  --> tests/ui_cod_probe/literal.rs:9:9
+   |
+ 8 |     let run = CodProbeRun {
+   |               ----------- in this type
+ 9 |         market: InstrumentId::new(1),
+   |         ^^^^^^ private field
+10 |         flat_start: false,
+   |         ^^^^^^^^^^ private field

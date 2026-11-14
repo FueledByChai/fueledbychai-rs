@@ -15,8 +15,12 @@
 //!   builds under `preprod_probe` or `production_probe` alone (decision 0143 item 2), its caps
 //!   [`probe_exec_caps`] in both. Under `production_probe` alone, loopback origins included, it
 //!   refuses every place, batch place and amend `NotSent(Unsupported)`, whatever the epoch and the
-//!   order, though its caps declare places, until a record admits places on production (FBC-5d7x,
-//!   decision 0145); in every other way it is alike in both. It encodes one cancel-on-disconnect
+//!   order, though its caps declare places (FBC-5d7x, decision 0145), unless
+//!   `qfex.exec.production_places` is `probe_place_stages`: then it encodes a single place only as
+//!   a post-only GTC or a limit IOC at exactly the instrument's `min_size`, refusing every other
+//!   place, batch place and amend `NotSent(Unsupported)` before the epoch is read, one below the
+//!   minimum `Unencodable` as in every mode (FBC-qnv1, decision 0148 item 4); in every other way
+//!   it is alike in both. It encodes one cancel-on-disconnect
 //!   arm per epoch, and refuses unsent every later arm on that epoch and every disarm (item 1), so
 //!   at most one arm is in flight on a connection. Only the arm's own echo answers it
 //!   (`echo::arm_echo`), on its epoch, while it is in flight on the authenticated stream: an ack
@@ -92,11 +96,13 @@
 //!   query by the venue's order UUID, each one frame naming its request with the consumer's
 //!   deadline and labelled with its command's traffic class, sent only on an authenticated
 //!   epoch (`NotSent(Disconnected)` otherwise); everything else is refused unsent (`order.rs`),
-//!   and under `production_probe` every place too, before the epoch is read (decision 0145),
-//!   but the probe's one arm per epoch, [`ARM`], charged as the rate page's 0.1 for
-//!   `cancel_on_disconnect` under `Control`, which charges both buckets since the page names
-//!   none for it. While the resync's open-order pages run, a query, answered in the same kind
-//!   of frame, is refused `NotSent(Backpressure)` with nothing written (item 5).
+//!   and under `production_probe` every place too, before the epoch is read (decision 0145), or
+//!   with `qfex.exec.production_places` every place but the place stages' two shapes at the
+//!   minimum (`order::staged`, decision 0148 item 4), but the probe's one arm per epoch, [`ARM`],
+//!   charged as the rate page's 0.1 for `cancel_on_disconnect` under `Control`, which charges both
+//!   buckets since the page names none for it. While the resync's open-order pages run, a query,
+//!   answered in the same kind of frame, is refused `NotSent(Backpressure)` with nothing written
+//!   (item 5).
 //!   No reply settles a request but the probe's arm, as above, and its cancels (decision 0132
 //!   item 8): a `CANCELLED` `order_response` naming a cancel's order accepts it at
 //!   `AckLevel::Final`, pushed before the order's update, and a `NO_SUCH_ORDER` one rejects it
@@ -255,6 +261,17 @@ enum Sent {
     Query(VenueOrderId),
 }
 
+/// How the codec's mode lets places through (decisions 0145 and 0148 item 4). It derives
+/// nothing: it is only matched by value.
+enum Placing {
+    /// Recording-only and `preprod_probe`: every place `order.rs` sends.
+    Sent,
+    /// `production_probe` without `qfex.exec.production_places`: none (decision 0145).
+    Refused,
+    /// `production_probe` with it: the place stages' two shapes at the minimum (decision 0148).
+    Stages,
+}
+
 /// The order-entry codec for one QFEX account's trade WebSocket, recording-only or in a probe
 /// mode.
 pub struct QfexExec {
@@ -330,16 +347,18 @@ impl QfexExec {
         QfexExec::with(auth, rpc_timeout, None, String::new())
     }
 
-    /// The codec in the probe mode `cfg` sets (decision 0132 item 6, decision 0143 item 2),
-    /// alike in both but for `production_probe`'s refusal of every place, batch place and amend
-    /// (decision 0145), for the account `auth` authenticates as: each command it sends, its one
-    /// arm per epoch included, awaits its reply for `qfex.exec.rpc_timeout`. Its settings are
-    /// those the mode's guard admitted ([`crate::probe::mode`]), and its resync reads positions
-    /// from the REST origin that same guard admitted ([`crate::probe::connections`]), so the
-    /// signed read never leaves the environment the mode names. Refused, naming the key and
-    /// never a value, when `qfex.exec.mode` is absent, for everything `probe::connections`
-    /// refuses, and when `auth` was built for another account key than `cfg` binds, or for the
-    /// primary account where `cfg` selects a subaccount or the other way round.
+    /// The codec in the probe mode `cfg` sets (decision 0132 item 6, decision 0143 item 2), alike
+    /// in both but for `production_probe`'s refusal of every place, batch place and amend (decision
+    /// 0145), or of every place but the place stages' two shapes at the minimum with
+    /// `qfex.exec.production_places` (decision 0148 item 4), for the account `auth` authenticates
+    /// as: each command it sends, its one arm per epoch included, awaits its reply for
+    /// `qfex.exec.rpc_timeout`. Its settings are those the mode's guard admitted
+    /// ([`crate::probe::mode`]), and its resync reads positions from the REST origin that same
+    /// guard admitted ([`crate::probe::connections`]), so the signed read never leaves the
+    /// environment the mode names. Refused, naming the key and never a value, when `qfex.exec.mode`
+    /// is absent, for everything `probe::connections` refuses, and when `auth` was built for
+    /// another account key than `cfg` binds, or for the primary account where `cfg` selects a
+    /// subaccount or the other way round.
     pub fn probe(auth: TradeAuth, cfg: &VenueConfig) -> Result<QfexExec, ConfigError> {
         let probe = crate::probe::mode(cfg)?.ok_or(ConfigError::Missing(KEY_EXEC_MODE))?;
         let connections = crate::probe::connections(cfg)?;
@@ -452,12 +471,18 @@ impl QfexExec {
         });
     }
 
-    /// Whether this codec refuses every place, batch place and amend unsent, whatever the epoch
-    /// and the order: the probe under `production_probe`, loopback origins included, until a
-    /// record admits places on production (FBC-5d7x, decision 0145).
-    fn refuses_places(&self) -> bool {
-        self.probe
-            .is_some_and(|p| p.environment() == Environment::Production)
+    /// How this codec's mode lets places through, whatever the epoch: under `production_probe`,
+    /// loopback origins included, none (FBC-5d7x, decision 0145), or with
+    /// `qfex.exec.production_places` the place stages' two shapes at the minimum (decision 0148
+    /// item 4).
+    fn placing(&self) -> Placing {
+        match self.probe {
+            Some(p) if p.environment() == Environment::Production && p.place_stages() => {
+                Placing::Stages
+            }
+            Some(p) if p.environment() == Environment::Production => Placing::Refused,
+            _ => Placing::Sent,
+        }
     }
 
     /// The request the probe's arm is sent as: `on`, in the probe, on an epoch that has not
@@ -866,7 +891,9 @@ impl ExecCodec for QfexExec {
     /// One frame for a command `order.rs` sends, or the probe's one arm per epoch, once the
     /// stream is authenticated; a command it refuses is refused for what it is, whatever the
     /// epoch, and under `production_probe` that is every place, batch place and amend, refused
-    /// first, with nothing changed (decision 0145). QFEX signs no order and takes no nonce, so
+    /// first, with nothing changed (decision 0145), or with `qfex.exec.production_places` every
+    /// batch place and amend and every place but the place stages' two shapes at the minimum
+    /// (decision 0148 item 4). QFEX signs no order and takes no nonce, so
     /// the receipt is empty.
     fn encode(
         &mut self,
@@ -877,13 +904,19 @@ impl ExecCodec for QfexExec {
         _t: &mut PathStamps<'_>,
         fx: &mut Effects,
     ) -> Result<EncodeReceipt, NotSentReason> {
-        let request = match cmd {
-            VenueCommand::Place(_) | VenueCommand::PlaceBatch(_) | VenueCommand::Amend(_)
-                if self.refuses_places() =>
-            {
+        let request = match (cmd, self.placing()) {
+            (
+                VenueCommand::Place(_) | VenueCommand::PlaceBatch(_) | VenueCommand::Amend(_),
+                Placing::Refused,
+            )
+            | (VenueCommand::PlaceBatch(_) | VenueCommand::Amend(_), Placing::Stages) => {
                 return Err(NotSentReason::Unsupported);
             }
-            VenueCommand::ArmCancelOnDisconnect(on) => self.arm(*on)?,
+            (VenueCommand::Place(order), Placing::Stages) => {
+                order::staged(order, specs)?;
+                order::request(cmd, specs)?
+            }
+            (VenueCommand::ArmCancelOnDisconnect(on), _) => self.arm(*on)?,
             _ => order::request(cmd, specs)?,
         };
         if self.phase != Phase::Authenticated {

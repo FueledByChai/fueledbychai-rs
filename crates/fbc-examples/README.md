@@ -285,9 +285,10 @@ PRE-PRODUCTION environment, with the credentials QFEX supplied for it, as a decl
 such declaration (decision 0143; below). It arms
 cancel-on-disconnect once per account and records what answers the arm. It places nothing, and
 it sends no command but each session's arm, its resync's reads and its own reads. FBC-9sk2's
-place stages build on it now that FBC-jxau has landed; they are not decided for production. With
-`--hold-secs` it first holds one trade connection that never arms, to record how QFEX keeps it
-alive (the liveness hold, decision 0146; below), and a run may hold without arming.
+place stages build on it now that FBC-jxau has landed; decision 0148 lets them run on production
+too, behind `--production` and `--sole-trader`, once FBC-9sk2 builds them. With `--hold-secs` it
+first holds one trade connection that never arms, to record how QFEX keeps it alive (the
+liveness hold, decision 0146; below), and a run may hold without arming.
 
 Before anything connects, it refuses:
 

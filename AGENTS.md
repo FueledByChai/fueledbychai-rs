@@ -205,9 +205,15 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   refusing the other environment's domain; its caps in `src/exec/caps.rs`, alike in both,
   account-wide cancel-on-disconnect offering no disarm, which `caps_truthful` holds it to in
   `tests/conformance.rs`, 0141; under `production_probe` alone its codec refusing every place,
-  batch place and amend unsent, `NotSent(Unsupported)` before the epoch is read, until a record
-  admits places on production, so `caps_truthful` there breaches exactly the placement checks
-  (FBC-5d7x, 0145, `tests/probe_mode.rs`, `tests/conformance.rs`); in either mode (FBC-jxau,
+  batch place and amend unsent, `NotSent(Unsupported)` before the epoch is read (FBC-5d7x,
+  0145), unless `qfex.exec.production_places` is `probe_place_stages`, under which it encodes a
+  single place only as a post-only GTC or a limit IOC at exactly the instrument's `min_size`
+  (`exec::order::staged`) and refuses every other place, batch place and amend `Unsupported`
+  unsent, one below the minimum `Unencodable` as in every mode, the key under any other mode or
+  none a configuration error naming the key, never its value (FBC-qnv1, 0148 item 4); so
+  `caps_truthful` there breaches exactly the placement control and the post-only IOC conflict,
+  with the key or without (`tests/probe_mode.rs`, `tests/probe_resync.rs`,
+  `tests/conformance.rs`); in either mode (FBC-jxau,
   0143 item 4) the arm answered by its own echo alone (`src/exec/echo.rs`, `arm_echo`: an ack
   accepting it at Final, as FBC-291a's capture shows, an err rejecting it unless `RateLimited`,
   which holds every frame budget for its kept hint and leaves the arm to its deadline, 0132 item
@@ -506,8 +512,13 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     a declared `TestnetRun` and no probe's, or the seed, as seeded, is flat on the one market a
     declared `CodProbeRun` names (`CodProbeRun::owner_supervised(market)`, given to
     `Registry::for_cod_probe`, which keeps the first it is given, neither `Clone` nor `Copy`;
-    0140 item 6; `tests/cod_probe.rs`, compile-fail cases in `tests/ui_cod_probe/`), every
-    change advancing the market's `StateGeneration`; the
+    0140 item 6; `tests/cod_probe.rs`, compile-fail cases in `tests/ui_cod_probe/`), on which
+    market Start, Flatten and Wind-down arm after a fill moved the position off that flat seed,
+    but under the place stages' `CodProbeRun::owner_supervised_places(market)` Start arms only
+    while the position is flat (`SeededByHand` otherwise), a fill leaving a Quoting market
+    Quoting, and Flatten and Wind-down still reach Exit (0148 item 3, the owner keeping Start's
+    rule QFEX-only; `tests/cod_probe.rs`), every change advancing the market's
+    `StateGeneration`; the
     registry's `CancelOnlyTrip`, which the shard's journal trips at its soft limit, moving
     every market in Quoting to Cancel-only, its armed flag unchanged, read at once and applied
     at the registry's next mutating call, and a place, batch or amend authorized in Quoting
