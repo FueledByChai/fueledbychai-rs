@@ -16,7 +16,7 @@ use fbc_core::{
 
 use crate::audit::{Audit, AuditSink};
 use crate::caps::{Adds, CapRefusal, Exposure, PreTradeCaps};
-use crate::entry::{Admits, Entries, StateRefusal, TestnetRun};
+use crate::entry::{Admits, CodProbeRun, Entries, StateRefusal, TestnetRun};
 use crate::grant::{Counters, Guard, IssueRefusal, Watch};
 use crate::ladder;
 use crate::ledger::AcceptedFill;
@@ -58,6 +58,10 @@ pub struct Registry {
     /// The consumer's declaration of an owner-assisted testnet run, under which a market seeded
     /// by hand may be armed (decision 0067; [`Registry::for_testnet_run`]).
     pub(crate) testnet_run: Option<TestnetRun>,
+    /// The consumer's declaration of an owner-supervised probe run, under which a flat hand seed
+    /// on the one market it names may be armed (decision 0140 item 6;
+    /// [`Registry::for_cod_probe`]).
+    pub(crate) cod_probe: Option<CodProbeRun>,
     /// Per market, how many times its inventory moved: an Exit command's authorization is
     /// refused at submit once it moved since the build (decision 0066).
     positions: Counters,
@@ -762,12 +766,15 @@ impl Registry {
     /// Refused once the market is seeded, and once a fill moved its inventory before it was
     /// seeded: only a resync's snapshot can place such a fill, so the market stays unknown.
     ///
-    /// For tests, fixtures and an owner-assisted testnet run only: a hand seed is never a way
-    /// around the rule that nothing is sent after a restart until the first trustworthy resync
-    /// (decision 0055's Consequences, Reviewer B's RB80-10 on PR #80). Enforced at arming: Start,
+    /// For tests, fixtures, an owner-assisted testnet run and an owner-supervised probe run's
+    /// flat seed only: a hand seed is never a way around the rule that nothing is sent after a
+    /// restart until the first trustworthy resync (decision 0055's Consequences, Reviewer B's
+    /// RB80-10 on PR #80). Enforced at arming: Start,
     /// Flatten and Wind-down refuse a market seeded by hand ([`ArmRefusal::SeededByHand`])
     /// unless the registry was built for a declared testnet run ([`Registry::for_testnet_run`],
-    /// decision 0067), so nothing is placed or amended on it.
+    /// decision 0067), or the seed is flat on the one market a declared probe run names
+    /// ([`Registry::for_cod_probe`], decision 0140 item 6), so nothing is placed or amended on
+    /// it.
     ///
     /// [`ArmRefusal::SeededByHand`]: crate::ArmRefusal::SeededByHand
     pub fn seed_position(&mut self, inst: InstrumentId, pos: SignedLots) -> Result<(), OmsError> {

@@ -1,0 +1,7 @@
+error[E0451]: field `market` of struct `CodProbeRun` is private
+ --> tests/ui_cod_probe/literal.rs:8:9
+  |
+7 |     let run = CodProbeRun {
+  |               ----------- in this type
+8 |         market: InstrumentId::new(1),
+  |         ^^^^^^ private field

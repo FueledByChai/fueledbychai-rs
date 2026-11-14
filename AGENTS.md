@@ -501,11 +501,17 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     `src/entry.rs`, `tests/states.rs`): each market armed or not and Killed, Cancel-only, Exit
     or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
     Start, Flatten and Wind-down arming with the market lease (and the account lease where
-    nonces are per account) and refused while Killed or the position is unknown, every change
-    advancing the market's `StateGeneration`; the registry's `CancelOnlyTrip`, which the shard's
-    journal trips at its soft limit, moving every market in Quoting to Cancel-only, its armed
-    flag unchanged, read at once and applied at the registry's next mutating call, and a place,
-    batch or amend authorized in Quoting before it refused at submit
+    nonces are per account) and refused while Killed or the position is unknown, and for a
+    market seeded by hand (`SeededByHand`, 0067; `tests/hand_seed.rs`) unless the registry is
+    a declared `TestnetRun` and no probe's, or the seed, as seeded, is flat on the one market a
+    declared `CodProbeRun` names (`CodProbeRun::owner_supervised(market)`, given to
+    `Registry::for_cod_probe`, which keeps the first it is given, neither `Clone` nor `Copy`;
+    0140 item 6; `tests/cod_probe.rs`, compile-fail cases in `tests/ui_cod_probe/`), every
+    change advancing the market's `StateGeneration`; the
+    registry's `CancelOnlyTrip`, which the shard's journal trips at its soft limit, moving
+    every market in Quoting to Cancel-only, its armed flag unchanged, read at once and applied
+    at the registry's next mutating call, and a place, batch or amend authorized in Quoting
+    before it refused at submit
     (`StaleAuthorization::CancelOnly`), while a market in Exit stays in Exit, its reducing
     orders built and sent (0139, `tests/cancel_only_trip.rs`); cancels and fills in
     every state (0012;
@@ -909,7 +915,7 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
     first rule, in normal and build dependencies (not dev-dependencies, which venue tests use).
 - Tests: unit tests beside the code (`#[cfg(test)]`), integration and property tests in
   `crates/<crate>/tests/`, `trybuild` compile-fail tests for the seals in `fbc-core`'s tests, and for the
-  authorization in `fbc-oms`'s.
+  authorization, the permits and the probe declaration in `fbc-oms`'s.
 - Fixtures in `fixtures/<venue>/`: recorded frames, journals and signing vectors. Synthetic
   key- or address-shaped values sit in a directory of their own carrying a `SYNTHETIC` file
   that says where they come from (0009); that marker exempts only its own directory from the
