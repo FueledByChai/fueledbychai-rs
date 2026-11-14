@@ -12,8 +12,10 @@
 //!   request, `{"type":"get_user_orders","params":{"limit":N,"offset":M}}`, as the codec writes
 //!   each page of its resync ([`ask`]). The journal keeps an outbound frame as written: the
 //!   codec names no span in a page's request;
-//! - **its answer** is the first text frame after it on that connection that is a page as the
-//!   codec reads one on the probe's sessions ([`rows`]), read from the bytes the journal kept. The
+//! - **its answer** is the first text frame after it on that connection, before its epoch's
+//!   close, that is a page as the codec reads one on the probe's sessions ([`rows`]), read from
+//!   the bytes the journal kept. A frame journaled after the close reached no codec: a session
+//!   the probe stops journals its epoch closed, then the frame waiting, which no codec reads. The
 //!   codec reads a page only from a text frame: a binary one it refuses as no JSON object, ending
 //!   its epoch, whatever its bytes hold, so `capture.rs` offers [`Pages::heard`] only the frames
 //!   the journal kept as text. A page is JSON in which no object names a member twice (the codec
@@ -71,6 +73,13 @@ impl Pages {
             self.asked += 1;
             self.waiting = Some(page);
         }
+    }
+
+    /// Ends the session's epoch: no frame journaled after its close reached the codec (the
+    /// runtime journals a frame waiting as a session stops after its close, and hands it to no
+    /// codec), so none answers the page waiting.
+    pub fn closed(&mut self) {
+        self.waiting = None;
     }
 
     /// Reads `text`, a text frame QFEX sent the session as its journal kept it: the answer to the
