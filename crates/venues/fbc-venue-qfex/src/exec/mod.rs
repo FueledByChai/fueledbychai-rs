@@ -48,6 +48,26 @@
 //!   ([trade.yaml](https://docs.qfex.com/websocket/trade.yaml)); anything else, or no reply when
 //!   the deadline fires, ends the epoch. The deadline's tag names the epoch's opening, so a
 //!   timer of an earlier epoch does nothing.
+//! - **Liveness: no client keepalive (FBC-sbbl, decision 0146 item 8).** The codec sends no
+//!   keepalive frame and arms no keepalive timer (an order-entry codec's keepalive is its own
+//!   timer, decision 0056). Once a connection has authenticated, QFEX's server keeps it alive by
+//!   periodically sending WebSocket ping frames
+//!   ([authenticate](https://docs.qfex.com/websocket/channels/trade/authenticate)), and the
+//!   WebSocket layer answers each with a pong (`tests/liveness.rs`).
+//!
+//!   The owner's hour-long hold on QFEX production measured this
+//!   (`fixtures/qfex/exec-recorded/hold-production/README.md`). After its subscriptions the
+//!   connection sent nothing but those pongs until its own close at the hour's end. No ping came
+//!   before authentication, a ping came about every 10 s after it, and no server close came in
+//!   3600 s. That speaks for production only. Not measured:
+//!   - pre-production;
+//!   - a lifetime longer than the hour;
+//!   - an armed connection.
+//!
+//!   The same directory's first run recorded a server close with no code during a QFEX outage.
+//!   Such a close would end an armed session's epoch: the session reconnects as its pacing
+//!   allows and must arm again before it places (decision 0121). Whether QFEX cancels the
+//!   account's orders at such a close, and reconnecting during an outage, were not measured.
 //! - **Subscriptions, and when the stream is authenticated (FBC-bsou, decision 0132 item 1).**
 //!   A successful auth reply sends `order_responses`, `fills` and `positions`, one frame each,
 //!   as the AsyncAPI's `subscribe_orders`, `subscribe_fills` and `subscribe_positions` show,
@@ -273,7 +293,9 @@ enum Placing {
 }
 
 /// The order-entry codec for one QFEX account's trade WebSocket, recording-only or in a probe
-/// mode.
+/// mode. It sends no client keepalive: QFEX's server pings keep an authenticated connection
+/// alive, as its authenticate page says and an hour-long hold measured on production only (the
+/// module's liveness paragraph, FBC-sbbl).
 pub struct QfexExec {
     auth: TradeAuth,
     /// Each command's deadline, after which it ends `Unknown`.

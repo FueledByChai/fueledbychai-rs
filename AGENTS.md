@@ -239,7 +239,10 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   the journal keeps; 0146, FBC-39ks), its trade session's liveness on server pings alone held in
   `tests/liveness.rs` (an `ExecSession` under `preprod_probe` against the conformance stub on a
   paused clock: its arm accepted and its resync answered before the first ping, then each ping
-  answered, no frame of its own; FBC-39ks),
+  answered, no frame of its own; FBC-39ks), and its codec sending no client keepalive, since the
+  owner's hour-long hold on QFEX production showed server pings about every 10 s after
+  authentication and no server close (for production only; FBC-sbbl, 0146 item 8;
+  `fixtures/qfex/exec-recorded/hold-production/`, held by `tests/hold_production.rs`),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
@@ -965,6 +968,12 @@ when green" (from 0009) until a record settles that clause (FBC-ftg0).
   replaced by one fixed placeholder after the run. The run's `report.md` sits beside them, and
   the README says what answered the arm on each account. Being recorded, it carries no
   `SYNTHETIC` marker.
+  `fixtures/qfex/exec-recorded/hold-production/` holds the reports and evidence of the probe's
+  liveness hold on production (FBC-sbbl, 0146 item 6): an hour-long hold at its top level, and
+  in `first-run/` an earlier one that a server close ended during a QFEX outage. It holds no
+  frame. Its README records the pings, the closes and what was not measured, and
+  `tests/hold_production.rs` in `fbc-venue-qfex` holds that README to both runs' evidence. Being
+  recorded, it carries no `SYNTHETIC` marker.
   `fixtures/licence-gate/` is a standalone two-crate workspace the licence gate's self-test
   runs against (0017); `fixtures/dep-direction/` a standalone workspace of empty crates in this
   layout, with three forbidden edges, that the dependency-direction check's self-test runs

@@ -169,3 +169,19 @@ the arm on the primary account and on the subaccount with an ack echoing it. Aft
 markets the primary account has position rows in. Its README says what answered the arm on each
 account and what was blanked, and the run's `report.md` sits beside it. There is no
 pre-production capture.
+
+`exec-recorded/hold-production/` holds the probe's liveness hold on production (FBC-39ks,
+decision 0146), committed by FBC-sbbl: the `report.md` and `evidence.json` of an hour-long hold
+on the primary account, and in `first-run/` those of an earlier hold that a server close ended
+during a QFEX outage. No frame is kept, since the hold journals none (decision 0146 item 6). Its
+README records:
+
+- that no ping came before authentication;
+- the intervals between the server pings after it;
+- the one server close, which came in the first run, with no code and its time since open, and
+  that none came within the hour;
+- that a lifetime longer than the hold was not measured.
+
+It also says why the trade codec sends no client keepalive, and that the result speaks for
+production only. `crates/venues/fbc-venue-qfex/tests/hold_production.rs` holds the README to
+both runs' evidence. There is no pre-production hold (`exec-recorded/hold/`).
