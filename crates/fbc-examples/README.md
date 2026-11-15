@@ -534,12 +534,15 @@ could have lost a record, and says why. A partial session's report concludes
 nothing of what answered its arm and places none of its frames against the arm, and its fixture
 files are named `<account>-<n>-partial.json`.
 
-**The liveness hold** (decision 0146, FBC-39ks). Nothing in this repository says how QFEX's
-trade WebSocket stays alive, whether QFEX closes an idle one, or how long one may live, and an
-armed connection that drops cancels every open order of the account. QFEX's
+**The liveness hold** (decision 0146, FBC-39ks). It measures how QFEX's trade WebSocket stays
+alive, whether QFEX closes an idle one, and how long one may live, on one connection that never
+arms. This matters because an armed connection that drops cancels every open order of the
+account. QFEX's
 [authenticate page](https://docs.qfex.com/websocket/channels/trade/authenticate) says only that
-the server pings an authenticated connection from time to time. The hold measures it on one
-connection that never arms.
+the server pings an authenticated connection from time to time. On production the owner's
+hour-long hold saw a ping about every 10 s after authentication and no server close
+(`fixtures/qfex/exec-recorded/hold-production/README.md`, FBC-sbbl). A longer lifetime,
+pre-production and an armed connection remain unmeasured.
 
 With `--hold-secs <S>` (whole seconds, 1 to 86400, no default), the run holds one trade
 connection before any session, while no other connection of the probe is open:
@@ -619,7 +622,9 @@ A run that only holds writes no frame: its `fixtures/` holds a README alone, and
 holds nothing of the hold. Read `report.md` before committing it, then commit it as
 `fixtures/qfex/exec-recorded/hold-production/report.md` (a pre-production hold's as
 `fixtures/qfex/exec-recorded/hold/`) beside a README that records the result (decision 0146 item
-6). The result speaks for the environment it was measured on only.
+6). The result speaks for the environment it was measured on only. FBC-sbbl committed the
+owner's production holds there: an hour with no server close, and an earlier run a server
+close ended during a QFEX outage (`first-run/`).
 
 The exit status is 0 only when the hold, when asked for, authenticated, had its three
 subscriptions confirmed, received no order or fill frame and ended at its duration, the owner's

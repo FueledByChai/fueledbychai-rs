@@ -7,9 +7,11 @@
 //! WebSocket layer, and send nothing of its own while it is pinged.
 //!
 //! fbc-runtime's `ExecSession`, unchanged, runs the QFEX codec under `preprod_probe` (decision
-//! 0132 item 6) against the conformance kit's stub server on 127.0.0.1, on a paused clock that
-//! only the test moves: a blocking task that never ends keeps tokio from jumping it while socket
-//! I/O is under way. The stub confirms each of the three subscriptions, so the codec reports the
+//! 0132 item 6), and again under `production_probe` (decision 0143 item 2), the mode the owner's
+//! hour-long hold on QFEX production measured (FBC-sbbl,
+//! `fixtures/qfex/exec-recorded/hold-production/README.md`). Each runs against the conformance
+//! kit's stub server on 127.0.0.1, on a paused clock that only the test moves: a blocking task
+//! that never ends keeps tokio from jumping it while socket I/O is under way. The stub confirms each of the three subscriptions, so the codec reports the
 //! stream authenticated (FBC-bsou) and the session sends its cancel-on-disconnect arm (decisions
 //! 0058 and 0121), which the stub answers with the ack QFEX production sent (FBC-291a), and the
 //! codec accepts at Final (FBC-jxau, decision 0132 item 1). The session then asks for its resync
@@ -62,6 +64,7 @@ use fbc_runtime::{
 use fbc_venue_qfex::exec::{ARM, AUTH_DEADLINE, CHANNELS};
 use fbc_venue_qfex::probe::{
     KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, PREPROD_PROBE,
+    PRODUCTION_PROBE,
 };
 use fbc_venue_qfex::sign::QfexNonces;
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_TIMEOUT, KEY_REST_URL, Qfex, auth};
@@ -103,10 +106,11 @@ const SHARD: u16 = 0;
 /// The consumer's account key, which the configuration binds the session to (decision 0122).
 const ACCT: AccountKey = AccountKey::new(4);
 
-/// The probe's configuration for the primary account on the stub's origins.
-fn config(server: &StubServer) -> VenueConfig {
+/// The probe's configuration for the primary account on the stub's origins, in `mode`: both
+/// probe modes' guards admit an all-loopback configuration.
+fn config(server: &StubServer, mode: &str) -> VenueConfig {
     let mut cfg = VenueConfig::new();
-    cfg.insert(KEY_EXEC_MODE, PREPROD_PROBE);
+    cfg.insert(KEY_EXEC_MODE, mode);
     cfg.insert(auth::TRADE_URL, &server.ws_url(""));
     cfg.insert(KEY_REST_URL, &server.http_url(""));
     cfg.insert(KEY_MDS_URL, &server.ws_url(""));
@@ -275,6 +279,17 @@ fn script() -> (Vec<Step>, Vec<usize>) {
 
 #[tokio::test(start_paused = true)]
 async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_nothing_of_its_own() {
+    holds_on_server_pings(PREPROD_PROBE).await;
+}
+
+/// The same under `production_probe`, where the owner's hold measured QFEX's pings (FBC-sbbl):
+/// its codec refuses places (decision 0145) but arms, resyncs and answers pings alike.
+#[tokio::test(start_paused = true)]
+async fn under_production_probe_too_the_session_answers_each_ping_and_writes_nothing_of_its_own() {
+    holds_on_server_pings(PRODUCTION_PROBE).await;
+}
+
+async fn holds_on_server_pings(mode: &str) {
     assert!(INTERVAL * (PINGS as u32 - 1) > AUTH_DEADLINE);
     assert!(INTERVAL < RESYNC_TIMEOUT && RESYNC_TIMEOUT < INTERVAL * 2);
     let frozen = freeze();
@@ -283,7 +298,7 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
     let server = StubServer::start(WsScript::new(steps), positions_route(Arc::clone(&reads)))
         .await
         .unwrap();
-    let cfg = config(&server);
+    let cfg = config(&server, mode);
     let caps = Qfex.caps(&cfg).unwrap();
     let limits = caps
         .exec_limits
@@ -315,7 +330,7 @@ async fn an_authenticated_trade_session_answers_each_server_ping_and_writes_noth
         outbound: bound,
         in_flight: InFlight::new(bound),
     };
-    let root = fresh_dir("qfex_liveness");
+    let root = fresh_dir(&format!("qfex_liveness_{mode}"));
     let sink = SinkConfig {
         budget_bytes: 1 << 20,
         soft_limit_pct: 85,
