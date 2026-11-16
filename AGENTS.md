@@ -156,8 +156,8 @@ rather than guess.
 
 Merge profile: legacy
 
-This repository keeps the staged/legacy handoff, the default (kit decision 0028), because the
-owner merges pull requests by hand, CI runs when the `ci:run` label is added to a ready pull
+This repository keeps the staged/legacy handoff, the default (kit decision 0028), because
+pull requests are merged by hand, CI runs when the `ci:run` label is added to a ready pull
 request (`.github/workflows/loop.yml`; a new head needs the label removed and added again), and no
 merge-queue App runs here.
 
@@ -167,11 +167,22 @@ auto-merge disabled. Open each ticket's pull request as a draft with
 a review path still gets its `needs-review` label); verify auto-merge is disabled
 (`gh pr view <number> --json autoMergeRequest` shows it null) before `gh pr ready <number>`
 starts review; and keep it disabled through the final gate: never open the pull request without
-`--draft`, and never run `gh pr merge --auto`. A green check merges nothing by itself; the owner
-merges each pull request by hand. The review paths under Rules below (0009) still decide which
-pull requests also wait for the owner's review; under this handoff no other one merges itself
-when green. This paragraph governs over the Rules line's "every other pull request auto-merges
-when green" (from 0009) until a record settles that clause (FBC-ftg0).
+`--draft`, and never run `gh pr merge --auto`. A green check merges nothing by itself. Agents
+review and merge each pull request by hand (0149):
+- An independent reviewer agent accepts or refuses it. It is never the pull request's author.
+  It follows `loop/prompts/review-prs.md`, posts the `Agent review` status, and adds `ci:run`
+  only to the one candidate it accepted.
+- The coordinating agent merges that candidate with
+  `gh pr merge <number> --rebase --match-head-commit <head>`, and only once all of these hold on
+  that exact head:
+  - `scripts/codex_review_evidence.py` passes;
+  - the reviewer accepted it;
+  - CI passed;
+  - `scripts/pr-readiness.sh --pr <number>` passes.
+- A pull request touching a review path under Rules below (0009) waits for the owner. The agent
+  merges it only once the owner has reviewed its current head and said to merge it; otherwise
+  the owner merges it.
+- A pull request adding a decision record merges only once the owner has approved the record.
 
 ### Layout
 
@@ -1214,7 +1225,8 @@ Privacy and review (0001, 0009):
 - Always leave changes to venue signers and to JWT and API-key handling
   (`crates/venues/*/src/sign*`, `crates/*/src/auth*`, and the DeepSeek reviewer's
   `scripts/deepseek-review.py` and `.github/workflows/deepseek-review.yml`, which inject its API
-  key) for the owner's review; every other pull request auto-merges when green.
+  key) for the owner's review; every other pull request is reviewed and merged by the agents as
+  the Merge profile says (0149).
 
 Design rules the records fix:
 
