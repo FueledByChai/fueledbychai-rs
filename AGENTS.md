@@ -168,21 +168,46 @@ a review path still gets its `needs-review` label); verify auto-merge is disable
 (`gh pr view <number> --json autoMergeRequest` shows it null) before `gh pr ready <number>`
 starts review; and keep it disabled through the final gate: never open the pull request without
 `--draft`, and never run `gh pr merge --auto`. A green check merges nothing by itself. Agents
-review and merge each pull request by hand (0149):
-- An independent reviewer agent accepts or refuses it. It is never the pull request's author.
-  It follows `loop/prompts/review-prs.md`, posts the `Agent review` status, and adds `ci:run`
-  only to the one candidate it accepted.
-- The coordinating agent merges that candidate with
-  `gh pr merge <number> --rebase --match-head-commit <head>`, and only once all of these hold on
-  that exact head:
-  - `scripts/codex_review_evidence.py` passes;
-  - the reviewer accepted it;
-  - CI passed;
-  - `scripts/pr-readiness.sh --pr <number>` passes.
-- A pull request touching a review path under Rules below (0009) waits for the owner. The agent
-  merges it only once the owner has reviewed its current head and said to merge it; otherwise
-  the owner merges it.
-- A pull request adding a decision record merges only once the owner has approved the record.
+review and merge each pull request by hand (0149). Three agent roles take part, and no agent
+holds two of them for one pull request:
+- **The author** writes the pull request and answers its review. It names its session in the
+  body (`Author session: <name>`), and never accepts or merges the pull request.
+- **The reviewer** accepts or refuses it. It wrote no commit on it, and it is the named
+  coordinator above, under `loop/prompts/review-prs.md`:
+  - it claims the coordination epic and selects one candidate;
+  - it adds `ci:run` only to the selected candidate, after accepting it;
+  - it records the final gate and posts the `Agent review` status;
+  - it never merges.
+- **The merge agent** wrote no commit on the pull request and did not review it.
+  - It takes only the pull request's number, changes nothing on the pull request, and waives
+    nothing.
+  - It runs `scripts/pr-readiness.sh` and `scripts/codex_review_evidence.py` from the default
+    branch's tip.
+  - It merges with `gh pr merge <number> --rebase --match-head-commit <head>` only once 0149's
+    checks hold on that exact head, then records the merge on the epic.
+- **Epic entries.** Every entry is an epic comment whose first line is
+  `<KIND> #<number> <full head SHA> by <session>`, with the kinds 0149 lists.
+- **The owner's word.** Only the owner waives a gate, approves a decision record, clears a pull
+  request that waits for the owner, or directs an alternate external review (0127).
+  - The session the owner said it to records it on the epic, and a relayed record is not the
+    owner's word.
+  - An owner review or waiver holds for the head it names only.
+  - A waiver never covers the external review, the acceptance, the required check's success on
+    the head, or the roles.
+- **What waits for the owner.** These merge only once the owner has reviewed the current head and
+  said to merge it, or the owner merges them:
+  - a pull request touching a review path under Rules below (0009);
+  - one changing a gate:
+    - anything under `scripts/`, `loop/`, `ci/` or `.github/`;
+    - `.loop.toml`, `loop.toml.example` or `deny.toml`;
+    - the licence-gate or dep-direction fixtures;
+    - a lowered `coverage-floor.txt`;
+    - a `SYNTHETIC` file;
+    - this file outside its Layout section;
+    - `CLAUDE.md`, `.claude/`, `.codex/`, `.cursor/`, `.agents/` or `.beads/hooks/`;
+  - one touching `fixtures/*/exec-recorded/`.
+- **Decision records.** A pull request adding or changing a decision record merges only once the
+  owner has approved each changed record's text, as 0149 says.
 
 ### Layout
 
@@ -1225,8 +1250,8 @@ Privacy and review (0001, 0009):
 - Always leave changes to venue signers and to JWT and API-key handling
   (`crates/venues/*/src/sign*`, `crates/*/src/auth*`, and the DeepSeek reviewer's
   `scripts/deepseek-review.py` and `.github/workflows/deepseek-review.yml`, which inject its API
-  key) for the owner's review; every other pull request is reviewed and merged by the agents as
-  the Merge profile says (0149).
+  key) for the owner's review; every other pull request is reviewed and merged by the agents,
+  except as the Merge profile says (0149).
 
 Design rules the records fix:
 
