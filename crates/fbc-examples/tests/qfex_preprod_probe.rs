@@ -32,6 +32,8 @@
 //! - records in its report and evidence, for each session (FBC-4h1p, decision 0132 item 5), each
 //!   full `get_user_orders` page its resync read, by its page size and offset, read from the
 //!   session's journal, and none for a session whose pages were all short.
+//! - builds the place stages' registries as `place_registries.rs` proves (FBC-oxjs, decision
+//!   0148 items 3 and 7).
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -61,6 +63,11 @@ mod ledger;
 mod link;
 #[path = "../examples/qfex_preprod_probe/pages.rs"]
 mod pages;
+// The place stages' registries' proof (FBC-oxjs), declared by path so it is part of this test
+// binary, as decision 0148's Consequences name it (item 12 of FBC-fqv5's record), and Cargo
+// builds no target of its own for it.
+#[path = "qfex_preprod_probe/place_registries.rs"]
+mod place_registries;
 #[path = "../examples/qfex_preprod_probe/probe_args.rs"]
 mod probe_args;
 #[path = "../examples/qfex_preprod_probe/refusals.rs"]
