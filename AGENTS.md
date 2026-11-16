@@ -656,11 +656,17 @@ holds two of them for one pull request. The rules after the three roles bind all
     orders, FBC-nv2), `crates/fbc-conformance` (the adapter conformance kit,
     0025; it depends on `fbc-runtime`, `fbc-oms`, `fbc-journal` and `fbc-core`, never on a
     venue crate: so
-    far a public stub venue server on 127.0.0.1 ephemeral ports, a WebSocket endpoint that plays
-    a fault script of typed steps and records every connection and data frame, and an HTTP/1.1
-    endpoint with fixed responses by path; the reconnect-storm script and a check of connection
-    attempts against `ReconnectPacing`; the duplicate-ack and silence-after-subscription
-    scripts; venue crates take it as a dev-dependency instead of writing their own servers;
+    far a public stub venue server on 127.0.0.1 ephemeral ports: a WebSocket endpoint that
+    records every connection and data frame and plays either a fault script of typed steps or a
+    serving script (0150, FBC-0lng: `WsScript::serving`, which answers each data frame of every
+    connection, several open at once, with what the responder made for that connection
+    computes, each refused answer and a failed listener reported as a script failure
+    (`ScriptError::Answer`, `ScriptError::Listen`, `StubServer::failures`), its `Pusher`
+    sending an open connection unsolicited frames and closing it, with or without a code,
+    refused on a closed one; `tests/serving.rs`); and an HTTP/1.1 endpoint with fixed
+    responses by path; the reconnect-storm script and a check of connection attempts against
+    `ReconnectPacing`; the duplicate-ack and silence-after-subscription scripts; venue crates
+    take it as a dev-dependency instead of writing their own servers;
     and `src/toy/`, the conformance toy venue BT-502 means (0044), public and includable by path
     from another crate's tests, so far its order entry: every command kind encoded through
     `ExecCodec`, each declared order capability checked before signing; and its order updates,

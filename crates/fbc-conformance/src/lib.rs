@@ -16,6 +16,12 @@
 //!   [`HttpRequest`]. Venue crates take this crate as a
 //!   dev-dependency instead of writing servers of their own (design §6 step 12).
 //! - Scripts are typed Rust values; a text format is deferred (decision 0025).
+//! - Serving scripts (FBC-0lng, decision 0150), the second kind of [`WsScript`]: from
+//!   [`WsScript::serving`], the stub answers each data frame of every connection, several open
+//!   at once, with what the [`Responder`] made for that connection computes from it, and its
+//!   [`Pusher`] sends a connection unsolicited frames and closes it, with or without a code; a
+//!   refused answer fails itself alone, and each refused answer and a failed listener is
+//!   reported ([`StubServer::failures`]).
 //! - [`reconnect_storm`], the storm of [`STORM_RECONNECTS`] forced reconnects, and
 //!   [`check_pacing`], which holds the attempts a stub saw to the client's reconnect pacing.
 //! - [`duplicate_acks`], every subscription acknowledged twice and each data frame pushed once,
@@ -67,6 +73,7 @@ mod pacing;
 mod routes;
 mod script;
 mod server;
+mod serving;
 pub mod suite;
 pub mod toy;
 
@@ -77,3 +84,4 @@ pub use script::{
     silence_after_ack,
 };
 pub use server::{ConnRecord, ConnectionsView, ScriptError, StubServer};
+pub use serving::{PushError, Pusher};
