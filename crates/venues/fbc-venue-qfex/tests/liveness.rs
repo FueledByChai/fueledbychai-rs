@@ -11,15 +11,15 @@
 //! hour-long hold on QFEX production measured (FBC-sbbl,
 //! `fixtures/qfex/exec-recorded/hold-production/README.md`). Each runs against the conformance
 //! kit's stub server on 127.0.0.1, on a paused clock that only the test moves: a blocking task
-//! that never ends keeps tokio from jumping it while socket I/O is under way. The stub confirms each of the three subscriptions, so the codec reports the
-//! stream authenticated (FBC-bsou) and the session sends its cancel-on-disconnect arm (decisions
-//! 0058 and 0121), which the stub answers with the ack QFEX production sent (FBC-291a), and the
-//! codec accepts at Final (FBC-jxau, decision 0132 item 1). The session then asks for its resync
-//! (decision 0132 item 5), which the stub answers: the flat positions on its HTTP route and one
-//! short `get_user_orders` page, so the resync ends before the first ping. Then the stub pings
-//! it several times (`Step::Barrier`, which ends only on the pong to its own ping), the test
-//! moving virtual time between two pings past the resync's 30 s deadline and the codec's 60 s
-//! authentication deadline. The test shows:
+//! that never ends keeps tokio from jumping it while socket I/O is under way. The stub confirms
+//! each of the three subscriptions, so the codec reports the stream authenticated (FBC-bsou) and
+//! the session sends its cancel-on-disconnect arm (decisions 0058 and 0121), which the stub answers
+//! with the ack QFEX production sent (FBC-291a), and the codec accepts at Final (FBC-jxau, decision
+//! 0132 item 1). The session then asks for its resync (decision 0132 item 5), which the stub
+//! answers: the flat positions on its HTTP route and one short `get_user_orders` page, so the
+//! resync ends before the first ping. Then the stub pings it several times (`Step::Barrier`, which
+//! ends only on the pong to its own ping), the test moving virtual time between two pings past the
+//! resync's 30 s deadline and the codec's 60 s authentication deadline. The test shows:
 //!
 //! - each ping is answered with a pong, and the session stays in its one epoch: one connection
 //!   attempt, no epoch ended until the test stops it;

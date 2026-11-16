@@ -1,7 +1,7 @@
 Synthetic private trade-socket frames and REST answers (decision 0009). Nothing in this
 directory was received from QFEX or belongs to an account.
 
-- Each JSON file but the three REST answers below is one frame, hand-built with the member
+- Each JSON file but the REST answers below is one frame, hand-built with the member
   names QFEX's trade AsyncAPI (https://docs.qfex.com/websocket/trade.yaml) gives OrderResponse,
   AllOrdersResponse (its orders and twaps rows), FillResponse, PositionPayload, BalancePayload
   and StopOrder, in the envelopes its channel pages show (order_response is the order responses
@@ -22,5 +22,26 @@ directory was received from QFEX or belongs to an account.
   URLs are on a reserved example domain, and every balance, position, margin and count is
   invented; the positions are chosen to pin exact decoding (1e-12, a twenty-digit position, and
   0, 0.0 and -0.0 as flat), not taken from a capture.
+- user_trades_response.json (FBC-be57) is one frame in the envelope the trade AsyncAPI gives
+  the get_user_trades reply, user_trades_response, an array of TradePayload. Its first row
+  carries exactly TradePayload's members (trade_id, symbol, price, quantity, side, order_id,
+  fee, order_type, tif); its second carries exactly the members of the example row on the
+  get_user_trades page (https://docs.qfex.com/websocket/channels/trade/get_user_trades:
+  trade_id, symbol, price, quantity, aggressor_side, order_id, client_order_id, fee,
+  timestamp), both read 2026-11-16. The two rows sit in one page to pin how the probe's trades
+  reader keeps each field's presence, not because QFEX sends both shapes at once.
+- user_trades.json (FBC-be57) is one frame in the envelope the get_user_trades page gives its
+  answer (the same page, read 2026-11-16): user_trades, an array of rows, beside count. Its one
+  row carries exactly that page's example row's members. Its fee and timestamp carry more
+  significant digits than an f64 holds, to pin that the reader keeps them exactly as written.
+- historic_orders.json (FBC-be57) is a hand-built REST answer in the shape QFEX's REST
+  reference gives HistoricOrdersResponseBody and HistoricOrder
+  (https://docs.qfex.com/api-reference/rest/user/historic-orders, read 2026-11-16): a $schema,
+  count and data, and each order's sixteen required members. The page shows no example answer
+  and lists no terminal_status or execution_state value, so CANCELLED, FILLED and
+  SYNTHETIC_STATE are invented.
+- In all three, the UUIDs are repeated digits naming no order or trade, the client_order_id values
+  name no order, SYNTH-USD is no QFEX symbol, the $schema URL is on a reserved example domain,
+  and every price, quantity, fee and time is invented.
 
 This marker covers fixtures/qfex/private/ only. A recorded frame never goes here.

@@ -269,13 +269,23 @@ holds two of them for one pull request. The rules after the three roles bind all
   `GET /user/positions` and a `get_user_orders` page after that account's authentication, and
   `GET /user/subaccounts`, which the probe no longer sends (0144), each built only under the guard
   and signed by `src/auth`'s `ReadAuth` for an account and credentials the caller names, and
-  decoded exactly; 0132 item 7, FBC-h3z1; and, for the probe's liveness hold, the three
+  decoded exactly; 0132 item 7, FBC-h3z1; for item 4's drop test and the report, a
+  `get_user_trades` page on a socket that never arms, its frame and charge the resync's, read in
+  either envelope the resync reads (`user_trades` beside a whole `count`, or
+  `user_trades_response`, a whole `count` optional) and the envelope kept, each row's fields
+  read where it carries them and its member names kept, a row missing one read and not refused,
+  and a frame that is not exactly one envelope holding an array of objects, with no other member
+  but its `count`, refused, as an err or an ack is, and a signed
+  `GET /user/historic-orders` page, the requested account named only for a subaccount, its
+  `client_order_id` and `terminal_status` decoded exactly, both only under the guard (0132 items
+  4 and 5, FBC-be57); and, for the probe's liveness hold, the three
   subscriptions a session sends, built and charged by the codec's own `exec::subscription` and
   only under the guard, a `{"subscribed":…}` confirmation read where the codec reads one
   (`exec::channel_reply`) and an err read as a page reads one, `SocketErr`, each from the bytes
   the journal keeps; 0146, FBC-39ks), its trade session's liveness on server pings alone held in
-  `tests/liveness.rs` (an `ExecSession` under `preprod_probe` against the conformance stub on a
-  paused clock: its arm accepted and its resync answered before the first ping, then each ping
+  `tests/liveness.rs` (an `ExecSession` under `preprod_probe`, and again under
+  `production_probe`, against the conformance stub on a paused clock: its arm accepted and its
+  resync answered before the first ping, then each ping
   answered, no frame of its own; FBC-39ks), and its codec sending no client keepalive, since the
   owner's hour-long hold on QFEX production showed server pings about every 10 s after
   authentication and no server close (for production only; FBC-sbbl, 0146 item 8;

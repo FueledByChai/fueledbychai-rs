@@ -1,13 +1,16 @@
 //! The probe's account reads (decision 0132 item 7, FBC-h3z1): what the probe sends, outside an
 //! order-entry session, to check, before every session, that each account it reads holds no
 //! open order and a flat position; the account listing, which it no longer sends, since it
-//! reads the accounts its configuration names (decision 0144); and what its liveness hold sends
-//! and reads on its one trade connection (decision 0146, FBC-39ks).
+//! reads the accounts its configuration names (decision 0144); what its liveness hold sends and
+//! reads on its one trade connection (decision 0146, FBC-39ks); and the reads its drop test and
+//! report need (decision 0132 items 4 and 5, FBC-be57): a `get_user_trades` page and the ended
+//! orders `GET /user/historic-orders` lists.
 //!
-//! - **The requests.** `GET /user/subaccounts` ([`subaccounts`]) and `GET /user/positions`
-//!   ([`positions`]) on `qfex.rest_url`; and, on `qfex.trade_url` ([`trade_url`]), the
-//!   connection's authentication for one account ([`authentication`]) and then one
-//!   `get_user_orders` page ([`user_orders`]), or, on the hold's connection, the three
+//! - **The requests.** `GET /user/subaccounts` ([`subaccounts`]), `GET /user/positions`
+//!   ([`positions`]) and `GET /user/historic-orders` ([`historic_orders`]) on `qfex.rest_url`;
+//!   and, on `qfex.trade_url` ([`trade_url`]), the connection's authentication for one account
+//!   ([`authentication`]) and then one `get_user_orders` page ([`user_orders`]) or one
+//!   `get_user_trades` page ([`user_trades`]), or, on the hold's connection, the three
 //!   subscriptions a session sends ([`subscriptions`]). Each takes its origin only from a
 //!   configuration that a probe mode's guard admits (`preprod_probe`, FBC-mfey, or
 //!   `production_probe`, decision 0143 item 2) and whose provider account and account key
@@ -18,14 +21,18 @@
 //!   a listing's from [`Subaccounts::accounts`]), with that account's credentials; nothing here
 //!   reads or holds a credential. `ReadAuth` signs and names its spans for this crate only, so
 //!   these functions are the one way to them.
-//! - **The decoders.** [`decode_subaccounts`], [`decode_positions`], [`orders_page`],
-//!   [`authenticated`], and, for the hold, [`confirmation`] and [`socket_err`]. Every number is
-//!   read from its own JSON text exactly (`exec::exact`, FBC-zeb0), never through `f64`. A REST
-//!   decoder refuses a status outside 2xx, naming the status only, malformed JSON, a member
-//!   repeated, a required member missing and a top-level member QFEX does not document (both
-//!   bodies are `additionalProperties: false`, and a cursor or a count added would make the
-//!   answer partial). A frame is read only from the bytes the journal keeps of it
-//!   ([`redact_inbound`]), as the order-entry codec reads its own (decision 0134 item 5).
+//! - **The decoders.** [`decode_subaccounts`], [`decode_positions`], [`decode_historic`],
+//!   [`orders_page`], [`decode_trades_page`], [`authenticated`], and, for the hold,
+//!   [`confirmation`] and [`socket_err`]. Every number is read from its own JSON text exactly
+//!   (`exec::exact`, FBC-zeb0), never through `f64`. A REST decoder refuses a status outside
+//!   2xx, naming the status only, malformed JSON, a member repeated, a required member missing
+//!   and a top-level member QFEX does not document (every body is `additionalProperties:
+//!   false`, and a cursor or a count added would make the answer partial). A frame is read only
+//!   from the bytes the journal keeps of it ([`redact_inbound`]), as the order-entry codec reads
+//!   its own (decision 0134 item 5). A trades page is read in either envelope, and its rows as
+//!   each carries its fields, since QFEX's two sources disagree on both (decision 0132's
+//!   context): the envelope it came in is kept, a row missing a field is read, not refused, and
+//!   the names of the members it carries are kept.
 //! - **The redaction** ([`redact_inbound`]): the spans `src/auth` names (every listed account
 //!   id, every `user_id`, every balance value, and the rest, decisions 0028 and 0122 item 3), an
 //!   err or an ack that echoes a request kept as decision 0134 says (0126 as it narrows it), and
@@ -38,18 +45,28 @@
 //! required `balance`), [get_user_orders](https://docs.qfex.com/websocket/channels/trade/get_user_orders)
 //! (`limit`, default and largest 1000, and `offset`; the answer an `all_orders_response` of open
 //! `orders` and active `twaps`), and the [rate page](https://docs.qfex.com/websocket/rate)
-//! (`get_user_orders` weighs 5.0, so 50 in this crate's tenths).
+//! (`get_user_orders` weighs 5.0, so 50 in this crate's tenths). Read 2026-11-16:
+//! [historic orders](https://docs.qfex.com/api-reference/rest/user/historic-orders) (`limit`, 1
+//! to 1000, and `offset` in the query, the four signed headers and the optional
+//! `x-qfex-requested-account-id`; the answer a required `count` and `data`, an array of orders
+//! or null, each with a `client_order_id` and a `terminal_status` among its sixteen required
+//! members, and an optional `$schema`), [get_user_trades](https://docs.qfex.com/websocket/channels/trade/get_user_trades)
+//! (`start_ts`, `limit` and `offset`; the answer `user_trades` beside a `count`, its example
+//! rows carrying `aggressor_side`, `client_order_id` and `timestamp`) and the [trade AsyncAPI](https://docs.qfex.com/websocket/trade.yaml)
+//! (`user_trades_response`, an array of `TradePayload` rows carrying `side` and none of those
+//! three).
 //!
 //! FBC-l931 sends these but the listing (decision 0144) through fbc-runtime, charged to the
 //! run's shared limiter, and judges the answers. The order-entry codec's resync (FBC-jxau,
 //! decision 0132 item 5), inside this crate, reuses the positions request with its handle's
 //! signed headers (`positions_request`), the positions decoder, the `get_user_orders` frame
 //! (`user_orders_body`) and the page's shape (`page_rows`) on the bytes it keeps of a frame,
-//! without a `ReadAuth`.
+//! without a `ReadAuth`. Its trades pages it reads with its own reader, which this module's
+//! [`decode_trades_page`] leaves as it is.
 
 use core::fmt;
 use core::ops::Range;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -63,15 +80,18 @@ use rust_decimal::Decimal;
 use crate::auth::{AccountSelection, ReadAuth, canonical_uuid};
 use crate::exec::echo::{self, Envelope};
 use crate::exec::json::{self, Kind, Member, Node};
-use crate::exec::{self, ErrCode, exact, is_venue_order_id};
+use crate::exec::{self, ErrCode, TRADES_WEIGHT, exact, is_venue_order_id};
 use crate::{probe, rate};
 
 /// The account listing's path on the REST origin.
 pub const SUBACCOUNTS_PATH: &str = "/user/subaccounts";
 /// The positions read's path on the REST origin.
 pub const POSITIONS_PATH: &str = "/user/positions";
+/// The ended orders read's path on the REST origin.
+pub const HISTORIC_ORDERS_PATH: &str = "/user/historic-orders";
 /// The largest `get_user_orders` page QFEX documents, and the largest page size the probe sets
-/// (decision 0132 item 6).
+/// (decision 0132 item 6). `GET /user/historic-orders` documents the same largest `limit`;
+/// `get_user_trades` states none, so its page is bounded as the resync bounds one.
 pub const MAX_PAGE: u16 = 1000;
 /// What one `get_user_orders` costs, in tenths of QFEX's weight unit: the rate page's 5.0.
 pub const PAGE_WEIGHT: NonZeroU32 = NonZeroU32::new(50).expect("fifty is not zero");
@@ -108,6 +128,9 @@ pub enum BuildError {
     Sign(SignError),
     /// A `get_user_orders` page size outside 1 to [`MAX_PAGE`].
     PageSize,
+    /// A page size outside 1 to [`MAX_PAGE`] for the read it names: `get_user_trades` or
+    /// `GET /user/historic-orders`.
+    PageLimit(&'static str),
 }
 
 impl fmt::Display for BuildError {
@@ -116,6 +139,7 @@ impl fmt::Display for BuildError {
             BuildError::Config(err) => write!(f, "QFEX probe configuration refused: {err}"),
             BuildError::Sign(err) => write!(f, "QFEX account read not signed: {err}"),
             BuildError::PageSize => f.write_str("a get_user_orders page size outside 1 to 1000"),
+            BuildError::PageLimit(read) => write!(f, "a {read} page size outside 1 to 1000"),
         }
     }
 }
@@ -228,6 +252,71 @@ pub(crate) fn user_orders_body(ask: PageAsk) -> String {
     )
 }
 
+/// One `get_user_trades` page asked for, as the order-entry codec's resync asks for one: from
+/// `start_ts`, an inclusive Unix time in seconds, its page size, 1 to [`MAX_PAGE`], and its
+/// offset.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct TradesAsk {
+    start_ts: u64,
+    limit: u16,
+    offset: u32,
+}
+
+impl TradesAsk {
+    /// The page of `limit` trades from `offset`, of those at or after `start_ts`; refused, with
+    /// nothing built, for a `limit` of zero or above [`MAX_PAGE`].
+    pub fn new(start_ts: u64, limit: u16, offset: u32) -> Result<TradesAsk, BuildError> {
+        page_limit(limit, "get_user_trades")?;
+        Ok(TradesAsk {
+            start_ts,
+            limit,
+            offset,
+        })
+    }
+
+    pub fn start_ts(&self) -> u64 {
+        self.start_ts
+    }
+
+    pub fn limit(&self) -> u16 {
+        self.limit
+    }
+
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+}
+
+/// `limit` refused, naming `read`, outside 1 to [`MAX_PAGE`].
+fn page_limit(limit: u16, read: &'static str) -> Result<(), BuildError> {
+    match (1..=MAX_PAGE).contains(&limit) {
+        true => Ok(()),
+        false => Err(BuildError::PageLimit(read)),
+    }
+}
+
+/// The `get_user_trades` frame for `ask`, for every order (none named), sent once the socket's
+/// authentication succeeded ([`authenticated`]) on a connection that never arms: the frame the
+/// resync writes, `{"type":"get_user_trades","params":{"start_ts":S,"limit":N,"offset":M}}`,
+/// charged as the resync charges it, the rate page's 0.5 ([`TRADES_WEIGHT`]) under `Query`, and
+/// Normal traffic, as [`user_orders`] is, since no resync sends it.
+pub fn user_trades(cfg: &VenueConfig, ask: TradesAsk) -> Result<SocketWrite, BuildError> {
+    probe::connections(cfg)?;
+    let body = format!(
+        r#"{{"type":"get_user_trades","params":{{"start_ts":{},"limit":{},"offset":{}}}}}"#,
+        ask.start_ts, ask.limit, ask.offset
+    );
+    Ok(SocketWrite {
+        frame: WireSlice::plain(body.into_bytes()),
+        charge: RateCharge {
+            op: OpKind::Query,
+            inst: None,
+            weight: TRADES_WEIGHT,
+        },
+        class: TrafficClass::Normal,
+    })
+}
+
 /// `GET /user/subaccounts`, signed with `reader`'s credentials from the nonces and time `ctx`
 /// gives: the four signed headers, each `redact: true`, and no account selection, so QFEX reads
 /// the provider user from its primary account.
@@ -259,6 +348,49 @@ pub fn positions(
 /// resync builds it for the traded account (FBC-jxau, decision 0132 item 5).
 pub(crate) fn positions_request(rest: &str, headers: Vec<fbc_core::Header>) -> RestRead {
     rest_read(rest, POSITIONS_PATH, headers)
+}
+
+/// One `GET /user/historic-orders` page asked for: its page size, 1 to [`MAX_PAGE`], and its
+/// offset.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct HistoricAsk {
+    limit: u16,
+    offset: u32,
+}
+
+impl HistoricAsk {
+    /// The page of `limit` ended orders from `offset`; refused, with nothing built, for a
+    /// `limit` of zero or above [`MAX_PAGE`].
+    pub fn new(limit: u16, offset: u32) -> Result<HistoricAsk, BuildError> {
+        page_limit(limit, "historic-orders")?;
+        Ok(HistoricAsk { limit, offset })
+    }
+
+    pub fn limit(&self) -> u16 {
+        self.limit
+    }
+
+    pub fn offset(&self) -> u32 {
+        self.offset
+    }
+}
+
+/// `GET /user/historic-orders?limit=N&offset=M` of `reader`'s account, every order it lists
+/// (no filter named), signed from the nonces and time `ctx` gives, as [`positions`] is: the
+/// four signed headers, each `redact: true`, and `x-qfex-requested-account-id`, `redact: true`,
+/// only for a subaccount.
+pub fn historic_orders(
+    cfg: &VenueConfig,
+    reader: &ReadAuth,
+    ctx: &EncodeCtx,
+    ask: HistoricAsk,
+) -> Result<RestRead, BuildError> {
+    let rest = probe::connections(cfg)?.rest;
+    let path = format!(
+        "{HISTORIC_ORDERS_PATH}?limit={}&offset={}",
+        ask.limit, ask.offset
+    );
+    Ok(rest_read(rest, &path, reader.rest_headers(ctx)?))
 }
 
 fn rest_read(rest: &str, path: &str, headers: Vec<fbc_core::Header>) -> RestRead {
@@ -557,10 +689,8 @@ pub fn decode_positions(
             .ok_or(AnswerError::Invalid("symbol"))?;
         let position =
             number(required(row, "position")?).ok_or(AnswerError::Invalid("position"))?;
-        let open_orders = number(required(row, "open_orders")?)
-            .filter(|n| n.fract().is_zero())
-            .and_then(|n| u64::try_from(n).ok())
-            .ok_or(AnswerError::Invalid("open_orders"))?;
+        let open_orders =
+            count_of(required(row, "open_orders")?).ok_or(AnswerError::Invalid("open_orders"))?;
         rows.push(PositionRow {
             symbol,
             position,
@@ -570,6 +700,60 @@ pub fn decode_positions(
     let symbols: Vec<&VenueSymbol> = rows.iter().map(|row| &row.symbol).collect();
     unique(&symbols, "symbol")?;
     Ok(Positions { rows })
+}
+
+// ----- The ended orders -----
+
+/// One order `GET /user/historic-orders` listed: its `client_order_id` and its
+/// `terminal_status`, each exactly as written. QFEX lists no `terminal_status` value (decision
+/// 0132's context), so it is kept as text, for evidence, and not judged here.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct HistoricOrder {
+    pub client_order_id: String,
+    pub terminal_status: String,
+}
+
+/// What one `GET /user/historic-orders` page showed: its orders, in its order, and the `count`
+/// it states beside them.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct HistoricOrders {
+    rows: Vec<HistoricOrder>,
+    count: u64,
+}
+
+impl HistoricOrders {
+    pub fn rows(&self) -> &[HistoricOrder] {
+        &self.rows
+    }
+
+    /// The answer's `count`, as stated.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+}
+
+/// The answer to [`historic_orders`]: a required `count`, a whole number of at least zero, a
+/// required `data`, an array of orders or null (null lists none), and an optional `$schema`
+/// string, and nothing else. Each order must carry `client_order_id` and `terminal_status` as
+/// strings; its other members are not read. Nothing it reads is a member the journal blanks, so
+/// it decodes the same from the journal as live.
+pub fn decode_historic(resp: &HttpResponse<'_>) -> Result<HistoricOrders, AnswerError> {
+    let root = body(resp)?;
+    let top = documented(&root, &["count", "data"])?;
+    let count = count_of(required(top, "count")?).ok_or(AnswerError::Invalid("count"))?;
+    let mut rows = Vec::new();
+    for row in nullable_array(top, "data")? {
+        let row = row.members().ok_or(AnswerError::Invalid("data"))?;
+        let text = |key: &'static str| match required(row, key)?.str() {
+            Some(text) => Ok(text.to_owned()),
+            None => Err(AnswerError::Invalid(key)),
+        };
+        rows.push(HistoricOrder {
+            client_order_id: text("client_order_id")?,
+            terminal_status: text("terminal_status")?,
+        });
+    }
+    Ok(HistoricOrders { rows, count })
 }
 
 /// A 2xx answer's body as one JSON object naming no member twice.
@@ -632,6 +816,22 @@ fn unique<T: Eq + core::hash::Hash>(items: &[T], what: &'static str) -> Result<(
 fn number(node: &Node<'_>) -> Option<Decimal> {
     match node.kind {
         Kind::Num(raw) => exact(raw),
+        _ => None,
+    }
+}
+
+/// A JSON number that is a whole number of at least zero.
+fn count_of(node: &Node<'_>) -> Option<u64> {
+    number(node)
+        .filter(|n| n.fract().is_zero())
+        .and_then(|n| u64::try_from(n).ok())
+}
+
+/// `BUY` or `SELL`, the enums page's OrderDirection as the frames write it.
+fn side_of(text: &str) -> Option<Side> {
+    match text {
+        "BUY" => Some(Side::Buy),
+        "SELL" => Some(Side::Sell),
         _ => None,
     }
 }
@@ -748,16 +948,37 @@ pub(crate) fn decode_page(
     ask: PageAsk,
     scope: &DecodeScope<'_>,
 ) -> Result<OrdersPage, NotAPage> {
-    let root = json::parse(text).ok_or(NotAPage::Other(NOT_AN_OBJECT))?;
-    let top = root.members().ok_or(NotAPage::Other(NOT_AN_OBJECT))?;
+    read_frame(text, |top| page(top, ask, scope)).map_err(|why| match why {
+        NotRead::Err(err) => err.into(),
+        NotRead::Other(what) => NotAPage::Other(what),
+    })
+}
+
+/// Why a frame is not the answer a read on the trade socket asked for.
+enum NotRead {
+    Err(SocketErr),
+    Other(&'static str),
+}
+
+/// What `read` makes of `text`, the bytes the journal keeps of a text frame, once it is one JSON
+/// object naming no member twice in no err or ack envelope: an err is read as [`socket_err`]
+/// reads one, and an ack, two envelopes and any other frame are refused, naming what was wrong.
+fn read_frame<T>(
+    text: &str,
+    read: impl FnOnce(&[Member<'_>]) -> Result<T, &'static str>,
+) -> Result<T, NotRead> {
+    let root = json::parse(text).ok_or(NotRead::Other(NOT_AN_OBJECT))?;
+    let top = root.members().ok_or(NotRead::Other(NOT_AN_OBJECT))?;
     if root.repeats() {
-        return Err(NotAPage::Other("a repeated member"));
+        return Err(NotRead::Other("a repeated member"));
     }
     match echo::envelope(top) {
-        Envelope::FlatErr(body) | Envelope::NestedErr(body) => Err(refusal(echo::err(body)).into()),
-        Envelope::Ack(_) => Err(NotAPage::Other("an ack")),
-        Envelope::Ambiguous => Err(NotAPage::Other("two envelopes")),
-        Envelope::Other => page(top, ask, scope).map_err(NotAPage::Other),
+        Envelope::FlatErr(body) | Envelope::NestedErr(body) => {
+            Err(NotRead::Err(refusal(echo::err(body))))
+        }
+        Envelope::Ack(_) => Err(NotRead::Other("an ack")),
+        Envelope::Ambiguous => Err(NotRead::Other("two envelopes")),
+        Envelope::Other => read(top).map_err(NotRead::Other),
     }
 }
 
@@ -832,11 +1053,7 @@ fn order(row: &Node<'_>, scope: &DecodeScope<'_>) -> Result<PageOrder, &'static 
         .and_then(|id| scope.venue_order_id(id).ok())
         .ok_or("order_id")?;
     let symbol = scope.venue_symbol(text("symbol")?).or(Err("symbol"))?;
-    let side = match text("side")? {
-        "BUY" => Side::Buy,
-        "SELL" => Side::Sell,
-        _ => return Err("side"),
-    };
+    let side = side_of(text("side")?).ok_or("side")?;
     let amount = |key| json::get(row, key).and_then(number).ok_or(key);
     let quantity = Some(amount("quantity")?)
         .filter(|n| *n > Decimal::ZERO)
@@ -852,4 +1069,178 @@ fn order(row: &Node<'_>, scope: &DecodeScope<'_>) -> Result<PageOrder, &'static 
         remaining,
         client: scope.client_order_id(text("client_order_id")?),
     })
+}
+
+// ----- The get_user_trades page -----
+
+/// Which envelope a trades page came in, since QFEX's two sources name it differently (decision
+/// 0132's context), so the report says which one QFEX sent.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum TradesEnvelope {
+    /// `user_trades`, beside a whole `count`, as the get_user_trades page documents it.
+    UserTrades,
+    /// `user_trades_response`, a `count` beside it optional, as the trade AsyncAPI gives it.
+    UserTradesResponse,
+}
+
+impl TradesEnvelope {
+    /// The member that names it.
+    pub fn name(self) -> &'static str {
+        match self {
+            TradesEnvelope::UserTrades => "user_trades",
+            TradesEnvelope::UserTradesResponse => "user_trades_response",
+        }
+    }
+}
+
+/// One row of a `get_user_trades` page, as [`decode_trades_page`] reads it: each field below
+/// as QFEX's pages show it when the row carries it so, `None` when the row leaves it out or
+/// carries it otherwise, and the name of every member the row carries, so the caller tells the
+/// two apart and the report says which fields a row carries (decision 0132's consequences). No
+/// value of any other member is kept.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct TradeRow {
+    /// A string.
+    pub trade_id: Option<String>,
+    /// A string.
+    pub order_id: Option<String>,
+    /// A string, as the get_user_trades page's example rows carry it.
+    pub client_order_id: Option<String>,
+    /// `BUY` or `SELL`, as the AsyncAPI's `TradePayload` carries it.
+    pub side: Option<Side>,
+    /// `BUY` or `SELL`, as the get_user_trades page's example rows carry it.
+    pub aggressor_side: Option<Side>,
+    /// A number, exactly as written: Unix seconds in the page's example; no page states what
+    /// kind of time it is.
+    pub timestamp: Option<Decimal>,
+    /// A number, exactly as written, of unstated currency and sign.
+    pub fee: Option<Decimal>,
+    /// Every member name the row carries, its value never.
+    pub members: BTreeSet<String>,
+}
+
+impl TradeRow {
+    /// Whether the row carries a member named `name`, whatever its value.
+    pub fn carries(&self, name: &str) -> bool {
+        self.members.contains(name)
+    }
+}
+
+/// One `get_user_trades` page: the envelope it came in, its rows, in its order, a trade listed
+/// twice kept for the caller to deduplicate, and the `count` it states beside them, when it
+/// states one.
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub struct TradesPage {
+    envelope: TradesEnvelope,
+    rows: Vec<TradeRow>,
+    count: Option<u64>,
+}
+
+impl TradesPage {
+    pub fn envelope(&self) -> TradesEnvelope {
+        self.envelope
+    }
+
+    pub fn rows(&self) -> &[TradeRow] {
+        &self.rows
+    }
+
+    /// The page's `count`, as stated; `None` when it states none, as the AsyncAPI's need not.
+    pub fn count(&self) -> Option<u64> {
+        self.count
+    }
+}
+
+/// Why a frame is no trades page: never one whose rows leave a field out.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub enum NotATradesPage {
+    /// An err, as [`socket_err`] reads one: a RateLimited one's hold, or its code.
+    Err(SocketErr),
+    /// Any other frame; names what was wrong, never a value.
+    Other(&'static str),
+}
+
+impl fmt::Display for NotATradesPage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NotATradesPage::Err(err) => err.fmt(f),
+            NotATradesPage::Other(what) => write!(f, "not a get_user_trades page: {what}"),
+        }
+    }
+}
+
+impl std::error::Error for NotATradesPage {}
+
+/// The page `frame`, off `reader`'s trade socket, is: exactly one of the two envelopes
+/// [`TradesEnvelope`] names, as the resync reads both, holding an array of objects, with a
+/// `count` beside it, a whole number of at least zero, which `user_trades` requires and
+/// `user_trades_response` may leave out, and no other member. Each row is read as [`TradeRow`]
+/// says, a row missing a field or carrying it otherwise read, not refused; the order-entry
+/// codec's resync reads its own pages with its own reader, which this leaves as it is. It is
+/// read from the bytes the journal keeps, so no member the journal blanks is read. An err, a
+/// RateLimited one included, an ack, a frame naming both envelopes or neither, and any other
+/// frame are no page.
+pub fn decode_trades_page(
+    reader: &ReadAuth,
+    frame: RawFrame<'_>,
+) -> Result<TradesPage, NotATradesPage> {
+    let text = kept(reader, frame).ok_or(NotATradesPage::Other("not a text frame"))?;
+    read_frame(&text, trades).map_err(|why| match why {
+        NotRead::Err(err) => NotATradesPage::Err(err),
+        NotRead::Other(what) => NotATradesPage::Other(what),
+    })
+}
+
+fn trades(top: &[Member<'_>]) -> Result<TradesPage, &'static str> {
+    let documented = json::get(top, TradesEnvelope::UserTrades.name());
+    let asyncapi = json::get(top, TradesEnvelope::UserTradesResponse.name());
+    let (envelope, rows) = match (documented, asyncapi) {
+        (Some(rows), None) => (TradesEnvelope::UserTrades, rows),
+        (None, Some(rows)) => (TradesEnvelope::UserTradesResponse, rows),
+        (Some(_), Some(_)) => return Err("two trades envelopes"),
+        (None, None) => return Err("no trades envelope"),
+    };
+    if top
+        .iter()
+        .any(|(name, _)| name != envelope.name() && name != "count")
+    {
+        return Err("a member beside the trades envelope");
+    }
+    let rows = rows
+        .items()
+        .ok_or("a trades envelope that is not an array")?;
+    let count = match (json::get(top, "count"), envelope) {
+        (None, TradesEnvelope::UserTrades) => return Err("count"),
+        (None, TradesEnvelope::UserTradesResponse) => None,
+        (Some(count), _) => Some(count_of(count).ok_or("count")?),
+    };
+    let rows = rows
+        .iter()
+        .map(|row| {
+            row.members()
+                .map(trade_row)
+                .ok_or("a row that is not an object")
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(TradesPage {
+        envelope,
+        rows,
+        count,
+    })
+}
+
+fn trade_row(row: &[Member<'_>]) -> TradeRow {
+    let text = |key: &str| json::get(row, key).and_then(Node::str);
+    let owned = |key: &str| text(key).map(str::to_owned);
+    let amount = |key: &str| json::get(row, key).and_then(number);
+    TradeRow {
+        trade_id: owned("trade_id"),
+        order_id: owned("order_id"),
+        client_order_id: owned("client_order_id"),
+        side: text("side").and_then(side_of),
+        aggressor_side: text("aggressor_side").and_then(side_of),
+        timestamp: amount("timestamp"),
+        fee: amount("fee"),
+        members: row.iter().map(|(name, _)| name.to_string()).collect(),
+    }
 }

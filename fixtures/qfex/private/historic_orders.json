@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schemas.example/HistoricOrdersResponseBody.json",
+  "count": 2,
+  "data": [
+    {
+      "order_id": "16161616-1616-4616-8616-161616161616",
+      "client_order_id": "synthetic-cid-5",
+      "terminal_status": "CANCELLED",
+      "status_ts": "2025-10-09T08:53:25Z",
+      "execution_state": "SYNTHETIC_STATE",
+      "symbol": "SYNTH-USD",
+      "side": "BUY",
+      "type": "ALO",
+      "time_in_force": "GTC",
+      "quantity": 0.5,
+      "price": 40.75,
+      "passive_qty": 0.5,
+      "filled_qty": 0,
+      "avg_price": null,
+      "first_fill_ts": null,
+      "last_fill_ts": null
+    },
+    {
+      "order_id": "17171717-1717-4717-8717-171717171717",
+      "client_order_id": "",
+      "terminal_status": "FILLED",
+      "status_ts": "2025-10-09T08:53:30.5Z",
+      "execution_state": "SYNTHETIC_STATE",
+      "symbol": "SYNTH-USD",
+      "side": "SELL",
+      "type": "LIMIT",
+      "time_in_force": "IOC",
+      "quantity": 1.25,
+      "price": 41.5,
+      "passive_qty": 0,
+      "filled_qty": 1.25,
+      "avg_price": 41.5,
+      "first_fill_ts": "2025-10-09T08:53:30Z",
+      "last_fill_ts": "2025-10-09T08:53:30.5Z"
+    }
+  ]
+}

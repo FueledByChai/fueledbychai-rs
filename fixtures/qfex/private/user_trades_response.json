@@ -1,0 +1,26 @@
+{
+  "user_trades_response": [
+    {
+      "trade_id": "12121212-1212-4212-8212-121212121212",
+      "symbol": "SYNTH-USD",
+      "price": 41.25,
+      "quantity": 0.5,
+      "side": "SELL",
+      "order_id": "13131313-1313-4313-8313-131313131313",
+      "fee": -1e-4,
+      "order_type": "ALO",
+      "tif": "GTC"
+    },
+    {
+      "trade_id": "14141414-1414-4414-8414-141414141414",
+      "symbol": "SYNTH-USD",
+      "price": 41.5,
+      "quantity": 1.25,
+      "aggressor_side": "BUY",
+      "order_id": "15151515-1515-4515-8515-151515151515",
+      "client_order_id": "synthetic-cid-4",
+      "fee": 0.000123456789,
+      "timestamp": 1760000005
+    }
+  ]
+}
