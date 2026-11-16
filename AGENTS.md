@@ -169,7 +169,7 @@ a review path still gets its `needs-review` label); verify auto-merge is disable
 starts review; and keep it disabled through the final gate: never open the pull request without
 `--draft`, and never run `gh pr merge --auto`. A green check merges nothing by itself. Agents
 review and merge each pull request by hand (0149). Three agent roles take part, and no agent
-holds two of them for one pull request:
+holds two of them for one pull request. The rules after the three roles bind all of them:
 - **The author** writes the pull request and answers its review. It names its session in the
   body (`Author session: <name>`), and never accepts or merges the pull request.
 - **The reviewer** accepts or refuses it. It wrote no commit on it, and it is the named
@@ -192,8 +192,9 @@ holds two of them for one pull request:
   - The session the owner said it to records it on the epic, and a relayed record is not the
     owner's word.
   - An owner review or waiver holds for the head it names only.
-  - A waiver never covers the external review, the acceptance, the required check's success on
-    the head, or the roles.
+  - A waiver names one readiness fact on one head, and, for the `ci` fact, the one check run it
+    waives. It never covers the external review, the acceptance, the required check's success
+    on the head, the roles, or anything that waits for the owner below.
 - **What waits for the owner.** These merge only once the owner has reviewed the current head and
   said to merge it, or the owner merges them:
   - a pull request touching a review path under Rules below (0009);
@@ -202,7 +203,7 @@ holds two of them for one pull request:
     - `.loop.toml`, `loop.toml.example` or `deny.toml`;
     - the licence-gate or dep-direction fixtures;
     - a lowered `coverage-floor.txt`;
-    - a `SYNTHETIC` file;
+    - a `SYNTHETIC` file added, moved or removed;
     - this file outside its Layout section;
     - `CLAUDE.md`, `.claude/`, `.codex/`, `.cursor/`, `.agents/` or `.beads/hooks/`;
   - one touching `fixtures/*/exec-recorded/`.

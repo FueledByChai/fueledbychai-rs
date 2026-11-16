@@ -1,4 +1,4 @@
-# 0149 — Agents review and merge each pull request by hand after the gates, the owner keeping review-path and gate-rule pull requests, decision-record approval and gate waivers, amending 0009
+# 0149 — Agents review and merge each pull request by hand after the gates, the owner keeping review-path, gate-rule and recorded-fixture pull requests, decision-record approval and gate waivers, amending 0009
 
 Status: accepted
 Date: 2026-11-16
@@ -17,8 +17,8 @@ moved away from both:
 
 From #221 (2026-11-04), the session the owner works through merged each pull request by hand. It
 did so on the owner's word in chat, after an independent reviewer's final gate on FBC-n2l5.
-- The epic's entries for #236 to #256 also record that session's merges. For the rest, the epic
-  records the reviewer's final gate.
+- The epic records that session's merges in its notes for #221 to #235 and in its comments for
+  #236 to #256. For #257 to #263 it records the reviewer's final gate.
 - Every pull request from #221 to #263 merged that way, apart from Dependabot's #225, which is
   still open.
 - GitHub shows the owner's account as the merger of each, because the agents use that account.
@@ -162,8 +162,9 @@ the owner, or directs an alternate external review.
   - An `OWNER APPROVAL` holds while its blobs match.
   - An `ALTERNATE REVIEW` holds for the pull request, as 0127 has it.
   - No agent reads an entry as covering another pull request.
-- **What a waiver may cover.** A waiver names one readiness fact, and one check run on that
-  head. FBC-vvn2's stale run is one example. A waiver never covers any of these:
+- **What a waiver may cover.** A waiver names one readiness fact on one head. Where that fact is
+  `ci`, it also names the one check run it waives. FBC-vvn2's stale run is one example. A waiver
+  never covers any of these:
   - the external review: 0127 allows only an alternate review there;
   - the independent acceptance;
   - the need for a successful run of the required check on the head;
