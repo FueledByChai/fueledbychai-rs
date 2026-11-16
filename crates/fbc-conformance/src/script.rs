@@ -1,10 +1,14 @@
 //! Fault scripts as typed Rust values (decision 0025): a [`WsScript`] is one timeline of
 //! [`Step`]s, each naming the connection it acts on by its accept order, so a script can drive
 //! several connections and interleave them. A [`Step::Respond`] answers the frame it reads with
-//! frames a [`Responder`] computes from it (decision 0047).
+//! frames a [`Responder`] computes from it (decision 0047). A serving script
+//! ([`WsScript::serving`], decision 0150) is the second kind: no timeline, every frame of every
+//! connection answered by a responder, and pushes and closes on demand.
 
 use std::fmt;
 use std::sync::Arc;
+
+use crate::serving::{Pusher, Serving};
 
 /// A WebSocket data frame, as the stub sends or received it. Pings, pongs and close frames are
 /// protocol, not data, and are never recorded.
@@ -93,15 +97,63 @@ impl fmt::Debug for Responder {
     }
 }
 
-/// A script the stub plays from its start, step by step.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// A script the stub plays from its start: step by step, or, for a serving script
+/// ([`WsScript::serving`]), answering every frame of every connection.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct WsScript {
     pub steps: Vec<Step>,
+    serving: Option<Serving>,
 }
 
 impl WsScript {
     pub fn new(steps: Vec<Step>) -> WsScript {
-        WsScript { steps }
+        WsScript {
+            steps,
+            serving: None,
+        }
+    }
+
+    /// A serving script (decision 0150), for a venue model whose frame count and order no
+    /// timeline can know: the stub accepts every connection and answers each data frame of
+    /// connection `n` (numbered in accept order, as its record is), in the order they arrive,
+    /// with the frames `responder(n)` computes from it, connections at once, until the stub is
+    /// dropped; it records every connection as a step script does. `responder(n)` is called
+    /// once, when connection `n`'s upgrade completes; a responder that needs state keeps it
+    /// itself (0047). A refusal, or a panic in the responder, fails that answer alone; a panic
+    /// in `responder(n)` fails every answer of connection `n`; each failed answer is reported as
+    /// [`ScriptError::Answer`](crate::ScriptError::Answer), and every other connection is still
+    /// served. The [`Pusher`] sends a connection unsolicited frames and closes it. A serving
+    /// script takes no steps, and is started on one stub only, ever: clones share their pusher.
+    pub fn serving(
+        responder: impl Fn(usize) -> Responder + Send + Sync + 'static,
+    ) -> (WsScript, Pusher) {
+        let (serving, pusher) = Serving::new(responder);
+        let script = WsScript {
+            steps: Vec::new(),
+            serving: Some(serving),
+        };
+        (script, pusher)
+    }
+
+    /// Whether this is a serving script.
+    pub fn is_serving(&self) -> bool {
+        self.serving.is_some()
+    }
+
+    pub(crate) fn served(&self) -> Option<&Serving> {
+        self.serving.as_ref()
+    }
+}
+
+/// A step script shows as it always did; a serving script shows that it serves.
+impl fmt::Debug for WsScript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut shown = f.debug_struct("WsScript");
+        shown.field("steps", &self.steps);
+        if let Some(serving) = &self.serving {
+            shown.field("serving", serving);
+        }
+        shown.finish()
     }
 }
 

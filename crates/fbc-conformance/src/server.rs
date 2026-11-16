@@ -1,6 +1,7 @@
-//! The stub venue server: a WebSocket endpoint that plays a [`WsScript`] and an HTTP/1.1
-//! endpoint that answers by an [`HttpRouter`]'s rules, each on its own 127.0.0.1 ephemeral port.
-//! Nothing here reaches beyond the loopback interface.
+//! The stub venue server: a WebSocket endpoint that plays a [`WsScript`] (a timeline of steps,
+//! or a serving script, decision 0150) and an HTTP/1.1 endpoint that answers by an
+//! [`HttpRouter`]'s rules, each on its own 127.0.0.1 ephemeral port. Nothing here reaches beyond
+//! the loopback interface.
 
 use std::any::Any;
 use std::fmt;
@@ -21,6 +22,7 @@ use fbc_runtime::http::Method;
 
 use crate::routes::{HttpReply, HttpRequest, HttpRouter};
 use crate::script::{Frame, Responder, Step, WsScript};
+use crate::serving::{self, Link};
 
 /// The most bytes the stub reads of one request's head, and of its body.
 const MAX_REQUEST: usize = 64 * 1024;
@@ -74,6 +76,19 @@ pub enum ScriptError {
         conn: usize,
         reason: String,
     },
+    /// A serving script's responder refused data frame `frame` of connection `conn` (numbered
+    /// from 0, its place in the connection's `received`), or panicked on it, or making the
+    /// connection's responder panicked, which fails each of that connection's answers so;
+    /// `reason` says which. The stub goes on serving every connection (decision 0150).
+    Answer {
+        conn: usize,
+        frame: usize,
+        reason: String,
+    },
+    /// A serving script's WebSocket listener failed to accept a connection; `reason` is the
+    /// error. The stub accepts no further connection and goes on serving those it accepted
+    /// (decision 0150). A step script reports no such failure: its next `Step::Accept` fails.
+    Listen { reason: String },
 }
 
 impl fmt::Display for ScriptError {
@@ -94,15 +109,26 @@ impl fmt::Display for ScriptError {
                     "step {step}: the responder on connection {conn} failed: {reason}"
                 )
             }
+            ScriptError::Answer {
+                conn,
+                frame,
+                reason,
+            } => write!(
+                f,
+                "connection {conn}, frame {frame}: the responder failed: {reason}"
+            ),
+            ScriptError::Listen { reason } => {
+                write!(f, "the WebSocket listener failed to accept: {reason}")
+            }
         }
     }
 }
 
 impl std::error::Error for ScriptError {}
 
-type Shared<T> = Arc<Mutex<T>>;
+pub(crate) type Shared<T> = Arc<Mutex<T>>;
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     // A poisoned lock still holds a usable record: nothing here panics while holding one.
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -115,28 +141,48 @@ pub struct StubServer {
     /// One slot per HTTP connection in accept order, filled once its request is read.
     requests: Shared<Vec<Option<String>>>,
     result: watch::Receiver<Option<Result<(), ScriptError>>>,
-    /// How many of the script's steps have played to their end.
+    /// Held, so a serving script, which sends a result only when it fails, never reads as
+    /// finished while the stub runs.
+    _result: Arc<watch::Sender<Option<Result<(), ScriptError>>>>,
+    /// Every way the script failed, in the order reported.
+    failures: Shared<Vec<ScriptError>>,
+    /// How many of the script's steps have played to their end, or of a serving script's
+    /// frames have been answered.
     played: watch::Receiver<usize>,
     _stop: watch::Sender<()>,
 }
 
 impl StubServer {
     /// Binds both endpoints and starts playing `script`; HTTP requests are answered by `router`,
-    /// an [`HttpRouter`] or 0025's fixed [`HttpRoutes`](crate::HttpRoutes).
+    /// an [`HttpRouter`] or 0025's fixed [`HttpRoutes`](crate::HttpRoutes). A serving script
+    /// ([`WsScript::serving`]) is refused, as `InvalidInput`, when it was given steps or was
+    /// already started on a stub; it counts as started once both endpoints are bound, so a
+    /// failed bind leaves it free to start.
     pub async fn start(script: WsScript, router: impl Into<HttpRouter>) -> io::Result<StubServer> {
         let ws_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let http_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let (ws, http) = (ws_listener.local_addr()?, http_listener.local_addr()?);
+        let link = script.served().map(|s| s.bind(&script.steps)).transpose()?;
         let (stop_tx, stop) = watch::channel(());
         let conns = Shared::default();
         let requests = Shared::default();
         let (accepted_tx, accepted) = mpsc::unbounded_channel();
         let (result_tx, result) = watch::channel(None);
         let (played_tx, played) = watch::channel(0);
+        let failures: Shared<Vec<ScriptError>> = Shared::default();
+        let report = Report {
+            failures: failures.clone(),
+            result: Arc::new(result_tx),
+            played: Arc::new(played_tx),
+        };
+        let held = report.result.clone();
+        // A serving script's listener reports its own failure; a step script's Accept step does.
+        let served = link.map(|link| (link, report.clone()));
         tokio::spawn(accept_ws(
             ws_listener,
             conns.clone(),
             accepted_tx,
+            served,
             stop.clone(),
         ));
         tokio::spawn(accept_http(
@@ -145,21 +191,25 @@ impl StubServer {
             requests.clone(),
             stop.clone(),
         ));
-        tokio::spawn(async move {
-            let mut stop = stop;
-            tokio::select! {
-                done = play(script.steps, accepted, played_tx) => {
-                    result_tx.send_replace(Some(done));
+        match script.served().cloned() {
+            None => tokio::spawn(async move {
+                let mut stop = stop;
+                tokio::select! {
+                    done = play(script.steps, accepted, &report.played) => report.end(done),
+                    _ = stop.changed() => {}
                 }
-                _ = stop.changed() => {}
-            }
-        });
+            }),
+            // It serves until the stub's drop stops the listener, which ends `accepted`.
+            Some(serving) => tokio::spawn(serving::serve(serving, accepted, report)),
+        };
         Ok(StubServer {
             ws,
             http,
             conns,
             requests,
             result,
+            _result: held,
+            failures,
             played,
             _stop: stop_tx,
         })
@@ -175,11 +225,12 @@ impl StubServer {
         format!("http://{}{path}", self.http)
     }
 
-    /// Waits until the script has played to its end or failed.
+    /// Waits until the script has played to its end or failed. A serving script has no end: it
+    /// waits for its first failure.
     pub async fn finished(&self) -> Result<(), ScriptError> {
         let mut result = self.result.clone();
-        // The player sends its result before its sender drops; only the stub's drop, which
-        // `&self` prevents, ends it without one.
+        // The stub holds a sender; only its drop, which `&self` prevents, ends the wait without
+        // a result.
         let done = result.wait_for(Option::is_some).await;
         done.ok().and_then(|r| r.clone()).unwrap_or(Ok(()))
     }
@@ -187,8 +238,18 @@ impl StubServer {
     /// How many of the script's steps have played to their end: a [`Step::Respond`] once every
     /// frame it computed was written, a [`Step::Barrier`] once the client's pong arrived. The
     /// script's position, which a test waits on instead of a time (FBC-pn85).
+    ///
+    /// A serving script's position is how many data frames it has answered, on every
+    /// connection: each once its answer was attempted (every frame computed for it written, or
+    /// not sent because the connection was closing or gone) or refused.
     pub fn played(&self) -> usize {
         *self.played.borrow()
+    }
+
+    /// Every way the script failed so far, in the order reported, without waiting: a step
+    /// script's one failure once it failed, and each answer a serving script failed.
+    pub fn failures(&self) -> Vec<ScriptError> {
+        lock(&self.failures).clone()
     }
 
     /// Every connection the WebSocket endpoint accepted, in accept order.
@@ -217,8 +278,41 @@ impl StubServer {
     }
 }
 
-/// What the player asks a connection's task to do.
-enum Cmd {
+/// Where a script's position is counted and its failures reported: the stub's list of failures,
+/// its result (a step script's end, or a serving script's first failure), and its position.
+#[derive(Clone)]
+pub(crate) struct Report {
+    pub(crate) failures: Shared<Vec<ScriptError>>,
+    pub(crate) result: Arc<watch::Sender<Option<Result<(), ScriptError>>>>,
+    pub(crate) played: Arc<watch::Sender<usize>>,
+}
+
+impl Report {
+    /// A step script's end: its failure listed, if it failed, and its result sent.
+    fn end(&self, done: Result<(), ScriptError>) {
+        if let Err(failure) = &done {
+            lock(&self.failures).push(failure.clone());
+        }
+        self.result.send_replace(Some(done));
+    }
+
+    /// Lists a serving script's `failure`, and makes it the script's result when it is the
+    /// first.
+    pub(crate) fn fail(&self, failure: ScriptError) {
+        lock(&self.failures).push(failure.clone());
+        self.result.send_if_modified(|result| {
+            let first = result.is_none();
+            if first {
+                *result = Some(Err(failure));
+            }
+            first
+        });
+    }
+}
+
+/// What the player, or a serving script's [`Pusher`](crate::Pusher), asks a connection's task
+/// to do.
+pub(crate) enum Cmd {
     Push(Frame, oneshot::Sender<bool>),
     /// Close, with the frame's code and reason when it has them.
     Close(Option<CloseFrame>, oneshot::Sender<bool>),
@@ -228,28 +322,55 @@ enum Cmd {
 }
 
 /// The player's handle on an upgraded connection.
-struct Conn {
-    frames: mpsc::UnboundedReceiver<Frame>,
-    cmds: mpsc::UnboundedSender<Cmd>,
+pub(crate) struct Conn {
+    pub(crate) frames: mpsc::UnboundedReceiver<Frame>,
+    pub(crate) cmds: mpsc::UnboundedSender<Cmd>,
 }
 
-type Ready = oneshot::Receiver<Option<Conn>>;
+pub(crate) type Ready = oneshot::Receiver<Option<Conn>>;
+
+/// Where the WebSocket endpoint's connections come from: its listener, or in a unit test one
+/// whose accept fails, which no socket fails on every platform.
+trait Accept: Send + 'static {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
+}
+
+impl Accept for TcpListener {
+    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
+        TcpListener::accept(self)
+    }
+}
 
 /// Accepts every TCP connection, records it at once and upgrades it in a task of its own; hands
-/// the player each upgrade's outcome in accept order.
+/// the player each upgrade's outcome in accept order. For a serving script, `served` carries its
+/// link, in which each upgraded connection is entered, and its report, which an accept error
+/// fails.
 async fn accept_ws(
-    listener: TcpListener,
+    listener: impl Accept,
     conns: Shared<Vec<ConnRecord>>,
     accepted: mpsc::UnboundedSender<Ready>,
+    served: Option<(Arc<Link>, Report)>,
     mut stop: watch::Receiver<()>,
 ) {
+    let (link, report) = served.unzip();
     loop {
         let stream = tokio::select! {
             r = listener.accept() => r,
             _ = stop.changed() => return,
         };
-        // An accept error drops the listener: the player's next Accept fails.
-        let Ok((stream, _)) = stream else { return };
+        // An accept error drops the listener. A step script's next Accept then fails; a serving
+        // script has no Accept step, so the error is reported as its failure (0150).
+        let stream = match stream {
+            Ok((stream, _)) => stream,
+            Err(err) => {
+                if let Some(report) = &report {
+                    report.fail(ScriptError::Listen {
+                        reason: err.to_string(),
+                    });
+                }
+                return;
+            }
+        };
         let index = {
             let mut conns = lock(&conns);
             conns.push(ConnRecord {
@@ -267,6 +388,7 @@ async fn accept_ws(
             stream,
             index,
             conns.clone(),
+            link.clone(),
             ready_tx,
             stop.clone(),
         ));
@@ -277,6 +399,7 @@ async fn serve_ws(
     stream: TcpStream,
     index: usize,
     conns: Shared<Vec<ConnRecord>>,
+    link: Option<Arc<Link>>,
     ready: oneshot::Sender<Option<Conn>>,
     mut stop: watch::Receiver<()>,
 ) {
@@ -290,9 +413,13 @@ async fn serve_ws(
         let _ = ready.send(None);
         return;
     };
-    record(&|c| c.upgraded = true);
     let (heard, frames) = mpsc::unbounded_channel();
     let (cmds, mut cmd_rx) = mpsc::unbounded_channel();
+    // A pusher reaches the connection from the moment its record says it is upgraded.
+    if let Some(link) = &link {
+        link.enter(index, cmds.clone());
+    }
+    record(&|c| c.upgraded = true);
     let _ = ready.send(Some(Conn { frames, cmds }));
     let mut player = true;
     // The ping a barrier waits on the pong to, by payload, and the barrier's answer.
@@ -365,7 +492,8 @@ async fn serve_ws(
                     let _ = stop.changed().await;
                     break;
                 }
-                // The script ended: the connection goes on recording until it closes.
+                // The script ended: the connection goes on recording until it closes. A serving
+                // script's link keeps a sender, so it never ends.
                 None => player = false,
             },
             _ = stop.changed() => break,
@@ -379,7 +507,7 @@ async fn serve_ws(
 async fn play(
     steps: Vec<Step>,
     mut accepted: mpsc::UnboundedReceiver<Ready>,
-    played: watch::Sender<usize>,
+    played: &watch::Sender<usize>,
 ) -> Result<(), ScriptError> {
     let mut conns: Vec<Conn> = Vec::new();
     let all = steps.len();
@@ -401,21 +529,21 @@ async fn play(
                 let frame = handle.frames.recv().await.ok_or(closed.clone())?;
                 let refused = |reason| ScriptError::Respond { step, conn, reason };
                 for frame in respond(&with, &frame).map_err(refused)? {
-                    if !done(handle, |sent| Cmd::Push(frame, sent)).await {
+                    if !done(&handle.cmds, |sent| Cmd::Push(frame, sent)).await {
                         return Err(closed);
                     }
                 }
             }
             Step::Push { conn, frame } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                if !done(handle, |sent| Cmd::Push(frame, sent)).await {
+                if !done(&handle.cmds, |sent| Cmd::Push(frame, sent)).await {
                     return Err(closed);
                 }
             }
             // A close the socket did not take was not forced by the stub (Codex r4177464414).
             Step::Close { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                if !done(handle, |sent| Cmd::Close(None, sent)).await {
+                if !done(&handle.cmds, |sent| Cmd::Close(None, sent)).await {
                     return Err(closed);
                 }
             }
@@ -425,7 +553,7 @@ async fn play(
                     code: code.into(),
                     reason: reason.into(),
                 };
-                if !done(handle, |sent| Cmd::Close(Some(frame), sent)).await {
+                if !done(&handle.cmds, |sent| Cmd::Close(Some(frame), sent)).await {
                     return Err(closed);
                 }
             }
@@ -433,14 +561,14 @@ async fn play(
             // it (FBC-3il).
             Step::Barrier { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                if !done(handle, Cmd::Ping).await {
+                if !done(&handle.cmds, Cmd::Ping).await {
                     return Err(closed);
                 }
             }
             // The step ends once the connection has stopped reading (Codex r4177514250).
             Step::Silent { conn } => {
                 let (handle, closed) = handle(&mut conns, step, conn)?;
-                if !done(handle, Cmd::Silent).await {
+                if !done(&handle.cmds, Cmd::Silent).await {
                     return Err(closed);
                 }
             }
@@ -452,23 +580,26 @@ async fn play(
 
 /// What `with` computes from `frame`; a panic in it is a refusal, so a script whose responder
 /// panicked never reads as finished.
-fn respond(with: &Responder, frame: &Frame) -> Result<Vec<Frame>, String> {
+pub(crate) fn respond(with: &Responder, frame: &Frame) -> Result<Vec<Frame>, String> {
     let caught = catch_unwind(AssertUnwindSafe(|| with.respond(frame)));
     caught.unwrap_or_else(|panic| Err(format!("panicked: {}", panic_text(&*panic))))
 }
 
 /// A panic's message, when it is a string.
-fn panic_text(panic: &(dyn Any + Send)) -> &str {
+pub(crate) fn panic_text(panic: &(dyn Any + Send)) -> &str {
     let text = panic.downcast_ref::<&str>().copied();
     let text = text.or_else(|| panic.downcast_ref::<String>().map(String::as_str));
     text.unwrap_or("a panic")
 }
 
-/// Asks the connection's task for `cmd` and waits for its outcome: false when the write failed
-/// or the connection had already ended.
-async fn done(handle: &Conn, cmd: impl FnOnce(oneshot::Sender<bool>) -> Cmd) -> bool {
+/// Asks the connection's task, through its `cmds`, for `cmd` and waits for its outcome: false
+/// when the write failed or the connection had already ended.
+pub(crate) async fn done(
+    cmds: &mpsc::UnboundedSender<Cmd>,
+    cmd: impl FnOnce(oneshot::Sender<bool>) -> Cmd,
+) -> bool {
     let (sent, ok) = oneshot::channel();
-    handle.cmds.send(cmd(sent)).is_ok() && ok.await.unwrap_or(false)
+    cmds.send(cmd(sent)).is_ok() && ok.await.unwrap_or(false)
 }
 
 /// The next accepted connection once upgraded; `None` when its upgrade failed or the listener
@@ -608,4 +739,48 @@ async fn read_request(stream: &mut TcpStream) -> Option<(String, HttpRequest)> {
         params: Vec::new(),
     };
     Some((line, request))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A listener whose every accept fails.
+    struct Refusing;
+
+    impl Accept for Refusing {
+        async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            Err(io::Error::other("out of descriptors"))
+        }
+    }
+
+    fn report() -> Report {
+        Report {
+            failures: Shared::default(),
+            result: Arc::new(watch::channel(None).0),
+            played: Arc::new(watch::channel(0).0),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_serving_scripts_accept_error_is_its_failure_and_a_step_scripts_is_not() {
+        let (_held, stop) = watch::channel(());
+        let served = report();
+        let (accepted, mut ready) = mpsc::unbounded_channel();
+        let pair = Some((Arc::new(Link::default()), served.clone()));
+        accept_ws(Refusing, Shared::default(), accepted, pair, stop.clone()).await;
+        // The listener is dropped: no connection is handed on, and the failure is the script's.
+        assert!(ready.recv().await.is_none());
+        let failure = ScriptError::Listen {
+            reason: "out of descriptors".to_owned(),
+        };
+        assert_eq!(*lock(&served.failures), vec![failure.clone()]);
+        assert_eq!(*served.result.borrow(), Some(Err(failure.clone())));
+        let shown = "the WebSocket listener failed to accept: out of descriptors";
+        assert_eq!(failure.to_string(), shown);
+        // A step script's listener reports nothing: its next Accept step fails instead.
+        let (accepted, mut ready) = mpsc::unbounded_channel();
+        accept_ws(Refusing, Shared::default(), accepted, None, stop).await;
+        assert!(ready.recv().await.is_none());
+    }
 }
