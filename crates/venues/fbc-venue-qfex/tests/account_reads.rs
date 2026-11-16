@@ -17,6 +17,14 @@
 //! - The liveness hold's subscriptions (decision 0146) are the codec's own three, frame, charge
 //!   and class, and none is built without a probe mode; a confirmation is read exactly where the
 //!   codec reads one, and an err on a trade socket as a page reads one.
+//! - FBC-be57 (decision 0132 items 4 and 5): a `get_user_trades` page is built only under the
+//!   guard, its frame and charge the resync's own; its rows are read with each field's presence,
+//!   in either envelope QFEX's sources give it, `user_trades` beside a whole `count` or
+//!   `user_trades_response`, the envelope kept, a row missing a field read, not refused, and a
+//!   frame that is not exactly one of them holding an array of objects refused.
+//!   `GET /user/historic-orders` is built only under the guard, signed with `ReadAuth`'s headers,
+//!   each redacted, naming the requested account only for a subaccount, and decoded exactly,
+//!   `terminal_status` included.
 //! - The redaction spans cover every listed account id, every `user_id` and every balance value,
 //!   and no `Debug`, `Display` or error shows a header value, an account id, a `user_id` or a
 //!   balance value. A listing read back from the journal is refused, its ids blanked to no
@@ -26,6 +34,10 @@
 //! `fixtures/qfex/private` (its `SYNTHETIC` file) or built from the shapes QFEX's pages show,
 //! and each test names the page.
 
+#[allow(dead_code)]
+mod probe_harness;
+
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -39,11 +51,12 @@ use fbc_core::{
 };
 use fbc_venue_qfex::Qfex;
 use fbc_venue_qfex::account_reads::{
-    self, AnswerError, BuildError, MAX_PAGE, NotAPage, OrdersPage, PAGE_WEIGHT, PageAsk, Positions,
-    RateHold, SocketErr, Subaccounts,
+    self, AnswerError, BuildError, HistoricAsk, HistoricOrder, HistoricOrders, MAX_PAGE, NotAPage,
+    NotATradesPage, OrdersPage, PAGE_WEIGHT, PageAsk, Positions, RateHold, SocketErr, Subaccounts,
+    TradeRow, TradesAsk, TradesEnvelope, TradesPage,
 };
 use fbc_venue_qfex::auth::{self, AccountSelection, ReadAuth, TradeAuth};
-use fbc_venue_qfex::exec::{CLIENT_ID_FORMAT, ErrCode, QfexExec, TRADE};
+use fbc_venue_qfex::exec::{CLIENT_ID_FORMAT, ErrCode, QfexExec, TRADE, TRADES_WEIGHT};
 use fbc_venue_qfex::probe::{
     self, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, PREPROD_MDS,
     PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE,
@@ -194,13 +207,14 @@ fn blanked(bytes: &[u8], spans: &[core::ops::Range<u32>]) -> String {
 
 // ----- Nothing is built outside the probe's guard -----
 
-#[test]
-fn a_config_without_the_probe_mode_or_refused_by_its_guard_builds_no_request() {
+/// Each configuration with no probe mode, or one its guard or decision 0122 item 1's check
+/// refuses, and what it is.
+fn refused_configs() -> [(VenueConfig, &'static str); 6] {
     let mut md_only = VenueConfig::new();
     md_only.insert(KEY_MDS_URL, PREPROD_MDS);
     md_only.insert(KEY_REST_URL, PREPROD_REST);
     md_only.insert(KEY_REST_TIMEOUT, "5000ms");
-    let cases = [
+    [
         (md_only, "market data only"),
         (
             with(preprod(SUB), KEY_EXEC_MODE, "live"),
@@ -222,9 +236,13 @@ fn a_config_without_the_probe_mode_or_refused_by_its_guard_builds_no_request() {
             with(preprod(SUB), auth::ACCOUNT_KEY, "09"),
             "an account key decision 0122 refuses",
         ),
-    ];
+    ]
+}
+
+#[test]
+fn a_config_without_the_probe_mode_or_refused_by_its_guard_builds_no_request() {
     let reader = reader(SUB);
-    for (cfg, what) in cases {
+    for (cfg, what) in refused_configs() {
         let want = probe::connections(&cfg).expect_err(what);
         let build = BuildError::Config(want);
         assert_eq!(
@@ -1603,6 +1621,11 @@ fn no_debug_display_or_error_shows_a_header_value_an_account_id_a_user_id_or_a_b
             "{:?}",
             account_reads::positions(&cfg, &reader, &ctx(9)).unwrap()
         ));
+        let ask = HistoricAsk::new(1, 0).unwrap();
+        shown.push(format!(
+            "{:?}",
+            account_reads::historic_orders(&cfg, &reader, &ctx(9), ask).unwrap()
+        ));
         // Its own nonce and time are written in clear, as the codec's are (FBC-77aa), so it
         // is made with another context than the REST reads' headers.
         shown.push(format!(
@@ -1688,4 +1711,589 @@ fn the_account_reads_read_no_credential_outside_src_auth_and_src_sign() {
     assert!(text.contains("reader.frame(ctx)?"));
     assert!(text.contains("reader.user_headers(ctx)?"));
     assert!(text.contains("reader.rest_headers(ctx)?"));
+}
+
+// ----- The get_user_trades page (FBC-be57) -----
+
+/// The trades page `frame` is, read off the traded subaccount's socket.
+fn trades_of(frame: &str) -> Result<TradesPage, NotATradesPage> {
+    account_reads::decode_trades_page(&reader(SUB), RawFrame::Text(frame))
+}
+
+/// The member names `names`, as a row records them.
+fn names(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+fn exact(text: &str) -> Decimal {
+    Decimal::from_str_exact(text).unwrap()
+}
+
+/// The `get_user_trades` frame the order-entry codec's resync writes for its first trades page:
+/// the harness's place at `ctx(3)` on epoch 1, then the resync's empty orders page, under `cfg`.
+fn resync_trades_frame(cfg: &VenueConfig) -> Effect {
+    use probe_harness as h;
+    let mut codec = h::probe_on(cfg);
+    h::authenticate(&mut codec, 1);
+    let place = fbc_core::VenueCommand::Place(h::gtc());
+    assert!(h::encode(&mut codec, &place, 3).result.is_ok());
+    h::resync(&mut codec, 5);
+    let page = h::text(
+        &mut codec,
+        r#"{"all_orders_response":{"orders":[],"twaps":[]}}"#,
+    );
+    match page.effects.as_slice() {
+        [effect] => effect.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_trades_page_is_built_only_under_the_guard() {
+    let ask = TradesAsk::new(1_760_000_003, MAX_PAGE, 0).unwrap();
+    for (cfg, what) in refused_configs() {
+        let want = BuildError::Config(probe::connections(&cfg).expect_err(what));
+        assert_eq!(account_reads::user_trades(&cfg, ask), Err(want), "{what}");
+    }
+    // Under either mode, on QFEX's origins or on loopback, the frame and charge the resync
+    // writes for the same page (its place admitted under `preprod_probe`), as Normal traffic,
+    // since no resync sends it.
+    let Effect::Send {
+        stream: TRADE,
+        frame,
+        rpc: None,
+        class: TrafficClass::Safety,
+        charge,
+    } = resync_trades_frame(&probe_harness::preprod(SUB))
+    else {
+        panic!("the resync's trades page");
+    };
+    for cfg in probe_harness::every_mode(SUB) {
+        let write = account_reads::user_trades(&cfg, ask).unwrap();
+        assert!(write.frame.redactions().is_empty());
+        assert_eq!(write.class, TrafficClass::Normal);
+        assert_eq!(write.frame, frame);
+        assert_eq!(write.charge, charge);
+    }
+    let cfg = preprod(SUB);
+    for (start, limit, offset) in [(0, 1, 0), (1_760_000_003, 1, 1000), (u64::MAX, 1000, 7)] {
+        let ask = TradesAsk::new(start, limit, offset).unwrap();
+        assert_eq!(
+            (ask.start_ts(), ask.limit(), ask.offset()),
+            (start, limit, offset)
+        );
+        let write = account_reads::user_trades(&cfg, ask).unwrap();
+        let want = format!(
+            r#"{{"type":"get_user_trades","params":{{"start_ts":{start},"limit":{limit},"offset":{offset}}}}}"#
+        );
+        assert_eq!(write.frame.bytes(), want.as_bytes());
+        let weight = TRADES_WEIGHT;
+        assert_eq!(
+            write.charge,
+            RateCharge {
+                op: OpKind::Query,
+                inst: None,
+                weight
+            }
+        );
+        assert_eq!(TRADES_WEIGHT.get(), 5, "the rate page's 0.5");
+    }
+    for limit in [0, 1001, u16::MAX] {
+        let refused = BuildError::PageLimit("get_user_trades");
+        assert_eq!(TradesAsk::new(1, limit, 0), Err(refused), "{limit}");
+        assert_eq!(
+            refused.to_string(),
+            "a get_user_trades page size outside 1 to 1000"
+        );
+    }
+}
+
+#[test]
+fn a_trades_page_is_asked_and_its_rows_read_with_each_fields_presence() {
+    let page = trades_of(&fixture("user_trades_response.json")).unwrap();
+    assert_eq!(page.envelope(), TradesEnvelope::UserTradesResponse);
+    assert_eq!(page.count(), None, "the AsyncAPI's page states none");
+    let rows = page.rows();
+    assert_eq!(rows.len(), 2);
+    // The AsyncAPI's TradePayload: a side, and no aggressor side, client id or time.
+    assert_eq!(
+        rows[0],
+        TradeRow {
+            trade_id: Some("12121212-1212-4212-8212-121212121212".to_owned()),
+            order_id: Some("13131313-1313-4313-8313-131313131313".to_owned()),
+            client_order_id: None,
+            side: Some(Side::Sell),
+            aggressor_side: None,
+            timestamp: None,
+            fee: Some(exact("-0.0001")),
+            members: names(&[
+                "trade_id",
+                "symbol",
+                "price",
+                "quantity",
+                "side",
+                "order_id",
+                "fee",
+                "order_type",
+                "tif",
+            ]),
+        }
+    );
+    assert!(rows[0].carries("side") && !rows[0].carries("aggressor_side"));
+    // The get_user_trades page's example row: the aggressor's side, a client id and a time.
+    assert_eq!(
+        rows[1],
+        TradeRow {
+            trade_id: Some("14141414-1414-4414-8414-141414141414".to_owned()),
+            order_id: Some("15151515-1515-4515-8515-151515151515".to_owned()),
+            client_order_id: Some("synthetic-cid-4".to_owned()),
+            side: None,
+            aggressor_side: Some(Side::Buy),
+            timestamp: Some(Decimal::from(1_760_000_005_u64)),
+            fee: Some(exact("0.000123456789")),
+            members: names(&[
+                "trade_id",
+                "symbol",
+                "price",
+                "quantity",
+                "aggressor_side",
+                "order_id",
+                "client_order_id",
+                "fee",
+                "timestamp",
+            ]),
+        }
+    );
+    assert!(rows[1].carries("client_order_id") && !rows[1].carries("side"));
+    // A count beside the rows is kept; a whole one of any size, zero included.
+    for (count, want) in [
+        ("0", 0),
+        ("2", 2),
+        ("2.0", 2),
+        ("18446744073709551615", u64::MAX),
+    ] {
+        let frame = format!(r#"{{"count":{count},"user_trades_response":[]}}"#);
+        assert_eq!(trades_of(&frame).unwrap().count(), Some(want), "{count}");
+    }
+    // A row naming a user is read from what the journal keeps, as live: its `user_id` is a
+    // member it carries, never a value it reads.
+    let named = format!(
+        r#"{{"user_trades_response":[{{"trade_id":"t","user_id":"{USER}","side":"BUY","timestamp":1760000005.25}}]}}"#
+    );
+    let frame = RawFrame::Text(&named);
+    let spans = account_reads::redact_inbound(&reader(SUB), Inbound::Frame(frame));
+    let kept = blanked(named.as_bytes(), spans.body());
+    assert!(!kept.contains(USER));
+    let live = trades_of(&named).unwrap();
+    assert_eq!(trades_of(&kept), Ok(live.clone()));
+    let row = &live.rows()[0];
+    assert!(row.carries("user_id"));
+    assert_eq!(row.timestamp, Some(exact("1760000005.25")));
+    assert!(!format!("{live:?}").contains(USER));
+}
+
+#[test]
+fn a_documented_user_trades_page_is_read_with_its_count() {
+    // The get_user_trades page's own envelope, `user_trades` beside a `count`, which the resync
+    // reads too: its row read as the AsyncAPI's are.
+    let page = trades_of(&fixture("user_trades.json")).unwrap();
+    assert_eq!(page.envelope(), TradesEnvelope::UserTrades);
+    assert_eq!(page.count(), Some(1));
+    let fee = "0.12345678901234567890";
+    let timestamp = "1760000006.123456789012";
+    assert_eq!(
+        page.rows(),
+        [TradeRow {
+            trade_id: Some("16161616-1616-4616-8616-161616161616".to_owned()),
+            order_id: Some("17171717-1717-4717-8717-171717171717".to_owned()),
+            client_order_id: Some("synthetic-cid-5".to_owned()),
+            side: None,
+            aggressor_side: Some(Side::Sell),
+            timestamp: Some(exact(timestamp)),
+            fee: Some(exact(fee)),
+            members: names(&[
+                "trade_id",
+                "symbol",
+                "price",
+                "quantity",
+                "aggressor_side",
+                "order_id",
+                "client_order_id",
+                "fee",
+                "timestamp",
+            ]),
+        }]
+    );
+    // Exactly as written, its scale too, where an f64 holds neither: never read through one.
+    let row = &page.rows()[0];
+    assert_eq!(row.fee.unwrap().to_string(), fee);
+    assert_eq!(row.timestamp.unwrap().to_string(), timestamp);
+    assert_ne!(fee.parse::<f64>().unwrap().to_string(), fee);
+    assert_ne!(timestamp.parse::<f64>().unwrap().to_string(), timestamp);
+    for (count, want) in [("0", 0), ("2.0", 2), ("18446744073709551615", u64::MAX)] {
+        let frame = format!(r#"{{"user_trades":[],"count":{count}}}"#);
+        let page = trades_of(&frame).unwrap();
+        assert_eq!(
+            (page.envelope(), page.count()),
+            (TradesEnvelope::UserTrades, Some(want)),
+            "{count}"
+        );
+    }
+    assert_eq!(TradesEnvelope::UserTrades.name(), "user_trades");
+    assert_eq!(
+        TradesEnvelope::UserTradesResponse.name(),
+        "user_trades_response"
+    );
+}
+
+#[test]
+fn a_row_missing_a_field_is_read_not_refused() {
+    let empty = TradeRow {
+        trade_id: None,
+        order_id: None,
+        client_order_id: None,
+        side: None,
+        aggressor_side: None,
+        timestamp: None,
+        fee: None,
+        members: BTreeSet::new(),
+    };
+    // A row with no member at all, and one carrying each field otherwise than QFEX shows it.
+    let odd = r#"{"trade_id":5,"order_id":null,"client_order_id":7,"side":"HOLD","aggressor_side":"buy","timestamp":"1760000005","fee":"0.1"}"#;
+    let page = trades_of(&format!(r#"{{"user_trades_response":[{{}},{odd}]}}"#)).unwrap();
+    assert_eq!(page.rows()[0], empty);
+    let fields = [
+        "trade_id",
+        "order_id",
+        "client_order_id",
+        "side",
+        "aggressor_side",
+        "timestamp",
+        "fee",
+    ];
+    assert_eq!(
+        page.rows()[1],
+        TradeRow {
+            members: names(&fields),
+            ..empty.clone()
+        }
+    );
+    // Each field alone: read, and every other one absent.
+    for field in fields {
+        let value = match field {
+            "side" | "aggressor_side" => r#""SELL""#,
+            "timestamp" | "fee" => "1e-3",
+            _ => r#""x""#,
+        };
+        let frame = format!(r#"{{"user_trades_response":[{{"{field}":{value}}}]}}"#);
+        let page = trades_of(&frame).unwrap();
+        let row = &page.rows()[0];
+        assert_eq!(row.members, names(&[field]), "{field}");
+        let read = [
+            row.trade_id.is_some(),
+            row.order_id.is_some(),
+            row.client_order_id.is_some(),
+            row.side == Some(Side::Sell),
+            row.aggressor_side == Some(Side::Sell),
+            row.timestamp == Some(exact("0.001")),
+            row.fee == Some(exact("0.001")),
+        ];
+        let want: Vec<bool> = fields.iter().map(|f| *f == field).collect();
+        assert_eq!(read.to_vec(), want, "{field}");
+    }
+    // A trade listed twice is kept, for the caller to deduplicate.
+    let twice = r#"{"user_trades_response":[{"trade_id":"t"},{"trade_id":"t"}]}"#;
+    let page = trades_of(twice).unwrap();
+    assert_eq!(page.rows()[0], page.rows()[1]);
+}
+
+#[test]
+fn a_frame_that_is_not_one_trades_envelope_holding_an_array_of_objects_is_refused() {
+    let other = |frame: &str, what: &'static str| {
+        assert_eq!(
+            trades_of(frame),
+            Err(NotATradesPage::Other(what)),
+            "{frame}"
+        );
+    };
+    other(r#"{"count":0}"#, "no trades envelope");
+    other(r#"{}"#, "no trades envelope");
+    for both in [
+        r#"{"user_trades":[],"user_trades_response":[]}"#,
+        r#"{"user_trades_response":[],"count":0,"user_trades":[]}"#,
+    ] {
+        other(both, "two trades envelopes");
+    }
+    for envelope in ["user_trades", "user_trades_response"] {
+        for body in ["{}", "null"] {
+            let frame = format!(r#"{{"{envelope}":{body},"count":0}}"#);
+            other(&frame, "a trades envelope that is not an array");
+        }
+        for row in ["1", "[]", "null", r#""row""#] {
+            let frame = format!(r#"{{"{envelope}":[{{}},{row}],"count":1}}"#);
+            other(&frame, "a row that is not an object");
+        }
+        for count in ["-1", "1.5", r#""1""#, "null", "1e40"] {
+            let frame = format!(r#"{{"{envelope}":[],"count":{count}}}"#);
+            other(&frame, "count");
+        }
+        let frame = format!(r#"{{"{envelope}":[],"count":0,"order_response":{{}}}}"#);
+        other(&frame, "a member beside the trades envelope");
+    }
+    // The documented page states its count, as the resync holds it to one; the AsyncAPI's need
+    // not.
+    other(r#"{"user_trades":[]}"#, "count");
+    other(r#"{"user_trades":[{"trade_id":"t"}]}"#, "count");
+    other("[]", "not a JSON object");
+    other("nope", "not a JSON object");
+    other(
+        r#"{"user_trades_response":[{"fee":1,"fee":2}]}"#,
+        "a repeated member",
+    );
+    other(
+        r#"{"ack":{"incoming_message":{"type":"get_user_trades","params":{}}}}"#,
+        "an ack",
+    );
+    other(
+        r#"{"type":"Err","err":{"error_code":"ServerError"},"error_code":"ServerError"}"#,
+        "two envelopes",
+    );
+    let binary = account_reads::decode_trades_page(
+        &reader(SUB),
+        RawFrame::Binary(br#"{"user_trades_response":[]}"#),
+    );
+    assert_eq!(binary, Err(NotATradesPage::Other("not a text frame")));
+    // An err, read as `socket_err` reads one: a RateLimited one's hold for the trades read.
+    let echo = r#"{"type":"get_user_trades","params":{"start_ts":1,"limit":1000,"offset":0}}"#;
+    let limited = flat(
+        "RateLimited",
+        r#""Rate limit exceeded, retry after 3 seconds""#,
+        echo,
+    );
+    let hold = SocketErr::RateLimited(RateHold {
+        charge: Some(RateCharge::one(OpKind::Query, None)),
+        retry_after: Some(Duration::from_secs(3)),
+    });
+    let invalid = nested("InvalidParameter", "null", echo);
+    for (frame, want) in [
+        (limited, hold),
+        (invalid, SocketErr::Other(Some(ErrCode::InvalidParameter))),
+    ] {
+        assert_eq!(trades_of(&frame), Err(NotATradesPage::Err(want)), "{frame}");
+        let reader = reader(SUB);
+        assert_eq!(
+            account_reads::socket_err(&reader, RawFrame::Text(&frame)),
+            Some(want)
+        );
+    }
+    // What each says: a code or what was wrong, never a value.
+    assert_eq!(
+        NotATradesPage::Err(hold).to_string(),
+        "QFEX answered an err: RateLimited"
+    );
+    assert_eq!(
+        NotATradesPage::Other("count").to_string(),
+        "not a get_user_trades page: count"
+    );
+}
+
+// ----- GET /user/historic-orders (FBC-be57) -----
+
+fn decode_historic(body: &str) -> Result<HistoricOrders, AnswerError> {
+    account_reads::decode_historic(&ok(body))
+}
+
+#[test]
+fn historic_orders_are_built_only_under_the_guard() {
+    let ask = HistoricAsk::new(MAX_PAGE, 0).unwrap();
+    let reader = reader(SUB);
+    for (cfg, what) in refused_configs() {
+        let want = BuildError::Config(probe::connections(&cfg).expect_err(what));
+        let built = account_reads::historic_orders(&cfg, &reader, &ctx(1), ask);
+        assert_eq!(built, Err(want), "{what}");
+    }
+    // Under either mode, on QFEX's origins or on loopback, on the guarded REST origin.
+    for cfg in probe_harness::every_mode(SUB) {
+        let rest = probe::connections(&cfg).unwrap().rest.to_owned();
+        let read = account_reads::historic_orders(&cfg, &reader, &ctx(1), ask).unwrap();
+        assert_eq!(
+            read.req.url.as_str(),
+            format!("{rest}/user/historic-orders?limit=1000&offset=0")
+        );
+    }
+    // Unsigned, nothing is built.
+    let cfg = preprod(SUB);
+    let unsigned = EncodeCtx {
+        nonces: NonceBlock::new(vec![1]),
+        ..ctx(1)
+    };
+    assert_eq!(
+        account_reads::historic_orders(&cfg, &reader, &unsigned, ask),
+        Err(BuildError::Sign(SignError::Unsignable(
+            "a QFEX REST read takes two nonces"
+        )))
+    );
+    for limit in [0, 1001, u16::MAX] {
+        let refused = BuildError::PageLimit("historic-orders");
+        assert_eq!(HistoricAsk::new(limit, 0), Err(refused), "{limit}");
+        assert_eq!(
+            refused.to_string(),
+            "a historic-orders page size outside 1 to 1000"
+        );
+    }
+    for (limit, offset) in [(1, 0), (1000, 4_294_967_295)] {
+        let ask = HistoricAsk::new(limit, offset).unwrap();
+        assert_eq!((ask.limit(), ask.offset()), (limit, offset));
+        let read = account_reads::historic_orders(&cfg, &reader, &ctx(1), ask).unwrap();
+        assert_eq!(
+            read.req.url.as_str(),
+            format!("{PREPROD_REST}/user/historic-orders?limit={limit}&offset={offset}")
+        );
+    }
+    assert_eq!(account_reads::HISTORIC_ORDERS_PATH, "/user/historic-orders");
+}
+
+#[test]
+fn historic_orders_are_signed_and_decoded_exactly() {
+    let cfg = preprod(SUB);
+    let ask = HistoricAsk::new(MAX_PAGE, 0).unwrap();
+    let (signature, nonce, unix_ts) = signed(&ctx(6));
+    let read = account_reads::historic_orders(&cfg, &reader("primary"), &ctx(6), ask).unwrap();
+    assert_eq!(read.req.method, fbc_core::HttpMethod::Get);
+    assert!(read.req.url.redactions().is_empty());
+    assert!(read.req.body.bytes().is_empty());
+    assert_eq!(
+        shown(&read.req.headers),
+        [
+            ("x-qfex-public-key", PUBLIC, true),
+            ("x-qfex-hmac-signature", signature.as_str(), true),
+            ("x-qfex-nonce", nonce.as_str(), true),
+            ("x-qfex-timestamp", unix_ts.as_str(), true),
+        ]
+    );
+    assert_eq!(read.charge, RateCharge::one(OpKind::Rest, None));
+    assert_eq!(read.class, TrafficClass::Normal);
+    // Signed as the positions read is, by ReadAuth's own headers.
+    for account in ["primary", SUB] {
+        let reader = reader(account);
+        let historic = account_reads::historic_orders(&cfg, &reader, &ctx(6), ask).unwrap();
+        let positions = account_reads::positions(&cfg, &reader, &ctx(6)).unwrap();
+        assert_eq!(historic.req.headers, positions.req.headers, "{account}");
+    }
+
+    // The answer, exactly: every order's client id and terminal status, and the count.
+    let listing = fixture("historic_orders.json");
+    let listed = decode_historic(&listing).unwrap();
+    assert_eq!(listed.count(), 2);
+    assert_eq!(
+        listed.rows(),
+        [
+            HistoricOrder {
+                client_order_id: "synthetic-cid-5".to_owned(),
+                terminal_status: "CANCELLED".to_owned(),
+            },
+            HistoricOrder {
+                client_order_id: String::new(),
+                terminal_status: "FILLED".to_owned(),
+            },
+        ]
+    );
+    for body in [
+        r#"{"count":0,"data":null}"#,
+        r#"{"count":0,"data":[]}"#,
+        r#"{"$schema":"https://schemas.example/h.json","data":null,"count":0.0}"#,
+    ] {
+        let none = decode_historic(body).unwrap();
+        assert!(none.rows().is_empty() && none.count() == 0, "{body}");
+    }
+    // Read from what the journal keeps, as live.
+    let resp = ok(&listing);
+    let spans = account_reads::redact_inbound(&reader(SUB), Inbound::Http(HttpTag(1), resp));
+    let kept = blanked(listing.as_bytes(), spans.body());
+    assert_eq!(decode_historic(&kept), Ok(listed));
+
+    // What QFEX does not document, or a value not as documented, is refused.
+    let row = |members: &str| format!(r#"{{"count":1,"data":[{{{members}}}]}}"#);
+    let cases: Vec<(String, AnswerError)> = vec![
+        (r#"{"data":null}"#.to_owned(), AnswerError::Missing("count")),
+        (r#"{"count":0}"#.to_owned(), AnswerError::Missing("data")),
+        (
+            r#"{"count":-1,"data":null}"#.to_owned(),
+            AnswerError::Invalid("count"),
+        ),
+        (
+            r#"{"count":1.5,"data":null}"#.to_owned(),
+            AnswerError::Invalid("count"),
+        ),
+        (
+            r#"{"count":"1","data":null}"#.to_owned(),
+            AnswerError::Invalid("count"),
+        ),
+        (
+            r#"{"count":0,"data":{}}"#.to_owned(),
+            AnswerError::Invalid("data"),
+        ),
+        (
+            r#"{"count":1,"data":[1]}"#.to_owned(),
+            AnswerError::Invalid("data"),
+        ),
+        (
+            r#"{"count":0,"data":null,"next_cursor":"x"}"#.to_owned(),
+            AnswerError::Undocumented,
+        ),
+        (
+            r#"{"count":0,"count":0,"data":null}"#.to_owned(),
+            AnswerError::Malformed,
+        ),
+        (
+            row(r#""terminal_status":"CANCELLED""#),
+            AnswerError::Missing("client_order_id"),
+        ),
+        (
+            row(r#""client_order_id":"c""#),
+            AnswerError::Missing("terminal_status"),
+        ),
+        (
+            row(r#""client_order_id":null,"terminal_status":"CANCELLED""#),
+            AnswerError::Invalid("client_order_id"),
+        ),
+        (
+            row(r#""client_order_id":"c","terminal_status":7"#),
+            AnswerError::Invalid("terminal_status"),
+        ),
+        ("[]".to_owned(), AnswerError::Malformed),
+    ];
+    for (body, want) in &cases {
+        assert_eq!(decode_historic(body), Err(*want), "{body}");
+    }
+    let refused = account_reads::decode_historic(&answer(401, &listing));
+    assert_eq!(refused, Err(AnswerError::Status(401)));
+}
+
+#[test]
+fn a_subaccount_read_names_the_requested_account() {
+    let cfg = loopback("primary");
+    let ask = HistoricAsk::new(1, 0).unwrap();
+    for (account, selected) in [("primary", None), (SUB, Some(SUB)), (SUB2, Some(SUB2))] {
+        let reader = reader(account);
+        let read = account_reads::historic_orders(&cfg, &reader, &ctx(8), ask).unwrap();
+        let names: Vec<&str> = read.req.headers.iter().map(|h| h.name).collect();
+        let requested: Vec<(&str, bool)> = (read.req.headers.iter())
+            .filter(|h| h.name == "x-qfex-requested-account-id")
+            .map(|h| (h.value.as_str(), h.redact))
+            .collect();
+        match selected {
+            None => {
+                assert_eq!(names.len(), 4, "{account}");
+                assert!(requested.is_empty(), "{account}");
+            }
+            Some(id) => {
+                assert_eq!(names.len(), 5, "{account}");
+                assert_eq!(requested, [(id, true)], "{account}");
+            }
+        }
+        // The account is named in a header only, never in the URL.
+        assert!(!read.req.url.as_str().contains("5a5a"), "{account}");
+        assert!(!format!("{read:?}").contains("5a5a"), "{account}");
+    }
 }

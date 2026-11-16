@@ -1,0 +1,16 @@
+{
+  "user_trades": [
+    {
+      "trade_id": "16161616-1616-4616-8616-161616161616",
+      "symbol": "SYNTH-USD",
+      "price": 41.75,
+      "quantity": 0.25,
+      "aggressor_side": "SELL",
+      "order_id": "17171717-1717-4717-8717-171717171717",
+      "client_order_id": "synthetic-cid-5",
+      "fee": 0.12345678901234567890,
+      "timestamp": 1760000006.123456789012
+    }
+  ],
+  "count": 1
+}
