@@ -20,7 +20,11 @@
 //!   ([`Registry::on_outcome`]); an outcome naming a request not submitted here is the session's
 //!   own (its cancel-on-disconnect arm) and is only noted. An order event is applied under the
 //!   venue's sequence with the ingest order as tiebreak ([`Registry::apply_update`]); a fill goes
-//!   through the [`FillLedger`] and, accepted, to [`Registry::apply_fill`]. The `Resync*` events
+//!   through the [`FillLedger`] and, accepted, to [`Registry::apply_fill`], and one the ledger
+//!   refuses for its time (`BeyondHorizon` or `Untimed`: it may have applied the fill and
+//!   forgotten it, or nothing shows the fill newer than its watermark) is also kept in
+//!   [`Link::fill_refusals`], for a driver that stops on one (qfex_preprod_probe's place
+//!   stages, decision 0132 item 7). The `Resync*` events
 //!   are collected into one [`ResyncSnapshot`] and applied at `ResyncEnd`
 //!   ([`Registry::resync`]); its `requested_at` is the receive time of the event reporting the
 //!   socket authenticated, which comes before the session asks for the resync. A snapshot the
@@ -466,10 +470,21 @@ enum Item {
     },
 }
 
+/// A fill the ledger refused for its time ([`Link::fill_refusals`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillRefusal {
+    /// The ledger's admission, by its name: `BeyondHorizon` or `Untimed`.
+    pub admission: &'static str,
+    /// When the fill arrived, on the shard's monotonic clock.
+    pub at: MonoNs,
+}
+
 /// The registry, the fill ledger and what was submitted (module documentation).
 pub struct Link {
     reg: Registry,
     ledger: FillLedger,
+    /// Each fill the ledger refused for its time, in order.
+    fill_refusals: Vec<FillRefusal>,
     caps: OrderCaps,
     ladder: LadderConfig,
     /// The items of each request submitted here.
@@ -507,6 +522,7 @@ impl Link {
         Link {
             reg,
             ledger,
+            fill_refusals: Vec::new(),
             caps,
             ladder,
             sent: HashMap::new(),
@@ -568,6 +584,18 @@ impl Link {
     /// The venue's order caps.
     pub fn caps(&self) -> &OrderCaps {
         &self.caps
+    }
+
+    /// The fill ledger every fill goes through, to read its horizon, the fills it holds and its
+    /// replay counts.
+    pub fn ledger(&self) -> &FillLedger {
+        &self.ledger
+    }
+
+    /// Each fill the ledger refused for its time, in order: every one it did not apply but a
+    /// duplicate or one before its watermark, which the position already holds.
+    pub fn fill_refusals(&self) -> &[FillRefusal] {
+        &self.fill_refusals
     }
 
     /// Everything noted so far, in order.
@@ -1020,7 +1048,15 @@ impl Link {
                     held @ (Admission::Duplicate | Admission::BeforeWatermark) => {
                         (format!("not applied: {held:?}"), false, false)
                     }
-                    other => (format!("not applied: {other:?}"), true, false),
+                    refused @ (Admission::BeyondHorizon | Admission::Untimed) => {
+                        let admission = match refused {
+                            Admission::BeyondHorizon => "BeyondHorizon",
+                            _ => "Untimed",
+                        };
+                        let at = now;
+                        self.fill_refusals.push(FillRefusal { admission, at });
+                        (format!("not applied: {admission}"), true, false)
+                    }
                 };
                 self.notes.push(Note::Fill {
                     seen,

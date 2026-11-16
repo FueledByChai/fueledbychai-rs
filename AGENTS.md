@@ -798,12 +798,26 @@ holds two of them for one pull request. The rules after the three roles bind all
     reports whether any ping came before authentication, the intervals after it, each server
     close and that a lifetime longer than the hold was not measured; a hold that fails, an order
     or fill frame on it, an account read after it that is not clean, or Ctrl-C on the hold in a
-    run that also arms stops the run, so no session starts. Its credentials
-    come from the environment through `src/auth_qfex.rs`, a review path, which also hands each
-    signed read to the connector; it reuses `paradex_testnet_acceptance`'s privacy patterns by
+    run that also arms stops the run, so no session starts. For FBC-9sk2's place stages
+    `ledger.rs` also holds, not yet used by a run (FBC-oxjs; decision 0148 items 3 and 7, built
+    to items 1, 9 and 12 of FBC-fqv5's record as proposed), the place registries: four per named
+    account, one per `Step` (drop, cross, take, pages), each a `PlaceRegistry` built with its
+    caps, declared `CodProbeRun::owner_supervised_places` on its one market and never a testnet
+    run (production only), under its lease names and bound to its account, its `CancelOnlyTrip`
+    given to the journal (`trip_on`, 0139), and handed with its one fill ledger to one `Link` for
+    the registry's life (`into_link`, `PlaceRun::session_ended` reading the ledger back); its
+    `MayPlace` list from `PlaceLists`, every order at the minimum size in size steps, the
+    entries other than the flatten IOCs summing to 0148 item 7's most per account and every list
+    carrying `--flatten-attempts` flatten IOCs under one budget per account, which the driver
+    spends (FBC-23ch); and its count bound above that list's ceiling (`PlaceBounds::accept`),
+    held in `tests/qfex_preprod_probe/place_registries.rs`, which `tests/qfex_preprod_probe.rs`
+    declares by path. The probe's credentials come from the environment through
+    `src/auth_qfex.rs`, a review path, which also hands each signed read to the connector; the
+    probe reuses `paradex_testnet_acceptance`'s privacy patterns by
     path. The samples that trade share
-    `src/link.rs` (the glue) and `src/testnet.rs` (guard and wiring), and the mainnet ones
-    `src/mainnet.rs` (the mainnet guard), included by path.
+    `src/link.rs` (the glue; `Link::ledger` shows its fill ledger and `Link::fill_refusals` lists
+    each fill that ledger refuses for its time) and `src/testnet.rs` (guard and wiring), and the
+    mainnet ones `src/mainnet.rs` (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:
