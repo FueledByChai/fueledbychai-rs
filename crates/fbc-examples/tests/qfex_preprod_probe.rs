@@ -72,6 +72,8 @@ mod place_registries;
 mod probe_args;
 #[path = "../examples/qfex_preprod_probe/refusals.rs"]
 mod refusals;
+#[path = "../examples/qfex_preprod_probe/report.rs"]
+mod report;
 #[path = "../examples/qfex_preprod_probe/stage.rs"]
 mod stage;
 

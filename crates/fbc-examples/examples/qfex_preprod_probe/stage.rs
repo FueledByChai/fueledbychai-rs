@@ -92,11 +92,11 @@
 //! - **The resync's full pages** ([`crate::pages`]): each full `get_user_orders` page a session's
 //!   resync read, with its page size and offset (decision 0132 item 5, FBC-4h1p), from the
 //!   session's journal, since its codec's own count cannot be reached from outside the session.
-//! - **The files** ([`crate::capture`]): the report, the evidence, the journal and the scrubbed
-//!   fixture slice, which scripts/privacy-check.sh must pass. A record the journal dropped,
-//!   marked in it or only counted by its sink, one its writer never wrote, and a journal that
-//!   cannot be read to its end each make the run incomplete and the capture of every session
-//!   that could have lost a record partial (decision 0006).
+//! - **The files** ([`crate::report`] for the report and the evidence, [`crate::capture`] for the
+//!   journal and the scrubbed fixture slice), which scripts/privacy-check.sh must pass. A record
+//!   the journal dropped, marked in it or only counted by its sink, one its writer never wrote, and
+//!   a journal that cannot be read to its end each make the run incomplete and the capture of every
+//!   session that could have lost a record partial (decision 0006).
 
 use std::cell::RefCell;
 use std::fmt;

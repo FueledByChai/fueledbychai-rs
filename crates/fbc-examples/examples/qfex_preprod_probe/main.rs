@@ -45,6 +45,7 @@ mod link;
 mod pages;
 mod probe_args;
 mod refusals;
+mod report;
 mod stage;
 
 use std::cell::RefCell;
