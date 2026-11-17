@@ -46,9 +46,10 @@ session's arm, its resync's reads (one GET /user/positions and get_user_orders p
 that never arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming
 at all.
 
-With --place-stages (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions 0148 and
-0151) it runs the place stages' preflight, then decision 0132 item 4's drop test on each named
-account in turn: on production alone (--production; 0151 item 1), and, until FBC-4plj lands
+With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; decisions
+0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's drop test on each
+named account in turn, then stage two's crossing post-only (decision 0132 item 7): on production
+alone (--production; 0151 item 1), and, until FBC-4plj lands
 every stop decisions 0132 item 7 and 0148 item 8 require, only against a loopback test stub,
 every origin (trade, REST and MDS) a loopback address. It prints a CAPS line with the
 environment and both caps first, before any request; runs the hold first, alone, when
@@ -82,20 +83,49 @@ account's verdict, judged in this run and never carried to another, passes only 
 are absent, named by no trades row and listed by historic-orders (decision 0132 item 4, 0151
 item 13); then the read of every named account. A failed verdict, an arm-time cancel of X QFEX
 did not report, or a fill of X or Y the reads show (the position yours, 0151 item 9) stops the
-run, so nothing more is placed on that account or any other. With no stop the run ends after
-the last account's drop test, its outcome not ok, until FBC-su9i builds stage two.
+run, so nothing more is placed on that account or any other. With no stop, stage two follows.
+
+Stage two (FBC-su9i) is judged on this run alone, in memory: its exact-echo gate opens only once
+an order_response ACK in this run echoed one of our client ids byte for byte (decision 0148 item
+2; an upper-cased or escaped one keeps it shut, and an ack or err echo of an add_order never
+opens it; an ACK whose client id is absent, null or empty names no order of ours, so it stops the
+run in drop session one, StrayOrder, before the gate is judged: 0151 item 13). Shut, every
+account's drop test still runs and the run then ends NoEcho, which is not a fault and writes no
+stop marker. Open, each named account whose drop test
+passed in this run in turn: every named account read clean, its cross registry built, tripped and
+seeded flat; one session armed, resynced and Started; then, only while no registry of the run
+holds another order of ours open, in flight or Unknown and no named account's read shows one
+(decision 0148 item 6, X and Y counted ended only on 0151 item 5's three reads after the drop),
+one post-only GTC at the instrument's minimum size at the far touch, through it, to show how QFEX
+refuses it (CANCELLED, a status the adapter does not map, or an err echo, each recorded); its end
+or its deadline (--rpc-timeout-ms), a place never answered, or refused by a status the adapter
+does not map or by an err echo, ending Unknown, never resent and counted resting (decision 0005);
+the streams compared with the reads; then every order of ours cancelled by venue id before the
+session stops, and the read of every named account. A fill of it stops the run (UnexpectedFill;
+FBC-ou9g builds the flatten); an order of ours still resting after the session, read or counted
+resting, an Unknown place included, stops it too (LeftResting), as does a named account that
+cannot be read after it. With no stop the
+run ends after the last account's crossing post-only, its outcome not ok, until FBC-ou9g builds
+the taker IOC. The report gives the characters our client ids exercised (the rest not measured),
+whether QFEX accepted add_order as encoded, whether ACK, rejects and fills echo our client id
+exactly, which statuses are rejects and ends, and how each crossing post-only was refused.
 
 Each stop decisions 0132 item 7 and 0148 item 8 name stops the run by name, with the read of
 every named account after it, the report and the stop marker: an order event or fill of ours
 without our client id, an order_response naming no order of ours (0151 item 13), a replayed
 fill refused for its time, a resync that disagrees or leaves a fill unsettled, a provider rate
 refusal on the session, a read socket or REST, a read showing an order or a position the streams
-did not, an unplanned end of the connection, the span bound, a fill of X or Y, a position not
-flat, an order left resting, and Ctrl-C. In a drop session only Ctrl-C and a fill of ours cancel
-(0151 item 2): Kill, every order of ours cancelled by venue id, a wait of up to --rpc-timeout-ms
-for each to end (a second Ctrl-C meanwhile recorded), the market disarmed, then a graceful close;
-cancels held by a provider rate refusal or refused locally end it by a graceful close too (0151
-item 11). Every other stop sends no cancel and ends the session by a graceful close.
+did not, an unplanned end of the connection, the span bound, a fill of X, Y or the crossing
+post-only, a position not flat, an order left resting, and Ctrl-C. In a drop session only Ctrl-C
+and a fill of ours cancel (0151 item 2): Kill, every order of ours cancelled by venue id, a wait
+of up to --rpc-timeout-ms for each to end (a second Ctrl-C meanwhile recorded), the market
+disarmed, then a graceful close; cancels held by a provider rate refusal or refused locally end
+it by a graceful close too (0151 item 11). Every other stop sends no cancel and ends the session
+by a graceful close. A crossing session also cancels every order of ours by venue id before it
+stops, at every stop, Ctrl-C and its span bound included, and once it ran its course (decision
+0132 item 7, 0148 item 8); its span bound is met one --rpc-timeout-ms early, so its cancels begin
+before it; and cancels held by a provider rate refusal or refused locally end it by the abrupt
+drop, since its account's drop test passed in this run (0151 item 11).
 
 Before anything connects, a place-stage run opens its lease directory (0151 items 1 and 6): it
 tags the directory production on its first use and refuses one tagged for another environment;
@@ -108,10 +138,11 @@ every read is clean; the declaration is the owner's, which the probe does not ch
 stops (any stop but NoEcho, each named in its report) writes a marker with the stop's name and
 its start time. In a place-stage run Ctrl-C outside the hold's connection never ends the
 program: a press from the hold's first read to its last, its connecting included, is the hold's
-(below), and a press during the preflight, the reads, a drop session or its stop's cancels
-stops the run, Interrupted, and its report and its marker are written; between the drop test's
-sessions it stops the run once the reads under way end, X still resting reported for your hand
-cancel; in a drop session it cancels by venue id first.
+(below), and a press during the preflight, the reads, a drop session, a crossing session or a
+session's stop's cancels stops the run, Interrupted, and its report and its marker are written;
+between the drop test's sessions it stops the run once the reads under way end, X still resting
+reported for your hand cancel; in a drop session or a crossing session it cancels by venue id
+first.
 
 Before anything connects it refuses any origin but the environment's own (or, for a test stub,
 all of them loopback addresses): without --production, a production origin is refused; with it,
@@ -179,7 +210,9 @@ Options:
                            --production, beside the owner's README (decision 0146 item 6); a
                            place-stage run writes its scrubbed slice into drop-production/, to
                            commit as fixtures/qfex/exec-recorded/drop-production/ once every
-                           file is read (0151 item 7)
+                           file is read (0151 item 7), and stage two's crossing sessions' frames
+                           into places-production/, to commit as
+                           fixtures/qfex/exec-recorded/places-production/
   --arm <ACCOUNT>          once or twice, in run order: primary, or subaccount (the one
                            {SUB_ID_VAR} names); required unless --hold-secs is given, or
                            --place-stages, which refuses it
@@ -219,7 +252,8 @@ Options:
                            deadline, the longer of --rpc-timeout-ms and the resync's {resync} s
                            deadline and --agree-wait-ms, and the reads of every named account
                            between them, each --read-wait-ms (0151 item 3)
-  --place-stages           the place stages' preflight and drop tests (above): refused
+  --place-stages           the place stages' preflight, drop tests and stage two's crossing
+                           post-only (above): refused
                            with --arm, and without --production; needs every flag below, each
                            of which it alone takes
   --symbol <SYMBOL>        required: the venue symbol traded, at most 32 ASCII letters, digits
@@ -416,6 +450,11 @@ pub struct TestHooks {
     /// with no stop (`stage::Halt::Error`), that order left resting: a failure after a place,
     /// which no answer of the QFEX model makes (FBC-77r8's review).
     pub fail_after_place: Option<usize>,
+    /// Before the `n`th crossing session's check for no other order of ours (0 the first named
+    /// account's), an order of ours, never sent, held in the first named account's cross
+    /// registry (FBC-su9i): decision 0148 item 6's refusal, which the reads before each session
+    /// and the stop an order left resting after one is keep the QFEX model from reaching.
+    pub other_order: Option<usize>,
 }
 
 /// What `--reconciled` declares the owner did by hand after an earlier place-stage run's stop

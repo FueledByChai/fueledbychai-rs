@@ -129,6 +129,15 @@ mod refusals;
 mod report;
 #[path = "../examples/qfex_preprod_probe/stage.rs"]
 mod stage;
+// Stage two (FBC-su9i): the exact-echo gate, no_other_order(), each crossing session's record and
+// the report's items, proven at function level in [`crossing`] and in runs in [`place_stages`].
+#[path = "../examples/qfex_preprod_probe/stage_two.rs"]
+mod stage_two;
+// Stage two's parts against the QFEX model and at function level (FBC-su9i): the model's
+// ack_echo, alo_cross and cancel_misses knobs, the session machinery's policy, stage two's record
+// and the report's items.
+#[path = "qfex_preprod_probe/crossing.rs"]
+mod crossing;
 // The place stages' capture scrub and the arm window (FBC-t45e).
 #[path = "qfex_preprod_probe/place_scrub.rs"]
 mod place_scrub;

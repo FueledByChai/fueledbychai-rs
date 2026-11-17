@@ -577,7 +577,6 @@ pub fn rest_price(
 
 /// A crossing order's price on `side`, the crossing post-only's and the taker IOC's: the far
 /// touch (the ask for a buy, the bid for a sell).
-#[allow(dead_code)] // the driver prices the crossing post-only and the taker IOC (FBC-su9i)
 pub fn far_touch(spec: &InstrumentSpec, side: Side, quote: Quote) -> Result<Ticks, String> {
     match side {
         Side::Buy => snapped(spec, side, i128::from(quote.ask.0)),
@@ -705,8 +704,9 @@ const FENCES: &str = "--production; --sole-trader (decision 0148 item 7); --rest
 
 /// What the place stages do after the preflight, and do not do yet, as the report says it.
 const NOT_BUILT: &str = "After the preflight, decision 0132 item 4's drop test runs on each \
-     named account in turn (FBC-23ch and FBC-77r8), and the run ends after the last account's: \
-     stage two and the stages after it are not built yet (FBC-su9i and the slices after it)";
+     named account in turn (FBC-23ch and FBC-77r8), then stage two's crossing post-only on each \
+     (FBC-su9i), and the run ends after the last account's: stage two's taker IOC and the stages \
+     after it are not built yet (FBC-ou9g and the slices after it)";
 
 /// The report's section on the place stages' preflight.
 pub fn markdown(s: &mut String, pre: &Preflight) {

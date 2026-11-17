@@ -4,7 +4,8 @@
 //! nothing and sends no command but each session's arm, its resync's reads and the probe's own
 //! reads. With `--hold-secs` it first holds one trade connection that never arms (decision 0146),
 //! and a run may hold without arming at all. With `--place-stages` it runs the place stages'
-//! preflight and each named account's drop test, which places X and Y (below).
+//! preflight, each named account's drop test, which places X and Y, and stage two's crossing
+//! post-only (below).
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
 //!   (`src/auth_qfex.rs`), and the configuration of each account it reads, under the adapter's
@@ -160,8 +161,45 @@
 //!   before the drop; a failed verdict, an arm-time cancel QFEX did not report, a fill of X or
 //!   Y the reads show (the run stopping not flat, the position the owner's, 0151 item 9) or an
 //!   order still resting after it is a stop, marked, so nothing more is placed on that account or
-//!   any other. With no stop the run ends after the last account's drop test, naming FBC-su9i,
-//!   which builds stage two ([`NOT_BUILT`]).
+//!   any other. With no stop, stage two follows.
+//! - **Stage two** ([`Run::cross_tests`], FBC-su9i; decisions 0005, 0132 item 7, 0148 items 2, 6
+//!   and 8, 0151 items 5, 9 and 11), once every named account's drop test ran with no stop. The
+//!   run's exact-echo gate ([`crate::stage_two::EchoGate`]) is judged on what the tee heard in this
+//!   run, in memory: shut, the run ends [`Stop::NoEcho`], not a fault, with no stop marker. Open,
+//!   each named account whose drop test passed in this run, in turn ([`Run::cross_test`]): every
+//!   named account read clean, the account's cross registry built, tripped and seeded flat, its
+//!   allowance the one its drop test spent from, the drop registry's market disarmed first so its
+//!   market lease is free; one session ([`Run::cross_session`]), armed, resynced and Started under
+//!   the market lease; no other order of ours ([`crate::stage_two::no_other_order`]: every registry
+//!   of the run, X and Y counted ended only on 0151 item 5's three reads, and every named account's
+//!   read before the session), else no crossing order and a stop; the crossing post-only, a
+//!   post-only GTC at the minimum size at the far touch, as an fbc-oms authorization spent from the
+//!   cross registry's list; its first answer (its ACK timed), then its end or its deadline,
+//!   `--rpc-timeout-ms` from its send, a place never answered ending `Unknown`, never resent; how
+//!   it came back ([`crate::stage_two::Crossed`]), read before any cancel of ours; the streams
+//!   compared with the reads; then the session machinery's Stop: every order of ours cancelled by
+//!   venue id, and a graceful close, or the abrupt drop when those cancels were held (below); then
+//!   the read of every named account. A fill of it is [`Stop::UnexpectedFill`] (FBC-ou9g builds the
+//!   flatten); a position not flat in those reads is [`Stop::NotFlat`], said to be the owner's
+//!   whatever stop came first (0151 item 9); an order or a TWAP not ours in those reads is
+//!   [`Stop::ReadDisagrees`]; an order of ours still resting after the session, listed by a read,
+//!   counted open by REST and listed by no page, or counted resting by the registry (an `Unknown`
+//!   one, decision 0005), is [`Stop::LeftResting`] ([`cross_after_stop`]). With no stop the run
+//!   ends after the last account's crossing post-only, naming FBC-ou9g, which builds the taker IOC
+//!   ([`NOT_BUILT`]). The report gives what the whole run's frames show of our client ids and
+//!   QFEX's statuses ([`crate::stage_two::StageTwo`]), and the crossing sessions' frames go in the
+//!   `places-production/` slice ([`PLACES_SLICE`]).
+//! - **The session machinery** ([`Run::end_session`], FBC-su9i): every place stage's session ends
+//!   through it under its [`Policy`]. A drop session cancels only at Ctrl-C or once a fill of ours
+//!   came and ends by a graceful close, or drop session two by its abrupt drop (above); a session
+//!   outside the drop test cancels every order of ours by venue id before it stops, at every stop
+//!   and once it ran its course (decision 0132 item 7, 0148 item 8), meets its span bound one
+//!   `--rpc-timeout-ms` early ([`cancels_begin`]), and, its cancels refused locally or met by a
+//!   provider rate refusal ([`Cancels::blocked`]), ends by the abrupt drop once its account's
+//!   drop test passed in the run, and by a graceful close otherwise (0151 item 11). A graceful
+//!   close waits for the shared budget's room when a provider rate refusal holds it, and a
+//!   Ctrl-C, or a stop that cancels under the policy, taken while it waits with no cancels run
+//!   yet, runs its cancels first (0151 items 2 and 11).
 //! - **The files** ([`crate::report`] for the report and the evidence, [`crate::capture`] for the
 //!   journal and the scrubbed fixture slice), which scripts/privacy-check.sh must pass. A record
 //!   the journal dropped, marked in it or only counted by its sink, one its writer never wrote, and
@@ -222,8 +260,9 @@ use crate::places::{
 };
 use crate::probe_args::{self as args, Hold, Options, Places, RESYNC_TIMEOUT};
 use crate::refusals::{
-    self, AFTER_DROP_ONE, AFTER_DROP_TWO, AFTER_HOLD, HOLD, ReadSocket, Refusals,
+    self, AFTER_CROSS, AFTER_DROP_ONE, AFTER_DROP_TWO, AFTER_HOLD, HOLD, ReadSocket, Refusals,
 };
+use crate::stage_two::{self as two, CrossRun, StageTwo};
 use crate::tee::{Tap, Tee};
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -387,11 +426,11 @@ pub const LOOPBACK_ONLY: &str = "--place-stages: refused, nothing sent: until FB
      every stop decisions 0132 item 7 and 0148 item 8 require, the place stages run only against \
      a loopback test stub, every origin (trade, REST and MDS) a loopback address";
 
-/// Why a place-stage run ends after every named account's drop test, when no stop came first
-/// (FBC-77r8): stage two is not built yet.
-pub const NOT_BUILT: &str = "stage two of the place stages (decision 0132 item 7: the crossing \
-     post-only and the taker IOC) and the stages after it are not built yet (FBC-su9i builds \
-     stage two): the run ends after every named account's drop test, its outcome not ok";
+/// Why a place-stage run ends after each named account's crossing post-only, when no stop came
+/// first (FBC-su9i): stage two's taker IOC is not built yet.
+pub const NOT_BUILT: &str = "stage two's taker IOC (decision 0132 item 7) and the stages after \
+     it are not built yet (FBC-ou9g builds the taker IOC): the run ends after each named \
+     account's crossing post-only, its outcome not ok";
 
 /// Why a place-stage run that holds stops when the owner's Ctrl-C comes before the hold's
 /// connection opens, during the reads before it or its connect: it is the hold's interrupt, so
@@ -572,6 +611,8 @@ async fn run_with(
         patient: None,
         rest_refused: 0,
         unread: Vec::new(),
+        built: Vec::new(),
+        allowances: Vec::new(),
     };
     let held = opts.hold.map_or(String::new(), |hold| {
         format!(
@@ -592,8 +633,11 @@ async fn run_with(
              named account's drop test in turn (FBC-23ch and FBC-77r8): drop session one places \
              X, one post-only GTC at the minimum size behind the touch, and closes gracefully; \
              drop session two places Y and drops abruptly; the reads after the drop judge the \
-             account's verdict; the run ends after the last account's, not ok, until FBC-su9i \
-             builds stage two{held}",
+             account's verdict; then stage two (FBC-su9i): with the run's exact-echo gate open, \
+             each named account in turn places its crossing post-only, one post-only GTC at the \
+             minimum size at the far touch, and cancels every order of ours by venue id before \
+             its session stops, and with it shut the run ends NoEcho; the run ends after the last \
+             account's crossing post-only, not ok, until FBC-ou9g builds the taker IOC{held}",
             environment(env),
             env.mode(),
         )),
@@ -613,6 +657,13 @@ async fn run_with(
     if let Err(why) = run.stage().await {
         run.line(format_args!("STOPPED {why}"));
         run.ev.stopped = Some(why);
+    }
+    // What the whole run's frames show of our client ids and QFEX's statuses, for stage two's
+    // report items (FBC-su9i), once a drop session ran.
+    if !run.ev.drops.is_empty() {
+        let kept = run.tee.kept();
+        let two = run.ev.stage_two.get_or_insert_with(StageTwo::default);
+        two.read(&kept);
     }
     run.mark();
     let Run {
@@ -742,9 +793,16 @@ pub fn write_slice(dir: &Path, ev: &mut Evidence, script: &Path) -> Result<(), S
 /// `fixtures/qfex/exec-recorded/drop-production/` once the owner has read every file.
 pub const DROP_SLICE: &str = "drop-production";
 
+/// The directory a place-stage run writes stage two's crossing sessions' frames into (0151 item
+/// 7, FBC-su9i), to commit as `fixtures/qfex/exec-recorded/places-production/` once the owner
+/// has read every file.
+pub const PLACES_SLICE: &str = "places-production";
+
 /// A place-stage run's [`write_slice`]: the slice scrubbed by `capture::Scrub::Places`
 /// (decision 0148 item 10), each resync page read on `specs`, the spec table its sessions held,
-/// written into `dir/drop-production/` with its README, then checked by `script`.
+/// the drop test's sessions' frames written into `dir/drop-production/` with its README, and,
+/// when a crossing session ran, stage two's into `dir/places-production/` with its own, each
+/// then checked by `script`.
 pub fn write_place_slice(
     dir: &Path,
     ev: &mut Evidence,
@@ -752,8 +810,16 @@ pub fn write_place_slice(
     script: &Path,
 ) -> Result<(), String> {
     let files = capture::slice_places(&dir.join("journal"), SHARD, ev, specs)?;
+    let (crossing, files) = capture::split_crossing(ev, files);
+    let crossed = ev.sessions.iter().any(capture::is_crossing);
     checked_fixtures(&dir.join(DROP_SLICE), ev, script, |fixtures, ev| {
         capture::write_fixtures_scrubbed(fixtures, files, ev, capture::Scrub::Places)
+    })?;
+    if !crossed {
+        return Ok(());
+    }
+    checked_fixtures(&dir.join(PLACES_SLICE), ev, script, |fixtures, ev| {
+        capture::write_crossing_fixtures(fixtures, crossing, ev)
     })
 }
 
@@ -832,6 +898,21 @@ struct Run<'a> {
     /// The accounts whose reads could not be made so far, one entry per read ([`Run::read_one`]),
     /// which the evidence's reads do not hold.
     unread: Vec<Armed>,
+    /// Every place-stage registry the run built, on every named account, for stage two's
+    /// [`crate::stage_two::no_other_order`] (decision 0148 item 6).
+    built: Vec<BuiltReg>,
+    /// Each named account's allowance once its drop test's sessions ran, which its later
+    /// registries spend from (decision 0148 item 7: one flatten budget per account).
+    allowances: Vec<(Armed, Allowance)>,
+}
+
+/// A place-stage registry the run built ([`Run::built`]): its account, its step, its `Link`, and,
+/// for a drop registry, X and Y as placed, which count ended only as 0151 item 5 rules.
+struct BuiltReg {
+    on: Armed,
+    step: Step,
+    link: Rc<RefCell<Link>>,
+    xy: Vec<fbc_core::ClientOrderId>,
 }
 
 impl Run<'_> {
@@ -2008,11 +2089,13 @@ impl From<Stop> for Halt {
     }
 }
 
-/// Which session of a drop test (decision 0132 item 4).
+/// Which session of a place stage: one of a drop test's two (decision 0132 item 4), or stage
+/// two's crossing session (FBC-su9i, decision 0132 item 7).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Which {
     One,
     Two,
+    Cross,
 }
 
 impl Which {
@@ -2021,6 +2104,7 @@ impl Which {
         match self {
             Which::One => places::DROP_ONE,
             Which::Two => places::DROP_TWO,
+            Which::Cross => places::CROSS,
         }
     }
 
@@ -2029,14 +2113,24 @@ impl Which {
         match self {
             Which::One => AFTER_DROP_ONE,
             Which::Two => AFTER_DROP_TWO,
+            Which::Cross => AFTER_CROSS,
         }
     }
 
-    /// The order it places: X, or Y.
+    /// The order it places: X, Y, or the crossing post-only.
     fn order(self) -> &'static str {
         match self {
             Which::One => "X",
             Which::Two => "Y",
+            Which::Cross => "the crossing post-only",
+        }
+    }
+
+    /// How the reads around it mark the label of the account it runs on.
+    fn mark(self) -> &'static str {
+        match self {
+            Which::One | Which::Two => " (drop)",
+            Which::Cross => " (cross)",
         }
     }
 }
@@ -2099,6 +2193,90 @@ pub fn place_pacing(connect_wait: Duration) -> ReconnectPacing {
     pacing.expect("one attempt a day, each within --connect-wait-ms")
 }
 
+/// How a place stage's session ends once its steps ended ([`Run::end_session`], the place
+/// stages' session machinery, which every session of the place stages ends through).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Policy {
+    /// A drop session (decision 0132 item 4, 0151 items 2 and 11): only a stop at the owner's
+    /// Ctrl-C or once a fill of ours came cancels, by venue id ([`Stop::cancels_in_drop`]), and
+    /// it ends by a graceful close, since no drop test has passed yet on its account; but with
+    /// `abrupt`, drop session two, once it ran its course with no stop and no failure, ends by
+    /// the abrupt drop.
+    Drop { abrupt: bool },
+    /// A session outside the drop test (decision 0132 item 7, 0148 item 8, 0151 item 11): before
+    /// it stops, at every stop and once it ran its course alike, the owner's Ctrl-C and the span
+    /// bound included, it cancels every order of ours by venue id, each an fbc-oms authorization
+    /// through the `Link`, then Stops; it ends by a graceful close, but when those cancels were
+    /// refused locally or met by a provider rate refusal ([`Cancels::blocked`], 0151 item 11's
+    /// two causes; a cancel answered other than accepted alone is neither) by the abrupt drop if
+    /// this account's drop test passed in this run (`drop_passed`), which showed the drop
+    /// cancels.
+    Stage { drop_passed: bool },
+}
+
+/// How a place stage's session ends, when its connection did not end first.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// A graceful close: the WebSocket close frame, sent by dropping the session's control.
+    Close,
+    /// The abrupt drop: the session's run dropped unpolled, its connection with it, with no
+    /// WebSocket close.
+    Drop,
+}
+
+impl Policy {
+    /// Whether a session under it, its steps ended with `stop` (none when it ran its course),
+    /// cancels every order of ours before it stops, given whether a fill of ours reached it.
+    pub fn cancels(self, stop: Option<Stop>, fill_of_ours: bool) -> bool {
+        match self {
+            Policy::Drop { .. } => stop.is_some_and(|s| s.cancels_in_drop(fill_of_ours)),
+            Policy::Stage { .. } => true,
+        }
+    }
+
+    /// How a session under it ends, its steps ended with `stop`, `failed` when they ended on a
+    /// failure that is no stop, and `cancels` the stop's cancels when they ran.
+    pub fn ending(self, stop: Option<Stop>, failed: bool, cancels: Option<&Cancels>) -> Ending {
+        match self {
+            Policy::Drop { abrupt: true } if stop.is_none() && !failed => Ending::Drop,
+            Policy::Drop { .. } => Ending::Close,
+            Policy::Stage { drop_passed: true } if cancels.is_some_and(|c| c.blocked) => {
+                Ending::Drop
+            }
+            Policy::Stage { .. } => Ending::Close,
+        }
+    }
+}
+
+/// When a session outside the drop test meets its registry's span bound, `span_end`, as a stop
+/// ([`Stop::SpanBound`]): one `--rpc-timeout-ms`, `rpc`, before it, so its cancels begin early
+/// enough to be answered before the bound (decision 0148 item 8), or, when the bound is nearer
+/// the clock's origin than that, so no instant one timeout before it can be named, `now` or the
+/// bound, whichever comes first: at once, the earliest the cancels can begin, never later than
+/// one timeout before the bound would have been. A drop session meets it at the bound itself and
+/// cancels nothing (0151 item 2).
+pub fn cancels_begin(
+    span_end: tokio::time::Instant,
+    rpc: Duration,
+    now: tokio::time::Instant,
+) -> tokio::time::Instant {
+    span_end.checked_sub(rpc).unwrap_or(now.min(span_end))
+}
+
+/// What [`Run::end_session`] did: the session's stop, how the session ended, the stop's cancels
+/// when they ran, the comparison after them when one was made, and whether the session's own
+/// order rested as its close was sent.
+struct Closed {
+    /// The session's stop: the one its steps ended with, or, when none came, the stop the
+    /// comparison after the stop's cancels raised, a press of Ctrl-C or a stop the tee or the
+    /// handler raised as the close waited for room.
+    stop: Option<Stop>,
+    ended_by: &'static str,
+    cancels: Option<Cancels>,
+    compared: Option<(crate::compare::Compared, Option<ReadSocket>)>,
+    rested_at_close: bool,
+}
+
 /// The stop and the error of a drop session whose session's run ended first, `ended`, given
 /// `raised`, the stop its tee or handler raised: that stop, or, when none was raised (the run
 /// ended before any epoch opened, so its handler heard no end), [`Stop::ConnectionEnded`], with
@@ -2139,8 +2317,8 @@ impl Run<'_> {
     /// of ours rests on another account while a session runs (decision 0132 items 4 and 7). The
     /// first account's reads before drop session one are skipped when `read` (the reads that
     /// cleared a stop marker just made them). The first stop ends the run, so a drop test that
-    /// failed places nothing more on its account or any other; with none, the run ends after the
-    /// last account's, [`NOT_BUILT`], naming FBC-su9i, which builds stage two.
+    /// failed places nothing more on its account or any other; with none, stage two follows
+    /// ([`Run::cross_tests`]).
     async fn drop_tests(
         &mut self,
         places: &Places,
@@ -2151,7 +2329,7 @@ impl Run<'_> {
             self.drop_test(places, &mut market, on, read && n == 0)
                 .await?;
         }
-        Err(NOT_BUILT.to_owned())
+        self.cross_tests(places, market).await
     }
 
     /// The drop test on `on` (FBC-23ch, FBC-77r8; decision 0132 item 4), as [`Run::drop_sessions`]
@@ -2263,6 +2441,13 @@ impl Run<'_> {
         let ladder = ladder.map_err(|e| format!("the ladder: {}", places::variant_name(&e)))?;
         let (link, mut placed) = built.into_link(order, ladder);
         let link = Rc::new(RefCell::new(link));
+        let at = self.built.len();
+        self.built.push(BuiltReg {
+            on,
+            step: Step::Drop,
+            link: Rc::clone(&link),
+            xy: Vec::new(),
+        });
         // The flat seed, after clean reads of every named account (decision 0148 item 3): once,
         // for both of the drop test's sessions.
         let seeded = link
@@ -2428,6 +2613,11 @@ impl Run<'_> {
         let ran = self
             .drop_session(places, market, on, ctx, &mut allowance, Some(x))
             .await;
+        // What the account's later registries spend from (decision 0148 item 7).
+        self.allowances.push((on, allowance));
+        // The drop registry serves no more sessions: its market disarmed, so its market lease is
+        // given up for the account's later registries, which take it under the same names.
+        link.borrow_mut().reg().disarm(market.found.inst);
         let now = self.mono();
         let ended = self.ev.place_registries.last_mut();
         ended
@@ -2440,6 +2630,8 @@ impl Run<'_> {
                 (None, None)
             }
         };
+        // X and Y, which count ended for a later registry only as 0151 item 5 rules.
+        self.built[at].xy = std::iter::once(x).chain(y).map(|p| p.cid).collect();
         let said = stop.map(|stop| self.halt(stop, "in drop session two"));
         self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
         let (mut verdict, mut pressed) = (None, false);
@@ -2539,7 +2731,14 @@ impl Run<'_> {
         match which {
             Which::One => &mut self.drop_run().x,
             Which::Two => &mut self.two_run().y,
+            Which::Cross => &mut self.cross_run().placed,
         }
+    }
+
+    /// The crossing session begun last, as the evidence holds it (FBC-su9i).
+    fn cross_run(&mut self) -> &mut CrossRun {
+        let two = self.ev.stage_two.get_or_insert_with(StageTwo::default);
+        two.crosses.last_mut().expect("a crossing session begun")
     }
 
     /// The drop test's verdict on `on` once drop session two dropped (decision 0132 item 4, 0151
@@ -2802,7 +3001,7 @@ impl Run<'_> {
                 "SESSION {label} (drop session one): it arms, places X, compares, and closes \
                  gracefully"
             )),
-            Which::Two => self.line(format_args!(
+            _ => self.line(format_args!(
                 "SESSION {label} (drop session two): it arms, places Y, reads before the drop, \
                  and drops abruptly"
             )),
@@ -2833,8 +3032,7 @@ impl Run<'_> {
         // Whether `running` completed: an `async fn` polled again once it completed panics, so
         // every select on it after the first one that took it is skipped.
         let mut over = false;
-        let mut ended_by = GRACEFUL;
-        let mut rested_at_close = false;
+        let (ended_by, rested_at_close);
         {
             let running = session.run();
             tokio::pin!(running);
@@ -2877,105 +3075,33 @@ impl Run<'_> {
                     (stop, error) = ended_first(self.stop_now(&d), ended);
                 }
             }
-            // The abrupt drop's case, decided once the steps ended: drop session two that ran
-            // its course waits for no room and sends no cancel (decision 0132 item 4).
-            let drop_it = which == Which::Two && stop.is_none() && error.is_none() && !over;
-            // The stop's cancels, then the wait for room to close; a press of Ctrl-C taken while
-            // the close waits, before any cancels ran, is a stop that cancels too (0151 item 2),
-            // and so is a stop the tee or the handler raised meanwhile once a fill of ours came,
-            // so they run once there is room, or, with none within the patience, are held (0151
-            // item 11), and the close waits again after them.
-            let (mut cancelled, mut pressed, mut roomless) = (false, false, false);
-            loop {
-                let fill = d.watched.borrow().fill_of_ours || self.tee.kept().fill_of_ours;
-                let cancels = pressed || stop.is_some_and(|s| s.cancels_in_drop(fill));
-                if cancels && !cancelled && !over {
-                    cancelled = true;
-                    let cancels = tokio::select! {
-                        biased;
-                        _ = &mut running => None,
-                        c = self.stop_cancels(&d, &mut presses) => Some(c),
-                    };
-                    over |= cancels.is_none();
-                    let cancels = cancels.unwrap_or_else(|| Cancels {
-                        held: true,
-                        ..Cancels::default()
-                    });
-                    let compare = !cancels.held && cancels.ended && !over;
-                    // X, and Y in drop session two: every order of the drop test placed so far.
-                    let ours = (x.iter().chain(placed.iter())).map(|p| p.cid);
-                    let ours: Vec<fbc_core::ClientOrderId> = ours.collect();
-                    self.stop_cancelled(which, cancels);
-                    if compare {
-                        let step = "the stop's cancels";
-                        let compare = self.compare_step(&d, (&found, &ours), on, step, None);
-                        let compared = tokio::select! {
-                            biased;
-                            _ = &mut running => None,
-                            c = compare => Some(c),
-                        };
-                        over |= compared.is_none();
-                        if let Some(compared) = compared {
-                            self.compared(which, compared);
-                        }
-                    }
-                }
-                // A provider rate refusal holds the shared budget (decision 0126), the session's
-                // close frame included, which the runtime would then drop unsent, the connection
-                // with it: the close waits out the hold, the session read on meanwhile, so it is
-                // graceful (0151 item 11). A hold that outlasts the patience leaves no room.
-                if !over && !drop_it && !roomless && self.rejected() > before {
-                    let room = self.room_for_close();
-                    tokio::pin!(room);
-                    let room = loop {
-                        tokio::select! {
-                            biased;
-                            _ = &mut running => break None,
-                            () = presses.pressed(), if !cancelled && !pressed => pressed = true,
-                            room = &mut room => break Some(room),
-                        }
-                    };
-                    over |= room.is_none();
-                    roomless = room == Some(false);
-                    if roomless {
-                        ended_by = NO_ROOM_TO_CLOSE;
-                    }
-                }
-                // The press is the run's stop when none came before it, even when the connection
-                // ended as it waited, so that it is not lost: no later read takes it again.
-                if pressed && !cancelled {
-                    stop = stop.or(Some(Stop::Interrupted));
-                }
-                // A stop the tee or the handler raised as the close waited, a fill of ours among
-                // them, is the session's too when none came before it, and cancels as one
-                // raised during the steps would (0151 item 2): back to the cancels, with room.
-                stop = stop.or_else(|| self.stop_now(&d));
-                let fill = d.watched.borrow().fill_of_ours || self.tee.kept().fill_of_ours;
-                let cancels = pressed || stop.is_some_and(|s| s.cancels_in_drop(fill));
-                if cancels && !cancelled && !over {
-                    continue;
-                }
-                break;
+            // Every order of the drop test placed so far: X, and Y in drop session two.
+            let ours = (x.iter().chain(placed.iter())).map(|p| p.cid);
+            let ours: Vec<fbc_core::ClientOrderId> = ours.collect();
+            let policy = Policy::Drop {
+                abrupt: which == Which::Two,
+            };
+            let closed = self
+                .end_session(
+                    &d,
+                    (&mut running, &control),
+                    &mut presses,
+                    policy,
+                    (stop, error.is_some(), over),
+                    (&found, &ours, placed.map(|p| p.cid)),
+                    before,
+                )
+                .await;
+            if let Some(cancels) = closed.cancels {
+                self.stop_cancelled(which, cancels);
             }
-            if over {
-                ended_by = CONNECTION_ENDED;
-            } else if drop_it {
-                // The abrupt drop (decision 0132 item 4): its end planned, the session's run is
-                // dropped here unpolled, its connection with it, with no WebSocket close.
-                d.watched.borrow_mut().closing = true;
-                ended_by = DROPPED;
-            } else {
-                // What a graceful close could cancel: X as the registry holds it now.
-                rested_at_close = placed.as_ref().is_some_and(|p| {
-                    let state = d.link.borrow().registry().get(p.cid).map(|r| r.state());
-                    matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled))
-                });
-                // The close: the control's drop sends the close frame (decision 0132 item 4),
-                // the end of its connection planned.
-                d.watched.borrow_mut().closing = true;
-                drop(control.borrow_mut().take());
-                let _ = tokio::time::timeout(CLOSE_WAIT, &mut running).await;
+            if let Some(compared) = closed.compared {
+                self.compared(which, compared);
             }
+            // A press, or a stop the tee or the handler raised, taken as the close waited.
+            stop = closed.stop;
+            ended_by = closed.ended_by;
+            rested_at_close = closed.rested_at_close;
         }
         // A stop raised after the steps, as the session closed or while it waited for room to
         // close, is the session's when none came before it.
@@ -2988,6 +3114,38 @@ impl Run<'_> {
         let compared: u64 = (self.ev.read_sockets[sockets..].iter())
             .map(|r| r.refusals.limiter)
             .sum();
+        let refused = self.rejected().saturating_sub(before + compared);
+        let seen = (counters, refused, error.clone(), ended_by, rested_at_close);
+        self.session_seen(&d, label, seen);
+        match (stop, error) {
+            (None, Some(why)) => {
+                match which {
+                    Which::One => self.drop_run().error = Some(why),
+                    _ => self.two_run().error = Some(why),
+                }
+                Ok((None, placed))
+            }
+            (stop, _) => Ok((stop, placed)),
+        }
+    }
+
+    /// Records what session `d` on `label` showed as it ended, in its record and as a session of
+    /// the run, and prints its `SESSION` line: its counters, the provider rate refusals its
+    /// runtime made while it ran (its comparisons' own taken off), its error, how it ended and
+    /// whether its own order rested as its close was sent, then what the tee heard of it and
+    /// what its handler saw.
+    fn session_seen(
+        &mut self,
+        d: &DropCtx,
+        label: &'static str,
+        (counters, refused, error, ended_by, rested_at_close): (
+            fbc_runtime::ExecCounters,
+            u64,
+            Option<String>,
+            &'static str,
+            bool,
+        ),
+    ) {
         let w = d.watched.borrow();
         let arm = w.arm.as_ref().map(places::outcome_name);
         let (echoes, as_encoded) = {
@@ -2997,12 +3155,12 @@ impl Run<'_> {
         };
         let (authenticated, resynced) = (w.authenticated, w.resynced);
         drop(w);
-        match which {
+        self.placed_run(d.which).rested_at_close = rested_at_close;
+        match d.which {
             Which::One => {
                 let run = self.drop_run();
                 run.echoes = echoes;
                 run.as_encoded = as_encoded;
-                run.x.rested_at_close = rested_at_close;
                 run.authenticated = authenticated;
                 run.arm.clone_from(&arm);
                 run.resynced = resynced;
@@ -3017,15 +3175,24 @@ impl Run<'_> {
                 two.resynced = resynced;
                 two.ended_by = Some(ended_by);
             }
+            Which::Cross => {
+                let run = self.cross_run();
+                run.echoes = echoes;
+                run.as_encoded = as_encoded;
+                run.authenticated = authenticated;
+                run.arm.clone_from(&arm);
+                run.resynced = resynced;
+                run.ended_by = Some(ended_by);
+            }
         }
         self.line(format_args!(
             "SESSION {label} ({}): arm outcome {}, ended by {ended_by}",
-            which.name(),
+            d.which.name(),
             arm.as_deref().unwrap_or("none")
         ));
         self.ev.sessions.push(SessionRun {
             account: label,
-            name: which.name(),
+            name: d.which.name(),
             authenticated,
             arm,
             ended_by,
@@ -3033,30 +3200,165 @@ impl Run<'_> {
             failed_attempts: counters.failed_attempts,
             arm_failures: counters.arm_failures,
             decode_errors: counters.decode_errors,
-            error: error.clone(),
+            error,
             refusals: Refusals {
-                limiter: self.rejected().saturating_sub(before + compared),
+                limiter: refused,
                 ..Refusals::default()
             },
             ..SessionRun::default()
         });
-        match (stop, error) {
-            (None, Some(why)) => {
-                match which {
-                    Which::One => self.drop_run().error = Some(why),
-                    Which::Two => self.two_run().error = Some(why),
-                }
-                Ok((None, placed))
-            }
-            (stop, _) => Ok((stop, placed)),
-        }
     }
 
-    /// Records `cancels`, a stop's cancels in drop session `which`.
+    /// Ends a place stage's session `d`, its steps ended with `stop` (none when they ran their
+    /// course), `failed` when they ended on a failure that is no stop, and `over` when its run,
+    /// `running`, completed first (its connection ended), as `policy` says: the stop's cancels
+    /// when it cancels ([`Policy::cancels`]; [`Run::stop_cancels`]: Kill, every order of ours by
+    /// venue id as fbc-oms authorizations through the `Link`, the wait for each to end, the
+    /// disarm), then, once each was seen to end, the streams of `ours` on `found`'s market
+    /// compared with the reads, the comparison's stop the session's when none came before it;
+    /// then the ending [`Policy::ending`] gives: a graceful close, which waits first for the
+    /// shared budget's room when a provider rate refusal holds it (0151 item 11), or the abrupt
+    /// drop, its end planned and its run left for the caller to drop unpolled.
+    /// While the close waits for room with no cancels run, a press of Ctrl-C, or a stop the tee or
+    /// the handler raised that cancels under `policy` (a fill of ours in a drop session), is the
+    /// session's stop, and its cancels run first (0151 items 2 and 11); [`Closed::stop`] gives
+    /// it. A connection that ended first ends it, and nothing waits on its run again. `own` is the
+    /// session's own order, whose state the close is sent with; `before`, the shared limiter's
+    /// refusal count as the session began.
+    #[allow(clippy::too_many_arguments)]
+    async fn end_session<F>(
+        &self,
+        d: &DropCtx,
+        (running, control): (&mut Pin<&mut F>, &RefCell<Option<ExecControl>>),
+        presses: &mut Presses,
+        policy: Policy,
+        (stop, failed, mut over): (Option<Stop>, bool, bool),
+        (found, ours, own): (
+            &Discovered,
+            &[fbc_core::ClientOrderId],
+            Option<fbc_core::ClientOrderId>,
+        ),
+        before: u64,
+    ) -> Closed
+    where
+        F: Future<Output = Result<(), ExecSessionError>>,
+    {
+        let mut closed = Closed {
+            stop,
+            ended_by: GRACEFUL,
+            cancels: None,
+            compared: None,
+            rested_at_close: false,
+        };
+        // The stop's cancels, then the wait for room to close. A press of Ctrl-C taken while the
+        // close waits, before any cancels ran, is a stop that cancels too (0151 item 2), and so is
+        // a stop the tee or the handler raised meanwhile that cancels under `policy`, a fill of
+        // ours among them in a drop session: they run once there is room, or, with none within
+        // the patience, are held (0151 item 11), and the close waits again after them. How the
+        // session ends is the one the steps' own stop gives, so drop session two that ran its
+        // course still waits for no room ([`Policy::ending`]).
+        let (mut cancelled, mut pressed, mut roomless) = (false, false, false);
+        let ending = loop {
+            let fill = d.watched.borrow().fill_of_ours || self.tee.kept().fill_of_ours;
+            if !cancelled && !over && (pressed || policy.cancels(closed.stop, fill)) {
+                cancelled = true;
+                let cancels = tokio::select! {
+                    biased;
+                    _ = &mut *running => None,
+                    c = self.stop_cancels(d, presses) => Some(c),
+                };
+                over |= cancels.is_none();
+                let cancels = cancels.unwrap_or_else(|| Cancels {
+                    held: true,
+                    ..Cancels::default()
+                });
+                let compare = !cancels.held && cancels.ended && !over;
+                closed.cancels = Some(cancels);
+                if compare {
+                    let step = "the stop's cancels";
+                    let compare = self.compare_step(d, (found, ours), d.on, step, None);
+                    let compared = tokio::select! {
+                        biased;
+                        _ = &mut *running => None,
+                        c = compare => Some(c),
+                    };
+                    over |= compared.is_none();
+                    // The comparison's stop, a provider rate refusal or a read that disagrees, is
+                    // the session's when none came before it. Under `Policy::Stage` the cancels
+                    // run on a session that ran its course too, and the reads after the session
+                    // begin past this refusal, so no later read takes it again.
+                    if let Some((c, _)) = &compared {
+                        closed.stop = closed.stop.or(c.stop);
+                    }
+                    closed.compared = compared;
+                }
+            }
+            let ending = policy.ending(stop, failed, closed.cancels.as_ref());
+            // A provider rate refusal holds the shared budget (decision 0126), the session's
+            // close frame included, which the runtime would then drop unsent, the connection with
+            // it: the close waits out the hold, the session read on meanwhile, so it is graceful
+            // (0151 item 11). A hold that outlasts the patience leaves no room.
+            if !over && ending == Ending::Close && !roomless && self.rejected() > before {
+                let room = self.room_for_close();
+                tokio::pin!(room);
+                let room = loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut *running => break None,
+                        () = presses.pressed(), if !cancelled && !pressed => pressed = true,
+                        room = &mut room => break Some(room),
+                    }
+                };
+                over |= room.is_none();
+                roomless = room == Some(false);
+                if roomless {
+                    closed.ended_by = NO_ROOM_TO_CLOSE;
+                }
+            }
+            // The press is the session's stop when none came before it, even when the connection
+            // ended as it waited, so that it is not lost: no later read takes it again.
+            if pressed && !cancelled {
+                closed.stop = closed.stop.or(Some(Stop::Interrupted));
+            }
+            // A stop the tee or the handler raised as the close waited is the session's too when
+            // none came before it, and cancels as one raised during the steps would: back to the
+            // cancels, with room.
+            closed.stop = closed.stop.or_else(|| self.stop_now(d));
+            let fill = d.watched.borrow().fill_of_ours || self.tee.kept().fill_of_ours;
+            if !cancelled && !over && (pressed || policy.cancels(closed.stop, fill)) {
+                continue;
+            }
+            break ending;
+        };
+        if over {
+            closed.ended_by = CONNECTION_ENDED;
+        } else if ending == Ending::Drop {
+            // The abrupt drop (decision 0132 item 4): its end planned, the session's run is
+            // dropped by the caller unpolled, its connection with it, with no WebSocket close.
+            d.watched.borrow_mut().closing = true;
+            closed.ended_by = DROPPED;
+        } else {
+            // What a graceful close could cancel: the session's own order as the registry holds
+            // it now.
+            closed.rested_at_close = own.is_some_and(|cid| {
+                let state = d.link.borrow().registry().get(cid).map(|r| r.state());
+                matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled))
+            });
+            // The close: the control's drop sends the close frame (decision 0132 item 4), the
+            // end of its connection planned.
+            d.watched.borrow_mut().closing = true;
+            drop(control.borrow_mut().take());
+            let _ = tokio::time::timeout(CLOSE_WAIT, &mut *running).await;
+        }
+        closed
+    }
+
+    /// Records `cancels`, a stop's cancels in session `which`.
     fn stop_cancelled(&mut self, which: Which, cancels: Cancels) {
         match which {
             Which::One => self.drop_run().cancels = Some(cancels),
             Which::Two => self.two_run().cancels = Some(cancels),
+            Which::Cross => self.cross_run().cancels = Some(cancels),
         }
     }
 
@@ -3366,7 +3668,7 @@ impl Run<'_> {
     ) -> Result<Placed, Halt> {
         let what = match d.which {
             Which::One => ledger::X,
-            Which::Two => ledger::Y,
+            _ => ledger::Y,
         };
         let order = d.which.order();
         allowance.take(Step::Drop, what)?;
@@ -3541,7 +3843,7 @@ impl Run<'_> {
         (compared, Some(socket))
     }
 
-    /// Records `compared`, a comparison of drop session `which`, and its read socket's refusals.
+    /// Records `compared`, a comparison of session `which`, and its read socket's refusals.
     fn compared(
         &mut self,
         which: Which,
@@ -3551,6 +3853,7 @@ impl Run<'_> {
         match which {
             Which::One => self.drop_run().compared.push(compared),
             Which::Two => self.two_run().compared.push(compared),
+            Which::Cross => self.cross_run().compared.push(compared),
         }
     }
 
@@ -3560,7 +3863,9 @@ impl Run<'_> {
     /// each lands; then a wait, up to `--rpc-timeout-ms`, for every order they name to end,
     /// each of the owner's presses meanwhile counted, a second Ctrl-C included, none ending it
     /// early; then the market disarmed. A cancel refused locally, answered other than accepted,
-    /// or met by a provider rate refusal holds them: the wait ends there.
+    /// or met by a provider rate refusal holds them: the wait ends there ([`Cancels::held`]);
+    /// refused locally or met by a rate refusal, it is one of 0151 item 11's causes too
+    /// ([`Cancels::blocked`]).
     async fn stop_cancels(&self, d: &DropCtx, presses: &mut Presses) -> Cancels {
         let mut c = Cancels::default();
         let refusals_before = self.tee.kept().stops.len();
@@ -3583,7 +3888,9 @@ impl Run<'_> {
                 }
             }
         };
-        c.held |= refused > 0;
+        if refused > 0 {
+            c.refused_locally();
+        }
         let mut rpcs = Vec::new();
         let submit = |cmd, rpcs: &mut Vec<fbc_core::RpcId>| {
             let mut link = d.link.borrow_mut();
@@ -3595,9 +3902,18 @@ impl Run<'_> {
                 .map(|rpc| rpcs.push(rpc))
         };
         for cmd in cmds {
-            c.held |= submit(cmd, &mut rpcs).is_err();
+            if submit(cmd, &mut rpcs).is_err() {
+                c.refused_locally();
+            }
         }
         let until = tokio::time::Instant::now() + Duration::from_millis(self.opts.rpc_timeout_ms);
+        // A provider rate refusal the tee raised since the cancels began: one met on the
+        // session's connection, which wakes no wait here, so it is read again as the wait ends.
+        let rate = || {
+            let kept = self.tee.kept();
+            let since = kept.stops.get(refusals_before..).unwrap_or_default();
+            since.iter().any(|s| matches!(s, Stop::RateRefused { .. }))
+        };
         loop {
             let woken = d.wake.notified();
             tokio::pin!(woken);
@@ -3621,10 +3937,12 @@ impl Run<'_> {
                 };
                 match built {
                     Ok(fbc_oms::CancelChoice::Send(cmd)) => {
-                        c.held |= submit(cmd, &mut rpcs).is_err()
+                        if submit(cmd, &mut rpcs).is_err() {
+                            c.refused_locally();
+                        }
                     }
                     Ok(fbc_oms::CancelChoice::AwaitAck) => waiting.push(cid),
-                    Err(_) => c.held = true,
+                    Err(_) => c.refused_locally(),
                 }
             }
             let (named, answered) = {
@@ -3636,18 +3954,7 @@ impl Run<'_> {
                     .all(|cid| (link.registry().get(*cid)).is_none_or(|r| r.state().is_terminal()));
                 (ended && waiting.is_empty(), answered)
             };
-            let rate = (self
-                .tee
-                .kept()
-                .stops
-                .get(refusals_before..)
-                .unwrap_or_default())
-            .iter()
-            .any(|s| matches!(s, Stop::RateRefused { .. }));
-            c.held |= rate
-                || answered
-                    .iter()
-                    .any(|o| !matches!(o, SubmitOutcome::Accepted { .. }));
+            c.answered(&answered, rate());
             if named || c.held {
                 c.ended = named;
                 break;
@@ -3656,14 +3963,21 @@ impl Run<'_> {
                 biased;
                 () = presses.pressed() => c.presses += 1,
                 () = woken => {}
-                () = tokio::time::sleep_until(until) => break,
+                () = tokio::time::sleep_until(until) => {
+                    // The wait's end: a rate refusal met by then holds them too (0151 item 11).
+                    c.answered(&[], rate());
+                    break;
+                }
             }
         }
         c.sent = rpcs.len();
         d.link.borrow_mut().reg().disarm(d.inst);
+        let why = match d.which {
+            Which::Cross => "decision 0132 item 7, 0148 item 8",
+            _ => "0151 item 2",
+        };
         self.line(format_args!(
-            "STOP cancels: Kill, then {} cancels by venue id (0151 item 2), {}; the market \
-             disarmed",
+            "STOP cancels: Kill, then {} cancels by venue id ({why}), {}; the market disarmed",
             c.sent,
             match (c.held, c.ended) {
                 (true, _) => "held",
@@ -3697,7 +4011,7 @@ impl Run<'_> {
         let x = ours.first().copied();
         for account in self.named.clone() {
             let read = {
-                let read = self.read_one(which.after(), on, " (drop)", account, (x, ours));
+                let read = self.read_one(which.after(), on, which.mark(), account, (x, ours));
                 tokio::pin!(read);
                 loop {
                     tokio::select! {
@@ -3711,13 +4025,19 @@ impl Run<'_> {
                 Ok(read) => {
                     // X's account is read when its page listed X or was the last: a full page
                     // not listing X leaves X unread, not absent. With no X to find, after drop
-                    // session two, the account is read when its read ended.
+                    // session two or a crossing session, the account is read when its read
+                    // ended, and every order its page lists counts as resting.
                     let found = x.is_none() || read.page_lists_it || !read.page_full;
                     after.read |= account == on;
                     after.x_read |= account == on && found;
                     after.x_flat |= account == on && read.flat;
                     after.not_flat |= !read.flat;
                     after.resting |= read.page_orders > 0 || read.rest_open_orders > 0;
+                    // An order of ours: one the page names among `ours`, or one REST counts and
+                    // the page does not list, which is not told from ours.
+                    let rest = usize::try_from(read.rest_open_orders).unwrap_or(usize::MAX);
+                    after.ours_resting |=
+                        read.page_orders > read.page_unknown || rest > read.page_orders;
                     // An order none of ours, or a TWAP: what the streams did not show (decision
                     // 0148 item 8), as compare::judge counts one. An open order REST alone counts
                     // (a stop order) or one on a later page of a full page is not told from ours
@@ -3726,12 +4046,72 @@ impl Run<'_> {
                     // X by its venue id once known, whatever client id its row carries.
                     after.x_listed |= read.page_lists_it;
                 }
-                Err(why) => self.ev.errors.push(why),
+                Err(why) => {
+                    after.unread = true;
+                    self.ev.errors.push(why);
+                }
             }
         }
         self.presses = presses;
         after.pressed = pressed;
         after.refused = self.refused_since(mark);
+        after
+    }
+
+    /// The reads after a crossing session on `on` that ended by the abrupt drop (decision 0151
+    /// item 11): [`Run::read_after`] of every named account, again at the comparisons' cadence
+    /// (one at once, then each one interval after the one before began, at most
+    /// `cadence.reads()`, none due at or past the end of `--agree-wait-ms`; 0151 item 4), until
+    /// one lists no order of ours, or the round they judge ends them ([`AfterReads::read_again`]:
+    /// it lists an order or a TWAP not ours, shows a position not flat, could not read a named
+    /// account, met a provider rate refusal or took the owner's Ctrl-C), or the wait ends. QFEX
+    /// cancels on a drop as it learns of it, which a read made at once can precede, as the reads
+    /// after drop session two allow ([`crate::verdict::until_absent`]). A round finished past the
+    /// wait, or one that could not read a named account, is not judged and ends them: the round
+    /// before it is, with what it showed folded in ([`AfterReads::fold`]), so no later round
+    /// erases what an earlier one showed (FBC-77r8's review). `ours` are the crossing order, once
+    /// placed, as [`Run::read_after`] takes them.
+    async fn read_after_cross_drop(&mut self, on: Armed, ours: &[&AllowedOrder]) -> AfterReads {
+        let places = self.places.expect("a place-stage run");
+        let cadence = crate::compare::Cadence::of(places);
+        let start = tokio::time::Instant::now();
+        let end = start + cadence.wait;
+        let mut after = self.read_after(Which::Cross, on, ours).await;
+        let (mut began, mut rounds) = (start, 1);
+        while rounds < cadence.reads() && after.read_again() {
+            let due = began + cadence.interval;
+            if due >= end {
+                break;
+            }
+            let mut presses = std::mem::take(&mut self.presses);
+            let slept = unless_pressed(&mut presses, tokio::time::sleep_until(due)).await;
+            self.presses = presses;
+            if slept.is_none() {
+                after.pressed = true;
+                break;
+            }
+            began = tokio::time::Instant::now();
+            let next = self.read_after(Which::Cross, on, ours).await;
+            rounds += 1;
+            // A round finished past the wait, or one that could not read a named account, is not
+            // judged: the round before it is, with what it showed folded in.
+            let judged = tokio::time::Instant::now() <= end && !next.unread;
+            after.fold(next, judged);
+            if !judged {
+                break;
+            }
+        }
+        self.line(format_args!(
+            "READ after the crossing session's drop: {}: {rounds} of at most {} rounds of reads \
+             of every named account, the last judged listing {}",
+            name(on),
+            cadence.reads(),
+            match (after.ours_resting, after.unexpected) {
+                (_, true) => "an order or a TWAP not ours",
+                (true, false) => "an order of ours",
+                (false, false) => "no order of ours",
+            }
+        ));
         after
     }
 
@@ -3870,7 +4250,7 @@ impl Run<'_> {
         heard.limiter = self.rejected().saturating_sub(before);
         let what = match which {
             Which::One => "X and its trades",
-            Which::Two => "X, Y and their trades",
+            _ => "X, Y and their trades",
         };
         self.ev.read_sockets.push(ReadSocket {
             before: which.after(),
@@ -4063,29 +4443,745 @@ struct ReadMark {
     sockets: usize,
 }
 
+// ----- Stage two: the crossing post-only (FBC-su9i; decisions 0005, 0132 item 7, 0148, 0151) --
+
+impl Run<'_> {
+    /// Stage two (FBC-su9i), once every named account's drop test ran with no stop: the run's
+    /// exact-echo gate (decision 0148 item 2), judged on what its tee heard, in memory, never
+    /// carried to another run. Shut, the run ends [`Stop::NoEcho`], which is not a fault and
+    /// writes no stop marker. Open, each named account whose drop test passed in this run
+    /// ([`crate::stage_two::crossers`]) in turn places its crossing post-only
+    /// ([`Run::cross_test`]); the first stop ends the run, and with none it ends after the last
+    /// one, [`NOT_BUILT`], naming FBC-ou9g, which builds the taker IOC.
+    async fn cross_tests(&mut self, places: &Places, mut market: Market) -> Result<(), String> {
+        let gate = two::EchoGate::of(&self.tee.kept());
+        self.ev.stage_two.get_or_insert_with(StageTwo::default).gate = Some(gate.open);
+        self.line(format_args!("GATE {}", gate.says()));
+        if !gate.open {
+            return Err(self.halt(Stop::NoEcho, "once every named account's drop test ran"));
+        }
+        let named: Vec<&'static str> = self.named.iter().map(|a| name(*a)).collect();
+        let crossers = two::crossers(&self.ev.drops, &named);
+        let crossing = self.named.clone().into_iter();
+        for on in crossing.filter(|a| crossers.contains(&name(*a))) {
+            self.cross_test(places, &mut market, on).await?;
+        }
+        Err(NOT_BUILT.to_owned())
+    }
+
+    /// The crossing post-only on `on` (decision 0132 item 7, 0148 items 2, 6 and 8): every named
+    /// account read clean (a provider rate refusal in those reads a stop, marked,
+    /// [`Run::unless_refused`]), the account's cross registry built, its trip given to the journal
+    /// before any market arms (decision 0139) and seeded flat (decision 0148 item 3); then its
+    /// session ([`Run::cross_session`]); then the read of every named account after it. Each way
+    /// it ends the run is a stop, marked: the session's stop, a failure that was no stop (with
+    /// the stop the reads after it show), then the reads' own ([`cross_after_stop`]): a provider
+    /// rate refusal, the owner's Ctrl-C, a position not flat, an order or a TWAP not ours (the
+    /// crossing order known as ours on its own account), or an order of ours still resting,
+    /// listed by a read or counted resting by the registry, an `Unknown` order included, never
+    /// resent (decision 0005). With none it ends `Ok`, the next account's crossing next.
+    async fn cross_test(
+        &mut self,
+        places: &Places,
+        market: &mut Market,
+        on: Armed,
+    ) -> Result<(), String> {
+        let label = name(on);
+        let (mark, made) = (self.read_mark(), self.ev.reads.len());
+        let mut presses = std::mem::take(&mut self.presses);
+        let reads = self.check_accounts(places::CROSS, on, " (cross)");
+        let reads = unless_pressed(&mut presses, reads).await;
+        self.presses = presses;
+        match reads {
+            None => {
+                let when = "during the reads before the crossing session";
+                return Err(self.halt(Stop::Interrupted, when));
+            }
+            // A provider rate refusal they met is the run's stop, marked, whether or not they
+            // failed on it (0151 items 4 and 6), as before drop session one.
+            Some(reads) => {
+                let when = "in the reads before the crossing session";
+                self.unless_refused(mark, reads, when)?;
+            }
+        }
+        let reads = self.ev.reads[made..].to_vec();
+        let (cfg, creds) = place_config(&self.base, self.lookup, on)?;
+        let acct = account_key(on);
+        let order = (self.caps.exec.as_ref()).map(|e| e.order.clone());
+        let order = order.ok_or("the probe's caps declare no order entry")?;
+        let inst = market.found.inst;
+        let symbol = market.found.spec.venue_symbol.clone();
+        let keys = places::lease_keys(label, &order, inst, symbol);
+        let opened = Opened::now(self.origin, wall_ns());
+        let caps = market::pre_trade_caps(inst, market.caps);
+        let built = PlaceRegistry::new(
+            Step::Cross,
+            label,
+            acct,
+            &market.bounds,
+            opened,
+            inst,
+            caps,
+            keys,
+        );
+        built.trip_on(&self.journal);
+        let rpc = Duration::from_millis(self.opts.rpc_timeout_ms);
+        let ladder = fbc_oms::LadderConfig::new(rpc, Duration::ZERO, rpc * 6, 2);
+        let ladder = ladder.map_err(|e| format!("the ladder: {}", places::variant_name(&e)))?;
+        let (link, mut placed) = built.into_link(order, ladder);
+        let link = Rc::new(RefCell::new(link));
+        self.built.push(BuiltReg {
+            on,
+            step: Step::Cross,
+            link: Rc::clone(&link),
+            xy: Vec::new(),
+        });
+        let seeded = link
+            .borrow_mut()
+            .reg()
+            .seed_position(inst, fbc_core::SignedLots(0));
+        seeded.map_err(|e| format!("the flat seed was refused: {}", places::variant_name(&e)))?;
+        self.line(format_args!(
+            "REGISTRY cross on {label}: {} on its one market, its CancelOnlyTrip given to the \
+             journal before any market arms (decision 0139), then seeded flat after clean reads \
+             of every named account (decision 0148 item 3)",
+            ledger::PLACES_DECLARATION
+        ));
+        let two = self.ev.stage_two.get_or_insert_with(StageTwo::default);
+        two.crosses.push(CrossRun {
+            account: label,
+            ..CrossRun::default()
+        });
+        let at = self.allowances.iter().position(|(a, _)| *a == on);
+        let (_, mut allowance) = self
+            .allowances
+            .remove(at.expect("its drop test's allowance"));
+        let span_end = placed.deadline();
+        let ctx = (cfg, creds, Rc::clone(&link), span_end);
+        let (ran, crossing) = self
+            .cross_session(places, market, on, ctx, &mut allowance, &reads)
+            .await;
+        self.allowances.push((on, allowance));
+        // The cross registry serves no more sessions: its market disarmed and its lease given up,
+        // as its Stop's cancels already did unless its connection ended first.
+        link.borrow_mut().reg().disarm(inst);
+        placed.session_ended(&link.borrow(), places::CROSS, self.mono());
+        self.ev.place_registries.push(placed);
+        let said = ran.map(|stop| self.halt(stop, "in the crossing session"));
+        // The crossing order, once placed, is ours on its own account, by its venue id once the
+        // streams named it: an order or a TWAP any read lists that is not it is what the
+        // streams did not show (decision 0148 item 8; FBC-77r8's review).
+        let crossing = crossing.map(|cid| AllowedOrder {
+            account: on,
+            cid,
+            venue: (link.borrow().registry().get(cid)).and_then(|r| r.vid().cloned()),
+        });
+        let ours: Vec<&AllowedOrder> = crossing.iter().collect();
+        self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
+        let after = match self.cross_run().ended_by == Some(DROPPED) {
+            true => self.read_after_cross_drop(on, &ours).await,
+            false => self.read_after(Which::Cross, on, &ours).await,
+        };
+        self.patient = None;
+        let counted = two::counted_resting(link.borrow().registry(), inst);
+        let run = self.cross_run();
+        run.resting = after.ours_resting;
+        run.read = after.x_read;
+        run.counted_resting = counted;
+        run.others = match (after.unexpected, after.unread) {
+            (true, _) => Some(true),
+            (false, true) => None,
+            (false, false) => Some(false),
+        };
+        // A position not flat in those reads is said whatever stop came first: it is the
+        // owner's (0151 item 9; FBC-su9i's review).
+        run.not_flat_after = match (after.not_flat, after.unread) {
+            (true, _) => Some(true),
+            (false, true) => None,
+            (false, false) => Some(false),
+        };
+        if after.ours_resting {
+            self.line(format_args!("RESTING {}", two::HAND_CANCEL_CROSS));
+        }
+        if after.unexpected {
+            self.line(format_args!(
+                "READ after the crossing session: {}",
+                two::OTHERS_CROSS
+            ));
+        }
+        let resting = (after.ours_resting || counted, after.unread);
+        let (refused, pressed) = (after.refused, after.pressed);
+        let read = cross_after_stop(refused, pressed, after.not_flat, after.unexpected, resting);
+        let ended = match (said, self.cross_run().error.clone(), read) {
+            (Some(said), ..) => Err(said),
+            (None, Some(why), Some((stop, when))) => {
+                Err(format!("{why}; {}", self.halt(stop, when)))
+            }
+            (None, Some(why), None) => Err(why),
+            (None, None, Some((stop, when))) => Err(self.halt(stop, when)),
+            (None, None, None) => Ok(()),
+        };
+        let stop = self.stop.map(Stop::name);
+        self.cross_run().stop = stop;
+        ended
+    }
+
+    /// The crossing session on `on` (decision 0132 item 7): an unchanged `ExecSession` whose
+    /// handler is a [`PlaceHandler`] over the cross registry's `link`, its steps
+    /// ([`Run::cross_steps`]) run beside it and the MDS touch driven on, its span bound met one
+    /// `--rpc-timeout-ms` early ([`cancels_begin`]; decision 0148 item 8). Once its steps end, how
+    /// the crossing post-only came back is read ([`crate::stage_two::Crossed::of`]), before any
+    /// cancel of ours; then, whatever ended them, it ends under [`Policy::Stage`]: every order of
+    /// ours cancelled by venue id, then a graceful close, or, those cancels refused locally or
+    /// met by a provider rate refusal, the abrupt drop, since this account's drop test passed in
+    /// this run (0151 item 11). Gives the run's stop, if any came; a failure that is no stop is
+    /// recorded as the session's error, and one before the session opened is its error too.
+    async fn cross_session(
+        &mut self,
+        places: &Places,
+        market: &mut Market,
+        on: Armed,
+        (cfg, creds, link, span_end): (
+            VenueConfig,
+            fbc_core::Secrets,
+            Rc<RefCell<Link>>,
+            tokio::time::Instant,
+        ),
+        allowance: &mut Allowance,
+        reads: &[AccountRead],
+    ) -> (Option<Stop>, Option<fbc_core::ClientOrderId>) {
+        let acct = account_key(on);
+        let label = name(on);
+        let before = self.rejected();
+        let sockets = self.ev.read_sockets.len();
+        let wake = Rc::new(tokio::sync::Notify::new());
+        let watched = Rc::new(RefCell::new(Watched::after(&link.borrow())));
+        let control = Rc::new(RefCell::new(None));
+        let handler = PlaceHandler {
+            inner: LinkHandler {
+                link: Rc::clone(&link),
+                wake: Rc::clone(&wake),
+            },
+            watched: Rc::clone(&watched),
+            control: Rc::clone(&control),
+        };
+        let config = self.place_session_config(acct, cfg, creds, market.found.specs.clone());
+        let built = ExecSession::new(config, handler);
+        let (mut session, ctl) = match built {
+            Ok(built) => built,
+            Err(e) => {
+                self.cross_run().error = Some(format!("the {label} session: {e}"));
+                return (None, None);
+            }
+        };
+        *control.borrow_mut() = Some(ctl);
+        session.set_journal(self.journal.clone());
+        let orders = session.orders();
+        link.borrow_mut().attach(orders.clone(), acct);
+        self.line(format_args!(
+            "SESSION {label} (the crossing session): it arms, resyncs and Starts, places the \
+             crossing post-only, compares, and cancels every order of ours by venue id before it \
+             stops"
+        ));
+        let (heard_from, sent_from) = {
+            let kept = self.tee.kept();
+            (kept.heard.len(), kept.sent().len())
+        };
+        let rpc = Duration::from_millis(self.opts.rpc_timeout_ms);
+        let d = DropCtx {
+            link,
+            wake,
+            watched: Rc::clone(&watched),
+            orders,
+            acct,
+            inst: market.found.inst,
+            caps: market.caps,
+            span_end: cancels_begin(span_end, rpc, tokio::time::Instant::now()),
+            on,
+            which: Which::Cross,
+            heard_from,
+            sent_from,
+        };
+        let mut presses = std::mem::take(&mut self.presses);
+        let mut placed = None;
+        let (mut stop, mut error) = (None, None);
+        let view = market.touch.view();
+        let found = market.found.clone();
+        let passed = two::crossers(&self.ev.drops, &[label]) == [label];
+        let mut over = false;
+        let (ended_by, rested_at_close);
+        {
+            let running = session.run();
+            tokio::pin!(running);
+            let drive = market.touch.drive();
+            tokio::pin!(drive);
+            let steps = self.cross_steps(
+                places,
+                (&found, &view),
+                &d,
+                allowance,
+                &mut presses,
+                (&mut placed, reads),
+            );
+            let stepped = tokio::select! {
+                biased;
+                ended = &mut running => Err(ended),
+                () = &mut drive => unreachable!("the touch is driven until dropped"),
+                stepped = steps => Ok(stepped),
+            };
+            match stepped {
+                Ok(Ok(())) => stop = self.stop_now(&d),
+                Ok(Err(Halt::Stop(s))) => stop = Some(s),
+                Ok(Err(Halt::Error(e))) => error = Some(e),
+                Err(ended) => {
+                    over = true;
+                    (stop, error) = ended_first(self.stop_now(&d), ended);
+                }
+            }
+            self.crossed(&d, placed.map(|p: Placed| p.cid));
+            if stop == Some(Stop::SpanBound) {
+                let lead = span_end.saturating_duration_since(tokio::time::Instant::now());
+                self.cross_run().cancels_lead = Some(lead);
+            }
+            let ours: Vec<fbc_core::ClientOrderId> = placed.iter().map(|p| p.cid).collect();
+            let closed = self
+                .end_session(
+                    &d,
+                    (&mut running, &control),
+                    &mut presses,
+                    Policy::Stage {
+                        drop_passed: passed,
+                    },
+                    (stop, error.is_some(), over),
+                    (&found, &ours, placed.map(|p| p.cid)),
+                    before,
+                )
+                .await;
+            if let Some(cancels) = closed.cancels {
+                self.stop_cancelled(Which::Cross, cancels);
+            }
+            if let Some(compared) = closed.compared {
+                self.compared(Which::Cross, compared);
+            }
+            // A press, or a stop the tee or the handler raised, taken as the close waited.
+            stop = closed.stop;
+            ended_by = closed.ended_by;
+            rested_at_close = closed.rested_at_close;
+        }
+        stop = stop.or_else(|| self.stop_now(&d));
+        self.presses = presses;
+        let counters = session.counters();
+        drop(session);
+        let compared: u64 = (self.ev.read_sockets[sockets..].iter())
+            .map(|r| r.refusals.limiter)
+            .sum();
+        let refused = self.rejected().saturating_sub(before + compared);
+        let seen = (counters, refused, error.clone(), ended_by, rested_at_close);
+        self.session_seen(&d, label, seen);
+        self.cross_run().error = error;
+        (stop, placed.map(|p| p.cid))
+    }
+
+    /// Records how the crossing post-only, `cid` once placed, came back
+    /// ([`crate::stage_two::Crossed::of`]): from the frames the tee heard on `d`'s session, its
+    /// client id as written, and where `d`'s registry holds it now, before any cancel of ours.
+    fn crossed(&mut self, d: &DropCtx, cid: Option<fbc_core::ClientOrderId>) {
+        let Some(cid) = cid else {
+            return;
+        };
+        let text = two::cid_text(cid).unwrap_or_default();
+        let state = d.link.borrow().registry().get(cid).map(|r| r.state());
+        let crossed = two::Crossed::of(&self.tee.kept(), d.heard_from, &text, state);
+        self.line(format_args!(
+            "CROSSED on {}: {}",
+            name(d.on),
+            crossed.says()
+        ));
+        self.cross_run().crossed = Some(crossed);
+    }
+
+    /// The crossing session's steps (decision 0132 item 7): authentication, an `Accepted` arm
+    /// and the resync ([`Run::armed`]); Start under the cross registry's market lease; no other
+    /// order of ours on any registry of the run or any named account's read before the session
+    /// ([`Run::no_other_order`]); the crossing post-only ([`Run::place_crossing`]); its first
+    /// answer, then its end or its deadline, an `Unknown` outcome included, never resent
+    /// (decision 0005); then the streams compared with the reads. Each step ends at the first
+    /// stop ([`Run::waiting`]).
+    async fn cross_steps(
+        &mut self,
+        places: &Places,
+        (found, touch): (&Discovered, &market::TouchView),
+        d: &DropCtx,
+        allowance: &mut Allowance,
+        presses: &mut Presses,
+        (placed, reads): (&mut Option<Placed>, &[AccountRead]),
+    ) -> Result<(), Halt> {
+        self.armed(d, presses).await?;
+        let dir = self.leases.as_ref().map(|l| l.dir.clone());
+        let dir = dir.ok_or_else(|| Halt::Error("no lease directory".to_owned()))?;
+        places::start(d.link.borrow_mut().reg(), &dir, d.inst).map_err(Halt::Error)?;
+        self.cross_run().started = true;
+        self.line(format_args!(
+            "START the cross registry on {}: the market armed under its market lease, with no \
+             account lease (QFEX's nonce scope is none)",
+            name(d.on)
+        ));
+        #[cfg(test)]
+        self.test_other_order(places, found).await;
+        let checked = self.no_other_order(d.inst, reads);
+        self.cross_run().checked = true;
+        if let Err(blocked) = checked {
+            let said = blocked.says();
+            self.line(format_args!(
+                "BLOCKED the crossing post-only on {}: {said} (decision 0148 item 6)",
+                name(d.on)
+            ));
+            self.cross_run().blocked = Some(said);
+            return Err(Halt::Stop(blocked.stop()));
+        }
+        let sent = self
+            .place_crossing(places, (found, touch), d, allowance, presses, placed)
+            .await?;
+        let ours = [sent.cid];
+        let compared = self.compare_step(
+            d,
+            (found, &ours),
+            d.on,
+            "the crossing post-only",
+            Some(sent.at),
+        );
+        let compared = self.unless_stopped(d, presses, compared).await?;
+        let stop = compared.0.stop;
+        self.compared(Which::Cross, compared);
+        match stop {
+            Some(stop) => Err(Halt::Stop(stop)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`crate::stage_two::no_other_order`] for `inst` now: every registry the run built on every
+    /// named account, X and Y on a drop registry counted ended only as 0151 item 5 rules
+    /// ([`crate::stage_two::ended_after_drop`]), and each named account's read of `reads`, the
+    /// reads before the session, in the order the configuration names them.
+    fn no_other_order(
+        &self,
+        inst: fbc_core::InstrumentId,
+        reads: &[AccountRead],
+    ) -> Result<(), two::Blocked> {
+        let links: Vec<std::cell::Ref<'_, Link>> =
+            self.built.iter().map(|b| b.link.borrow()).collect();
+        let ended: Vec<Vec<fbc_core::ClientOrderId>> = (self.built.iter())
+            .map(|b| {
+                let drop = self.ev.drops.iter().find(|d| d.account == name(b.on));
+                let shown = drop.and_then(|d| d.two.as_ref());
+                let shown = shown.map_or([false; 2], two::ended_after_drop);
+                let ended = b.xy.iter().zip(shown).filter(|(_, e)| *e);
+                ended.map(|(cid, _)| *cid).collect()
+            })
+            .collect();
+        let built: Vec<two::Built<'_>> = (self.built.iter().zip(&links).zip(&ended))
+            .map(|((b, link), ended)| two::Built {
+                account: name(b.on),
+                step: b.step,
+                registry: link.registry(),
+                ended,
+            })
+            .collect();
+        let reads: Vec<(&'static str, Option<&AccountRead>)> = (self.named.iter().enumerate())
+            .map(|(n, a)| (name(*a), reads.get(n)))
+            .collect();
+        two::no_other_order(inst, &built, &reads)
+    }
+
+    /// A test's order of ours, never sent, held in the first named account's cross registry
+    /// before the `n`th crossing session's [`Run::no_other_order`], `n` its
+    /// `TestHooks::other_order` (0 the first named account's): a path no answer of the QFEX
+    /// model reaches, since the reads before each session and the stop an order left resting
+    /// after one is keep every such order away first.
+    #[cfg(test)]
+    async fn test_other_order(&mut self, places: &Places, found: &Discovered) {
+        let n = self
+            .ev
+            .stage_two
+            .as_ref()
+            .map_or(0, |t| t.crosses.len() - 1);
+        if places.test.other_order != Some(n) {
+            return;
+        }
+        let leases = self.leases.as_mut().expect("a place-stage run's leases");
+        let cid = leases.mint.mint(1).await.expect("a client id")[0];
+        let first = self.built.iter().find(|b| b.step == Step::Cross);
+        let new = fbc_core::NewOrder {
+            cid,
+            inst: found.inst,
+            side: places.side,
+            qty: found.min_size,
+            kind: fbc_core::OrderKind::Limit {
+                px: fbc_core::Ticks(1),
+            },
+            tif: fbc_core::Tif::Gtc,
+            channel: fbc_core::Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            reducing: false,
+        };
+        let mut link = first.expect("a cross registry").link.borrow_mut();
+        link.reg().insert(new).expect("a fresh client id registers");
+    }
+
+    /// Places the crossing post-only on `d`'s session: a post-only GTC at the instrument's
+    /// minimum size at the far touch (the ask for a buy, the bid for a sell), through it, spent
+    /// from the cross registry's list first ([`Allowance`]), its client id minted under the
+    /// run's namespace lease, as an fbc-oms authorization (decision 0132 item 7). Then its first
+    /// answer, its time to an `ACK` timed, and then its end or its deadline (`--rpc-timeout-ms`
+    /// from its send): an order that rests is waited on to its deadline, and one never answered
+    /// ends `Unknown` there unless an echoed `ACK` already routed it, never resent (decision
+    /// 0005). Before it is built into a command, both USD caps are asked again at the touch it
+    /// is priced at ([`market::caps_admit`]); an order either would not admit is not sent, and
+    /// never resized, the run's stop [`Stop::BeyondCaps`] (decision 0113). Gives it, as placed,
+    /// once handed to the session (`placed` holds it from then); a stop or a press first places
+    /// nothing.
+    async fn place_crossing(
+        &mut self,
+        places: &Places,
+        (found, touch): (&Discovered, &market::TouchView),
+        d: &DropCtx,
+        allowance: &mut Allowance,
+        presses: &mut Presses,
+        placed: &mut Option<Placed>,
+    ) -> Result<Placed, Halt> {
+        allowance.take(Step::Cross, ledger::THROUGH)?;
+        let leases = self.leases.as_mut().expect("a place-stage run's leases");
+        let cid = leases.mint.mint(1).await.map_err(Halt::Error)?[0];
+        let quote = touch.now(places.touch_max_age).map_err(Halt::Error)?;
+        let px = market::far_touch(&found.spec, places.side, quote).map_err(Halt::Error)?;
+        let new = fbc_core::NewOrder {
+            cid,
+            inst: d.inst,
+            side: places.side,
+            qty: found.min_size,
+            kind: fbc_core::OrderKind::Limit { px },
+            tif: fbc_core::Tif::Gtc,
+            channel: fbc_core::Channel::Public,
+            post_only: true,
+            reduce_only: false,
+            reducing: false,
+        };
+        self.not_stopped(d, presses)?;
+        // The caps asked again at the touch the crossing post-only is priced at, as for X and Y:
+        // fbc-oms holds them in lots fixed at the preflight's touch (decision 0113).
+        if !market::caps_admit(places, found, quote, d.caps, found.min_size) {
+            return Err(Halt::Stop(Stop::BeyondCaps));
+        }
+        let submitted = {
+            let mut link = d.link.borrow_mut();
+            let cmd = link.reg().place(new).map_err(|e| {
+                format!(
+                    "the crossing post-only was refused: {}",
+                    places::variant_name(&e)
+                )
+            });
+            let auth = cmd.and_then(|cmd| {
+                let auth = link.reg().authorize(d.acct, cmd);
+                auth.map_err(|e| {
+                    format!(
+                        "the crossing post-only was not authorized: {}",
+                        places::variant_name(&e)
+                    )
+                })
+            });
+            auth.and_then(|auth| link.submit(&d.orders, auth))
+        };
+        let rpc = submitted.map_err(Halt::Error)?;
+        let now = Placed {
+            cid,
+            at: tokio::time::Instant::now(),
+            wall_secs: u64::try_from(wall_secs()).unwrap_or(0),
+        };
+        *placed = Some(now);
+        self.cross_run().placed.submitted = true;
+        self.line(format_args!(
+            "PLACE the crossing post-only on {}: one post-only GTC at the instrument's minimum \
+             size at the far touch, through it (no price, size or id is shown)",
+            name(d.on)
+        ));
+        // Its first answer: no longer in flight.
+        let state = |link: &Link| link.registry().get(cid).map(|r| r.state());
+        self.waiting(d, presses, |link, _| {
+            (state(link) != Some(OrdState::PendingNew)).then_some(())
+        })
+        .await?;
+        let rested = matches!(
+            state(&d.link.borrow()),
+            Some(OrdState::Open | OrdState::PartiallyFilled)
+        );
+        let ack_after = now.at.elapsed();
+        self.line(format_args!(
+            "ANSWERED the crossing post-only on {}: {}",
+            name(d.on),
+            match rested {
+                true => "it rests, so it is waited on until it ends or its deadline",
+                false => "it does not rest",
+            }
+        ));
+        // It is ours whatever client id its later frames carry (decision 0132 item 7).
+        let vid = (d.link.borrow().registry().get(cid)).and_then(|r| r.vid().cloned());
+        if let Some(vid) = vid {
+            self.tee.ours(vid.as_str());
+        }
+        // Its end, or its deadline: one that rests is waited on until then.
+        let due = now.at + Duration::from_millis(self.opts.rpc_timeout_ms);
+        let ended = self.waiting(d, presses, |link, _| match state(link) {
+            Some(OrdState::Open | OrdState::PartiallyFilled)
+                if tokio::time::Instant::now() < due =>
+            {
+                None
+            }
+            _ => Some(()),
+        });
+        let woken = async {
+            tokio::time::sleep_until(due).await;
+            d.wake.notify_waiters();
+            std::future::pending::<()>().await
+        };
+        tokio::select! {
+            biased;
+            ended = ended => ended?,
+            () = woken => unreachable!("it wakes the wait, then waits for ever"),
+        }
+        let exact = self.tee.kept().exact_ack_from(d.heard_from);
+        let acked_ours = self.tee.kept().acked_ours_from(d.heard_from);
+        let outcome = d.link.borrow().outcome_of(rpc);
+        let run = &mut self.cross_run().placed;
+        run.acked = rested || acked_ours;
+        run.outcome = outcome.as_ref().map(places::outcome_name);
+        run.exact_echo = exact;
+        run.ack_after = run.acked.then_some(ack_after);
+        Ok(now)
+    }
+}
+
+/// The stop the reads after a crossing session make, and when it was met, the first that
+/// applies: the provider rate refusal they met, `refused`; the owner's Ctrl-C during them,
+/// `pressed`; a position not flat; an order of ours still resting, `resting`, whether a read
+/// listed it or the cross registry counts it resting, an `Unknown` one included, never resent
+/// (decision 0005): an order of ours still resting after a session stops the probe (decision
+/// 0132 item 7); then a named account that could not be read, `unread`, after an order was
+/// placed on one: nobody looked at it, so an order of ours may still rest there unjudged, as
+/// the read before drop session two takes an account it could not read (`LeftResting`; before
+/// every session an account that cannot be read stops the probe, decision 0132 item 7). Each is
+/// marked (0151 item 6), so the next run must reconcile. None when they show none of them.
+pub fn cross_read_stop(
+    refused: Option<Stop>,
+    pressed: bool,
+    not_flat: bool,
+    (resting, unread): (bool, bool),
+) -> Option<(Stop, &'static str)> {
+    const AFTER: &str = "after the crossing session";
+    if let Some(stop) = refused {
+        return Some((stop, "in the reads after the crossing session"));
+    }
+    match (pressed, not_flat, resting, unread) {
+        (true, ..) => Some((
+            Stop::Interrupted,
+            "during the reads after the crossing session",
+        )),
+        (false, true, ..) => Some((Stop::NotFlat, AFTER)),
+        (false, false, true, _) => Some((Stop::LeftResting, AFTER)),
+        (false, false, false, true) => Some((
+            Stop::LeftResting,
+            "after the crossing session, a named account not read after it",
+        )),
+        (false, false, false, false) => None,
+    }
+}
+
+/// The stop the reads after a crossing session make ([`Run::cross_test`]): [`cross_read_stop`]'s,
+/// with [`Stop::ReadDisagrees`] for an order or a TWAP not ours, `unexpected`, after a provider
+/// rate refusal, the owner's Ctrl-C and a position not flat, and before an order of ours resting
+/// (`resting`: listed by a read, counted by REST and listed by no page, or counted resting by the
+/// cross registry) or a named account not read (`unread`), as [`after_stop`] orders them after
+/// drop session two (decision 0148 item 8; FBC-77r8's review).
+pub fn cross_after_stop(
+    refused: Option<Stop>,
+    pressed: bool,
+    not_flat: bool,
+    unexpected: bool,
+    (resting, unread): (bool, bool),
+) -> Option<(Stop, &'static str)> {
+    let shown = cross_read_stop(refused, pressed, not_flat, (false, false));
+    let unexpected = unexpected.then_some((Stop::ReadDisagrees, CROSS_OTHERS));
+    (shown.or(unexpected)).or_else(|| cross_read_stop(None, false, false, (resting, unread)))
+}
+
+/// When the reads after a crossing session listed an order or a TWAP not ours.
+pub const CROSS_OTHERS: &str =
+    "after the crossing session, a read listing an order or a TWAP not ours";
+
 /// What the after-session read of every named account showed ([`Run::read_after`]).
-#[derive(Copy, Clone, Debug, Default)]
-struct AfterReads {
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct AfterReads {
     /// Whether an account held an open order (on the page, or counted by REST).
-    resting: bool,
+    pub resting: bool,
+    /// Whether an account held an open order of ours: one its page names among the orders the
+    /// reads know, or one REST counts and no page lists, which is not told from ours.
+    pub ours_resting: bool,
     /// Whether an account's page listed an order that is none of the drop test's, or a TWAP:
     /// what the streams did not show (decision 0148 item 8, FBC-77r8's review).
-    unexpected: bool,
+    pub unexpected: bool,
     /// Whether an account held a position that is not flat, or, after drop session two failed
     /// with no stop, a trade named X or Y.
-    not_flat: bool,
+    pub not_flat: bool,
     /// Whether X was listed on its account's page.
-    x_listed: bool,
+    pub x_listed: bool,
     /// Whether the drop test's account was read.
-    read: bool,
+    pub read: bool,
     /// Whether the drop test's account was read, on a page that listed X or was its last.
-    x_read: bool,
+    pub x_read: bool,
     /// Whether X's account was read and its position was flat.
-    x_flat: bool,
+    pub x_flat: bool,
+    /// Whether a named account could not be read.
+    pub unread: bool,
     /// Whether the owner pressed Ctrl-C while they ran.
-    pressed: bool,
+    pub pressed: bool,
     /// The provider rate refusal they met, if any: a stop ([`Run::read_after`]).
-    refused: Option<Stop>,
+    pub refused: Option<Stop>,
+}
+
+impl AfterReads {
+    /// Whether the reads after a crossing session's drop read every named account again
+    /// ([`Run::read_after_cross_drop`]): only while the round they judge lists an order of ours
+    /// and shows nothing that ends them, no order or TWAP not ours, no position not flat, no
+    /// account it could not read, no provider rate refusal and no press of Ctrl-C. A position
+    /// not flat ends them too: it stops the run, and the reads after it learn nothing more of it
+    /// (FBC-77r8's review).
+    pub fn read_again(&self) -> bool {
+        let ends = self.unexpected || self.not_flat || self.unread || self.pressed;
+        self.ours_resting && !ends && self.refused.is_none()
+    }
+
+    /// Folds `next`, a later round of [`Run::read_after_cross_drop`], into these: a round that
+    /// is `judged` (it finished within the wait and read every named account) replaces what an
+    /// earlier one showed of our orders, since QFEX cancels on a drop only once it learns of it;
+    /// one that is not judged replaces nothing, and adds what it showed. Whatever either showed
+    /// of a provider rate refusal, a press of Ctrl-C, an order or a TWAP not ours or a position
+    /// not flat is kept, as the reads after drop session two keep what a read showed whatever
+    /// a later one shows (FBC-77r8's review).
+    pub fn fold(&mut self, next: AfterReads, judged: bool) {
+        let earlier = *self;
+        if judged {
+            *self = next;
+        } else {
+            self.resting |= next.resting;
+            self.ours_resting |= next.ours_resting;
+            self.x_listed |= next.x_listed;
+            self.unread |= next.unread;
+        }
+        self.refused = earlier.refused.or(next.refused);
+        self.pressed = earlier.pressed || next.pressed;
+        self.unexpected = earlier.unexpected || next.unexpected;
+        self.not_flat = earlier.not_flat || next.not_flat;
+    }
 }
 
 /// The stop the reads after drop session two make, given `after` and whether the owner pressed

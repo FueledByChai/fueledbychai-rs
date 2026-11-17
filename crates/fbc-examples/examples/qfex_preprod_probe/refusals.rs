@@ -80,11 +80,16 @@ pub const AFTER_DROP_ONE: &str = "after drop session one";
 /// and the reads after its drop, of X, Y and their trades, are reported under.
 pub const AFTER_DROP_TWO: &str = "after drop session two";
 
+/// What the reads of every named account after stage two's crossing session on an account
+/// (FBC-su9i) are reported under.
+pub const AFTER_CROSS: &str = "after the crossing session";
+
 /// When a read was made, as the report and the evidence say it: `after the hold`, `after drop
-/// session one` or `two`, or before the session or the hold `before` names.
+/// session one` or `two`, `after the crossing session`, or before the session or the hold
+/// `before` names.
 pub fn read_when(before: &str) -> String {
     match before {
-        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO => before.to_owned(),
+        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS => before.to_owned(),
         _ => format!("before {before}"),
     }
 }

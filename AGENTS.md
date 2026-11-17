@@ -829,8 +829,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     spends (FBC-23ch); and its count bound above that list's ceiling (`PlaceBounds::accept`), the
     report showing the list and the ceiling as fences met (`place_markdown`, 0151 item 10),
     held in `tests/qfex_preprod_probe/place_registries.rs`, which `tests/qfex_preprod_probe.rs`
-    declares by path. With `--place-stages` (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2)
-    it runs the place stages' preflight, then each named account's drop test: on production alone
+    declares by path. With `--place-stages` (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of
+    FBC-9sk2) it runs the place stages' preflight, then each named account's drop test, then stage
+    two's crossing post-only: on production alone
     (`--production`) and, until FBC-4plj, only against a loopback test stub (every origin loopback,
     refused otherwise before anything connects); every place-stage flag (`--symbol`, `--side`,
     `--sole-trader`, both caps, `--away-bps` 20 to 10000, `--flatten-cap-bps` below it,
@@ -855,9 +856,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     priced at the resting price; `market.rs` also holds the pure prices, tested, each moved and
     snapped to its safe side in whole ticks (a resting order `--away-bps` behind the touch, the
     crossing orders at the far touch, a flatten IOC at most `--flatten-cap-bps` through the touch
-    it crosses), of which the resting price is used now, for the caps, X and Y, the touch kept
-    current by `Touch::drive` while each drop session runs. `stage::place_config` adds
-    `qfex.exec.production_places` to a place stage's session configuration alone (0148 item 4).
+    it crosses), of which the resting price is used for the caps, X and Y and the far touch for
+    the crossing post-only, the touch kept current by `Touch::drive` while each session runs.
+    `stage::place_config` adds `qfex.exec.production_places` to a place stage's session
+    configuration alone (0148 item 4).
     Its report and evidence give the fences met and the steps passed, never a value, and its
     evidence's ticket is FBC-9sk2. FBC-23ch's foundation is `places.rs` (0151 items 1, 2, 6 and
     9): before anything connects the run opens its lease directory, tagging it production on its
@@ -995,33 +997,98 @@ holds two of them for one pull request. The rules after the three roles bind all
     stop after its own in the verdict's order (`stage::outranks`: `NotFlat` over `ReadDisagrees`,
     `ArmCancelUnreported` and `DropFailed`, `ReadDisagrees` over the last two); or `ReadDisagrees`
     or `LeftResting` after drop session two. A failed drop test is a stop, so nothing more is
-    placed on its account or any other. With none, the run ends after the last account's drop
-    test, its line naming FBC-su9i, which builds stage two. The report and the evidence (`"ticket"`
-    FBC-9sk2) give each named account's drop test (what answered each arm, whether enabling cancels
-    open orders and whether QFEX reports it, the verdict, the drop's reach over X, whether a
-    graceful close cancels, measured on a read of X's own account alone, X found there by its venue
-    id once known whatever client id its row carries (`AllowedOrder::names`, apart from the stricter
-    `AllowedOrder::matches` a read before a session admits by), and unmeasured on a full page not
-    listing it; X absent counted cancelled only after a graceful close with no stop that cancels
-    before it, X resting as it was sent, X's account flat and X's trades since its send read whole
-    with no row since then, 0132 item 4, and otherwise not measured, its reason given
-    (`places::close_verdict`); whether the other named accounts stayed clean
-    (`places::OthersClean`, not known when a read of one could not be made), each order's
+    placed on its account or any other; the drop registry is disarmed once its second session
+    ends, giving up its market lease. With none, stage two follows (FBC-su9i; `stage.rs`'s
+    `Run::cross_tests`, `stage_two.rs`; decisions 0005, 0132 item 7, 0148 items 2, 6 and 8, 0151
+    items 5, 9 and 11): the run's exact-echo gate (`stage_two::EchoGate`, open only once an
+    `order_response` `ACK` in this run named one of our client ids byte for byte,
+    `tee::Kept::exact_ack`, which fbc-core's `CidMatch` cannot judge; per run, in memory; an
+    upper-cased or escaped id or an `ack` or `err` echo never opening it, each echo's exactness
+    recorded); shut, the run ends `NoEcho`, not a fault, with no marker, every account's drop test
+    having run. An `ACK` whose client id is absent, null or empty names no order of ours, so it
+    never reaches the gate: it stops the run `StrayOrder` in drop session one, marked, before the
+    gate is judged (0151 item 13, which wins over the ticket's `NoEcho` for these three). Open, each
+    named account whose drop test passed in this run (`stage_two::crossers`), in turn
+    (`Run::cross_test`): every named account read clean (a provider refusal in those reads, one kept
+    whole or a REST 429 or 418 included, a stop, marked, `Run::unless_refused`), its cross registry
+    built, tripped and seeded flat, spending the allowance its drop test spent from; one session
+    (`Run::cross_session`) armed, resynced and Started under the market lease, its span bound met
+    one `--rpc-timeout-ms` early (`stage::cancels_begin`); then `stage_two::no_other_order` (every
+    registry of every named account built in the run holding no order of ours on the market open, in
+    flight or `Unknown`, `Registry::resting_on` on both sides, X and Y counted ended only on 0151
+    item 5's three reads after the drop, and only as `places::close_verdict` counts X's absence, the
+    trades since X's send read whole with no row at all and the position flat,
+    `stage_two::ended_after_drop`, and each named account's read before the session listing none),
+    else no crossing order and `LeftResting` or `ReadDisagrees`; the crossing post-only, one
+    post-only GTC at the minimum size at the far touch, an fbc-oms authorization spent from the
+    cross registry's list, sent only while both USD caps admit the registry's lot caps and the order
+    at the far touch it is priced at (`market::caps_admit`; otherwise `BeyondCaps`, nothing sent or
+    resized, 0113); its first answer, its ACK timed, then its end or its deadline, a place never
+    answered ending `Unknown`, never resent (no Unknown ladder; 0005); `stage_two::Crossed`, read
+    before any cancel of ours (`CANCELLED`, an unmapped status or another mapped one, each saying
+    whether it named our client id byte for byte; an err echo of the `add_order`, whatever client id
+    it names, `tee::EchoCid` telling ours exactly, ours in another case or escaped, not ours, or
+    none; a rate refusal; an err echoing no message after the `add_order`; a fill; an ACK then an
+    end; rested; `Unknown`); a comparison; then the session machinery (`stage::Policy::Stage`,
+    `Run::end_session`): every order of ours cancelled by venue id before the session stops, at
+    every stop, Ctrl-C and the span bound included, and on a session that ran its course too, then
+    the streams compared with the reads again, that comparison's provider rate refusal or
+    `ReadDisagrees` the session's stop, marked, when none came before it, then a graceful close
+    (waiting for room as a drop session's does, a Ctrl-C during that wait, after the cancels, left
+    to the reads after the session), or the abrupt drop when those cancels were refused locally or
+    met by a rate refusal (`places::Cancels::blocked`), since the account's drop test passed (0151
+    item 11); then the read of every named account, the crossing order known as ours on its own
+    account, after the abrupt drop read again at the comparisons' cadence until a round lists no
+    order of ours or `--agree-wait-ms` ends, or the round judged lists an order or a TWAP not ours,
+    shows a position not flat, cannot read a named account, meets a provider rate refusal or takes
+    the owner's Ctrl-C (`stage::AfterReads::read_again`), a round finished past the wait or one that
+    cannot read an account folded into the round before it, erasing nothing that round showed
+    (`stage::AfterReads::fold`), since QFEX cancels on a drop only once it learns of it
+    (`Run::read_after_cross_drop`, 0151 item 4). A fill of it is `UnexpectedFill` (FBC-ou9g builds
+    the flatten); a position not flat in those reads is said to be the owner's whatever stop came
+    first (`stage_two::position_said`, 0151 item 9); an order or a TWAP not ours in those reads is
+    `ReadDisagrees` (`stage::cross_after_stop`: after a provider rate refusal, Ctrl-C and `NotFlat`,
+    before `LeftResting`, as `stage::after_stop` orders them); an order of ours still resting after
+    the session, listed by a read, counted open by REST and listed by no page, or counted resting by
+    the cross registry (`stage_two::counted_resting`: an `Unknown` one, from an unmapped status or
+    an err echo too), is `LeftResting`, so it blocks every crossing order after it, and so is a
+    named account that could not be read after the session, marked so the next run reconciles. With
+    no stop the run ends after the last account's crossing post-only, its line naming FBC-ou9g,
+    which builds the taker IOC (`stage::NOT_BUILT`).
+    The report and the evidence (`"ticket"` FBC-9sk2) give each named account's drop test (what
+    answered each arm, whether enabling cancels open orders and whether QFEX reports it, the
+    verdict, the drop's reach over X, whether a graceful close cancels, measured on a read of X's
+    own account alone, X found there by its venue id once known whatever client id its row carries
+    (`AllowedOrder::names`, apart from the stricter `AllowedOrder::matches` a read before a session
+    admits by), and unmeasured on a full page not listing it; X absent counted cancelled only after
+    a graceful close with no stop that cancels before it, X resting as it was sent, X's account flat
+    and X's trades since its send read whole with no row since then, 0132 item 4, and otherwise not
+    measured, its reason given (`places::close_verdict`); whether the other named accounts stayed
+    clean (`places::OthersClean`, not known when a read of one could not be made), each order's
     historic-orders `terminal_status`, the members a trades row carries, what followed; then each
-    session: each frame's client-id echo as a verdict, whether `add_order` went out as encoded,
-    the stop's cancels, each comparison, the reads before and after the drop, what the session
-    showed of X and Y as it dropped, not measured when it did not reach its drop, and whether X
-    rested when the run ended, from the read of X's account after drop session two once that
-    session was built: resting, absent, or not known), the place registries, each session's and
-    read socket's refusals (`refusals.rs`, a session named by `SessionRun::label` on each named
-    account, counted together, the reads after the drop under `AFTER_DROP_TWO`) and its
-    resync's full pages, read on the traded spec (`pages::rows_on`); its slice is
-    `drop-production/`, both sessions of each account's drop test, scrubbed by `Scrub::Places`, with
-    a README of its own. Held in `tests/qfex_preprod_probe/place_stages.rs` and `compare_reads.rs`,
-    against a QFEX model in `tests/qfex_preprod_probe/model.rs` on the conformance stub's serving
-    scripts (0150), whose trade sockets learn each connection's account from its authentication,
-    answer the arm, `add_order`, `cancel_order` and the two pages, cancel an armed account's orders
-    on a graceful close or a drop as their knobs say, and take the knobs `ack_delay`, `rate_limit`,
+    session: each frame's client-id echo as a verdict, whether `add_order` went out as encoded, the
+    stop's cancels, each comparison, the reads before and after the drop, what the session showed
+    of X and Y as it dropped, not measured when it did not reach its drop, and whether X rested
+    when the run ended, from the read of X's account after drop session two once that session was
+    built: resting, absent, or not known), the place registries, each session's and read socket's
+    refusals (`refusals.rs`, a session named by `SessionRun::label` on each named account, counted
+    together, the reads after the drop under `AFTER_DROP_TWO`) and its resync's full pages, read on
+    the traded spec (`pages::rows_on`), and stage two (`stage_two::StageTwo`, read from the whole
+    run's tee once its sessions end: the gate; the characters our client ids exercised by class of
+    QFEX's format, the rest named as not measured; whether QFEX accepted `add_order` as encoded,
+    without `take_profit`, `stop_loss` or `reduce_only`; how `ACK`s, rejects, ends, fills and
+    echoes gave back our client id; which statuses are rejects and which ends; then each crossing
+    session, how its crossing post-only was refused among it, whether it reached the check for
+    another order of ours, not checked when it ended first, and whether the reads after it listed an
+    order or a TWAP not ours, not known when one could not be made); its slices are
+    `drop-production/`, both sessions of each account's drop test, and `places-production/`, the
+    crossing sessions (`stage::PLACES_SLICE`, `capture::split_crossing`), each scrubbed by
+    `Scrub::Places`, with a README of its own. Held in `tests/qfex_preprod_probe/place_stages.rs`
+    and `compare_reads.rs`, against a QFEX model in `tests/qfex_preprod_probe/model.rs` on the
+    conformance stub's serving scripts (0150), whose trade sockets learn each connection's account
+    from its authentication, answer the arm, `add_order`, `cancel_order` and the two pages, cancel
+    an armed account's orders on a graceful close or a drop as their knobs say, and take the knobs
+    `ack_delay`, `rate_limit`,
     `stray_order`, `cid_absent_update`, `stray_fill`, `maker_fill`, `server_close`, `rest_lag`,
     `rest_fails`, `cancel_delay`, `close_on_place`, `arm_err`, `foreign_order`,
     `position_on_place`, `position_after_close`, `hold_on_place`, `cancel_place`,
@@ -1045,18 +1112,25 @@ holds two of them for one pull request. The rules after the three roles bind all
     `position_on_place_on` (a position moved with a later place), `foreign_on_drop` (one left as a
     connection drops), `twap_after_close` (a TWAP listed once a connection ended) and
     `after_drop_historic` (a position, an order not ours or a TWAP once the first historic-orders
-    read after a drop is answered), all declared by path; four paths no flag or answer reaches, X
-    spent from its list, X not priced, a session failing after its order's answer and the journal
-    past its soft limit, are a test's `probe_args::TestHooks`, compiled into the test binary
-    alone. The
-    probe's credentials come from the environment through `src/auth_qfex.rs`, a review path,
-    which also hands each signed read to the connector; the probe reuses
-    `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs` (the caps'
-    conversion to lots and the lease directory) by path. The samples
-    that trade share `src/link.rs` (the glue; `Link::ledger` shows its fill ledger and
+    read after a drop is answered), and, for stage two (FBC-su9i, held in `place_stages.rs` and
+    `tests/qfex_preprod_probe/crossing.rs`), `ack_echo` (exact, upper-cased, escaped, absent, null,
+    empty), `alo_cross` (a post-only through the touch answered `CANCELLED` by default, an unmapped
+    status, an err, an ACK then a cancel, a taker fill, or, unset, resting), `cancel_misses` (every
+    cancel answered `NO_SUCH_ORDER`, the order left open), `cancel_lies` (every cancel answered
+    `CANCELLED`, the order left open), `silent_after_cross` (the primary account's authentications
+    left unanswered once a given crossing order arrived), `hold_on_cancel` (the shared budget
+    held as the run's first `cancel_order` is read, as a provider rate refusal echoing nothing
+    would) and `after_cross_end` (a position, an order not ours or a TWAP once the crossing
+    session's connection ended), all declared by path; five paths no flag or answer reaches, X spent
+    from its list, X not priced, a session failing after its order's answer, the journal past its
+    soft limit and another order of ours held in a cross registry before a crossing order, are a
+    test's `probe_args::TestHooks`, compiled into the test binary alone. The probe's credentials
+    come from the environment through `src/auth_qfex.rs`, a review path, which also hands each
+    signed read to the connector; the probe reuses `paradex_testnet_acceptance`'s privacy patterns
+    by path, and `src/testnet.rs` (the caps' conversion to lots and the lease directory) by path.
+    The samples that trade share `src/link.rs` (the glue; `Link::ledger` shows its fill ledger and
     `Link::fill_refusals` lists each fill that ledger refuses for its time) and `src/testnet.rs`
-    (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet guard), included by
-    path.
+    (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:

@@ -84,6 +84,10 @@ pub const DROP_ONE: &str = "drop session one";
 /// 0132 item 7, 0144 item 4), as the report names them, and drop session two's own name.
 pub const DROP_TWO: &str = "drop session two";
 
+/// The reads of every named account before stage two's crossing session on an account (FBC-su9i;
+/// decision 0132 item 7), as the report names them, and that session's own name.
+pub const CROSS: &str = "the crossing session";
+
 /// Why the place stages stopped (decisions 0132 item 7 and 0148 item 8): each reported by name
 /// ([`Stop::name`]) and by what it is ([`Stop::says`]), never with an id or an amount.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -979,19 +983,45 @@ pub struct XRun {
     pub rested_at_close: bool,
 }
 
-/// A stop's cancels in a drop session (0151 items 2 and 11): Kill, cancel everything by venue
-/// id, the wait for each order to end up to `--rpc-timeout-ms`, and the disarm.
+/// A stop's cancels in a place stage's session (0151 items 2 and 11): Kill, cancel everything by
+/// venue id, the wait for each order to end up to `--rpc-timeout-ms`, and the disarm.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Cancels {
     /// The cancels handed to the session.
     pub sent: usize,
-    /// Whether any was refused locally or held by a provider rate refusal, so not every order
-    /// could be seen to end: the session then ends by a graceful close (0151 item 11).
+    /// Whether any was refused locally, answered other than accepted, or met by a provider rate
+    /// refusal, so the wait ended there and not every order could be seen to end: no comparison
+    /// follows them.
     pub held: bool,
+    /// Whether any was refused locally (not built, not authorized, not handed to the session, or
+    /// not sent) or met by a provider rate refusal: 0151 item 11's two causes alone, under which
+    /// a session outside the drop test ends by the abrupt drop once its account's drop test
+    /// passed in the run ([`crate::stage::Policy::ending`]). A cancel the venue answered other
+    /// than accepted (`NO_SUCH_ORDER` once its order ended first, say) holds them but is neither.
+    pub blocked: bool,
     /// Whether every order the cancels named was seen to end within the wait.
     pub ended: bool,
     /// The owner's presses taken while they ran, each recorded, none ending them early.
     pub presses: u32,
+}
+
+impl Cancels {
+    /// One cancel refused locally: it holds them, and is one of 0151 item 11's causes.
+    pub fn refused_locally(&mut self) {
+        self.held = true;
+        self.blocked = true;
+    }
+
+    /// The answers the cancels had so far, `answered`, and `rate`, whether a provider rate
+    /// refusal met them: a refusal by the session (`NotSent`), which is local, or a rate refusal
+    /// holds them and is one of 0151 item 11's causes; any other answer but accepted holds them
+    /// alone.
+    pub fn answered(&mut self, answered: &[SubmitOutcome], rate: bool) {
+        let not_sent = |o: &SubmitOutcome| matches!(o, SubmitOutcome::NotSent(_));
+        let accepted = |o: &SubmitOutcome| matches!(o, SubmitOutcome::Accepted { .. });
+        self.blocked |= rate || answered.iter().any(not_sent);
+        self.held |= self.blocked || !answered.iter().all(accepted);
+    }
 }
 
 /// The reads of X after drop session one (FBC-be57): its rows on `GET /user/historic-orders`
@@ -1344,13 +1374,27 @@ pub fn echoes(kept: &crate::tee::Kept, from: usize) -> Vec<String> {
     let echo = |cid: EchoCid| match cid {
         EchoCid::Exact => "exact",
         EchoCid::Differs => "not byte for byte",
+        EchoCid::Foreign => "not ours",
         EchoCid::Absent => "absent",
+        EchoCid::Unechoed => "none echoed",
     };
     (kept.heard.iter().skip(from))
         .map(|h| match h {
             Heard::Order { status, cid, .. } => format!("order_response {status}: {}", cid.name()),
             Heard::Fill { cid, .. } => format!("fill_response: {}", cid.name()),
-            Heard::Echo { envelope, cid, .. } => format!("{envelope} of add_order: {}", echo(*cid)),
+            Heard::Echo {
+                cid: EchoCid::Unechoed,
+                ..
+            } => "err echoing no message".to_owned(),
+            Heard::Echo {
+                envelope,
+                cid,
+                rate_limited,
+                ..
+            } => {
+                let limited = if *rate_limited { " RateLimited" } else { "" };
+                format!("{envelope}{limited} of add_order: {}", echo(*cid))
+            }
         })
         .collect()
 }
@@ -1406,8 +1450,11 @@ pub const HAND_CANCEL_ORDERS: &str = "an order rests on the account after drop s
 pub const NEXT_ACCOUNT: &str = "the next named account's drop test, which starts only after \
      every named account reads clean again";
 
-/// What follows the last named account's drop test that did not stop the run: the run's end.
-pub const LAST_ACCOUNT: &str = "the run's end: stage two is not built yet (FBC-su9i builds it)";
+/// What follows the last named account's drop test that did not stop the run: stage two
+/// (FBC-su9i), behind the run's exact-echo gate.
+pub const LAST_ACCOUNT: &str = "stage two (FBC-su9i): the run's exact-echo gate, then, with it \
+     open, the crossing post-only on each named account in turn; with it shut, the run's end, \
+     NoEcho, which is not a fault (decision 0148 item 2)";
 
 /// What the report says of a fill a drop test's reads after the drop show (0151 item 9).
 pub const OWNERS_POSITION: &str = "the run stops not flat, and the position is the owner's \
@@ -1419,11 +1466,11 @@ pub const OWNERS_POSITION: &str = "the run stops not flat, and the position is t
 pub const OWNERS_POSITION_BESIDE: &str = "a get_user_trades row names X or Y, so the position \
      is the owner's (0151 item 9), though the run stopped first on the stop below";
 
-fn yn(b: bool) -> &'static str {
+pub fn yn(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
-fn ms(d: Duration) -> String {
+pub fn ms(d: Duration) -> String {
     format!("{} ms", d.as_millis())
 }
 
@@ -1585,7 +1632,7 @@ fn cancels_said(cancels: Option<&Cancels>) -> String {
 
 /// An order's request, as the report says it: whether it was handed to the session, shown
 /// resting, echoed byte for byte, its outcome and its time to its ACK.
-fn placed_said(x: &XRun) -> String {
+pub fn placed_said(x: &XRun) -> String {
     format!(
         "handed to the session {}; shown resting by an order event {}; an ACK echoing its \
          client id byte for byte {}; its request's outcome {}; from its send to its ACK {}",
@@ -1598,7 +1645,7 @@ fn placed_said(x: &XRun) -> String {
 }
 
 /// The frames' client ids as QFEX gave them back, as the report says them.
-fn echoes_said(echoes: &[String]) -> String {
+pub fn echoes_said(echoes: &[String]) -> String {
     match echoes.is_empty() {
         true => "none heard".to_owned(),
         false => echoes.join("; "),
@@ -1606,7 +1653,7 @@ fn echoes_said(echoes: &[String]) -> String {
 }
 
 /// The comparisons' table.
-fn compared_markdown(s: &mut String, compared: &[crate::compare::Compared]) {
+pub fn compared_markdown(s: &mut String, compared: &[crate::compare::Compared]) {
     let _ = writeln!(
         s,
         "The comparisons of the streams with the reads (0151 item 4: a read at once, then each \
@@ -1828,7 +1875,7 @@ fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
 }
 
 /// A comparison, as the evidence keeps it.
-fn compared_json(c: &crate::compare::Compared) -> Value {
+pub fn compared_json(c: &crate::compare::Compared) -> Value {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let reads: Vec<Value> = (c.reads.iter())
         .map(|(at, took)| json!({"began_ms": ms(*at), "took": format!("{took:?}")}))
@@ -1839,7 +1886,7 @@ fn compared_json(c: &crate::compare::Compared) -> Value {
 }
 
 /// A stop's cancels, as the evidence keeps them.
-fn cancels_json(c: Option<&Cancels>) -> Value {
+pub fn cancels_json(c: Option<&Cancels>) -> Value {
     json!(
         c.map(|c| json!({"sent": c.sent, "held": c.held, "ended": c.ended,
         "presses": c.presses}))
@@ -1847,7 +1894,7 @@ fn cancels_json(c: Option<&Cancels>) -> Value {
 }
 
 /// An order's request, as the evidence keeps it.
-fn placed_json(x: &XRun) -> Value {
+pub fn placed_json(x: &XRun) -> Value {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     json!({"submitted": x.submitted, "acked": x.acked, "exact_echo": x.exact_echo,
         "outcome": x.outcome, "ack_after_ms": x.ack_after.map(ms)})

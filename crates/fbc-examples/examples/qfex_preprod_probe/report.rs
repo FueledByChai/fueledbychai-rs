@@ -5,7 +5,10 @@
 //! 0146) reports the hold too ([`crate::hold`]). A place-stage run's (FBC-9sk2) reports its
 //! preflight, its stop marker, each named account's drop test (what answered each arm, whether
 //! enabling cancels open orders, whether a graceful close cancelled X, the drop test's verdict,
-//! the comparisons, any stop by name: [`crate::places`]) and its registries
+//! the comparisons, any stop by name: [`crate::places`]), stage two (the exact-echo gate, the
+//! characters our client ids exercised, whether `add_order` was accepted as encoded, how each
+//! kind of frame gave back our client id, which statuses are rejects and ends, and how each
+//! named account's crossing post-only was refused: [`crate::stage_two`]) and its registries
 //! ([`crate::ledger::place_markdown`]), every cap, distance and attempt count as a fence met, never
 //! a value (0151 item 10).
 
@@ -15,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::capture::{Evidence, SessionRun, has_gap, list, partial_accounts, shown};
 use crate::evidence::privacy_hits;
-use crate::{hold, ledger, market, places, refusals};
+use crate::{hold, ledger, market, places, refusals, stage_two};
 
 /// Where the accounts read came from, as `evidence.json` says it (decision 0144 item 3).
 const ACCOUNTS_NOTE: &str = "named by the run's configuration, not listed by QFEX: the probe \
@@ -53,9 +56,10 @@ pub fn markdown(ev: &Evidence) -> String {
     };
     let title = match ev.places_asked {
         true => format!(
-            "# QFEX {} place stages: the preflight and each named account's drop test\n\n\
-             FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions 0132 item 4, 0148 \
-             and 0151.",
+            "# QFEX {} place stages: the preflight, each named account's drop test and stage \
+             two's crossing post-only\n\n\
+             FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; decisions 0132 \
+             items 4 and 7, 0148 and 0151.",
             ev.environment
         ),
         false => format!(
@@ -164,6 +168,9 @@ pub fn markdown(ev: &Evidence) -> String {
     for (n, run) in ev.drops.iter().enumerate() {
         places::drop_markdown(&mut s, run, n + 1 == ev.accounts.len());
     }
+    if let Some(two) = &ev.stage_two {
+        stage_two::markdown(&mut s, two);
+    }
     let asked_none = ev.arms.is_empty() && ev.hold_asked && !ev.places_asked;
     let _ = writeln!(s, "## The sessions\n");
     match (asked_none, ev.places_asked && sessions.is_empty()) {
@@ -259,15 +266,14 @@ const STAGE_ONE_NOT_MEASURED: &str = "Not measured by stage one (FBC-9sk2's stag
      0144).";
 
 /// What a place-stage run does not measure yet, as its report says it.
-const PLACES_NOT_MEASURED: &str = "Not measured until FBC-su9i and the slices after it build \
-     stages two and three: anything of the crossing post-only, the taker IOC, the flatten and the \
-     pages. Not measured by the drop test (decision 0132 item 4): an order placed through \
-     another live connection after the arm, and whether an arm or a drop cancels another \
-     account's orders, since no order of ours rests on another account while a session runs. Not \
-     checked by the probe: whether the user has a subaccount the configuration does not name, \
-     and `--sole-trader`'s declaration that nothing else trades on the named accounts (the owner \
-     confirms both before the run, which the probe does not record: decisions 0144 and 0148 item \
-     7).";
+const PLACES_NOT_MEASURED: &str = "Not measured until FBC-ou9g and the slices after it build \
+     them: anything of the taker IOC, the flatten and stage three's pages. Not measured by the \
+     drop test (decision 0132 item 4): an order placed through another live connection after the \
+     arm, and whether an arm or a drop cancels another account's orders, since no order of ours \
+     rests on another account while a session runs. Not checked by the probe: whether the user \
+     has a subaccount the configuration does not name, and `--sole-trader`'s declaration that \
+     nothing else trades on the named accounts (the owner confirms both before the run, which the \
+     probe does not record: decisions 0144 and 0148 item 7).";
 
 /// A session's heading: its account, and its name when it has one of its own.
 fn heading(run: &SessionRun) -> String {
@@ -349,6 +355,7 @@ pub fn to_json(ev: &Evidence) -> Value {
         "registries": ledger::to_json(&ev.registries),
         "place_registries": ledger::place_to_json(&ev.place_registries),
         "drop_tests": ev.drops.iter().map(places::drop_to_json).collect::<Vec<Value>>(),
+        "stage_two": ev.stage_two.as_ref().map(stage_two::to_json),
         "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
 }

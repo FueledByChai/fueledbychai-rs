@@ -51,7 +51,8 @@
 //!   [`QfexModel::fill_on_trades`] and [`QfexModel::fill_on_trades_page`]; as the first graceful
 //!   close of an armed connection is settled, [`QfexModel::fill_after_close`],
 //!   [`QfexModel::part_fill_after_close`], [`QfexModel::trade_after_close`] and
-//!   [`QfexModel::netting_after_close`]; at the first
+//!   [`QfexModel::netting_after_close`]; as each drop's cancel-on-disconnect cancels,
+//!   [`QfexModel::drop_lag`] (FBC-su9i); at the first
 //!   trade-socket authentication, [`QfexModel::touch_moves`]; on every read socket,
 //!   [`QfexModel::auth_fails`], [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`],
 //!   [`QfexModel::trades_err`] and [`QfexModel::hold_trades`], and on every read socket's pages
@@ -69,11 +70,21 @@
 //!   [`QfexModel::fill_on_drop`], [`QfexModel::trade_on_drop`],
 //!   [`QfexModel::historic_omits_last`],
 //!   [`QfexModel::historic_fails`] and
-//!   [`QfexModel::touch_moves_at_arm`]; and, for FBC-77r8's review,
+//!   [`QfexModel::touch_moves_at_arm`]; for FBC-77r8's review,
 //!   [`QfexModel::foreign_order_on`], [`QfexModel::position_on_place_on`],
 //!   [`QfexModel::foreign_on_drop`], [`QfexModel::twap_after_close`],
 //!   [`QfexModel::after_drop_historic`] ([`AfterHistoric`]), [`Limited::TradesPage`] and
 //!   [`Limited::HistoricAfterDrop`].
+//!   FBC-su9i's, on every place: [`QfexModel::ack_echo`]
+//!   ([`Echo`]), how each `ACK` writes the order's client id, [`QfexModel::alo_cross`]
+//!   ([`AloCross`]), how a post-only order priced through the touch is answered, `CANCELLED` by
+//!   default, [`QfexModel::cancel_misses`], every cancel answered `NO_SUCH_ORDER`,
+//!   [`QfexModel::cancel_lies`], every cancel answered `CANCELLED` with the order left open, and
+//!   [`QfexModel::silent_after_cross`], the primary account's authentications left unanswered
+//!   once a given post-only order through the touch arrived; on the run's first `cancel_order`,
+//!   [`QfexModel::hold_on_cancel`]; once the crossing session's connection ended, for FBC-77r8's
+//!   review, [`QfexModel::after_cross_end`]; for FBC-su9i's review, as a given drop is seen,
+//!   [`QfexModel::rest_fails_after_drop`], and on a given place, [`QfexModel::stop_order_on`].
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -166,6 +177,49 @@ pub enum StrayTrade {
     /// Its row names no order: it carries neither id, which a decoder reads, not refuses.
     Unnamed,
 }
+
+/// How every `ACK` `order_response` the model sends for a place writes the order's client id
+/// ([`QfexModel::ack_echo`]; FBC-su9i, decision 0148 item 2's exact-echo gate).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Echo {
+    /// Exactly as the `add_order` wrote it, byte for byte.
+    #[default]
+    Exact,
+    /// In upper case: the same id to fbc-core's `decode_cid`, but not byte for byte.
+    Upper,
+    /// Its first character written as a JSON `\u00XX` escape: the same string once decoded, but
+    /// not byte for byte.
+    Escaped,
+    /// No `client_order_id` member.
+    Absent,
+    /// `client_order_id` null.
+    Null,
+    /// `client_order_id` empty.
+    Empty,
+}
+
+/// How the model answers a post-only (`ALO`) order priced through its touch, a buy at or above
+/// the ask or a sell at or below the bid ([`QfexModel::alo_cross`]; FBC-su9i, decision 0132 item
+/// 7: QFEX's pages disagree on how it refuses one).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AloCross {
+    /// An `order_response` `CANCELLED` naming its client id: it never rests.
+    Cancelled,
+    /// An `order_response` whose status the adapter does not map, [`UNMAPPED`], naming its
+    /// client id: it never rests.
+    Unmapped,
+    /// An `err` echoing its `add_order`: no order is made.
+    Err,
+    /// Its `ACK`, written as [`QfexModel::ack_echo`] says, then an `order_response` `CANCELLED`
+    /// naming its client id: acknowledged, then ended before it could rest.
+    AckedCancelled,
+    /// It fills whole as a taker, its `fill_response` and `FILLED` `order_response` naming its
+    /// client id.
+    Fills,
+}
+
+/// The status [`AloCross::Unmapped`] answers: one the adapter does not map (FBC-jdj7).
+pub const UNMAPPED: &str = "REJECTED";
 
 /// What the cancel-on-disconnect arm does to its account's open orders
 /// ([`QfexModel::arm_cancels_open`]; decision 0132 items 2 and 4).
@@ -453,6 +507,23 @@ pub struct QfexModel {
     /// The run's first `GET /user/historic-orders` answered HTTP 500, as a read that fails with
     /// no provider rate refusal.
     pub historic_fails: bool,
+    /// How every place's `ACK` writes its client id (FBC-su9i).
+    pub ack_echo: Echo,
+    /// How a post-only order priced through the touch is answered, when set: `CANCELLED` by
+    /// default, as [`QfexModel::cancel_place`] says QFEX ends a post-only order that would
+    /// cross; with `None` it rests like any other (FBC-su9i).
+    pub alo_cross: Option<AloCross>,
+    /// Every `cancel_order` answered `NO_SUCH_ORDER`, the order it names left open, so it still
+    /// rests after the session (FBC-su9i: an order left resting).
+    pub cancel_misses: bool,
+    /// Every `cancel_order` of an open order answered `CANCELLED` naming its client id, the order
+    /// left open, so the registry holds it ended while the reads list it (FBC-su9i: an order left
+    /// resting that only a read shows).
+    pub cancel_lies: bool,
+    /// Once the `n`th post-only order through the touch, from 0, arrived, every later
+    /// authentication naming no subaccount (the primary account's) is left unanswered, so each
+    /// read of the primary account after it waits out `--read-wait-ms` and fails (FBC-su9i).
+    pub silent_after_cross: Option<usize>,
     pub rate_limit: Option<Limited>,
     /// After the first `ACK`: an `order_response` naming an order no run placed, with
     /// [`STRAY_CID`] (decision 0151 item 13's stray order). With it, as with
@@ -487,6 +558,11 @@ pub struct QfexModel {
     /// After each change to an account's orders or position, its next `rest_lag` read-socket
     /// pages and REST positions each answer what it was before the change.
     pub rest_lag: usize,
+    /// `(n, lag)`: after the `n`th drop of an armed connection of the run, from 0, cancels an
+    /// account's orders on its cancel-on-disconnect, the account's next `lag` read-socket pages
+    /// and REST positions each answer what it was before the drop, as QFEX cancels on a drop
+    /// only once it learns of it, which a read made at once can precede (FBC-su9i).
+    pub drop_lag: Option<(usize, usize)>,
     /// The `GET /user/positions` reads after the first `add_order`, from 0, answered HTTP 500.
     pub rest_fails: Vec<usize>,
     /// The first `cancel_order`'s answer is pushed this long after it, instead of at once.
@@ -524,6 +600,24 @@ pub struct QfexModel {
     /// every frame budget for the time given, as a provider refusal echoing nothing would: the
     /// run's shared limiter, under the run's provider user.
     pub hold_on_place: Option<(fbc_runtime::RateLimiter, Duration)>,
+    /// As it reads the run's first `cancel_order`, before answering it, the model holds this
+    /// limiter's every frame budget for the time given, as [`QfexModel::hold_on_place`] does:
+    /// the cancel is still answered, so only what the probe sends after it is held.
+    pub hold_on_cancel: Option<(fbc_runtime::RateLimiter, Duration)>,
+    /// What the model changes on an account, each in turn, once the trade connection the run's
+    /// first post-only through the touch arrived on ended, after its cancel-on-disconnect, so
+    /// only the reads after the crossing session see it ([`AfterHistoric`]; FBC-su9i, carrying
+    /// FBC-77r8's review).
+    pub after_cross_end: Vec<AfterHistoric>,
+    /// `(n, ok)`: once the `n`th drop of an armed connection of the run, from 0, is seen, its
+    /// account's `GET /user/positions` answers its next `ok` reads, then HTTP 500 to every one
+    /// after them, as a read that fails with no provider rate refusal (FBC-su9i's review: a
+    /// later round of the reads after a crossing session's drop that cannot read the account).
+    pub rest_fails_after_drop: Option<(usize, usize)>,
+    /// With the `n`th `add_order` of the run, from 0, its account's `GET /user/positions`
+    /// counts one more open order on [`SYMBOL`] than its pages list, as a stop order would, and
+    /// no frame says so (FBC-su9i's review: an order REST alone counts after a crossing session).
+    pub stop_order_on: Option<usize>,
     /// Whether every authentication is answered a failure.
     pub auth_fails: bool,
     /// The `n`th trade-socket authentication after the first `add_order`, from 0, a session's
@@ -637,12 +731,24 @@ pub struct QfexModel {
     pub(super) late_cancels: Vec<Frame>,
     /// Read-socket pages and REST positions answered since the first `add_order`.
     pub(super) pages_after: usize,
+    /// How many drops of an armed connection were seen, for [`QfexModel::drop_lag`].
+    pub(super) drops: usize,
     pub(super) rest_after: usize,
     /// Trade-socket authentications answered since the first `add_order`, a session's included
     /// ([`Limited::ReadAuth`]).
     pub(super) auths_after: usize,
     /// The `get_user_trades` pages asked so far ([`QfexModel::fill_on_trades_page`]).
     pub(super) trades_asked: usize,
+    /// The post-only orders through the touch that arrived ([`QfexModel::silent_after_cross`]).
+    pub(super) crossings: usize,
+    /// The trade connections a post-only through the touch arrived on
+    /// ([`QfexModel::after_cross_end`]).
+    pub(super) crossed_on: Vec<usize>,
+    /// The account [`QfexModel::rest_fails_after_drop`] fails, once its drop was seen, and how
+    /// many of its reads are still answered.
+    pub(super) failing: Option<(Option<String>, usize)>,
+    /// The accounts [`QfexModel::stop_order_on`] gave a stop order.
+    pub(super) stop_ordered: Vec<Option<String>>,
     pub(super) next_id: u64,
 }
 
@@ -682,6 +788,11 @@ impl Default for QfexModel {
             fill_on_drop: false,
             historic_omits_last: false,
             historic_fails: false,
+            ack_echo: Echo::Exact,
+            alo_cross: Some(AloCross::Cancelled),
+            cancel_misses: false,
+            cancel_lies: false,
+            silent_after_cross: None,
             rate_limit: None,
             stray_order: false,
             cid_absent_update: false,
@@ -694,6 +805,8 @@ impl Default for QfexModel {
             on_ack: None,
             crossed_on_place: None,
             rest_lag: 0,
+            drop_lag: None,
+            drops: 0,
             rest_fails: Vec::new(),
             cancel_delay: None,
             position_after_close: false,
@@ -707,6 +820,12 @@ impl Default for QfexModel {
             twaps: Vec::new(),
             foreign_order: false,
             hold_on_place: None,
+            hold_on_cancel: None,
+            after_cross_end: Vec::new(),
+            rest_fails_after_drop: None,
+            stop_order_on: None,
+            failing: None,
+            stop_ordered: Vec::new(),
             auth_fails: false,
             silent_auth: None,
             stuck_pages: false,
@@ -748,6 +867,8 @@ impl Default for QfexModel {
             rest_after: 0,
             auths_after: 0,
             trades_asked: 0,
+            crossings: 0,
+            crossed_on: Vec::new(),
             next_id: 0,
         }
     }
@@ -805,6 +926,12 @@ impl QfexModel {
                 }
                 if after && self.rest_fails.contains(&n) {
                     return status(500, r#"{"error":"synthetic failure"}"#);
+                }
+                if let Some(failing) = self.failing.as_mut().filter(|f| f.0 == account) {
+                    if failing.1 == 0 {
+                        return status(500, r#"{"error":"synthetic failure"}"#);
+                    }
+                    failing.1 -= 1;
                 }
                 ok(&self.positions_of(account))
             }
@@ -927,7 +1054,8 @@ impl QfexModel {
             })
             .sum();
         let position = filled + if moved { Decimal::ONE } else { Decimal::ZERO };
-        let open = self.open_of(account).len();
+        let stop = usize::from(self.stop_ordered.contains(account));
+        let open = self.open_of(account).len() + stop;
         serde_json::json!({"balance": {}, "positions": [
             {"symbol": SYMBOL, "position": number(position), "open_orders": open}
         ]})
@@ -989,6 +1117,10 @@ impl QfexModel {
                 let n = self.auths_after;
                 self.auths_after += usize::from(self.places > 0);
                 if self.places > 0 && self.silent_auth == Some(n) {
+                    return Ok(Vec::new());
+                }
+                let crossed = self.silent_after_cross.is_some_and(|n| self.crossings > n);
+                if crossed && v["params"]["account_id"].as_str().is_none() {
                     return Ok(Vec::new());
                 }
                 if self.places > 0 && self.rate_limit == Some(Limited::ReadAuth(n)) {
@@ -1290,6 +1422,18 @@ impl QfexModel {
         }
         if cancels {
             self.before_change(&account);
+            let lag = self
+                .drop_lag
+                .filter(|(on, _)| !graceful && *on == self.drops);
+            if let Some((_, lag)) = lag {
+                let stale = Stale {
+                    orders: self.open_of(&account),
+                    positions: self.current(&account),
+                    pages: lag,
+                    rest: lag,
+                };
+                self.lagging.insert(account.clone(), stale);
+            }
             let reach = self.cod_reach;
             let placed_on = &self.placed_on;
             let reached = |o: &Order| match reach {
@@ -1324,6 +1468,18 @@ impl QfexModel {
             let foreign = foreign.filter(new);
             self.orders.extend(foreign);
         }
+        if self.crossed_on.contains(&n) {
+            for change in std::mem::take(&mut self.after_cross_end) {
+                self.after_historic(account.clone(), change);
+            }
+        }
+        let failing = self
+            .rest_fails_after_drop
+            .filter(|(on, _)| !graceful && *on == self.drops);
+        if let Some((_, ok)) = failing {
+            self.failing = Some((account.clone(), ok));
+        }
+        self.drops += usize::from(!graceful);
         let did = if cancels { "cancels" } else { "keeps" };
         self.event(format!("cod {n} {how} {did}"), None);
     }
@@ -1374,6 +1530,26 @@ impl QfexModel {
             filled: Decimal::ZERO,
             state: State::Open,
         };
+        self.crossings += usize::from(self.crosses(&order));
+        if self.crosses(&order) {
+            self.crossed_on.push(conn);
+        }
+        // The knobs on the nth place apply to a post-only through the touch too, whichever way it
+        // is answered.
+        let moved = self.position_on_place_on == Some(self.places - 1);
+        if moved && !self.moved.contains(&account) {
+            self.moved.push(account.clone());
+        }
+        if self.foreign_order_on == Some(self.places - 1) {
+            self.foreign_beside(&account, "88888888-8888-4888-8888-888888888888");
+        }
+        if self.stop_order_on == Some(self.places - 1) && !self.stop_ordered.contains(&account) {
+            self.before_change(&account);
+            self.stop_ordered.push(account.clone());
+        }
+        if let Some(how) = self.alo_cross.filter(|_| self.crosses(&order)) {
+            return self.cross(order, how, text);
+        }
         if first && self.cancel_place {
             let ended = Order {
                 state: State::Cancelled,
@@ -1384,7 +1560,7 @@ impl QfexModel {
         }
         self.orders.push(order.clone());
         let mut frames = std::mem::take(&mut self.late_cancels);
-        frames.push(order_response(&order, "ACK", true));
+        frames.push(echoed(&order, "ACK", self.ack_echo));
         match self.on_ack {
             Some((n, OnAck::VenueCancel)) if n + 1 == self.places => {
                 let at = self.orders.len() - 1;
@@ -1427,13 +1603,6 @@ impl QfexModel {
                 self.orders.push(foreign);
             }
         }
-        let moved = self.position_on_place_on == Some(self.places - 1);
-        if moved && !self.moved.contains(&account) {
-            self.moved.push(account.clone());
-        }
-        if self.foreign_order_on == Some(self.places - 1) {
-            self.foreign_beside(&account, "88888888-8888-4888-8888-888888888888");
-        }
         if let Some(after) = self.part_fill_after.filter(|_| first) {
             let filled = self.fill_part(&order.id, order.quantity / Decimal::TWO);
             let frames = vec![
@@ -1458,6 +1627,63 @@ impl QfexModel {
             (after, _) => {
                 self.later(conn, frames, after.unwrap_or_default(), close);
                 Vec::new()
+            }
+        }
+    }
+
+    /// Whether `order` is a post-only order priced through the model's touch: a buy at or above
+    /// its ask, or a sell at or below its bid.
+    fn crosses(&self, order: &Order) -> bool {
+        let price = Decimal::from_str(&order.price.to_string()).ok();
+        let level = |side: Option<(&str, &str)>| side.and_then(|(px, _)| px.parse().ok());
+        let through = match order.side.as_str() {
+            "BUY" => price.zip(level(self.touch.ask)).map(|(p, ask)| p >= ask),
+            _ => price.zip(level(self.touch.bid)).map(|(p, bid)| p <= bid),
+        };
+        order.kind == "ALO" && through == Some(true)
+    }
+
+    /// The answer to `order`, a post-only order through the touch whose frame is `text`, as `how`
+    /// says, logged as `cross <how>`.
+    fn cross(&mut self, order: Order, how: AloCross, text: &str) -> Vec<Frame> {
+        self.event(format!("cross {how:?}"), None);
+        let ended = |state| Order {
+            state,
+            ..order.clone()
+        };
+        match how {
+            AloCross::Cancelled => {
+                self.orders.push(ended(State::Cancelled));
+                vec![order_response(&ended(State::Cancelled), "CANCELLED", true)]
+            }
+            AloCross::Unmapped => {
+                self.orders.push(ended(State::Cancelled));
+                vec![order_response(&ended(State::Cancelled), UNMAPPED, true)]
+            }
+            AloCross::AckedCancelled => {
+                self.orders.push(ended(State::Cancelled));
+                vec![
+                    echoed(&order, "ACK", self.ack_echo),
+                    order_response(&ended(State::Cancelled), "CANCELLED", true),
+                ]
+            }
+            AloCross::Err => {
+                self.placed_on.remove(&order.id);
+                vec![Frame::text(format!(
+                    concat!(
+                        r#"{{"type":"Err","error_code":"InvalidOrder","message":"synthetic","#,
+                        r#""incoming_message":{text}}}"#,
+                    ),
+                    text = text
+                ))]
+            }
+            AloCross::Fills => {
+                self.orders.push(order.clone());
+                let filled = self.fill(&order.id);
+                vec![
+                    taker_fill(&filled),
+                    order_response(&filled.order, "FILLED", true),
+                ]
             }
         }
     }
@@ -1644,6 +1870,14 @@ impl QfexModel {
     /// Cancels the order `v` names, whose frame is `text`, when it is open on `conn`'s account.
     fn cancel_order(&mut self, conn: usize, v: &Value, text: &str) -> Vec<Frame> {
         self.cancels += 1;
+        let first = self.cancels == 1;
+        if let Some((limiter, held)) = self.hold_on_cancel.as_ref().filter(|_| first) {
+            let on = fbc_core::ConnKey {
+                conn: u16::MAX,
+                epoch: 0,
+            };
+            limiter.provider_rejected(tokio::time::Instant::now(), on, None, Some(*held));
+        }
         if self.cancels == 1 && self.rate_limit == Some(Limited::Cancel) {
             return vec![Frame::text(limited(text, 1))];
         }
@@ -1655,12 +1889,19 @@ impl QfexModel {
         let id = v["params"]["order_id"].as_str().unwrap_or_default();
         let at = (self.orders.iter())
             .position(|o| o.id == id && o.account == account && o.state == State::Open);
-        let Some(n) = at else {
+        let Some(n) = at.filter(|_| !self.cancel_misses) else {
             let missing = serde_json::json!({"order_response": {
                 "order_id": id, "status": "NO_SUCH_ORDER"
             }});
             return vec![Frame::text(missing.to_string())];
         };
+        if self.cancel_lies {
+            let told = Order {
+                state: State::Cancelled,
+                ..self.orders[n].clone()
+            };
+            return vec![order_response(&told, "CANCELLED", true)];
+        }
         self.before_change(&account);
         self.orders[n].state = State::Cancelled;
         let answer = vec![order_response(&self.orders[n], "CANCELLED", true)];
@@ -1836,12 +2077,53 @@ fn order_response(order: &Order, status: &str, cid: bool) -> Frame {
     Frame::text(serde_json::json!({ "order_response": members }).to_string())
 }
 
+/// `order`'s `order_response` with `status`, its client id written as `echo` says
+/// ([`QfexModel::ack_echo`]).
+fn echoed(order: &Order, status: &str, echo: Echo) -> Frame {
+    let mut members = order_members(order, status, false);
+    members["take_profit"] = serde_json::json!(0.0);
+    members["stop_loss"] = serde_json::json!(0.0);
+    let cid = &order.cid;
+    let written = match echo {
+        Echo::Exact | Echo::Escaped => Some(Value::String(cid.clone())),
+        Echo::Upper => Some(Value::String(cid.to_uppercase())),
+        Echo::Absent => None,
+        Echo::Null => Some(Value::Null),
+        Echo::Empty => Some(Value::String(String::new())),
+    };
+    if let Some(written) = written {
+        members["client_order_id"] = written;
+    }
+    let text = serde_json::json!({ "order_response": members }).to_string();
+    let first = cid.chars().next().filter(|_| echo == Echo::Escaped);
+    let text = match first {
+        Some(first) => {
+            let plain = format!(r#""client_order_id":"{cid}""#);
+            let rest = &cid[first.len_utf8()..];
+            let escaped = format!(r#""client_order_id":"\u{:04x}{rest}""#, u32::from(first));
+            text.replacen(&plain, &escaped, 1)
+        }
+        None => text,
+    };
+    Frame::text(text)
+}
+
 /// `order`'s row on a `get_user_orders` page.
 fn row(order: &Order) -> Value {
     order_members(order, "ACK", true)
 }
 
-/// `filled`'s `fill_response`, naming the order's client id with `cid`.
+/// `filled`'s `fill_response` as a taker's ([`AloCross::Fills`]), naming its client id.
+fn taker_fill(filled: &Filled) -> Frame {
+    let Frame::Text(text) = fill_response(filled, true) else {
+        unreachable!("a text frame")
+    };
+    let mut v: Value = serde_json::from_str(&text).expect("the model's own frame");
+    v["fill_response"]["execution_type"] = Value::String("TAKER".to_owned());
+    Frame::text(v.to_string())
+}
+
+/// `filled`'s `fill_response`, a maker's, naming the order's client id with `cid`.
 fn fill_response(filled: &Filled, cid: bool) -> Frame {
     let order = &filled.order;
     let mut members = serde_json::json!({
