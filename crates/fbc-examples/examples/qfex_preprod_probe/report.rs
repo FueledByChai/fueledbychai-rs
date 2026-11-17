@@ -8,9 +8,12 @@
 //! the comparisons, any stop by name: [`crate::places`]), stage two (the exact-echo gate, the
 //! characters our client ids exercised, whether `add_order` was accepted as encoded, how each
 //! kind of frame gave back our client id, which statuses are rejects and ends, and how each
-//! named account's crossing post-only was refused: [`crate::stage_two`]) and its registries
-//! ([`crate::ledger::place_markdown`]), every cap, distance and attempt count as a fence met, never
-//! a value (0151 item 10).
+//! named account's crossing post-only was refused, and each taker IOC: how it came back, the
+//! taker fee's sign and the order of its frames: [`crate::stage_two`], [`crate::taker`]), its
+//! registries ([`crate::ledger::place_markdown`]) and what the run declares and leaves the owner
+//! (the key, the declarations, the fences met, the unchecked confirmations and every hand action:
+//! [`crate::taker::markdown`]), every cap, distance and attempt count as a fence met, never a
+//! value (0151 item 10).
 
 use std::fmt::Write as _;
 
@@ -57,9 +60,9 @@ pub fn markdown(ev: &Evidence) -> String {
     let title = match ev.places_asked {
         true => format!(
             "# QFEX {} place stages: the preflight, each named account's drop test and stage \
-             two's crossing post-only\n\n\
-             FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; decisions 0132 \
-             items 4 and 7, 0148 and 0151.",
+             two's crossing post-only and taker IOC\n\n\
+             FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of FBC-9sk2; decisions \
+             0132 items 4 and 7, 0148 and 0151.",
             ev.environment
         ),
         false => format!(
@@ -233,7 +236,10 @@ pub fn markdown(ev: &Evidence) -> String {
     }
     refusals::markdown(&mut s, ev, &sessions);
     match ev.places_asked {
-        true => ledger::place_markdown(&mut s, &ev.place_registries),
+        true => {
+            ledger::place_markdown(&mut s, &ev.place_registries);
+            crate::taker::markdown(&mut s, ev);
+        }
         false if !asked_none => ledger::markdown(&mut s, &ev.registries),
         false => {}
     }
@@ -266,8 +272,9 @@ const STAGE_ONE_NOT_MEASURED: &str = "Not measured by stage one (FBC-9sk2's stag
      0144).";
 
 /// What a place-stage run does not measure yet, as its report says it.
-const PLACES_NOT_MEASURED: &str = "Not measured until FBC-ou9g and the slices after it build \
-     them: anything of the taker IOC, the flatten and stage three's pages. Not measured by the \
+const PLACES_NOT_MEASURED: &str = "Not measured until FBC-4plj builds stage three: anything \
+     of stage three's pages; a flatten is made only after a fill of ours, and the report shows \
+     each one made. Not measured by the \
      drop test (decision 0132 item 4): an order placed through another live connection after the \
      arm, and whether an arm or a drop cancels another account's orders, since no order of ours \
      rests on another account while a session runs. Not checked by the probe: whether the user \
@@ -356,6 +363,7 @@ pub fn to_json(ev: &Evidence) -> Value {
         "place_registries": ledger::place_to_json(&ev.place_registries),
         "drop_tests": ev.drops.iter().map(places::drop_to_json).collect::<Vec<Value>>(),
         "stage_two": ev.stage_two.as_ref().map(stage_two::to_json),
+        "declared": ev.places_asked.then(|| crate::taker::to_json(ev)),
         "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
 }

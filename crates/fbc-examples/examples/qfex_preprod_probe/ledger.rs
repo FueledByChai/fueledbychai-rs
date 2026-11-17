@@ -389,6 +389,13 @@ impl AtEnd {
     }
 }
 
+/// A measured time in whole milliseconds, as the report prints the time a session ended after
+/// its first session's start and by how much it ended past the span bound. Whole milliseconds,
+/// never `Duration`'s Debug form, so a measured time never reads as a decimal value.
+fn whole_ms(d: Duration) -> String {
+    format!("{} ms", d.as_millis())
+}
+
 /// One registry's ledger, as the report and the evidence show it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegistryRun {
@@ -686,6 +693,12 @@ impl PlaceRun {
         self.opened.at + self.registry.bounds.span
     }
 
+    /// The account its sessions trade, as the configuration names it (FBC-ou9g's report of the
+    /// declarations).
+    pub fn account(&self) -> &'static str {
+        self.registry.account
+    }
+
     /// Whether its bounds held, as [`RegistryRun::held`] judges them.
     pub fn held(&self) -> bool {
         self.registry.held()
@@ -760,13 +773,13 @@ pub fn place_markdown(s: &mut String, runs: &[PlaceRun]) {
         let r = &run.registry;
         for e in &r.ends {
             let c = e.replays;
-            let past = (e.past_span(r.bounds.span)).map_or("no".to_owned(), |d| format!("{d:?}"));
+            let past = (e.past_span(r.bounds.span)).map_or("no".to_owned(), whole_ms);
             let _ = writeln!(
                 s,
-                "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 run.step.name(),
                 e.session,
-                e.after,
+                whole_ms(e.after),
                 past,
                 horizon(e.horizon),
                 e.held,
@@ -877,13 +890,13 @@ pub fn markdown(s: &mut String, registries: &[RegistryRun]) {
     for r in registries {
         for e in &r.ends {
             let c = e.replays;
-            let past = (e.past_span(r.bounds.span)).map_or("no".to_owned(), |d| format!("{d:?}"));
+            let past = (e.past_span(r.bounds.span)).map_or("no".to_owned(), whole_ms);
             let _ = writeln!(
                 s,
-                "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
                 r.account,
                 e.session,
-                e.after,
+                whole_ms(e.after),
                 past,
                 horizon(e.horizon),
                 e.held,

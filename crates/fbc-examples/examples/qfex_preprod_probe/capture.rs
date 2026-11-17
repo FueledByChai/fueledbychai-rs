@@ -477,6 +477,10 @@ pub struct Evidence {
     /// value.
     pub preflight: Option<Preflight>,
     pub reads: Vec<AccountRead>,
+    /// The named accounts whose last account read in a place-stage run could not be made, in
+    /// the order they failed: what the run leaves the owner by hand is not known for them
+    /// ([`crate::taker::hand_unknown`]; FBC-ou9g, carrying FBC-77r8's review).
+    pub last_unread: Vec<&'static str>,
     pub sessions: Vec<SessionRun>,
     /// Each registry's fill ledger: its bounds, and its horizon and replay counts at each of its
     /// sessions' ends (decision 0132 item 5).
@@ -1319,10 +1323,10 @@ fn readme_places(ev: &Evidence) -> String {
     )
 }
 
-/// Whether `run` is one of stage two's crossing sessions (FBC-su9i), whose frames go in the
-/// `places-production/` slice (0151 item 7).
+/// Whether `run` is one of stage two's sessions, a crossing session (FBC-su9i) or a taker IOC
+/// session (FBC-ou9g), whose frames go in the `places-production/` slice (0151 item 7).
 pub fn is_crossing(run: &SessionRun) -> bool {
-    run.name == crate::places::CROSS
+    run.name == crate::places::CROSS || run.name == crate::places::TAKE
 }
 
 /// Fixture files, each named, with its text.
@@ -1340,24 +1344,29 @@ pub fn split_crossing(ev: &Evidence, files: Files) -> (Files, Files) {
 }
 
 /// The README of a place-stage run's `places-production/` fixture directory (0151 item 7):
-/// stage two's crossing sessions' frames, scrubbed as the drop test's are.
+/// stage two's crossing and taker IOC sessions' frames, scrubbed as the drop test's are.
 fn readme_crossing(ev: &Evidence) -> String {
     let sessions: Vec<String> = (ev.sessions.iter().filter(|run| is_crossing(run)))
         .map(|run| format!("{} on {}", run.label(), run.account))
         .collect();
     format!(
-        "# QFEX trade-socket frames: stage two's crossing post-only\n\n\
+        "# QFEX trade-socket frames: stage two's crossing post-only and taker IOC\n\n\
          Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
-         `qfex_preprod_probe` (crates/fbc-examples, FBC-su9i, a slice of FBC-9sk2; decisions \
-         0132 item 7, 0148 and 0151): each named account's crossing session ({}), one post-only \
-         GTC at the instrument's minimum size at the far touch, through it, placed only once \
-         that account's drop test passed and an ACK in the run echoed one of our client ids \
-         byte for byte (decision 0148 item 2), to show how QFEX refuses a crossing post-only \
-         and whether that refusal echoes our client id. Each session cancels every order of \
-         ours by venue id before it stops. These are recorded frames, not synthetic ones: this \
-         directory carries no SYNTHETIC marker.\n\n\
+         `qfex_preprod_probe` (crates/fbc-examples, FBC-su9i and FBC-ou9g, slices of FBC-9sk2; \
+         decisions 0132 item 7, 0148 and 0151): each named account's crossing session, then its \
+         taker IOC session ({}). The crossing session places one post-only GTC at the \
+         instrument's minimum size at the far touch, through it, placed only once that \
+         account's drop test passed and an ACK in the run echoed one of our client ids byte for \
+         byte (decision 0148 item 2), to show how QFEX refuses a crossing post-only and whether \
+         that refusal echoes our client id. The taker IOC session places one limit IOC at the \
+         minimum size at the far touch, through it, for the taker fee's sign, the IOC's \
+         statuses and the order of its final order_response and its fill_response (FBC-tfxk), \
+         and flattens its fill through Exit with reducing limit IOCs (decision 0148 item 5). \
+         Each session cancels every order of ours by venue id before it stops. These are \
+         recorded frames, not synthetic ones: this directory carries no SYNTHETIC marker.\n\n\
          Each file is one frame QFEX sent on a session's trade socket, in the order received, \
-         named `<account>-the-crossing-session-<n>-<when>.json` against the session's arm: \
+         named `<account>-the-crossing-session-<n>-<when>.json` or \
+         `<account>-the-taker-IOC-session-<n>-<when>.json` against the session's arm: \
          `before-arm`, `in-window` or `after-window`, or `partial` for a partial capture.\n\n\
          Method: as the drop test's slice (`drop-production/`): the journal read back with \
          every span the codec named blanked to `2`s, then scrubbed member by member as decision \

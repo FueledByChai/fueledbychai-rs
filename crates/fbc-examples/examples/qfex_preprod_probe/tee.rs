@@ -323,6 +323,23 @@ impl Kept {
             .any(|h| matches!(h, Heard::Order { status, ours: true, .. } if status == "ACK"))
     }
 
+    /// Whether QFEX echoed one of our `add_order`s with an `err` that is no provider rate
+    /// refusal, among the frames heard from the `from`th on: a refusal of the order it echoes,
+    /// which settles nothing (FBC-ou9g: a flatten IOC's, the one `add_order` then in flight).
+    pub fn err_echo_from(&self, from: usize) -> bool {
+        (self.heard.iter().skip(from)).any(|h| {
+            matches!(
+                h,
+                Heard::Echo {
+                    envelope: "err",
+                    cid: EchoCid::Exact | EchoCid::Differs,
+                    rate_limited: false,
+                    ..
+                }
+            )
+        })
+    }
+
     /// Whether QFEX sent an `order_response` whose status is `CANCELLED` naming the order whose
     /// `add_order` carried `cid`, exactly as written, by that client id, among the frames heard
     /// from the `from`th on. One naming it with no client id of ours is no report of it: that

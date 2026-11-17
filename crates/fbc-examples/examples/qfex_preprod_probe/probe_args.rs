@@ -46,20 +46,19 @@ session's arm, its resync's reads (one GET /user/positions and get_user_orders p
 that never arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming
 at all.
 
-With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; decisions
-0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's drop test on each
-named account in turn, then stage two's crossing post-only (decision 0132 item 7): on production
-alone (--production; 0151 item 1), and, until FBC-4plj lands
-every stop decisions 0132 item 7 and 0148 item 8 require, only against a loopback test stub,
-every origin (trade, REST and MDS) a loopback address. It prints a CAPS line with the
-environment and both caps first, before any request; runs the hold first, alone, when
---hold-secs is given; reads the instrument --symbol names from this run's GET /refdata on the
-guarded REST origin, refusing one that is not listed, not trading, or that does not list both a
-post-only GTC and a limit IOC (decision 0148 item 4); holds --ledger-max-entries above each
-place registry's fill ceiling (0151 item 3); opens the MDS touch (bbo) on the guarded MDS origin
-and refuses a touch older than --touch-max-age-ms, a crossed or locked one, or one from before
-the MDS connection's current epoch; and refuses either cap below three of the instrument's
-minimum size at the touch.
+With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of FBC-9sk2;
+decisions 0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's drop test
+on each named account in turn, then stage two's crossing post-only and taker IOC on each in turn
+(decision 0132 item 7): on production alone (--production; 0151 item 1), and, until FBC-4plj lands
+every stop decisions 0132 item 7 and 0148 item 8 require, only against a loopback test stub, every
+origin (trade, REST and MDS) a loopback address. It prints a CAPS line with the environment and both
+caps first, before any request; runs the hold first, alone, when --hold-secs is given; reads the
+instrument --symbol names from this run's GET /refdata on the guarded REST origin, refusing one that
+is not listed, not trading, or that does not list both a post-only GTC and a limit IOC (decision
+0148 item 4); holds --ledger-max-entries above each place registry's fill ceiling (0151 item 3);
+opens the MDS touch (bbo) on the guarded MDS origin and refuses a touch older than
+--touch-max-age-ms, a crossed or locked one, or one from before the MDS connection's current epoch;
+and refuses either cap below three of the instrument's minimum size at the touch.
 
 Each account's drop test starts only once the one before ended with no stop. Drop session one:
 every named account read clean, the account's drop registry built
@@ -85,47 +84,84 @@ item 13); then the read of every named account. A failed verdict, an arm-time ca
 did not report, or a fill of X or Y the reads show (the position yours, 0151 item 9) stops the
 run, so nothing more is placed on that account or any other. With no stop, stage two follows.
 
-Stage two (FBC-su9i) is judged on this run alone, in memory: its exact-echo gate opens only once
-an order_response ACK in this run echoed one of our client ids byte for byte (decision 0148 item
-2; an upper-cased or escaped one keeps it shut, and an ack or err echo of an add_order never
-opens it; an ACK whose client id is absent, null or empty names no order of ours, so it stops the
-run in drop session one, StrayOrder, before the gate is judged: 0151 item 13). Shut, every
-account's drop test still runs and the run then ends NoEcho, which is not a fault and writes no
-stop marker. Open, each named account whose drop test
-passed in this run in turn: every named account read clean, its cross registry built, tripped and
-seeded flat; one session armed, resynced and Started; then, only while no registry of the run
-holds another order of ours open, in flight or Unknown and no named account's read shows one
-(decision 0148 item 6, X and Y counted ended only on 0151 item 5's three reads after the drop),
-one post-only GTC at the instrument's minimum size at the far touch, through it, to show how QFEX
-refuses it (CANCELLED, a status the adapter does not map, or an err echo, each recorded); its end
-or its deadline (--rpc-timeout-ms), a place never answered, or refused by a status the adapter
-does not map or by an err echo, ending Unknown, never resent and counted resting (decision 0005);
-the streams compared with the reads; then every order of ours cancelled by venue id before the
-session stops, and the read of every named account. A fill of it stops the run (UnexpectedFill;
-FBC-ou9g builds the flatten); an order of ours still resting after the session, read or counted
-resting, an Unknown place included, stops it too (LeftResting), as does a named account that
-cannot be read after it. With no stop the
-run ends after the last account's crossing post-only, its outcome not ok, until FBC-ou9g builds
-the taker IOC. The report gives the characters our client ids exercised (the rest not measured),
-whether QFEX accepted add_order as encoded, whether ACK, rejects and fills echo our client id
-exactly, which statuses are rejects and ends, and how each crossing post-only was refused.
+Stage two (FBC-su9i) is judged on this run alone, in memory: its exact-echo gate opens only once an
+order_response ACK in this run echoed one of our client ids byte for byte (decision 0148 item 2; an
+upper-cased or escaped one keeps it shut, and an ack or err echo of an add_order never opens it; an
+ACK whose client id is absent, null or empty names no order of ours, so it stops the run in drop
+session one, StrayOrder, before the gate is judged: 0151 item 13). Shut, every account's drop test
+still runs and the run then ends NoEcho, which is not a fault and writes no stop marker. Open, each
+named account whose drop test passed in this run in turn: every named account read clean, its cross
+registry built, tripped and seeded flat; one session armed, resynced and Started; then, only while
+no registry of the run holds another order of ours open, in flight or Unknown and no named account's
+read shows one (decision 0148 item 6, X and Y counted ended only on 0151 item 5's three reads after
+the drop), one post-only GTC at the instrument's minimum size at the far touch, through it, to show
+how QFEX refuses it (CANCELLED, a status the adapter does not map, or an err echo, each recorded);
+its end or its deadline (--rpc-timeout-ms), a place never answered, or refused by a status the
+adapter does not map or by an err echo, ending Unknown, never resent and counted resting (decision
+0005); the streams compared with the reads; then every order of ours cancelled by venue id before
+the session stops, and the read of every named account. A fill of it is flattened (below) and stops
+the run (UnexpectedFill); an order of ours still resting after the session, read or counted resting,
+an Unknown place included, stops it too (LeftResting), as does a named account that cannot be read
+after it. With no stop the account's taker IOC session follows, before the next account's crossing
+session (FBC-ou9g): every named account read clean, its take registry built, tripped and seeded
+flat; one session armed, resynced and Started; then, only while no other order of ours is open, in
+flight or Unknown on any registry or named account's read, one limit IOC at the instrument's minimum
+size at the far touch, through it, its fill expected; its end with its fills settled, or its
+deadline, never resent; the streams compared with the reads. Filled, it is flattened (below) while
+its session is open, and once flat the run goes on; expired unfilled, it is recorded and flattens
+nothing; left open with a fill, as the adapter decodes QFEX's IOC_PARTIALLY_FILLED with a remainder,
+it stops the run not flat with no flatten (IocRemainder; 0151 item 8, until FBC-jdj7); ended with
+fills its order events state that had not all reached the session by its deadline, it stops the run
+not flat with no flatten too (IocUnsettled), since the flatten judges the registry's position, which
+is then not QFEX's. Then every order of ours cancelled by venue id before the session stops, and the
+read of every named account, as after a crossing session. With no stop the run ends after the last
+account's taker IOC, its outcome not ok, until FBC-4plj builds stage three. The report gives the
+characters our client ids exercised (the rest not measured), whether QFEX accepted add_order as
+encoded, whether ACK, rejects and fills echo our client id exactly, which statuses are rejects and
+ends, how each crossing post-only was refused, and, of each taker IOC, how it came back, the taker
+fee's sign (paid, zero or received; no amount) and the order of its final order_response and its
+fill_response (FBC-tfxk); and what the run declares and leaves you: the key
+qfex.exec.production_places = probe_place_stages, the CodProbeRun declarations, the fences met
+(never their values), --sole-trader and your confirmations as unchecked, and every hand action (the
+--reconciled declaration, and any hand cancel or hand close the run leaves).
 
-Each stop decisions 0132 item 7 and 0148 item 8 name stops the run by name, with the read of
-every named account after it, the report and the stop marker: an order event or fill of ours
-without our client id, an order_response naming no order of ours (0151 item 13), a replayed
-fill refused for its time, a resync that disagrees or leaves a fill unsettled, a provider rate
-refusal on the session, a read socket or REST, a read showing an order or a position the streams
-did not, an unplanned end of the connection, the span bound, a fill of X, Y or the crossing
-post-only, a position not flat, an order left resting, and Ctrl-C. In a drop session only Ctrl-C
-and a fill of ours cancel (0151 item 2): Kill, every order of ours cancelled by venue id, a wait
-of up to --rpc-timeout-ms for each to end (a second Ctrl-C meanwhile recorded), the market
-disarmed, then a graceful close; cancels held by a provider rate refusal or refused locally end
-it by a graceful close too (0151 item 11). Every other stop sends no cancel and ends the session
-by a graceful close. A crossing session also cancels every order of ours by venue id before it
-stops, at every stop, Ctrl-C and its span bound included, and once it ran its course (decision
-0132 item 7, 0148 item 8); its span bound is met one --rpc-timeout-ms early, so its cancels begin
-before it; and cancels held by a provider rate refusal or refused locally end it by the abrupt
-drop, since its account's drop test passed in this run (0151 item 11).
+Each stop decisions 0132 item 7 and 0148 item 8 name stops the run by name, with the read of every
+named account after it, the report and the stop marker: an order event or fill of ours without our
+client id, an order_response naming no order of ours (0151 item 13), a replayed fill refused for its
+time, a resync that disagrees or leaves a fill unsettled, a provider rate refusal on the session, a
+read socket or REST, a read showing an order or a position the streams did not, an unplanned end of
+the connection, the span bound, a fill of X, Y or the crossing post-only, a taker IOC left open with
+a fill or with its fills unsettled, a position not flat, an order left resting, and Ctrl-C. In a
+drop session only Ctrl-C and a fill of ours cancel (0151 item 2): Kill, every order of ours
+cancelled by venue id, a wait of up to --rpc-timeout-ms for each to end (a second Ctrl-C meanwhile
+recorded), the market disarmed, then a graceful close; cancels held by a provider rate refusal or
+refused locally end it by a graceful close too (0151 item 11). Every other stop sends no cancel and
+ends the session by a graceful close. A crossing or taker IOC session also cancels every order of
+ours by venue id before it stops, at every stop, Ctrl-C and its span bound included, and once it ran
+its course (decision 0132 item 7, 0148 item 8); its span bound is met one --rpc-timeout-ms early, so
+its cancels begin before it; and cancels held by a provider rate refusal or refused locally end it
+by the abrupt drop, since its account's drop test passed in this run (0151 item 11).
+
+A fill of ours (X's, Y's, the crossing post-only's or the taker IOC's) other than a flatten IOC's is
+flattened while its session is still open, before its Stop (FBC-ou9g; decision 0148 item 5, 0151
+item 9): every other order of ours on the market cancelled by venue id and seen to end, else no
+flatten IOC (Flatten(NotEnded)); the owner's Flatten, into Exit; then, while the account's one
+budget of --flatten-attempts across its registries lasts, and only while no registry of the run and
+no named account's read shows another order of ours open, in flight or Unknown (decision 0148 item
+6), one limit IOC at the instrument's minimum size on the side that reduces the position, classified
+reducing with no reduce-only flag, priced at most --flatten-cap-bps through the touch it crosses,
+read just before it, as an fbc-oms authorization judged by Exit and both caps; its end with its
+fills settled, or its deadline (an Unknown one never resent); the streams compared with a
+never-arming read; the position read again from the registry. A read agreeing with the registry's
+flat position shows REST positions flat. A residual below the minimum size, a refusal (of the
+owner's Flatten, by fbc-oms, by the session or by an err echoing the IOC, or no client id minted for
+it), no price on the grid within the cap, the budget used up, a flatten IOC whose fills had not all
+reached the session by its deadline, or no fresh and uncrossed touch to price one from stops the run
+not flat, Flatten(BelowMinimum), Flatten(Refused), Flatten(Capped), Flatten(UsedUp),
+Flatten(Unsettled) or Flatten(NoTouch), the position yours; Ctrl-C meanwhile is recorded and ends
+nothing. The run then stops on the fill, or on the flatten's own stop; the taker IOC's fill is
+expected, so once flat it stops nothing. A fill seen only when no session is open stops the run not
+flat, the position yours (0151 item 9).
 
 Before anything connects, a place-stage run opens its lease directory (0151 items 1 and 6): it
 tags the directory production on its first use and refuses one tagged for another environment;
@@ -253,7 +289,7 @@ Options:
                            deadline and --agree-wait-ms, and the reads of every named account
                            between them, each --read-wait-ms (0151 item 3)
   --place-stages           the place stages' preflight, drop tests and stage two's crossing
-                           post-only (above): refused
+                           post-only and taker IOC (above): refused
                            with --arm, and without --production; needs every flag below, each
                            of which it alone takes
   --symbol <SYMBOL>        required: the venue symbol traded, at most 32 ASCII letters, digits
@@ -455,6 +491,32 @@ pub struct TestHooks {
     /// registry (FBC-su9i): decision 0148 item 6's refusal, which the reads before each session
     /// and the stop an order left resting after one is keep the QFEX model from reaching.
     pub other_order: Option<usize>,
+    /// As [`TestHooks::other_order`], before the `n`th taker IOC session's check (FBC-ou9g).
+    pub take_other_order: Option<usize>,
+    /// The account's flatten budget spent from its drop registry's list once its drop test
+    /// ran, as a flatten there would have (FBC-ou9g): the one budget its cross registry then
+    /// finds used up (decision 0148 item 7), which no run reaches, since a flatten stops it.
+    pub flatten_spent: bool,
+    /// The market the flatten works on Killed, at the step given, so fbc-oms refuses what it
+    /// builds there (FBC-ou9g): a refusal no answer of the QFEX model reaches.
+    pub kill_in_flatten: Option<KillAt>,
+    /// The first named account's read the flatten judges a flatten IOC by lists an order
+    /// (FBC-ou9g): a read no answer of the QFEX model gives there, since every named account
+    /// reads clean before each session, which [`crate::stage_two::no_other_order`] then refuses.
+    pub listed_in_flatten: bool,
+    /// The flatten's client id refused before each flatten IOC (FBC-ou9g): a refusal of the run's
+    /// mint no answer of the QFEX model reaches.
+    pub refuse_mint_in_flatten: bool,
+}
+
+/// Where [`TestHooks::kill_in_flatten`] Kills the flatten's market.
+#[cfg(test)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum KillAt {
+    /// Before the owner's Flatten, which fbc-oms then refuses.
+    Flatten,
+    /// Before the first flatten IOC is built, which fbc-oms then refuses.
+    Ioc,
 }
 
 /// What `--reconciled` declares the owner did by hand after an earlier place-stage run's stop

@@ -911,6 +911,12 @@ pub struct CrossRun {
     pub as_encoded: Option<bool>,
     /// The run's stop, by name, when one came during it.
     pub stop: Option<&'static str>,
+    /// The flatten of a fill of ours the session saw, while it was open (FBC-ou9g; 0151 item 9):
+    /// the crossing post-only's, or, in a taker IOC session, the taker IOC's.
+    pub flatten: Option<crate::flatten::FlattenRun>,
+    /// In a taker IOC session (FBC-ou9g), the taker IOC: how it came back, its fees' signs and
+    /// the order of its frames; `None` in a crossing session.
+    pub taken: Option<crate::taker::Taken>,
 }
 
 /// Stage two (FBC-su9i; decision 0132 item 7, 0148 items 2 and 10), as the report and the
@@ -929,6 +935,12 @@ pub struct StageTwo {
     pub statuses: Statuses,
     /// Each named account's crossing session, in run order.
     pub crosses: Vec<CrossRun>,
+    /// Each named account's taker IOC session (FBC-ou9g), in run order: one on each account whose
+    /// crossing session did not stop the run.
+    pub takes: Vec<CrossRun>,
+    /// Whether every account due to cross ran its crossing and its taker IOC sessions with no
+    /// stop and no error, so the run reached its end, `stage::NOT_BUILT` (FBC-ou9g).
+    pub finished: bool,
 }
 
 impl StageTwo {
@@ -947,16 +959,6 @@ impl StageTwo {
     }
 }
 
-/// What the report says follows the crossing session on an account that did not stop the run.
-pub const NEXT_CROSS: &str = "the next named account's crossing session, which starts only \
-     after every named account reads clean again and no registry of the run holds an order of \
-     ours (decision 0148 item 6)";
-
-/// What follows the last named account's crossing session that did not stop the run: the run's
-/// end, until FBC-ou9g builds the taker IOC.
-pub const LAST_CROSS: &str = "the run's end: stage two's taker IOC is not built yet (FBC-ou9g \
-     builds it)";
-
 /// What the report says of an order resting after a crossing session, for the owner (decision
 /// 0132 item 7, on production's site as decision 0143 item 4 reads it).
 pub const HAND_CANCEL_CROSS: &str = "an order rests on the account after the crossing session: \
@@ -970,8 +972,9 @@ pub const OTHERS_CROSS: &str = "an order or a TWAP that is not ours is listed on
      0148 item 8); read the accounts on QFEX's site before the next run";
 
 /// What the report says of a fill of the crossing post-only, beside its stop (0151 item 9).
-pub const CROSS_FILLED: &str = "FBC-ou9g builds the flatten a fill of ours needs; until it \
-     lands the run stops not flat, and the position is the owner's (0151 item 9)";
+pub const CROSS_FILLED: &str = "a fill of ours is flattened while its session is still open, \
+     before its Stop, as the flatten below says when one ran, and the run then stops (0151 item \
+     9)";
 
 /// What the report says of a position not flat in the reads after a crossing session when the
 /// run stops on it (0151 item 9).
@@ -1025,7 +1028,7 @@ fn cross_cancels_said(cancels: Option<&crate::places::Cancels>) -> String {
 }
 
 /// The report's section on stage two: the gate, the run's client ids and statuses, then each
-/// crossing session. Nothing when no drop session ran.
+/// named account's crossing session and, after it, its taker IOC session (FBC-ou9g).
 pub fn markdown(s: &mut String, two: &StageTwo) {
     use crate::places::{echoes_said, ms, placed_said, yn};
     use std::fmt::Write as _;
@@ -1049,9 +1052,11 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
          one of our client ids byte for byte (decision 0148 item 2), each named account in turn \
          places one post-only GTC at the instrument's minimum size at the far touch, through it, \
          to show how QFEX refuses a crossing post-only and whether that refusal echoes our client \
-         id; only while no registry of the run and no read of a named account shows another \
-         order of ours (decision 0148 item 6, 0151 item 5). What this run's frames show, read on \
-         every session (no id, no price and no size is shown):\n\n\
+         id, then, in a session of its own, one limit IOC at the instrument's minimum size at the \
+         far touch, through it, whose fill is flattened through Exit (FBC-ou9g); each only while \
+         no registry of the run and no read of a named account shows another order of ours \
+         (decision 0148 item 6, 0151 item 5). What this run's frames show, read on every session \
+         (no id, no price and no size is shown):\n\n\
          - The exact-echo gate: {gate}\n\
          - The characters our client ids exercised, by class of QFEX's client-id format \
            (decision 0132's Consequences; the rest not measured): {characters}\n\
@@ -1063,7 +1068,6 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
         two.statuses.says(),
     );
     for (n, run) in two.crosses.iter().enumerate() {
-        let last = n + 1 == two.crosses.len();
         let crossed = match &run.crossed {
             Some(crossed) => crossed.says(),
             None => "not measured: it was not placed".to_owned(),
@@ -1099,13 +1103,11 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
                 ms(lead)
             )
         });
-        let followed = match (run.stop, last) {
-            (Some(stop), _) => format!(
-                "the run's stop, {stop}: nothing more is placed on this account or any other \
-                 (decision 0132 item 7)"
-            ),
-            (None, false) => NEXT_CROSS.to_owned(),
-            (None, true) => LAST_CROSS.to_owned(),
+        let take = two.takes.iter().find(|t| t.account == run.account);
+        let followed = match (run.stop, take) {
+            (Some(stop), _) => stopped(stop),
+            (None, Some(_)) => crate::taker::THEN_TAKE.to_owned(),
+            (None, None) => crate::taker::RUN_ENDED.to_owned(),
         };
         let _ = writeln!(
             s,
@@ -1151,6 +1153,127 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
         if !run.compared.is_empty() {
             crate::places::compared_markdown(s, &run.compared);
         }
+        if let Some(flatten) = &run.flatten {
+            crate::flatten::markdown(s, flatten);
+        }
+        if let Some(take) = take {
+            let next = match (n + 1 < two.crosses.len(), two.finished) {
+                (true, _) => Next::Account,
+                (false, true) => Next::End,
+                (false, false) => Next::Ended,
+            };
+            take_markdown(s, take, next);
+        }
+    }
+}
+
+/// What the report says follows a session that stopped the run with `stop`.
+fn stopped(stop: &str) -> String {
+    format!(
+        "the run's stop, {stop}: nothing more is placed on this account or any other (decision \
+         0132 item 7)"
+    )
+}
+
+/// What came after a taker IOC session that did not stop the run itself (FBC-ou9g).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Next {
+    /// The next named account's crossing session ran.
+    Account,
+    /// The run reached its end, `stage::NOT_BUILT`, on the last account to cross.
+    End,
+    /// The run ended first, on a stop or an error that is no stop, before any later session.
+    Ended,
+}
+
+/// The report's section on one named account's taker IOC session (FBC-ou9g), `next` what came
+/// after it.
+fn take_markdown(s: &mut String, run: &CrossRun, next: Next) {
+    use crate::places::{echoes_said, ms, placed_said, yn};
+    use crate::taker::{HAND_CANCEL_TAKE, LAST_TAKE, NEXT_ACCOUNT, OTHERS_TAKE, RUN_ENDED};
+    use std::fmt::Write as _;
+    let resting = match (run.resting, run.counted_resting, run.read) {
+        (true, _, _) => HAND_CANCEL_TAKE,
+        (false, true, _) => {
+            "the take registry still counts an order of ours resting, open with a fill, Unknown or \
+             in flight, never resent (decision 0005): an order of ours still resting after a \
+             session, a stop (decision 0132 item 7)"
+        }
+        (false, false, true) => "no",
+        (false, false, false) => {
+            "not known: the account was not read after the session; read it on QFEX's site \
+             before the next run"
+        }
+    };
+    let others = match run.others {
+        Some(true) => OTHERS_TAKE,
+        Some(false) => "none",
+        None => {
+            "not known: a named account was not read after the session; read it on QFEX's \
+             site before the next run"
+        }
+    };
+    let lead = run.cancels_lead.map_or(String::new(), |lead| {
+        format!(
+            "; the span bound stopped it, its cancels begun {} before the bound",
+            ms(lead)
+        )
+    });
+    let followed = match (run.stop, next) {
+        (Some(stop), _) => stopped(stop),
+        (None, Next::Account) => NEXT_ACCOUNT.to_owned(),
+        (None, Next::End) => LAST_TAKE.to_owned(),
+        (None, Next::Ended) => RUN_ENDED.to_owned(),
+    };
+    let _ = writeln!(
+        s,
+        "### The taker IOC on {} (FBC-ou9g)\n\n\
+         On {} (named by the run's configuration), after its crossing session, whose drop test \
+         passed in this run, with the exact-echo gate open: its take registry built after clean \
+         reads of every named account, its CancelOnlyTrip given to the journal, seeded flat; one \
+         session armed, resynced and Started, then one limit IOC at the instrument's minimum size \
+         at the far touch, through it, its fill expected and flattened through Exit while the \
+         session is open; before the session stops it cancels every order of ours by venue id \
+         (decision 0132 item 7, 0148 items 5 and 8).\n\n\
+         - Stream authenticated: {}; what answered the arm: {}; resync applied: {}; market \
+           Started under its market lease: {}\n\
+         - No other order of ours (decision 0148 item 6): {}\n\
+         - The taker IOC: {}\n\
+         {}\
+         - The Stop's cancels: {}{lead}\n\
+         - Ended by: {}\n\
+         - An order resting on the account when the session ended: {resting}\n\
+         - An order or a TWAP not ours in the reads after the session: {others}\n\
+         - A position not flat in the reads after the session: {}\n\
+         - Our client id as QFEX gave it back, frame by frame: {}\n\
+         - add_order sent as encoded (FBC-blcw): {}\n\
+         - Error: {}\n\
+         - What followed: {followed}\n",
+        run.account,
+        run.account,
+        yn(run.authenticated),
+        run.arm.as_deref().unwrap_or("none reported"),
+        yn(run.resynced),
+        yn(run.started),
+        match (run.blocked.as_deref(), run.checked) {
+            (Some(b), _) => format!("kept back: {b}"),
+            (None, true) => "none: it may be placed".to_owned(),
+            (None, false) => "not checked: the session ended before it".to_owned(),
+        },
+        placed_said(&run.placed),
+        crate::taker::session_lines(run.taken.as_ref()),
+        cross_cancels_said(run.cancels.as_ref()),
+        run.ended_by.unwrap_or("it did not open"),
+        position_said(run.not_flat_after, run.stop),
+        echoes_said(&run.echoes),
+        run.as_encoded.map_or("none sent", yn),
+        run.error.as_deref().unwrap_or("none"),
+    );
+    if !run.compared.is_empty() {
+        crate::places::compared_markdown(s, &run.compared);
+    }
+    if let Some(flatten) = &run.flatten {
+        crate::flatten::markdown(s, flatten);
     }
 }
 
@@ -1162,31 +1285,45 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
     let echoes: serde_json::Map<String, serde_json::Value> = (two.echoes.says().into_iter())
         .map(|(kind, said)| (kind.to_owned(), json!(said)))
         .collect();
+    let session = |run: &CrossRun, hand_cancel: &str| {
+        let compared: Vec<serde_json::Value> = run.compared.iter().map(compared_json).collect();
+        let cancels = run.cancels.as_ref().map(|c| {
+            json!({"sent": c.sent, "held": c.held, "blocked": c.blocked, "ended": c.ended,
+                "presses": c.presses, "cut_short": c.cut_short})
+        });
+        json!({"account": run.account, "authenticated": run.authenticated, "arm": run.arm,
+            "resynced": run.resynced, "started": run.started, "blocked": run.blocked,
+            "other_order_checked": run.checked,
+            "cancels": cancels, "cancels_lead_ms": run.cancels_lead.map(ms),
+            "compared": compared, "ended_by": run.ended_by, "resting": run.resting,
+            "counted_resting": run.counted_resting, "read_after": run.read,
+            "others_after": run.others, "not_flat_after": run.not_flat_after,
+            "owners_position": (run.not_flat_after == Some(true))
+                .then(|| position_said(run.not_flat_after, run.stop)),
+            "hand_cancel": run.resting.then_some(hand_cancel),
+            "echoes": run.echoes, "add_order_as_encoded": run.as_encoded,
+            "error": run.error, "stop": run.stop,
+            "flatten": run.flatten.as_ref().map(crate::flatten::to_json)})
+    };
     let crosses: Vec<serde_json::Value> = (two.crosses.iter())
         .map(|run| {
-            let compared: Vec<serde_json::Value> = run.compared.iter().map(compared_json).collect();
-            let cancels = run.cancels.as_ref().map(|c| {
-                json!({"sent": c.sent, "held": c.held, "blocked": c.blocked, "ended": c.ended,
-                    "presses": c.presses, "cut_short": c.cut_short})
-            });
-            json!({"account": run.account, "authenticated": run.authenticated, "arm": run.arm,
-                "resynced": run.resynced, "started": run.started, "blocked": run.blocked,
-                "other_order_checked": run.checked,
-                "crossing_post_only": placed_json(&run.placed),
-                "refused": run.crossed.as_ref().map(Crossed::says),
-                "cancels": cancels, "cancels_lead_ms": run.cancels_lead.map(ms),
-                "compared": compared, "ended_by": run.ended_by, "resting": run.resting,
-                "counted_resting": run.counted_resting, "read_after": run.read,
-                "others_after": run.others, "not_flat_after": run.not_flat_after,
-                "owners_position": (run.not_flat_after == Some(true))
-                    .then(|| position_said(run.not_flat_after, run.stop)),
-                "hand_cancel": run.resting.then_some(HAND_CANCEL_CROSS),
-                "echoes": run.echoes, "add_order_as_encoded": run.as_encoded,
-                "error": run.error, "stop": run.stop})
+            let mut entry = session(run, HAND_CANCEL_CROSS);
+            entry["crossing_post_only"] = placed_json(&run.placed);
+            entry["refused"] = json!(run.crossed.as_ref().map(Crossed::says));
+            entry
+        })
+        .collect();
+    let takes: Vec<serde_json::Value> = (two.takes.iter())
+        .map(|run| {
+            let mut entry = session(run, crate::taker::HAND_CANCEL_TAKE);
+            entry["taker_ioc"] = placed_json(&run.placed);
+            entry["taken"] = crate::taker::taken_json(run.taken.as_ref());
+            entry
         })
         .collect();
     json!({"exact_echo_gate": two.gate,
         "characters": two.characters.as_ref().map(Characters::says),
         "add_order_as_encoded": two.as_encoded.map(AsEncoded::says),
-        "echoes": echoes, "statuses": two.statuses.says(), "crossings": crosses})
+        "echoes": echoes, "statuses": two.statuses.says(), "crossings": crosses,
+        "takes": takes})
 }

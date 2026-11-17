@@ -48,9 +48,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use fbc_core::{
-    AccountKey, CidMint, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent, InstrumentId,
-    LeaseError, MarketLease, NamedLeaseError, Namespace, NamespaceLease, OrderCaps, SubmitHandle,
-    SubmitOutcome, VenueFactory, VenueOrderSnapshot, VenueSymbol, WallNs,
+    AccountKey, CidMatch, CidMint, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent,
+    FillEvent, InstrumentId, LeaseError, MarketLease, NamedLeaseError, Namespace, NamespaceLease,
+    OrderCaps, SubmitHandle, SubmitOutcome, VenueFactory, VenueOrderSnapshot, VenueSymbol, WallNs,
 };
 use fbc_oms::{LeaseKeys, Leases, PositionCheck, Registry, ResyncReport};
 use fbc_runtime::{ExecControl, ExecHandler};
@@ -60,6 +60,7 @@ use serde_json::{Value, json};
 use crate::ledger::{FLATTEN, PlaceLists, Step};
 use crate::link::{LinkHandler, Note};
 use crate::probe_args::{Places, Reconciled};
+use crate::taker::FeeSign;
 use crate::testnet::{self, HighWater, off_thread_holding};
 
 /// The file of the lease directory naming the environment its leases are for (0151 item 1).
@@ -87,6 +88,10 @@ pub const DROP_TWO: &str = "drop session two";
 /// The reads of every named account before stage two's crossing session on an account (FBC-su9i;
 /// decision 0132 item 7), as the report names them, and that session's own name.
 pub const CROSS: &str = "the crossing session";
+
+/// The reads of every named account before stage two's taker IOC session on an account (FBC-ou9g;
+/// decision 0132 item 7), as the report names them, and that session's own name.
+pub const TAKE: &str = "the taker IOC session";
 
 /// Why the place stages stopped (decisions 0132 item 7 and 0148 item 8): each reported by name
 /// ([`Stop::name`]) and by what it is ([`Stop::says`]), never with an id or an amount.
@@ -136,6 +141,46 @@ pub enum Stop {
     BeyondCaps,
     /// No `ACK` in the run echoed one of our client ids byte for byte: not a fault (FBC-su9i).
     NoEcho,
+    /// The taker IOC left open with a fill, as the adapter decodes QFEX's `IOC_PARTIALLY_FILLED`
+    /// with a remainder (0151 item 8, until FBC-jdj7; FBC-ou9g): not flat, with no flatten.
+    IocRemainder,
+    /// The taker IOC ended with fills its order events state but whose `fill_response`s did not
+    /// all reach the registry by its deadline (FBC-ou9g): not flat by the venue's count, which
+    /// no flatten can judge, so none follows.
+    IocUnsettled,
+    /// A flatten that leaves the position not flat, and why (decision 0148 items 5, 8 and 9,
+    /// 0151 item 9; FBC-ou9g): the position is the owner's.
+    Flatten(Flattening),
+}
+
+/// Why a flatten stopped not flat (decision 0148 items 5 and 8; [`Stop::Flatten`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Flattening {
+    /// What is left of the position is below the instrument's minimum size, which no IOC is
+    /// placed at.
+    BelowMinimum,
+    /// The owner's Flatten or a flatten IOC was refused: by fbc-oms, by the session, or by an
+    /// err QFEX echoed its `add_order` with; or the probe minted no client id for it.
+    Refused,
+    /// No price on the grid at most `--flatten-cap-bps` through the touch it crosses, so the
+    /// IOC is not sent.
+    Capped,
+    /// `--resting-cap-usd` or `--inventory-cap-usd` would not admit the IOC at the touch it is
+    /// priced from, the registry's lot caps fixed at the preflight's touch, so it is not sent
+    /// and never resized (decision 0113; fbc-oms applies the caps to reducing orders too, 0013
+    /// rule 2).
+    BeyondCaps,
+    /// The account's flatten budget, `--flatten-attempts` across its registries, is used up.
+    UsedUp,
+    /// A flatten IOC ended with fills its order events state but whose `fill_response`s did not
+    /// all reach the registry by its deadline, so the registry's position is not the venue's
+    /// and no further flatten IOC is placed.
+    Unsettled,
+    /// Not every other order of ours on the market was seen to end, so no flatten IOC is placed
+    /// (decision 0148 item 6).
+    NotEnded,
+    /// No touch fresh and uncrossed to price a flatten IOC from, so none is sent.
+    NoTouch,
 }
 
 /// The time a replayed fill was refused for (fbc-oms's `Admission`).
@@ -160,7 +205,7 @@ pub enum RefusedOn {
 
 impl Stop {
     /// Every stop, in the order the report lists them.
-    pub const ALL: [Stop; 22] = [
+    pub const ALL: [Stop; 32] = [
         Stop::NotOurCid,
         Stop::StrayOrder,
         Stop::ReplayRefused(Replay::Untimed),
@@ -191,6 +236,16 @@ impl Stop {
         Stop::BeyondList,
         Stop::BeyondCaps,
         Stop::NoEcho,
+        Stop::IocRemainder,
+        Stop::IocUnsettled,
+        Stop::Flatten(Flattening::BelowMinimum),
+        Stop::Flatten(Flattening::Refused),
+        Stop::Flatten(Flattening::Capped),
+        Stop::Flatten(Flattening::BeyondCaps),
+        Stop::Flatten(Flattening::UsedUp),
+        Stop::Flatten(Flattening::Unsettled),
+        Stop::Flatten(Flattening::NotEnded),
+        Stop::Flatten(Flattening::NoTouch),
     ];
 
     /// Its name, as the report, the evidence and the marker give it.
@@ -220,6 +275,18 @@ impl Stop {
             Stop::BeyondList => "BeyondList",
             Stop::BeyondCaps => "BeyondCaps",
             Stop::NoEcho => "NoEcho",
+            Stop::IocRemainder => "IocRemainder",
+            Stop::IocUnsettled => "IocUnsettled",
+            Stop::Flatten(why) => match why {
+                Flattening::BelowMinimum => "Flatten(BelowMinimum)",
+                Flattening::Refused => "Flatten(Refused)",
+                Flattening::Capped => "Flatten(Capped)",
+                Flattening::BeyondCaps => "Flatten(BeyondCaps)",
+                Flattening::UsedUp => "Flatten(UsedUp)",
+                Flattening::Unsettled => "Flatten(Unsettled)",
+                Flattening::NotEnded => "Flatten(NotEnded)",
+                Flattening::NoTouch => "Flatten(NoTouch)",
+            },
         }
     }
 
@@ -311,6 +378,59 @@ impl Stop {
                 "no ACK in this run echoed one of our client ids byte for byte, so no crossing \
                  order is placed (decision 0148 item 2): not a fault"
             }
+            Stop::IocRemainder => {
+                "the taker IOC left open with a fill, as the adapter decodes QFEX's \
+                 IOC_PARTIALLY_FILLED with a remainder: not flat, with no flatten, the position \
+                 the owner's (0151 item 8, until FBC-jdj7)"
+            }
+            Stop::IocUnsettled => {
+                "the taker IOC ended with fills its order events state that had not all reached \
+                 the registry by its deadline: not flat by the venue's count, with no flatten, \
+                 the position the owner's (decision 0005, 0151 item 9)"
+            }
+            Stop::Flatten(why) => match why {
+                Flattening::BelowMinimum => {
+                    "a flatten left a position below the instrument's minimum size, which no IOC \
+                     is placed at: not flat, the position the owner's (decision 0148 items 5 and \
+                     9)"
+                }
+                Flattening::Refused => {
+                    "a flatten refused: the owner's Flatten or a flatten IOC refused by fbc-oms, \
+                     the session or an err QFEX echoed it with, or no client id minted for it: \
+                     not flat, the position the owner's (decision 0148 items 5, 8 and 9)"
+                }
+                Flattening::Capped => {
+                    "a flatten capped: no price on the grid within --flatten-cap-bps through the \
+                     touch the IOC crosses, so none was sent: not flat, the position the owner's \
+                     (decision 0148 items 5, 8 and 9)"
+                }
+                Flattening::BeyondCaps => {
+                    "a flatten IOC --resting-cap-usd or --inventory-cap-usd would not admit at \
+                     the touch it is priced from, the registry's lot caps fixed at the \
+                     preflight's touch: not sent and never resized, not flat, the position the \
+                     owner's (decision 0113, 0013 rule 2, 0148 items 5 and 9)"
+                }
+                Flattening::UsedUp => {
+                    "a flatten whose --flatten-attempts, one budget across the account's \
+                     registries, were used up: not flat, the position the owner's (decision 0148 \
+                     items 5, 8 and 9, 0151 item 9)"
+                }
+                Flattening::Unsettled => {
+                    "a flatten IOC ended with fills its order events state that had not all \
+                     reached the registry by its deadline, so no further flatten IOC was placed: \
+                     not flat by the venue's count, the position the owner's (decision 0148 items \
+                     5 and 9)"
+                }
+                Flattening::NotEnded => {
+                    "a flatten that did not see every other order of ours on the market end, so \
+                     it placed no flatten IOC: not flattened, the position the owner's (decision \
+                     0148 items 5, 6 and 9)"
+                }
+                Flattening::NoTouch => {
+                    "a flatten with no touch fresh and uncrossed to price its IOC from, so none \
+                     was sent: not flat, the position the owner's (decision 0148 items 5 and 9)"
+                }
+            },
         }
     }
 
@@ -491,12 +611,16 @@ pub fn start(reg: &mut Registry, dir: &Path, inst: InstrumentId) -> Result<(), S
         .map_err(|e| format!("Start was refused: {e}"))
 }
 
-/// The owner's Flatten on `inst` of `reg`, into Exit, under the market lease as [`start`] takes
-/// it (decision 0148 item 5).
-#[allow(dead_code)] // a flatten after a fill of ours takes it (FBC-ou9g)
+/// The owner's Flatten on `inst` of `reg`, into Exit (decision 0148 item 5): on a market
+/// already armed, under the market lease the registry holds for it, as fbc-oms moves an armed
+/// market to Exit with no lease given; on a disarmed one, under the market lease as [`start`]
+/// takes it.
 pub fn flatten(reg: &mut Registry, dir: &Path, inst: InstrumentId) -> Result<(), String> {
-    let lease = market_lease(reg, dir, inst)?;
-    let flattened = reg.flatten(inst, Leases::market(lease));
+    let leases = match reg.entry(inst).armed() {
+        true => Leases::none(),
+        false => Leases::market(market_lease(reg, dir, inst)?),
+    };
+    let flattened = reg.flatten(inst, leases);
     flattened
         .map(|_| ())
         .map_err(|e| format!("Flatten was refused: {e}"))
@@ -824,9 +948,20 @@ pub struct Watched {
     pub closing: bool,
     /// Whether the session's connection ended.
     pub ended: bool,
-    /// Whether a fill of ours reached the session: in a drop session it lets a stop cancel
-    /// (0151 item 2).
+    /// Whether a fill of ours other than an expected one ([`Watched::expected`]) reached the
+    /// session: in a drop session it lets a stop cancel (0151 item 2), and while the session is
+    /// open it is flattened (0151 item 9).
     pub fill_of_ours: bool,
+    /// The orders of ours whose fills the session expects (FBC-ou9g): its taker IOC and its
+    /// flatten IOCs, each added before it is handed to the session. A fill of one is no
+    /// [`Stop::UnexpectedFill`].
+    pub expected: Vec<ClientOrderId>,
+    /// The fills of an expected order the session applied.
+    pub expected_fills: usize,
+    /// The sign of the fee of each fill of an expected order handed on to the session, with that
+    /// order's client id, in the order they came (FBC-ou9g: the taker fee's sign, decision 0148
+    /// item 10): never an amount.
+    pub fee_signs: Vec<(ClientOrderId, crate::taker::FeeSign)>,
     /// The `Link`'s notes and fill refusals read so far.
     read: usize,
     refused: usize,
@@ -874,9 +1009,11 @@ pub fn resync_stop(report: &ResyncReport) -> Option<Stop> {
 /// resync the registry refused or that disagrees is [`Stop::ResyncDesync`] and one with a fill
 /// unsettled across it [`Stop::ResyncUnsettled`] ([`resync_stop`]); a replayed fill the ledger
 /// refused for its time ([`crate::link::Link::fill_refusals`]) is [`Stop::ReplayRefused`]; a fill
-/// of ours is [`Stop::UnexpectedFill`] (0151 item 9: no fill of ours is expected in the drop test);
-/// an end of the connection the driver did not ask for is [`Stop::ConnectionEnded`], and ends
-/// the session, through its control, with no second attempt (decision 0148 item 7).
+/// of ours is [`Stop::UnexpectedFill`] (0151 item 9) unless it fills an order the session expects
+/// fills of ([`Watched::expected`]: the taker IOC or a flatten IOC, FBC-ou9g), which is counted
+/// and stops nothing; an end of the connection the driver did not ask for is
+/// [`Stop::ConnectionEnded`], and ends the session, through its control, with no second attempt
+/// (decision 0148 item 7).
 pub struct PlaceHandler {
     pub inner: LinkHandler,
     pub watched: Rc<RefCell<Watched>>,
@@ -885,8 +1022,21 @@ pub struct PlaceHandler {
 }
 
 impl PlaceHandler {
+    /// The order whose fills the session expects ([`Watched::expected`]) that `fill` is one of,
+    /// if any: named by its client id as ours, or by the venue id the registry holds for it.
+    fn expected(&self, fill: &FillEvent) -> Option<ClientOrderId> {
+        let w = self.watched.borrow();
+        let link = self.inner.link.borrow();
+        w.expected.iter().copied().find(|cid| {
+            let named = fill.cid() == Some(CidMatch::Ours(*cid));
+            let vid = link.registry().get(*cid).and_then(|r| r.vid().cloned());
+            named || vid.is_some_and(|vid| fill.vid() == Some(&vid))
+        })
+    }
+
     /// Reads what the `Link` noted since the last call into [`Watched`], then wakes the driver.
-    fn judge(&self) {
+    /// `expected_fill` is whether the event just handed on was a fill of an expected order.
+    fn judge(&self, expected_fill: bool) {
         {
             let link = self.inner.link.borrow();
             let mut w = self.watched.borrow_mut();
@@ -906,6 +1056,7 @@ impl PlaceHandler {
                         }
                     }
                     Note::ResyncRefused(_) => w.raise(Stop::ResyncDesync),
+                    Note::Fill { ours: true, .. } if expected_fill => w.expected_fills += 1,
                     Note::Fill { ours: true, .. } => {
                         w.fill_of_ours = true;
                         w.raise(Stop::UnexpectedFill);
@@ -930,8 +1081,15 @@ impl PlaceHandler {
 
 impl ExecHandler for PlaceHandler {
     fn on_exec(&mut self, env: Envelope<ExecEvent>) {
+        let expected = match &env.body {
+            ExecEvent::Fill(fill) => (self.expected(fill)).map(|cid| (cid, FeeSign::of(&fill.fee))),
+            _ => None,
+        };
+        if let Some(sign) = expected {
+            self.watched.borrow_mut().fee_signs.push(sign);
+        }
         self.inner.on_exec(env);
-        self.judge();
+        self.judge(expected.is_some());
     }
 
     fn on_epoch_end(&mut self, key: ConnKey) {
@@ -945,22 +1103,22 @@ impl ExecHandler for PlaceHandler {
         }
         // A place stage's session has one connection attempt: its end ends the session.
         drop(self.control.borrow_mut().take());
-        self.judge();
+        self.judge(false);
     }
 
     fn on_submitted(&mut self, handle: SubmitHandle) {
         self.inner.on_submitted(handle);
-        self.judge();
+        self.judge(false);
     }
 
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         self.inner.on_unprotected(orders);
-        self.judge();
+        self.judge(false);
     }
 
     fn on_decode_error(&mut self, key: ConnKey) {
         self.inner.on_decode_error(key);
-        self.judge();
+        self.judge(false);
     }
 }
 
@@ -1155,6 +1313,9 @@ pub struct TwoRun {
     pub echoes: Vec<String>,
     /// Whether Y's `add_order` went out as encoded (FBC-blcw); `None` when none was sent.
     pub as_encoded: Option<bool>,
+    /// The flatten of a fill of ours the session saw, while it was open (FBC-ou9g; 0151 item
+    /// 9).
+    pub flatten: Option<crate::flatten::FlattenRun>,
 }
 
 /// One named account's drop test (FBC-23ch, FBC-77r8; decision 0132 item 4), as the report and
@@ -1190,6 +1351,10 @@ pub struct DropRun {
     pub x_resting: bool,
     /// Whether X's account was read after the session, so [`DropRun::x_resting`] is known.
     pub x_read: bool,
+    /// The owner's hand cancel the reads after the session ask for: [`HAND_CANCEL`] for X, or
+    /// [`HAND_CANCEL_ONE_ORDERS`] once the session sent a flatten IOC and an order of ours
+    /// rests (the restack's review); `None` when none rests.
+    pub hand_cancel: Option<&'static str>,
     /// The reads of X and its trades after the session.
     pub after: Option<XAfter>,
     /// Why the session could not run its course, when that was no stop: never an id or value.
@@ -1201,6 +1366,9 @@ pub struct DropRun {
     /// Whether every `add_order` the session sent went out as encoded, carrying none of
     /// `take_profit`, `stop_loss` and `reduce_only` (FBC-blcw); `None` when none was sent.
     pub as_encoded: Option<bool>,
+    /// The flatten of a fill of ours drop session one saw, while it was open (FBC-ou9g; 0151
+    /// item 9).
+    pub flatten: Option<crate::flatten::FlattenRun>,
     /// Whether the read before drop session two listed X on its account: X open as that session
     /// armed; `None` when that read was not made.
     pub x_before_two: Option<bool>,
@@ -1419,6 +1587,14 @@ pub const HAND_CANCEL: &str = "X still rests on the account: cancel it by hand o
      production's site, then give the next place-stage run --reconciled hand-cancel (0151 item \
      6); the order is named by none of its ids here";
 
+/// What the report says of an order of ours resting after drop session one once it sent a
+/// flatten IOC, for the owner (decision 0132 item 7, on production's site as decision 0143 item
+/// 4 reads it): X, or a flatten IOC QFEX left open (the restack's review).
+pub const HAND_CANCEL_ONE_ORDERS: &str = "an order of ours rests on the account after drop \
+     session one: cancel every order of ours (X and any flatten IOC) by hand on QFEX \
+     production's site, then give the next place-stage run --reconciled hand-cancel (0151 item \
+     6); no order is named by its ids here";
+
 /// What a comparison came to, as the report and the evidence name it.
 fn ended(e: crate::compare::Ended) -> &'static str {
     use crate::compare::Ended;
@@ -1440,17 +1616,29 @@ pub fn outcome_name(outcome: &SubmitOutcome) -> String {
 /// how a refusal of fbc-oms or the runtime reaches the report, the evidence and standard
 /// output, since one may carry a client id, a cap or an amount (0151 item 10).
 pub fn variant_name(value: &impl std::fmt::Debug) -> String {
-    let named = format!("{value:?}");
+    leading_name(&format!("{value:?}"))
+}
+
+/// The variant name a session's refusal begins with, as `Link::submit` gives it, a refusal's
+/// `Debug` (FBC-ou9g): what the refusal carries, a request id among it, is left out, as
+/// [`variant_name`] leaves it out.
+pub fn refusal_named(why: &str) -> String {
+    leading_name(why)
+}
+
+/// What `named` begins with up to the first character no name holds.
+fn leading_name(named: &str) -> String {
     let end = named.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'));
     named[..end.unwrap_or(named.len())].to_owned()
 }
 
-/// What the report says of an order of ours, X or Y, resting once drop session two ended
-/// short of its drop or after it, for the owner (decision 0132 item 7, on production's site as
-/// decision 0143 item 4 reads it).
+/// What the report says of an order of ours, X, Y or a flatten IOC, resting once drop session
+/// two ended short of its drop or after it, for the owner (decision 0132 item 7, on
+/// production's site as decision 0143 item 4 reads it).
 pub const HAND_CANCEL_ORDERS: &str = "an order rests on the account after drop session two: \
-     cancel every order of ours (X, Y) by hand on QFEX production's site, then give the next \
-     place-stage run --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
+     cancel every order of ours (X, Y and any flatten IOC) by hand on QFEX production's site, \
+     then give the next place-stage run --reconciled hand-cancel (0151 item 6); no order is \
+     named by its ids here";
 
 /// What follows a drop test that did not stop the run: the next named account's.
 pub const NEXT_ACCOUNT: &str = "the next named account's drop test, which starts only after \
@@ -1739,6 +1927,22 @@ fn one_markdown(s: &mut String, run: &DropRun) {
         run.error.as_deref().unwrap_or("none"),
     );
     compared_markdown(s, &run.compared);
+    if let Some(flatten) = &run.flatten {
+        crate::flatten::markdown(s, flatten);
+        // A flatten IOC QFEX left open is ours to cancel by hand too (the restack's review).
+        let resting = match (run.hand_cancel, run.x_read) {
+            (Some(hand), _) => hand,
+            (None, true) => "no",
+            (None, false) => {
+                "not known: the account was not read after the session; read it on QFEX's site \
+                 before the next run"
+            }
+        };
+        let _ = writeln!(
+            s,
+            "- An order of ours (X or a flatten IOC) resting after drop session one: {resting}\n"
+        );
+    }
 }
 
 /// Whether X rested when the run ended, as the report says it: from the read of X's account
@@ -1882,6 +2086,9 @@ fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
     if !two.compared.is_empty() {
         compared_markdown(s, &two.compared);
     }
+    if let Some(flatten) = &two.flatten {
+        crate::flatten::markdown(s, flatten);
+    }
 }
 
 /// A comparison, as the evidence keeps it.
@@ -1928,9 +2135,10 @@ pub fn drop_to_json(run: &DropRun) -> Value {
         "close_not_measured": run.close_not_measured.map(CloseUnmeasured::says),
         "x_resting": run.x_resting,
         "x_read_after": run.x_read,
-        "hand_cancel": (run.x_resting && run.two.is_none()).then_some(HAND_CANCEL),
+        "hand_cancel": run.hand_cancel.filter(|_| run.two.is_none()),
         "after": after,
-        "echoes": run.echoes, "add_order_as_encoded": run.as_encoded, "error": run.error});
+        "echoes": run.echoes, "add_order_as_encoded": run.as_encoded, "error": run.error,
+        "flatten": run.flatten.as_ref().map(crate::flatten::to_json)});
     let two = run.two.as_ref().map(two_to_json);
     let verdict = run.verdict.as_ref().map(verdict_to_json);
     json!({"account": run.account, "session_one": one, "x_before_two": run.x_before_two,
@@ -1968,7 +2176,8 @@ fn two_to_json(two: &TwoRun) -> Value {
         "resting": two.resting, "read_after": two.read,
         "x_resting": two.x_resting, "x_read_after": two.x_read,
         "hand_cancel": two.resting.then_some(HAND_CANCEL_ORDERS),
-        "echoes": two.echoes, "add_order_as_encoded": two.as_encoded, "error": two.error})
+        "echoes": two.echoes, "add_order_as_encoded": two.as_encoded, "error": two.error,
+        "flatten": two.flatten.as_ref().map(crate::flatten::to_json)})
 }
 
 /// The verdict's entry: names and flags alone.

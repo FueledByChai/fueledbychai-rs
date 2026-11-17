@@ -139,10 +139,29 @@
 //!   ending it by the abrupt drop after a passed drop test;
 //! - the report's characters exercised, whether add_order was accepted as encoded, an upper-cased
 //!   echo read "not byte for byte", and the places-production/ slice passing the privacy check.
+//!
+//! FBC-ou9g's flatten (decisions 0012, 0063, 0148 items 5, 6, 8 and 9, 0151 items 5, 8 and 9),
+//! reached from every registry, run against the model, with its pure parts in `flatten_run.rs`:
+//!
+//! - a maker fill of X in drop session one, of X or Y in drop session two, and a crossing
+//!   post-only that fills, each flattened while its session is open, before its Stop: every
+//!   other order of ours cancelled by venue id and seen to end, the owner's Flatten into Exit,
+//!   one reducing limit IOC at the minimum size with no reduce-only flag, within the cap of the
+//!   touch it crosses, REST flat; then the run stops UnexpectedFill
+//!   (`a_maker_fill_of_x_in_drop_session_one_is_flattened_then_stops`,
+//!   `a_crossing_post_only_that_fills_is_flattened_then_stops` and the drop session two ones);
+//! - each flatten stop, not flat and marked: no price within the cap (`Capped`), the budget used
+//!   up after one or two expired IOCs (`UsedUp`), an err echoing the IOC, fbc-oms refusing the IOC
+//!   or the owner's Flatten (`Refused`), a residual below the minimum after an IOC filled in part
+//!   (`BelowMinimum`); an Unknown IOC never resent and keeping the next back; the account's one
+//!   budget across its registries; a position frame before or after a fill changing nothing; a
+//!   connection that ends, Ctrl-C, other orders not seen to end, no touch and a rate refusal
+//!   during it.
 
 use super::*;
 
 use std::io::Write as _;
+use std::str::FromStr as _;
 
 use fbc_core::{
     AccountKey, CidMint, Effect, Envelope, ExchNs, ExchTsKind, HttpMethod, HttpRequest,
@@ -322,7 +341,7 @@ fn outputs_of(dir: &Path) -> (String, String) {
 
 /// The run's spec of `listed`, resolved from a `/refdata` answer listing it alone, as this run's
 /// discovery resolves it.
-fn spec_of(listed: Listed) -> Discovered {
+pub(super) fn spec_of(listed: Listed) -> Discovered {
     let mut cfg = VenueConfig::new();
     cfg.insert(KEY_EXEC_MODE, fbc_venue_qfex::probe::PRODUCTION_PROBE);
     cfg.insert(TRADE_URL, "ws://127.0.0.1:1");
@@ -567,18 +586,24 @@ fn place_stage_flags_are_refused_naming_the_flag() {
     }
     let usage = usage.split_whitespace().collect::<Vec<_>>().join(" ");
     for said in [
-        "With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; \
-         decisions 0148 and 0151) it runs the place stages' preflight, then decision 0132 item \
-         4's drop test on each named account in turn, then stage two's crossing post-only",
+        "With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of \
+         FBC-9sk2; decisions 0148 and 0151) it runs the place stages' preflight, then decision \
+         0132 item 4's drop test on each named account in turn, then stage two's crossing \
+         post-only and taker IOC on each in turn",
         "only against a loopback test stub, every origin (trade, REST and MDS) a loopback address",
         "It prints a CAPS line with the environment and both caps first, before any request",
         "Drop session two: every named account read again, X alone admitted, as one open order \
          on its symbol",
         "then the abrupt drop of its connection, with no WebSocket close",
         "With no stop, stage two follows.",
-        "With no stop the run ends after the last account's crossing post-only, its outcome not \
-         ok, until FBC-ou9g builds the taker IOC.",
-        "A crossing session also cancels every order of ours by venue id before it stops",
+        "With no stop the run ends after the last account's taker IOC, its outcome not ok, until \
+         FBC-4plj builds stage three.",
+        "it stops the run not flat with no flatten (IocRemainder; 0151 item 8, until FBC-jdj7)",
+        "the key qfex.exec.production_places = probe_place_stages, the CodProbeRun declarations, \
+         the fences met (never their values), --sole-trader and your confirmations as unchecked, \
+         and every hand action",
+        "A crossing or taker IOC session also cancels every order of ours by venue id before it \
+         stops",
         "a place never answered, or refused by a status the adapter does not map or by an err \
          echo, ending Unknown, never resent and counted resting (decision 0005)",
         "an ACK whose client id is absent, null or empty names no order of ours, so it stops the \
@@ -1010,7 +1035,7 @@ async fn a_hold_runs_before_the_preflight_with_nothing_else_open() {
     assert!(
         report.starts_with(
             "# QFEX production place stages: the preflight, each named account's drop test and \
-             stage two's crossing post-only\n"
+             stage two's crossing post-only and taker IOC\n"
         ),
         "{report}"
     );
@@ -1290,8 +1315,9 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
     );
     assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
     // Past the preflight, each named account's drop test ran, two sessions each (FBC-23ch and
-    // FBC-77r8), then each one's crossing session (FBC-su9i), and no stage-one registry was built.
-    assert_eq!(ev.sessions.len(), 6);
+    // FBC-77r8), then each one's crossing session (FBC-su9i) and its taker IOC session
+    // (FBC-ou9g), and no stage-one registry was built.
+    assert_eq!(ev.sessions.len(), 8);
     assert!(ev.registries.is_empty());
     assert_eq!(
         (ev.environment, ev.target),
@@ -1313,8 +1339,10 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
          the preflight, then each named account's drop test in turn (FBC-23ch and FBC-77r8)",
         "then stage two (FBC-su9i): with the run's exact-echo gate open, each named account in \
          turn places its crossing post-only",
-        "and with it shut the run ends NoEcho; the run ends after the last account's crossing \
-         post-only, not ok, until FBC-ou9g builds the taker IOC",
+        "then, in a session of its own (FBC-ou9g), one limit IOC at the minimum size at the far \
+         touch, whose fill is flattened through Exit before that session stops; with the \
+         exact-echo gate shut the run ends NoEcho; the run ends after the last account's taker \
+         IOC, not ok, until FBC-4plj builds stage three",
         "PREFLIGHT the instrument's spec from GET /refdata on the guarded REST origin",
         "PREFLIGHT the touch from the guarded MDS origin",
         "PREFLIGHT passed: the spec, the count bound, the touch and the caps",
@@ -1331,7 +1359,10 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         report.contains(&format!("Passed, in order: {DISCOVERED}; {COUNTED}")),
         "{report}"
     );
-    assert!(report.contains("stage two's taker IOC and the stages after it are not built yet"));
+    assert!(report.contains(
+        "the run ends after the last account's taker IOC: stage three is not built yet (FBC-4plj \
+         builds it)"
+    ));
     let json = super::json(&json);
     assert_eq!(json["place_stages"]["passed"].as_array().unwrap().len(), 4);
     assert_eq!(
@@ -3103,6 +3134,53 @@ fn start_holds_the_market_lease() {
     assert!(err.starts_with("Flatten was refused: "), "{err}");
 }
 
+#[test]
+fn the_owners_flatten_takes_no_new_lease_on_an_armed_market() {
+    // FBC-ou9g: on a market Started under its lease, the owner's Flatten moves it to Exit under
+    // the lease the registry holds, taking none of its own, where a second take of that lease
+    // would be refused (decision 0148 items 3 and 5).
+    let found = spec_of(Listed::trading());
+    let (opts, places) = parsed(&parse_only()).unwrap();
+    let bounds = market::count_bound(opts.ledger.as_ref().unwrap(), &found, &places).unwrap();
+    let caps = market::place_caps(&places, &found, QUOTE).unwrap();
+    let order: OrderCaps = probe_caps().exec.unwrap().order;
+    let keys = places::lease_keys(
+        "primary",
+        &order,
+        market::INST,
+        found.spec.venue_symbol.clone(),
+    );
+    let built = ledger::PlaceRegistry::new(
+        ledger::Step::Drop,
+        "primary",
+        AccountKey::new(1),
+        &bounds,
+        opened(MonoNs(0)),
+        market::INST,
+        market::pre_trade_caps(market::INST, caps),
+        keys,
+    );
+    let ladder = LadderConfig::new(
+        Duration::from_secs(5),
+        Duration::ZERO,
+        Duration::from_secs(60),
+        2,
+    )
+    .unwrap();
+    let (mut link, _run) = built.into_link(order, ladder);
+    let seeded = link
+        .reg()
+        .seed_position(market::INST, fbc_core::SignedLots(0));
+    seeded.unwrap();
+    let (dir, _removed) = temp_dir("place-flatten-armed");
+    places::start(link.reg(), &dir, market::INST).unwrap();
+    places::flatten(link.reg(), &dir, market::INST).unwrap();
+    let entry = link.reg().entry(market::INST);
+    assert!(entry.armed());
+    let exit = fbc_oms::EntryState::Exit(fbc_oms::ExitKind::Flatten);
+    assert_eq!(entry.state(), exit);
+}
+
 // ----- FBC-23ch: drop session one -----
 
 /// [`argv`] with every wait long enough that a loaded machine never times out a read or a
@@ -3289,9 +3367,10 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     assert!(historic < last("GET /user/historic-orders"), "{what:?}");
     // Two sessions on each named account, none of which reconnected, one add_order each and no
     // cancel: X and Y alone (FBC-77r8); then each one's crossing session, its crossing post-only
-    // refused CANCELLED, so nothing to cancel (FBC-su9i).
-    assert_eq!(d.count("subscribe"), 18);
-    assert_eq!((d.count("add_order"), d.count("cancel_order")), (6, 0));
+    // refused CANCELLED, so nothing to cancel (FBC-su9i); then each one's taker IOC session, its
+    // taker IOC filled and flattened by one flatten IOC, so nothing to cancel either (FBC-ou9g).
+    assert_eq!(d.count("subscribe"), 24);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (10, 0));
     // The lines, in order.
     let lines = [
         "READ before drop session one: primary (drop)",
@@ -3306,19 +3385,19 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
         "READ after drop session one: subaccount",
         "READ before drop session two: primary (drop)",
         "SESSION primary (drop session two)",
-        "STOPPED stage two",
+        "STOPPED stage three",
     ];
     for pair in lines.windows(2) {
         assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
     }
     // X rested after the close, but the run went on to drop session two: no hand cancel, no
-    // stop and no marker, the run ending after every account's crossing post-only, naming
-    // FBC-ou9g (FBC-su9i).
+    // stop and no marker, the run ending after every account's taker IOC, naming FBC-4plj
+    // (FBC-ou9g).
     assert!(!d.printed.contains("RESTING"), "{}", d.printed);
     assert!(d.marker().is_none() && d.ev.stop.is_none());
     let stopped = d.ev.stopped.clone().unwrap();
     assert_eq!(stopped, stage::NOT_BUILT);
-    assert!(stopped.contains("FBC-ou9g"), "{stopped}");
+    assert!(stopped.contains("FBC-4plj"), "{stopped}");
     // What the session did, as the evidence keeps it.
     let run = d.drop_run();
     assert!(run.authenticated && run.resynced && run.started);
@@ -3333,7 +3412,7 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     assert_eq!((after.trades, after.trades_naming_x), (0, 0));
     assert_eq!(after.terminal_status, None);
     assert_eq!(run.as_encoded, Some(true));
-    assert_eq!(d.ev.sessions.len(), 6);
+    assert_eq!(d.ev.sessions.len(), 8);
     let session = &d.ev.sessions[0];
     assert_eq!(
         (session.label(), session.account),
@@ -3354,14 +3433,28 @@ async fn every_place_is_the_minimum_size() {
     // X and Y on each named account (FBC-77r8), each at the instrument's minimum size (one lot of
     // 0.01), a post-only GTC on --side, --away-bps (50) behind the bid of 100.00, snapped onto
     // the cent grid; then each one's crossing post-only (FBC-su9i), at the minimum size too, at
-    // the far touch, the ask of 100.10.
-    assert_eq!(model.orders.len(), 6);
+    // the far touch, the ask of 100.10; then each one's taker IOC (FBC-ou9g), a limit IOC at the
+    // minimum size at the far touch too, and its flatten IOC, a limit IOC at the minimum size on
+    // the other side.
+    assert_eq!(model.orders.len(), 10);
     for (n, x) in model.orders.iter().enumerate() {
         assert_eq!(x.quantity, Decimal::new(1, 2));
-        assert_eq!((x.kind.as_str(), x.tif.as_str()), ("ALO", "GTC"));
-        assert_eq!(x.side, "BUY");
-        let price = if n < 4 { "99.5" } else { "100.1" };
-        assert_eq!(x.price, super::json(price));
+        let (kind, side) = match n {
+            0..4 => (("ALO", "GTC"), "BUY"),
+            4 | 7 => (("ALO", "GTC"), "BUY"),
+            5 | 8 => (("LIMIT", "IOC"), "BUY"),
+            _ => (("LIMIT", "IOC"), "SELL"),
+        };
+        assert_eq!((x.kind.as_str(), x.tif.as_str()), kind, "{n}");
+        assert_eq!(x.side, side, "{n}");
+        let price = match n {
+            0..4 => Some("99.5"),
+            4 | 5 | 7 | 8 => Some("100.1"),
+            _ => None,
+        };
+        if let Some(price) = price {
+            assert_eq!(x.price, super::json(price));
+        }
     }
     // The registry's list held it, and the codec's place-stage key admits it only at the
     // minimum (decision 0148 item 4).
@@ -3425,12 +3518,21 @@ async fn each_session_arms_under_an_authority_for_its_own_account() {
         model.conns.iter().filter(|(_, c)| c.armed).collect();
     armed.sort_by_key(|(n, _)| **n);
     // Each drop test's two sessions armed on its own account, as their authentication named it:
-    // the primary account's, then the subaccount's (FBC-77r8); then each crossing session, on
-    // its own account too (FBC-su9i).
+    // the primary account's, then the subaccount's (FBC-77r8); then each crossing session and
+    // taker IOC session, on its own account too (FBC-su9i, FBC-ou9g).
     let accounts: Vec<Option<&str>> = armed.iter().map(|(_, c)| c.account.as_deref()).collect();
     assert_eq!(
         accounts,
-        [None, None, Some(SUB), Some(SUB), None, Some(SUB)]
+        [
+            None,
+            None,
+            Some(SUB),
+            Some(SUB),
+            None,
+            None,
+            Some(SUB),
+            Some(SUB)
+        ]
     );
     assert!(armed.iter().all(|(_, c)| c.session));
     let arms =
@@ -3464,12 +3566,12 @@ async fn a_registrys_trip_reaches_the_journal_before_any_market_arms() {
     assert!(d.printed.contains(
         "its CancelOnlyTrip given to the journal before any market arms (decision 0139)"
     ));
-    // One drop registry per named account (FBC-77r8), then one cross registry each (FBC-su9i),
-    // whose trip is given before its market arms too.
+    // One drop registry per named account (FBC-77r8), then one cross registry (FBC-su9i) and
+    // one take registry (FBC-ou9g) each, whose trip is given before its market arms too.
     let registries = &d.ev.place_registries;
     let steps: Vec<ledger::Step> = registries.iter().map(|r| r.step).collect();
-    use ledger::Step::{Cross, Drop};
-    assert_eq!(steps, [Drop, Drop, Cross, Cross]);
+    use ledger::Step::{Cross, Drop, Take};
+    assert_eq!(steps, [Drop, Drop, Cross, Take, Cross, Take]);
     for registry in registries {
         assert_eq!(registry.declaration, ledger::PLACES_DECLARATION);
     }
@@ -3504,8 +3606,9 @@ async fn the_seed_follows_clean_reads_of_every_named_account() {
     let sub = d.at("READ before drop session one: subaccount (drop)");
     assert!(d.at("VERDICT drop test on primary") < sub);
     assert!(sub < d.at("REGISTRY drop on subaccount"));
-    // And each one's cross registry once, after clean reads of every named account (FBC-su9i).
-    assert_eq!(d.printed.matches("seeded flat").count(), 4);
+    // And each one's cross and take registries once each, after clean reads of every named
+    // account (FBC-su9i, FBC-ou9g).
+    assert_eq!(d.printed.matches("seeded flat").count(), 6);
     let cross = d.at("READ before the crossing session: subaccount");
     assert!(cross < d.at("REGISTRY cross on primary"));
     // An account that does not read clean stops the run before any registry is built, so
@@ -3539,11 +3642,11 @@ async fn no_two_sessions_are_ever_open() {
     // and the reads' sockets never arm or subscribe.
     let model = d.venue.model.lock().unwrap();
     assert!(!model.overlapped);
-    // Two sessions on each named account (FBC-77r8), then one crossing session each (FBC-su9i),
-    // one after the other.
+    // Two sessions on each named account (FBC-77r8), then one crossing session (FBC-su9i) and
+    // one taker IOC session (FBC-ou9g) each, one after the other.
     let sessions = model.conns.values().filter(|c| c.session).count();
-    assert_eq!(sessions, 6);
-    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 6);
+    assert_eq!(sessions, 8);
+    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 8);
 }
 
 #[tokio::test]
@@ -3575,14 +3678,15 @@ async fn before_the_echo_each_session_places_at_most_one_order() {
     };
     let d = dropped(model, "drop-one-place").await;
     // Y's ACK echoed exactly, so each crossing session placed its one crossing post-only too
-    // (FBC-su9i).
-    assert_eq!(d.places_by_session(), [1; 6]);
+    // (FBC-su9i), and each taker IOC session its taker IOC and the one flatten IOC its fill
+    // needed (FBC-ou9g).
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1, 2, 1, 2]);
     let run = d.drop_run();
     assert!(!run.x.acked && !run.x.exact_echo, "{run:?}");
     assert_eq!(run.x.outcome.as_deref(), Some("Unknown"));
-    // And with the echo: still one a session, X or Y (FBC-77r8).
+    // And with the echo: still one a session, X or Y (FBC-77r8), then as above.
     let d = dropped(QfexModel::default(), "drop-one-place-echoed").await;
-    assert_eq!(d.places_by_session(), [1; 6]);
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1, 2, 1, 2]);
     assert!(d.drop_run().x.exact_echo);
 }
 
@@ -3598,9 +3702,10 @@ async fn the_probe_authorizes_no_place_beyond_a_registrys_list() {
     assert_eq!(refused, places::Stop::BeyondList);
     assert!(refused.marks() && !refused.cancels_in_drop(false));
     // A run spends its list: X and Y alone reached QFEX from the drop registries, once each on
-    // each named account, and one crossing post-only from each cross registry (FBC-su9i).
+    // each named account, one crossing post-only from each cross registry (FBC-su9i), and one
+    // taker IOC and one flatten IOC from each take registry (FBC-ou9g).
     let d = dropped(QfexModel::default(), "drop-list").await;
-    assert_eq!(d.count("add_order"), 6);
+    assert_eq!(d.count("add_order"), 10);
     assert_eq!(d.ev.place_registries[0].step, Step::Drop);
     // Its list holds X and Y once: a third resting place is beyond it.
     assert_eq!(allowance.take(Step::Drop, ledger::Y), Ok(()));
@@ -3714,7 +3819,8 @@ async fn stop_on_an_order_event_without_our_client_id() {
 #[tokio::test]
 async fn stop_on_a_fill_without_our_client_id() {
     // After X's ACK, X filled whole, its fill_response naming no client id: a fill of ours, so
-    // the drop session cancels (0151 item 2), with nothing left to cancel.
+    // the drop session flattens it and cancels (0151 items 2 and 9), with nothing left to
+    // cancel.
     let model = QfexModel {
         stray_fill: true,
         ..QfexModel::default()
@@ -3722,6 +3828,9 @@ async fn stop_on_a_fill_without_our_client_id() {
     let d = dropped(model, "drop-no-cid-fill").await;
     assert_stopped(&d, places::Stop::NotOurCid);
     let run = d.drop_run();
+    // Counted on X by its venue id, it is a fill of ours the session flattens while open (0151
+    // item 9), the run's stop still the first raised.
+    assert_flattened(run.flatten.as_ref().expect("a flatten"), 0);
     let cancels = run.cancels.as_ref().expect("a fill of ours cancels");
     assert_eq!(cancels.sent, 0);
     assert!(cancels.ended && !cancels.held);
@@ -3745,7 +3854,7 @@ async fn stop_on_a_stray_order_response() {
 
 /// A `Link` under a [`places::PlaceHandler`], as drop session one builds them, its fill ledger
 /// keeping `max_entries` fills, its watermark well before every fill time the tests give.
-fn handled(max_entries: usize) -> (places::PlaceHandler, Rc<RefCell<link::Link>>) {
+pub(super) fn handled(max_entries: usize) -> (places::PlaceHandler, Rc<RefCell<link::Link>>) {
     let config = fbc_oms::LedgerConfig {
         max_age: Duration::from_secs(601),
         max_entries,
@@ -3774,7 +3883,11 @@ fn handled(max_entries: usize) -> (places::PlaceHandler, Rc<RefCell<link::Link>>
 
 /// `fill` as a session hands it, the `n`th input, timed by the matching engine at `exch` when
 /// given.
-fn fill_env(n: u64, fill: fbc_core::FillEvent, exch: Option<i64>) -> Envelope<fbc_core::ExecEvent> {
+pub(super) fn fill_env(
+    n: u64,
+    fill: fbc_core::FillEvent,
+    exch: Option<i64>,
+) -> Envelope<fbc_core::ExecEvent> {
     Envelope {
         stamp: Stamp {
             ingest_seq: n,
@@ -4403,10 +4516,12 @@ async fn the_span_bound_in_the_drop_test_cancels_nothing_and_fails_it() {
 }
 
 #[tokio::test]
-async fn a_maker_fill_of_x_in_drop_session_one_stops_with_cancels_not_flat() {
-    // After X's ACK, X fills whole as a maker: a fill of ours, so the session cancels by venue
-    // id (nothing of ours is left to cancel), closes gracefully, and the reads after it show a
-    // position: the run stops not flat (FBC-ou9g adds the flatten, 0151 item 9).
+async fn a_maker_fill_of_x_in_drop_session_one_is_flattened_then_stops() {
+    // After X's ACK, X fills whole as a maker: a fill of ours other than the taker IOC's and the
+    // flatten IOCs', so, the session still open, the flatten (0151 item 9): no other order of
+    // ours to cancel, the owner's Flatten into Exit, one reducing limit IOC at the minimum size
+    // within the cap, filled against the bid, REST flat; then the session's Stop and a graceful
+    // close, and the run stops UnexpectedFill, flat.
     let model = QfexModel {
         maker_fill: true,
         ..QfexModel::default()
@@ -4414,19 +4529,98 @@ async fn a_maker_fill_of_x_in_drop_session_one_stops_with_cancels_not_flat() {
     let d = dropped(model, "drop-maker-fill").await;
     assert_stopped(&d, places::Stop::UnexpectedFill);
     let run = d.drop_run();
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_flattened(flatten, 0);
+    assert_eq!(flatten.after, flatten::AFTER_FILL);
+    // The Stop after it cancels nothing more, and the session closes gracefully.
     let cancels = run.cancels.as_ref().expect("a fill of ours cancels");
-    assert!(cancels.ended && !cancels.held);
+    assert!(
+        cancels.ended && !cancels.held && cancels.sent == 0,
+        "{cancels:?}"
+    );
     assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.count("add_order"), 2, "{:?}", d.what());
+    assert_eq!(d.count("cancel_order"), 0, "{:?}", d.what());
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
     let after = (d.ev.reads.iter())
         .find(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "primary (drop)")
         .unwrap();
-    assert!(!after.flat);
+    assert!(after.flat, "{after:?}");
     // X filled is named by a trade since its send and ended FILLED on historic orders.
     let x = run.after.as_ref().unwrap();
-    assert_eq!(x.trades_naming_x, 1);
     assert_eq!(x.terminal_status.as_deref(), Some("FILLED"));
     let steps: Vec<&str> = run.compared.iter().map(|c| c.step).collect();
     assert_eq!(steps, ["the stop's cancels"]);
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains("#### The flatten (FBC-ou9g; decision 0148 item 5, 0151 item 9)"),
+        "{report}"
+    );
+    assert!(report.contains("  - IOC 1 (sell): filled whole, its fills settled"));
+    assert!(report.contains(&format!("- How it ended: {}", flatten.ended())));
+    let entry = &json["drop_tests"][0]["session_one"]["flatten"];
+    assert_eq!(entry["rest_flat"], true);
+    assert_eq!(entry["iocs"][0]["came_back"], flatten::Ioc::Filled.says());
+    assert!(
+        d.printed.contains("FLATTENED on primary: flat"),
+        "{}",
+        d.printed
+    );
+    // The drop-production/ slice, the flatten IOC's frames in it, passed the privacy check.
+    assert!(
+        d.ev.errors.is_empty() && !d.ev.fixtures.is_empty(),
+        "{:?}",
+        d.ev.errors
+    );
+}
+
+/// Asserts `flatten` ran its course flat: `cancels` cancels seen to end, the owner's Flatten
+/// into Exit, every IOC sent filled whole, the registry flat and REST flat, no stop of its own.
+fn assert_flattened(flatten: &flatten::FlattenRun, cancels: usize) {
+    let c = flatten.cancels.as_ref().expect("its cancels");
+    assert!(c.ended && !c.held && c.sent == cancels, "{flatten:?}");
+    assert_eq!(flatten.exit, Some(true), "{flatten:?}");
+    assert!(!flatten.iocs.is_empty(), "{flatten:?}");
+    for ioc in &flatten.iocs {
+        assert!(ioc.sent, "{flatten:?}");
+        assert_eq!(ioc.came_back, Some(flatten::Ioc::Filled), "{flatten:?}");
+    }
+    assert!(flatten.flat && flatten.rest_flat, "{flatten:?}");
+    assert_eq!((flatten.stop, &flatten.error), (None, &None), "{flatten:?}");
+    assert_eq!(flatten.blocked, None);
+}
+
+/// Asserts the model's limit IOCs, the flatten's, are each a reducing order on `sides`, in
+/// order, at the instrument's minimum size, with no reduce-only flag, priced at most the run's
+/// --flatten-cap-bps (10) through the model's touch it crosses and still crossing it.
+fn assert_flatten_iocs_within_the_cap(d: &Dropped, sides: &[&str]) {
+    let model = d.venue.model.lock().unwrap();
+    let iocs: Vec<&model::Order> = (model.orders.iter())
+        .filter(|o| o.kind == "LIMIT" && o.tif == "IOC")
+        .collect();
+    let got: Vec<&str> = iocs.iter().map(|o| o.side.as_str()).collect();
+    assert_eq!(got, sides);
+    let touch = |side: Option<(&str, &str)>| Decimal::from_str(side.unwrap().0).unwrap();
+    let (bid, ask) = (touch(model.touch.bid), touch(model.touch.ask));
+    let cap = Decimal::new(10, 4);
+    for ioc in iocs {
+        assert_eq!(ioc.quantity, Decimal::new(1, 2), "the minimum size");
+        let px = Decimal::from_str(&ioc.price.to_string()).unwrap();
+        match ioc.side.as_str() {
+            "SELL" => assert!(px <= bid && px >= bid * (Decimal::ONE - cap), "{px}"),
+            _ => assert!(px >= ask && px <= ask * (Decimal::ONE + cap), "{px}"),
+        }
+    }
+    drop(model);
+    // No add_order the run sent carried a reduce-only flag (decision 0148 item 4).
+    let journal = d.dir.join("evidence").join("journal");
+    let reader = fbc_journal::JournalReader::open(&journal, 0).unwrap();
+    for e in reader.entries() {
+        if let fbc_journal::Record::Outbound { frame, .. } = e.unwrap().record {
+            let text = String::from_utf8_lossy(frame.bytes()).into_owned();
+            assert!(!text.contains("reduce_only"), "{text}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -4617,16 +4811,18 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
     drop(model);
     // Every synthetic value the run met: the credentials and the subaccount's id, X's and Y's
     // venue ids and client ids on both accounts, and the crossing post-only's (FBC-su9i), the
-    // user id QFEX's frames name, their prices and size, both caps, the symbol and the
-    // namespace.
+    // taker IOC's and its flatten IOC's (FBC-ou9g), the user id QFEX's frames name, their prices
+    // and size, both caps, the symbol and the namespace.
     let mut values: Vec<String> = [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB, model::USER_ID]
         .map(str::to_owned)
         .to_vec();
-    assert_eq!(orders.len(), 6);
+    assert_eq!(orders.len(), 10);
     for order in &orders {
-        values.extend([order.id.clone(), order.cid.clone()]);
+        values.extend([order.id.clone(), order.cid.clone(), order.price.to_string()]);
     }
-    values.extend(["99.5", "100.1", "0.01"].map(str::to_owned));
+    // The fee amount the model writes in every fill_response and trades row (FBC-ou9g): only
+    // its sign reaches an output.
+    values.extend(["99.5", "100.1", "0.01", "0.001"].map(str::to_owned));
     values.extend(["424242", "373737", SYMBOL, "61437"].map(str::to_owned));
     // The report, the evidence and the drop-production/ slice the owner commits.
     let evidence = d.dir.join("evidence");
@@ -4666,7 +4862,7 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
     }
     assert!(d.printed.lines().next().unwrap().contains("424242.17"));
     // The journal, which stays local (decision 0006), keeps each add_order as written.
-    assert_eq!(written(&d, "add_order"), [true; 6]);
+    assert_eq!(written(&d, "add_order"), [true; 10]);
     // Each output passes scripts/privacy-check.sh, each slice by the run itself.
     assert_report_and_evidence_pass_the_privacy_check(&evidence);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
@@ -5188,7 +5384,10 @@ async fn a_fill_of_ours_while_the_close_waits_for_room_cancels_x_before_the_clos
     // while it waits, half of X fills as a maker, the rest resting: a fill of ours, so the
     // stop it raises cancels (0151 item 2), Kill, X's rest by its venue id and the disarm,
     // once there is room and before the graceful close. X is ten lots of 0.001 here, so half
-    // of it can fill.
+    // of it can fill. Since FBC-ou9g that fill is flattened too, after the cancels and before
+    // the disarm and the close (0151 item 9): half of the minimum size is below it, so no IOC
+    // is placed and the run stops `Flatten(BelowMinimum)`, the flatten's own stop in place of
+    // the fill's.
     let rate_user = user();
     let model = QfexModel {
         listed: vec![model::Listed {
@@ -5202,7 +5401,8 @@ async fn a_fill_of_ours_while_the_close_waits_for_room_cancels_x_before_the_clos
     let wait = |argv| set(argv, "--agree-wait-ms", "1000");
     let d = held_drop(model, "drop-fill-at-close", rate_user, wait).await;
     assert_eq!(d.drop_run().compared[0].ended, compare::Ended::Unread);
-    assert_stopped(&d, places::Stop::UnexpectedFill);
+    let below = places::Stop::Flatten(places::Flattening::BelowMinimum);
+    assert_stopped(&d, below);
     assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
     let run = d.drop_run();
     let cancels = run.cancels.as_ref().expect("a fill of ours cancels");
@@ -5212,10 +5412,16 @@ async fn a_fill_of_ours_while_the_close_waits_for_room_cancels_x_before_the_clos
     );
     assert_eq!(run.ended_by, Some(stage::GRACEFUL));
     assert!(!run.x_resting && run.close_cancelled_x.is_none(), "{run:?}");
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    assert_eq!(d.count("add_order"), 1, "no flatten IOC: {:?}", d.what());
+    let lifted = d.at("FLATTEN on primary: the Stop's Kill lifted");
     let cancels = d.at(
         "STOP cancels: Kill, then 1 cancels by venue id (0151 item 2), every order they named \
          seen to end; the market disarmed",
     );
+    assert!(d.at("COMPARE after the stop's cancels") < lifted);
+    assert!(lifted < cancels);
     assert!(cancels < d.at(&format!("ended by {}", stage::GRACEFUL)));
     let model = d.venue.model.lock().unwrap();
     assert_eq!(model.orders[0].state, model::State::Cancelled);
@@ -5223,6 +5429,46 @@ async fn a_fill_of_ours_while_the_close_waits_for_room_cancels_x_before_the_clos
     let at = |what: &str| model.log.iter().position(|e| e.what.contains(what));
     let (cancel, close) = (at(" cancel_order").unwrap(), at("cod ").unwrap());
     assert!(cancel < close, "{:?}", model.log);
+}
+
+#[tokio::test]
+async fn a_late_flatten_ages_a_touch_heard_while_the_close_waited_from_its_arrival() {
+    // As QFEX reads X the shared budget is held for 5 s, so the comparison after X's place reads
+    // nothing within its one second and the close waits for room. QFEX's clock runs an hour
+    // ahead of the probe's, so a touch's stamp ages it by nothing and only its arrival does. The
+    // touch is pushed again at the first trade-socket authentication, so X is priced from a
+    // fresh one, and again 2 s after X's place, while the close waits; at 2.5 s X fills whole as
+    // a maker. The MDS touch is read while the close waits, so the touch heard at 2 s is aged
+    // from then: once there is room and the stop's cancels ran, it is older than
+    // --touch-max-age-ms, 2500 ms, so the late flatten sends no IOC, Flatten(NoTouch), and the
+    // position is left to the owner.
+    let rate_user = user();
+    let ahead = model::Touch {
+        age_secs: -3600,
+        ..model::Touch::fresh()
+    };
+    let model = QfexModel {
+        touch: ahead.clone(),
+        touch_moves: Some(ahead),
+        touch_after: Some(Duration::from_secs(2)),
+        hold_on_place: Some((shared_limiter(rate_user), Duration::from_secs(5))),
+        fill_after: Some(Duration::from_millis(2500)),
+        ..QfexModel::default()
+    };
+    let argv = |argv| {
+        let argv = set(argv, "--agree-wait-ms", "1000");
+        set(argv, "--touch-max-age-ms", "2500")
+    };
+    let d = held_drop(model, "drop-touch-at-close", rate_user, argv).await;
+    let stop = places::Stop::Flatten(places::Flattening::NoTouch);
+    let flatten = assert_flatten_stopped(&d, stop, 0);
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    assert_eq!((flatten.exit, flatten.iocs.len()), (Some(true), 0));
+    assert_eq!(flatten.error.as_deref(), Some(STALE));
+    assert_eq!(d.count("add_order"), 1, "no flatten IOC: {:?}", d.what());
+    let run = d.drop_run();
+    assert_eq!(run.compared[0].ended, compare::Ended::Unread);
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
 }
 
 #[tokio::test]
@@ -6633,9 +6879,10 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
             .position(|e| e == w)
             .unwrap_or_else(|| panic!("{w}: {what:?}"))
     };
-    // The drop test's two sessions, then the crossing session (FBC-su9i).
+    // The drop test's two sessions, then the crossing session (FBC-su9i) and the taker IOC
+    // session (FBC-ou9g).
     let conns = d.session_conns();
-    assert_eq!(conns.len(), 3, "{what:?}");
+    assert_eq!(conns.len(), 4, "{what:?}");
     let (one, two) = (&conns[0], &conns[1]);
     let on = |conn: &str, kind: &str| at(&format!("trade {conn} {kind}"));
     // Session one: its arm, X, its graceful close.
@@ -6685,13 +6932,14 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
         .filter(|w| w.ends_with(" cancel_on_disconnect"))
         .count();
     assert_eq!(arms, 2, "{what:?}");
-    assert_eq!(d.count("subscribe"), 9);
+    assert_eq!(d.count("subscribe"), 12);
     let attempts: Vec<(u64, u64)> = (d.ev.sessions.iter())
         .map(|s| (s.attempts, s.failed_attempts))
         .collect();
-    assert_eq!(attempts, [(1, 0), (1, 0), (1, 0)]);
+    assert_eq!(attempts, [(1, 0); 4]);
     let ended: Vec<&str> = d.ev.sessions.iter().map(|s| s.ended_by).collect();
-    assert_eq!(ended, [stage::GRACEFUL, stage::DROPPED, stage::GRACEFUL]);
+    let graceful = stage::GRACEFUL;
+    assert_eq!(ended, [graceful, stage::DROPPED, graceful, graceful]);
     // The abrupt drop sent no WebSocket close; every other socket was closed.
     let n: usize = two.parse().unwrap();
     assert!(!d.venue.trade.connections()[n].client_closed);
@@ -6706,7 +6954,7 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
         "READ after the drop: primary:",
         "VERDICT drop test on primary: passed",
         "READ after drop session two: primary (drop)",
-        "STOPPED stage two",
+        "STOPPED stage three",
     ];
     for pair in lines.windows(2) {
         assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
@@ -6726,14 +6974,15 @@ async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
     .await;
     // One drop registry for the account, built, tripped and seeded once, whose ledger is read at
     // the end of each of its two sessions (decision 0148 item 3); the cross registry after it is
-    // the account's next (FBC-su9i).
-    assert_eq!(d.ev.place_registries.len(), 2);
+    // the account's next (FBC-su9i), then the take registry (FBC-ou9g).
+    assert_eq!(d.ev.place_registries.len(), 3);
     assert_eq!(d.ev.place_registries[1].step, ledger::Step::Cross);
+    assert_eq!(d.ev.place_registries[2].step, ledger::Step::Take);
     let ends = &d.ev.place_registries[0].registry_run().ends;
     let sessions: Vec<&str> = ends.iter().map(|e| e.session).collect();
     assert_eq!(sessions, [places::DROP_ONE, places::DROP_TWO]);
     assert_eq!(d.printed.matches("REGISTRY drop on primary").count(), 1);
-    assert_eq!(d.printed.matches("seeded flat").count(), 2);
+    assert_eq!(d.printed.matches("seeded flat").count(), 3);
     // Started once, by drop session one: drop session two's market stays armed.
     assert_eq!(d.printed.matches("START primary").count(), 1);
     assert!(d.at("REGISTRY drop on primary") < d.at("SESSION primary (drop session one)"));
@@ -6745,7 +6994,8 @@ async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
         [
             ("primary", places::DROP_ONE),
             ("primary", places::DROP_TWO),
-            ("primary", places::CROSS)
+            ("primary", places::CROSS),
+            ("primary", places::TAKE)
         ]
     );
     // Y went out through the same Link and registry: the market Started in session one placed
@@ -6776,13 +7026,16 @@ async fn the_drop_cancels_x_and_y_and_the_test_passes() {
         let clean = places::OthersClean::Clean;
         assert_eq!((run.stop, run.others_clean), (None, clean));
     }
+    // Every post-only order ended cancelled; the taker IOCs and their flatten IOCs filled
+    // (FBC-ou9g).
     let model = d.venue.model.lock().unwrap();
+    let post_only = model.orders.iter().filter(|o| o.kind == "ALO");
     assert!(
-        model
-            .orders
-            .iter()
+        post_only
+            .clone()
             .all(|o| o.state == model::State::Cancelled)
     );
+    assert_eq!(post_only.count(), 6);
     drop(model);
     assert_eq!((d.ev.stop, d.marker()), (None, None));
     assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
@@ -7204,11 +7457,11 @@ async fn historic_orders_not_terminal_fails_the_drop_test() {
 }
 
 #[tokio::test]
-async fn a_fill_of_x_in_drop_session_two_stops_with_cancels_not_flat() {
+async fn a_fill_of_x_in_drop_session_two_is_flattened_then_stops() {
     // Drop session two's arm comes with a maker fill of X: a fill of ours while the session is
-    // open, so it cancels by venue id (nothing of ours is left open; Y is never placed), closes
-    // gracefully, and the reads after it show a position: the run stops not flat (FBC-ou9g adds
-    // the flatten, 0151 item 9).
+    // open, so the flatten (0151 item 9): nothing of ours left open to cancel (Y is never
+    // placed), the owner's Flatten into Exit, one reducing IOC, REST flat; then the session's
+    // Stop and a graceful close, and the run stops UnexpectedFill, flat.
     let model = QfexModel {
         fill_at_arm: Some(1),
         ..QfexModel::default()
@@ -7216,18 +7469,21 @@ async fn a_fill_of_x_in_drop_session_two_stops_with_cancels_not_flat() {
     let d = dropped(model, "drop-two-fill-x").await;
     assert_stopped(&d, places::Stop::UnexpectedFill);
     let two = d.two();
+    assert_flattened(two.flatten.as_ref().expect("a flatten"), 0);
     let cancels = two.cancels.as_ref().expect("a fill of ours cancels");
     assert!(cancels.ended && !cancels.held, "{cancels:?}");
     assert_eq!(two.ended_by, Some(stage::GRACEFUL));
     assert!(!two.y.submitted);
     assert!(d.drop_run().verdict.is_none());
-    assert_eq!(d.count("add_order"), 1);
-    // X filled whole and Y never placed: nothing of ours was left open to cancel.
+    // X and the flatten IOC; X filled whole and Y never placed: nothing of ours was left open to
+    // cancel.
+    assert_eq!(d.count("add_order"), 2);
     assert_eq!((d.count("cancel_order"), cancels.sent), (0, 0));
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
     let after = (d.ev.reads.iter())
         .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
         .unwrap();
-    assert!(!after.flat);
+    assert!(after.flat);
     assert!(
         d.ev.stopped
             .as_deref()
@@ -7238,7 +7494,7 @@ async fn a_fill_of_x_in_drop_session_two_stops_with_cancels_not_flat() {
     );
     let steps: Vec<&str> = two.compared.iter().map(|c| c.step).collect();
     assert_eq!(steps, ["the stop's cancels"]);
-    let (report, _) = d.outputs();
+    let (report, json) = d.outputs();
     assert!(
         report.contains(
             "- The drop test: not judged: the drop test ended before its drop (decision 0132 \
@@ -7246,6 +7502,91 @@ async fn a_fill_of_x_in_drop_session_two_stops_with_cancels_not_flat() {
         ),
         "{report}"
     );
+    let entry = &json["drop_tests"][0]["session_two"]["flatten"];
+    assert_eq!(entry["rest_flat"], true);
+}
+
+#[tokio::test]
+async fn a_fill_heard_during_drop_session_twos_resync_is_flattened_once_it_may_place() {
+    // FBC-23ch's third review fix carried to the flatten: drop session two's arm fills X as a
+    // maker, but the fill's frames reach the session only with its resync's first page, as a
+    // kernel holding them for the client's acknowledgement sends them once the client writes.
+    // A place before the resync's end is NotSent(Disconnected) (decision 0058), so the flatten
+    // waits for the session's place gate before its IOC: one reducing IOC, REST flat, and the
+    // run stops UnexpectedFill, flat, as when the fill comes with the arm. The model holds the
+    // page that ends the resync until the flatten says it waits for the gate, so the IOC can go
+    // out only through that wait.
+    let model = QfexModel {
+        fill_in_resync: Some(1),
+        resync_page_held: true,
+        ..QfexModel::default()
+    };
+    let (dir, removed) = temp_dir("drop-two-fill-in-resync");
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let ran = stage::run_places(&opts, &places, &lookup, out);
+    tokio::pin!(ran);
+    let gate = format!("FLATTEN on primary: {}", stage::PLACE_GATE);
+    let release = async {
+        until("the flatten's wait for the gate", || {
+            printed.text().contains(&gate)
+        })
+        .await;
+        venue.release_held().await;
+        std::future::pending::<()>().await
+    };
+    let ran = tokio::select! {
+        ran = &mut ran => ran,
+        () = release => unreachable!("the release never ends"),
+    };
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    assert!(d.printed.contains(&gate), "{}", d.printed);
+    let two = d.two();
+    let flatten = two.flatten.as_ref().expect("a flatten");
+    assert_flattened(flatten, 0);
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(!two.y.submitted);
+    assert_eq!(d.count("add_order"), 2);
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+    assert!(
+        d.printed.contains("FLATTENED on primary: flat"),
+        "{}",
+        d.printed
+    );
+}
+
+#[tokio::test]
+async fn a_taker_iocs_final_order_response_after_its_fill_is_awaited_for_the_frame_order() {
+    // FBC-23ch's third review fix carried to the taker IOC: QFEX fills the taker IOC whole, its
+    // fill_response first and its FILLED order_response 300 ms later (--rpc-timeout-ms is 600),
+    // as a frame held behind another can come. The fill alone ends it whole in the take
+    // registry, so the wait goes on for the final order_response, and the frame order
+    // (FBC-tfxk) is read on both frames.
+    let model = QfexModel {
+        ioc_order_after: Some(Duration::from_millis(300)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-order-late").await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    for n in 0..2 {
+        let taken = d.take(n).taken.as_ref().expect("the taker IOC");
+        assert_eq!(taken.ioc, Some(flatten::Ioc::Filled));
+        assert_eq!(taken.frame_order, Some(taker::FrameOrder::FillFirst), "{n}");
+    }
 }
 
 #[tokio::test]
@@ -7530,8 +7871,9 @@ async fn the_report_gives_each_accounts_drop_items_and_the_slice_passes_the_priv
     }
     // Every session's capture is whole, drop session two's, which journals no Closed control,
     // included; its frames are in the drop-production/ slice, which passes the privacy check.
-    // The crossing sessions' frames are in the places-production/ slice (FBC-su9i).
-    assert_eq!(d.ev.sessions.len(), 6);
+    // The crossing and taker IOC sessions' frames are in the places-production/ slice (FBC-su9i,
+    // FBC-ou9g).
+    assert_eq!(d.ev.sessions.len(), 8);
     assert!(
         d.ev.sessions
             .iter()
@@ -7922,11 +8264,12 @@ async fn ctrl_c_in_drop_session_two_cancels_x_and_y_by_venue_id_and_fails_it() {
 }
 
 #[tokio::test]
-async fn a_fill_of_y_in_drop_session_two_stops_with_cancels_not_flat() {
-    // Y fills whole as a maker right after its ACK, the session open: a fill of ours, so X, the
-    // one order of ours still open, is cancelled by its venue id, the session closes gracefully
-    // with no drop, and the reads after it show the position: a stop not flat (0151 items 2 and
-    // 9; FBC-ou9g adds the flatten).
+async fn a_fill_of_y_in_drop_session_two_is_flattened_then_stops() {
+    // Y fills whole as a maker right after its ACK, the session open: a fill of ours, so the
+    // flatten (0151 items 2 and 9): X, the one order of ours still open, cancelled by its venue
+    // id and seen to end, the owner's Flatten into Exit, one reducing IOC, REST flat; then the
+    // session's Stop, with nothing left to cancel, a graceful close with no drop, and the run
+    // stops UnexpectedFill, flat.
     let model = QfexModel {
         on_ack: Some((1, model::OnAck::MakerFill)),
         ..QfexModel::default()
@@ -7935,31 +8278,38 @@ async fn a_fill_of_y_in_drop_session_two_stops_with_cancels_not_flat() {
     assert_stopped(&d, places::Stop::UnexpectedFill);
     let two = d.two();
     assert!(two.y.submitted, "{two:?}");
+    assert_flattened(two.flatten.as_ref().expect("a flatten"), 1);
     let cancels = two.cancels.as_ref().expect("a fill of ours cancels");
     assert_eq!(
         (cancels.sent, cancels.held, cancels.ended),
-        (1, false, true)
+        (0, false, true)
     );
     assert_eq!(two.ended_by, Some(stage::GRACEFUL));
     assert!(d.drop_run().verdict.is_none());
     assert_eq!(d.count("cancel_order"), 1);
-    // The model held the read pages from Y's fill until the session wrote again: the cancel the
-    // fill's stop sent released them, so the comparison after it agreed, its connection still
-    // open (FBC-77r8).
+    // The model held the read pages from Y's fill until the session wrote again: the flatten's
+    // cancel of X by its venue id, the session's first write after the fill, released them, so
+    // the comparison after the Stop's cancels agreed, its connection still open (FBC-77r8).
     let compared: Vec<_> = (two.compared.iter())
         .map(|c| c.first_agreed.is_some())
         .collect();
     assert_eq!(compared, [true], "{:?}", two.compared);
     let model = d.venue.model.lock().unwrap();
     let states: Vec<model::State> = model.orders.iter().map(|o| o.state).collect();
-    assert_eq!(states, [model::State::Cancelled, model::State::Filled]);
+    let filled = model::State::Filled;
+    assert_eq!(states, [model::State::Cancelled, filled, filled]);
     let x = model.orders[0].id.clone();
     drop(model);
     assert!(cancel_names(&d, &x), "the cancel names X by its venue id");
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
     let after = (d.ev.reads.iter())
         .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
         .unwrap();
-    assert!(!after.flat);
+    assert!(after.flat);
+    let compared: Vec<&str> = (two.flatten.as_ref().unwrap().compared.iter())
+        .map(|c| c.step)
+        .collect();
+    assert_eq!(compared, ["the flatten's cancels", "a flatten IOC"]);
     assert!(
         d.ev.stopped
             .as_deref()
@@ -8488,6 +8838,14 @@ async fn a_fill_of_ours_while_drop_session_twos_close_waits_for_room_cancels_x_a
         (2, false, true)
     );
     assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    // Since FBC-ou9g the fill is flattened too, after the cancels and before the close (0151
+    // item 9): half of the minimum size is below it, so no IOC is placed, and the refusal stays
+    // the run's stop.
+    let flatten = two.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    let below = places::Stop::Flatten(places::Flattening::BelowMinimum);
+    assert_eq!(flatten.stop, Some(below.name()), "{flatten:?}");
+    assert_eq!(d.count("add_order"), 2, "no flatten IOC: {:?}", d.what());
     assert!(two.after_drop.is_none() && d.drop_run().verdict.is_none());
     assert_eq!(d.count("cancel_order"), 2, "{:?}", d.what());
     assert!(
@@ -9575,11 +9933,21 @@ impl Dropped {
         &self.stage_two().crosses[n]
     }
 
-    /// The trade connections of the crossing sessions, in order: the sessions after the drop
-    /// tests' two each.
+    /// The trade connections of the crossing sessions, in order: after the drop tests' two
+    /// sessions each, every other session, since each account's taker IOC session follows its
+    /// crossing session (FBC-ou9g).
     fn cross_conns(&self) -> Vec<String> {
         let drops = 2 * self.ev.drops.len();
-        self.session_conns().into_iter().skip(drops).collect()
+        let conns = self.session_conns().into_iter().skip(drops);
+        conns.step_by(2).collect()
+    }
+
+    /// The trade connections of the taker IOC sessions, in order (FBC-ou9g): each the session
+    /// after its account's crossing session.
+    fn take_conns(&self) -> Vec<String> {
+        let drops = 2 * self.ev.drops.len();
+        let conns = self.session_conns().into_iter().skip(drops + 1);
+        conns.step_by(2).collect()
     }
 
     /// Whether the run's journal holds a `kind` frame it wrote naming `id`.
@@ -9599,7 +9967,9 @@ impl Dropped {
     fn crossing_orders(&self) -> Vec<model::Order> {
         let model = self.venue.model.lock().unwrap();
         let drops = 2 * self.ev.drops.len();
-        model.orders.iter().skip(drops).cloned().collect()
+        let after = model.orders.iter().skip(drops);
+        // The post-only orders alone: no taker IOC or flatten IOC (FBC-ou9g).
+        after.filter(|o| o.kind == "ALO").cloned().collect()
     }
 }
 
@@ -9659,7 +10029,19 @@ fn cross_section(report: &str, account: &str) -> String {
         .split(&heading)
         .nth(1)
         .unwrap_or_else(|| panic!("{report}"));
-    section.split("\n## ").next().unwrap().to_owned()
+    let section = section.split("\n## ").next().unwrap();
+    section.split("\n### ").next().unwrap().to_owned()
+}
+
+/// The report's section on `account`'s taker IOC session (FBC-ou9g), up to the next section.
+fn take_section(report: &str, account: &str) -> String {
+    let heading = format!("### The taker IOC on {account} (FBC-ou9g)");
+    let section = report
+        .split(&heading)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{report}"));
+    let section = section.split("\n## ").next().unwrap();
+    section.split("\n### ").next().unwrap().to_owned()
 }
 
 #[tokio::test]
@@ -9830,10 +10212,10 @@ async fn the_crossing_post_only_is_refused_and_recorded() {
                 assert_eq!(d.stage_two().crosses.len(), 2);
                 assert_eq!(d.cross(1).crossed.as_ref(), Some(&want));
                 assert_eq!(placed(&conns[1]), 1);
-                assert!(section.contains(&format!("- What followed: {}", stage_two::NEXT_CROSS)));
-                let last = cross_section(&report, "subaccount");
+                assert!(section.contains(&format!("- What followed: {}", taker::THEN_TAKE)));
+                let last = take_section(&report, "subaccount");
                 assert!(
-                    last.contains(&format!("- What followed: {}", stage_two::LAST_CROSS)),
+                    last.contains(&format!("- What followed: {}", taker::LAST_TAKE)),
                     "{last}"
                 );
             }
@@ -10336,10 +10718,11 @@ async fn the_span_bound_begins_cancels_one_rpc_timeout_early() {
 async fn the_span_bound_is_not_met_a_millisecond_before_one_rpc_timeout_early() {
     // As the test before, but the clock moved to 601 ms before the span bound: the crossing
     // post-only's deadline is due, the span bound's early instant is not, so the session runs its
-    // course, cancels by venue id as it stops, and the run ends after it with no stop.
+    // course, cancels by venue id as it stops, and the run goes on with no stop to the account's
+    // taker IOC session (FBC-ou9g), whose own course this test leaves aside.
     let d = span_run("cross-span-short", Duration::from_millis(601)).await;
     assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
     let run = d.cross(0);
     assert_eq!(run.cancels_lead, None, "{run:?}");
     assert_eq!(run.crossed, Some(stage_two::Crossed::Rested));
@@ -10687,12 +11070,15 @@ async fn the_report_lists_the_characters_exercised() {
     let places = evidence.join(stage::PLACES_SLICE);
     let readme = fs::read_to_string(places.join("README.md")).unwrap();
     assert!(
-        readme.starts_with("# QFEX trade-socket frames: stage two's crossing post-only"),
+        readme.starts_with(
+            "# QFEX trade-socket frames: stage two's crossing post-only and taker IOC"
+        ),
         "{readme}"
     );
-    assert!(
-        readme.contains("the crossing session on primary then the crossing session on subaccount")
-    );
+    assert!(readme.contains(
+        "the crossing session on primary then the taker IOC session on primary then the crossing \
+         session on subaccount then the taker IOC session on subaccount"
+    ));
     let listed = |dir: &Path| -> Vec<String> {
         let names = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name());
         names.map(|n| n.to_string_lossy().into_owned()).collect()
@@ -10792,10 +11178,12 @@ async fn an_upper_cased_echo_reads_not_byte_for_byte() {
 }
 
 #[tokio::test]
-async fn a_crossing_post_only_that_fills_stops_the_run_not_flat() {
+async fn a_crossing_post_only_that_fills_is_flattened_then_stops() {
     // QFEX fills the crossing post-only as a taker: a fill of ours other than the taker IOC's
-    // and the flatten IOCs', a stop (0151 item 9), the session cancelling by venue id first.
-    // FBC-ou9g adds the flatten; until then the run stops not flat, the position the owner's.
+    // and the flatten IOCs' (0151 item 9). The session still open, the flatten: no other order
+    // of ours to cancel, the owner's Flatten into Exit, one reducing limit IOC within the cap,
+    // filled against the bid, REST flat; then the session's Stop, every order of ours cancelled
+    // by venue id, and the run stops UnexpectedFill, flat.
     let model = QfexModel {
         alo_cross: Some(model::AloCross::Fills),
         ..QfexModel::default()
@@ -10804,14 +11192,41 @@ async fn a_crossing_post_only_that_fills_stops_the_run_not_flat() {
     assert_cross_stopped(&d, places::Stop::UnexpectedFill);
     let run = d.cross(0);
     assert_eq!(run.crossed, Some(stage_two::Crossed::Filled));
-    assert!(run.cancels.is_some(), "{run:?}");
-    let (report, _) = d.outputs();
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_flattened(flatten, 0);
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert!(
+        cancels.ended && !cancels.held && cancels.sent == 0,
+        "{cancels:?}"
+    );
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+    // The crossing post-only on the primary account alone: the stop keeps the subaccount's back.
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    let flat = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_CROSS)
+        .all(|r| r.flat);
+    assert!(flat, "{:?}", d.ev.reads);
+    let (report, json) = d.outputs();
     let section = cross_section(&report, "primary");
     assert!(section.contains(stage_two::CROSS_FILLED), "{section}");
-    let not_flat = (d.ev.reads.iter())
-        .filter(|r| r.before == refusals::AFTER_CROSS)
-        .any(|r| !r.flat);
-    assert!(not_flat, "{:?}", d.ev.reads);
+    assert!(
+        section.contains("#### The flatten (FBC-ou9g; decision 0148 item 5, 0151 item 9)"),
+        "{section}"
+    );
+    // The places-production/ slice, the flatten IOC's frames in it, passed the privacy check.
+    assert!(
+        d.ev.errors.is_empty() && !d.ev.fixtures.is_empty(),
+        "{:?}",
+        d.ev.errors
+    );
+    let places = d.dir.join("evidence").join(stage::PLACES_SLICE);
+    assert!(places.join("README.md").exists());
+    let entry = &json["stage_two"]["crossings"][0]["flatten"];
+    assert_eq!(
+        (&entry["flat"], &entry["rest_flat"]),
+        (&Value::Bool(true), &Value::Bool(true))
+    );
 }
 
 #[tokio::test]
@@ -10932,7 +11347,9 @@ async fn a_crossing_order_is_kept_back_in_a_run_while_another_order_of_ours_rest
     // own registry before its crossing post-only, and on the primary account's registry before
     // the subaccount's. Either keeps the crossing order back, a stop, LeftResting, with no
     // crossing order (decision 0148 item 6).
-    for (n, account, places_before) in [(0, "primary", 4), (1, "subaccount", 5)] {
+    // Before the subaccount's, the primary account's crossing post-only, then its taker IOC and
+    // the flatten IOC its fill needed (FBC-ou9g).
+    for (n, account, places_before) in [(0, "primary", 4), (1, "subaccount", 7)] {
         let (dir, removed) = temp_dir("cross-blocked");
         let venue = Venue::start(QfexModel::default()).await;
         let (mut opts, mut places) = parsed(&drop_argv(&dir, &venue)).unwrap();
@@ -11089,12 +11506,12 @@ async fn a_rate_refusal_in_the_reads_before_the_crossing_session_stops_the_run_m
 async fn a_stop_the_comparison_after_the_crossing_sessions_cancels_raises_ends_the_run_marked() {
     // The primary account's crossing session runs its course, its crossing post-only cancelled
     // by QFEX, so no stop comes from its steps; under Policy::Stage its Stop still cancels every
-    // order of ours by venue id and compares the streams with the reads after them. As those
-    // cancels end, the model refuses the next get_user_orders page on a read socket with a
-    // RateLimited err, or the next GET /user/positions with HTTP 429, or shows a position on the
-    // primary account that no fill made. That comparison's stop, a provider rate refusal or
-    // ReadDisagrees, is the session's: the run stops, marked, and the subaccount's crossing
-    // post-only is never placed.
+    // order of ours by venue id and compares the streams with the reads after them. As the
+    // session's steps end, before those cancels, the model refuses the next get_user_orders page
+    // on a read socket with a RateLimited err, or the next GET /user/positions with HTTP 429, or
+    // shows a position on the primary account that no fill made. That comparison's stop, a
+    // provider rate refusal or ReadDisagrees, is the session's: the run stops, marked, and the
+    // subaccount's crossing post-only is never placed.
     let cases = [
         Some(places::RefusedOn::ReadSocket),
         Some(places::RefusedOn::Rest),
@@ -11125,7 +11542,9 @@ async fn a_stop_the_comparison_after_the_crossing_sessions_cancels_raises_ends_t
         };
         let out: stage::Out = Rc::new(RefCell::new(PressAt {
             printed: printed.clone(),
-            at: "cancels by venue id (decision 0132 item 7, 0148 item 8)",
+            // Before the Stop's cancels, which read nothing: the next read is the comparison after
+            // them. Their own line comes after that comparison and the late flatten.
+            at: "CROSSED on primary",
             press: Some(Box::new(then)),
         }));
         let hold: stage::Interrupt = Box::pin(std::future::pending());
@@ -11579,4 +11998,2657 @@ async fn an_open_order_rest_alone_counts_after_a_crossing_session_stops_left_res
         stage_two::HAND_CANCEL_CROSS
     );
     assert_eq!(d.stage_two().crosses.len(), 1);
+}
+
+/// [`short_wait`], three reads, for a run whose drop test comes before the step whose wait it
+/// shortens: the drop test's reads after the drop have that wait too, and the model sees the drop
+/// only once the conformance stub has recorded the connection's end on a task of its own, which a
+/// loaded machine can put after a read made at once, so one read is not enough (FBC-4ptk). A
+/// budget held so that a later comparison reads nothing is held well past that comparison's last
+/// read, which begins 2 s after its first.
+fn wait_past_a_drop(argv: Argv) -> Argv {
+    short_wait(argv)
+}
+
+#[tokio::test]
+async fn a_fill_of_ours_while_the_crossing_sessions_close_waits_for_room_is_flattened_first() {
+    // The crossing post-only rests, and QFEX finds it filled whole as a maker as the Stop's
+    // cancel of it arrives, the run's first: the FILLED order_response ends it at once, the
+    // cancel answered NO_SUCH_ORDER after it, and the fill_response follows 4 s later. As QFEX
+    // reads that cancel the shared budget is held for 6 s, so, the cancels ended and the market
+    // disarmed, the graceful close waits for room (0151 item 11): the comparison after the
+    // cancels, when the NO_SUCH_ORDER did not hold them first, reads nothing within its wait.
+    // The fill reaches the session as the close waits, after the Stop's cancels and the disarm: it
+    // is flattened once there is room and before the close (0151 item 9), the owner's Flatten
+    // taking the market lease again to put the market in Exit, one reducing limit IOC filled,
+    // and the market disarmed again after it. The run stops UnexpectedFill, flat.
+    let rate_user = user();
+    let model = QfexModel {
+        hold_on_cancel: Some((shared_limiter(rate_user), Duration::from_secs(6))),
+        fill_on_cancel: true,
+        fill_on_cancel_after: Some(Duration::from_secs(4)),
+        ..resting_cross()
+    };
+    let d = held_drop(model, "cross-fill-at-close", rate_user, wait_past_a_drop).await;
+    assert_cross_stopped(&d, places::Stop::UnexpectedFill);
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    let run = d.cross(0);
+    assert_eq!(run.crossed, Some(stage_two::Crossed::Rested));
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!(
+        (cancels.sent, cancels.blocked, cancels.ended),
+        (1, false, true)
+    );
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    assert_flattened(flatten, 0);
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    // The disarm, then the flatten, then the disarm again, all before the session's end.
+    let lines = [
+        "STOP cancels: Kill, then 1 cancels by venue id (decision 0132 item 7, 0148 item 8)",
+        "FLATTEN on primary: the Stop's Kill lifted",
+        "FLATTEN on primary: the owner's Flatten, the market in Exit",
+        "FLATTENED on primary: flat",
+        "FLATTEN on primary: the market disarmed again, as the Stop left it",
+        "SESSION primary (the crossing session): arm outcome Accepted, ended by a graceful close",
+    ];
+    for pair in lines.windows(2) {
+        assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
+    }
+    let flat = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_CROSS)
+        .all(|r| r.flat);
+    assert!(flat, "{:?}", d.ev.reads);
+}
+
+// ----- FBC-ou9g: the flatten, reached from every registry (decision 0148 items 5, 6, 8 and 9,
+// 0151 items 5, 8 and 9), run against the model -----
+
+/// The model's default, but X filled whole as a maker right after its ACK, and every limit IOC
+/// answered as `ioc` says.
+fn maker_filled(ioc: model::IocAnswer) -> QfexModel {
+    QfexModel {
+        maker_fill: true,
+        ioc,
+        ..QfexModel::default()
+    }
+}
+
+/// [`dropped_with`], with the test's `hooks` set on the run (`probe_args::TestHooks`).
+async fn hooked(
+    model: QfexModel,
+    what: &str,
+    argv: impl Fn(Argv) -> Argv,
+    hooks: probe_args::TestHooks,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, mut places) = parsed(&argv(drop_argv(&dir, &venue))).unwrap();
+    places.test = hooks;
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let ran = stage::run_places(&opts, &places, &lookup, out).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+/// `argv` with `--flatten-attempts` set to `n`.
+fn attempts(n: &'static str) -> impl Fn(Argv) -> Argv {
+    move |argv| set(argv, "--flatten-attempts", n)
+}
+
+/// How many times the model logged `event`.
+fn events(d: &Dropped, event: &str) -> usize {
+    d.what().iter().filter(|w| *w == event).count()
+}
+
+/// Asserts drop session one's flatten stopped with `stop`, the run's stop, not flat, after
+/// `sent` flatten IOCs; the account read not flat after the session; its record, its report
+/// section and stdout saying so. Gives the flatten.
+fn assert_flatten_stopped(d: &Dropped, stop: places::Stop, sent: usize) -> &flatten::FlattenRun {
+    assert_stopped(d, stop);
+    let flatten = d.drop_run().flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.stop, Some(stop.name()), "{flatten:?}");
+    assert!(!flatten.flat && !flatten.rest_flat, "{flatten:?}");
+    assert_eq!(flatten.sent(), sent, "{flatten:?}");
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "primary (drop)")
+        .unwrap();
+    assert!(!after.flat, "{after:?}");
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(&format!("- How it ended: {}", flatten.ended())),
+        "{report}"
+    );
+    let when = format!("{} in drop session one", stop.name());
+    assert!(
+        d.ev.stopped.as_deref().unwrap().starts_with(&when),
+        "{:?}",
+        d.ev.stopped
+    );
+    flatten
+}
+
+#[tokio::test]
+async fn a_flatten_past_its_cap_is_not_sent_and_stops_capped() {
+    // As X goes out, the touch's bid turns zero: once X fills as a maker, no positive price on
+    // the grid is within --flatten-cap-bps of that bid, so the flatten IOC is not sent and the
+    // run stops Flatten(Capped), not flat, the position the owner's (decision 0148 items 5 and
+    // 8). The cap held on a grid coarser than the touch is `flatten_run.rs`'s.
+    let zero_bid = model::Touch {
+        bid: Some(("0.00", "1.00")),
+        ask: Some(("100.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        maker_fill: true,
+        touch_on_place: Some((0, zero_bid)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "flatten-capped").await;
+    let capped = places::Stop::Flatten(places::Flattening::Capped);
+    let flatten = assert_flatten_stopped(&d, capped, 0);
+    assert_eq!(flatten.exit, Some(true));
+    assert_eq!(flatten.iocs.len(), 1, "{flatten:?}");
+    assert_eq!(flatten.iocs[0].side, "sell");
+    assert_eq!(d.count("add_order"), 1, "{:?}", d.what());
+    assert_eq!(events(&d, "mds touch"), 1);
+    assert_flatten_iocs_within_the_cap(&d, &[]);
+    let (report, json) = d.outputs();
+    assert!(report.contains("  - IOC 1 (sell): not sent"), "{report}");
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["flatten"]["stop"],
+        "Flatten(Capped)"
+    );
+    assert!(
+        d.printed.contains("FLATTEN capped on primary"),
+        "{}",
+        d.printed
+    );
+}
+
+#[tokio::test]
+async fn flatten_attempts_used_up_stop_the_run_not_flat() {
+    // Every flatten IOC expires unfilled: with --flatten-attempts 1, one IOC, then the budget is
+    // used up; with 2, two, each placed only once the one before ended; either way the run stops
+    // Flatten(UsedUp), not flat (decision 0148 items 5 and 8, 0151 item 9).
+    for (n, sent) in [("1", 1), ("2", 2)] {
+        let model = maker_filled(model::IocAnswer::Expire);
+        let d = dropped_with(model, "flatten-used-up", attempts(n)).await;
+        let used_up = places::Stop::Flatten(places::Flattening::UsedUp);
+        let flatten = assert_flatten_stopped(&d, used_up, sent);
+        for ioc in &flatten.iocs {
+            assert_eq!(ioc.came_back, Some(flatten::Ioc::Expired), "{flatten:?}");
+        }
+        assert_eq!(events(&d, "ioc Expire"), sent);
+        let sides = vec!["SELL"; sent];
+        assert_flatten_iocs_within_the_cap(&d, &sides);
+        // Compared after each IOC: an expired one leaves the position, which REST shows.
+        let compared: Vec<crate::compare::Ended> =
+            flatten.compared.iter().map(|c| c.ended).collect();
+        assert_eq!(compared, vec![crate::compare::Ended::Agreed; sent]);
+    }
+}
+
+#[tokio::test]
+async fn a_refused_flatten_stops_not_flat() {
+    // QFEX echoes the flatten IOC's add_order with an err: refused, left in flight, never resent
+    // though a second attempt is left; the run stops Flatten(Refused), not flat (decision 0148
+    // items 5 and 8).
+    let model = maker_filled(model::IocAnswer::Refuse);
+    let d = dropped_with(model, "flatten-refused", attempts("2")).await;
+    let refused = places::Stop::Flatten(places::Flattening::Refused);
+    let flatten = assert_flatten_stopped(&d, refused, 1);
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Refused));
+    assert_eq!(events(&d, "ioc Refuse"), 1);
+    // fbc-oms refusing the IOC (its market Killed, a test's hook): never sent; and refusing the
+    // owner's Flatten itself: no IOC built.
+    let at_ioc = probe_args::TestHooks {
+        kill_in_flatten: Some(probe_args::KillAt::Ioc),
+        ..probe_args::TestHooks::default()
+    };
+    let d = hooked(
+        maker_filled(model::IocAnswer::Full),
+        "flatten-ioc-killed",
+        |a| a,
+        at_ioc,
+    )
+    .await;
+    let flatten = assert_flatten_stopped(&d, refused, 0);
+    assert_eq!(
+        flatten.iocs[0].refused.as_deref(),
+        Some("State"),
+        "{flatten:?}"
+    );
+    assert_eq!(d.count("add_order"), 1, "{:?}", d.what());
+    assert!(
+        d.printed.contains("FLATTEN IOC refused on primary"),
+        "{}",
+        d.printed
+    );
+    let at_flatten = probe_args::TestHooks {
+        kill_in_flatten: Some(probe_args::KillAt::Flatten),
+        ..probe_args::TestHooks::default()
+    };
+    let model = maker_filled(model::IocAnswer::Full);
+    let d = hooked(model, "flatten-exit-killed", |a| a, at_flatten).await;
+    let flatten = assert_flatten_stopped(&d, refused, 0);
+    assert_eq!((flatten.exit, flatten.iocs.len()), (Some(false), 0));
+    assert!(
+        d.printed.contains("FLATTEN refused on primary"),
+        "{}",
+        d.printed
+    );
+}
+
+#[tokio::test]
+async fn the_flatten_budget_is_shared_by_an_accounts_registries() {
+    // The primary account's crossing post-only fills, so its cross registry flattens, from the
+    // account's one budget its drop registry spends from too (decision 0148 items 5 and 7): with
+    // that budget spent by the drop registry (a test's hook, as a flatten there would have spent
+    // it, which a run never reaches since a flatten stops it), --flatten-attempts 1 leaves the
+    // cross registry none, so no IOC goes out and the run stops Flatten(UsedUp); 2 leave it one,
+    // which flattens. The account's allowance at function level is
+    // `the_allowance_holds_an_accounts_flatten_iocs_to_one_budget_across_its_registries`.
+    let spent = probe_args::TestHooks {
+        flatten_spent: true,
+        ..probe_args::TestHooks::default()
+    };
+    let crossing = || QfexModel {
+        alo_cross: Some(model::AloCross::Fills),
+        ..QfexModel::default()
+    };
+    let d = hooked(
+        crossing(),
+        "flatten-budget-spent",
+        attempts("1"),
+        spent.clone(),
+    )
+    .await;
+    let used_up = places::Stop::Flatten(places::Flattening::UsedUp);
+    assert_cross_stopped(&d, used_up);
+    let flatten = d.cross(0).flatten.as_ref().expect("a flatten");
+    assert_eq!(
+        (flatten.sent(), flatten.exit),
+        (0, Some(true)),
+        "{flatten:?}"
+    );
+    assert_eq!(flatten.stop, Some(used_up.name()));
+    assert_flatten_iocs_within_the_cap(&d, &[]);
+    let d = hooked(crossing(), "flatten-budget-one-left", attempts("2"), spent).await;
+    assert_cross_stopped(&d, places::Stop::UnexpectedFill);
+    assert_flattened(d.cross(0).flatten.as_ref().expect("a flatten"), 0);
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+}
+
+#[tokio::test]
+async fn an_unknown_order_blocks_a_flatten_ioc() {
+    // QFEX answers the first flatten IOC with nothing: Unknown at its deadline, never resent and
+    // counted resting, it keeps the second attempt back (decision 0148 item 6, 0151 item 5): the
+    // run stops LeftResting, not flat, one IOC sent.
+    let model = maker_filled(model::IocAnswer::Silent);
+    let d = dropped_with(model, "flatten-unknown", attempts("2")).await;
+    let flatten = assert_flatten_stopped(&d, places::Stop::LeftResting, 1);
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Unknown));
+    let blocked = flatten.blocked.clone().expect("kept back");
+    assert!(
+        blocked.starts_with("the drop registry on primary holds an order of ours"),
+        "{blocked}"
+    );
+    assert_eq!(events(&d, "ioc Silent"), 1);
+    assert!(
+        d.printed
+            .contains(&format!("BLOCKED a flatten IOC on primary: {blocked}")),
+        "{}",
+        d.printed
+    );
+}
+
+#[tokio::test]
+async fn a_flatten_ioc_filled_in_part_leaves_a_residual_below_the_minimum_and_stops() {
+    // On an instrument of two lots' minimum, the flatten IOC fills one lot and QFEX ends it
+    // IOC_PARTIALLY_FILLED with the rest left, which the adapter decodes as open with a fill
+    // (0151 item 8): what is left of the position is below the minimum size, so the run stops
+    // Flatten(BelowMinimum), not flat (decision 0148 items 5 and 8).
+    let listed = Listed {
+        min: "0.02",
+        ..Listed::trading()
+    };
+    let model = QfexModel {
+        listed: vec![listed],
+        ..maker_filled(model::IocAnswer::Partial)
+    };
+    let d = dropped_with(model, "flatten-partial", short_agree).await;
+    let below = places::Stop::Flatten(places::Flattening::BelowMinimum);
+    let flatten = assert_flatten_stopped(&d, below, 1);
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::PartOpen));
+    assert_eq!(events(&d, "ioc Partial"), 1);
+    let model = d.venue.model.lock().unwrap();
+    let ioc = model.orders.last().unwrap();
+    assert_eq!(
+        (ioc.quantity, ioc.filled),
+        (Decimal::new(2, 2), Decimal::new(1, 2))
+    );
+}
+
+#[tokio::test]
+async fn a_position_frame_before_or_after_a_fill_leaves_the_flatten_to_the_registry() {
+    // QFEX's position_response after each fill, before its fill_response or after its
+    // order_response: the flatten reads the position from the registry alone, so it places one
+    // IOC and ends flat either way.
+    for push in [model::PositionPush::Before, model::PositionPush::After] {
+        let model = QfexModel {
+            position_push: Some(push),
+            ..maker_filled(model::IocAnswer::Full)
+        };
+        let d = dropped(model, "flatten-position-push").await;
+        assert_stopped(&d, places::Stop::UnexpectedFill);
+        assert_flattened(d.drop_run().flatten.as_ref().expect("a flatten"), 0);
+        assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+        let journal = d.dir.join("evidence").join("journal");
+        let reader = fbc_journal::JournalReader::open(&journal, 0).unwrap();
+        let positions = reader
+            .entries()
+            .filter(|e| match &e.as_ref().unwrap().record {
+                fbc_journal::Record::Inbound { bytes, .. } => {
+                    String::from_utf8_lossy(&bytes.0).contains("position_response")
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(positions, 2, "X's fill and the IOC's: {push:?}");
+        assert!(d.ev.errors.is_empty(), "{:?}", d.ev.errors);
+    }
+}
+
+#[tokio::test]
+async fn a_connection_that_ends_during_the_flatten_ends_the_session_not_flat() {
+    // QFEX closes the session's connection as the flatten IOC arrives, answering nothing: the
+    // flatten ends there, the session with it, with no second attempt, and the run stops on the
+    // fill it answered, not flat.
+    let d = dropped(maker_filled(model::IocAnswer::Close), "flatten-closed").await;
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    let run = d.drop_run();
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.error.as_deref(), Some(flatten::CONNECTION_ENDED));
+    assert!(!flatten.flat && flatten.stop.is_none(), "{flatten:?}");
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED));
+    assert_eq!(events(&d, "ioc Close"), 1);
+    // The IOC went out before the connection ended: recorded as sent, its answer never heard.
+    assert_eq!(flatten.sent(), 1, "{flatten:?}");
+    assert_eq!(flatten.iocs[0].came_back, None, "{flatten:?}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!(
+            "- The flatten IOCs, 1 sent:\n  - IOC 1 (sell): {}",
+            flatten::IN_FLIGHT
+        )),
+        "{report}"
+    );
+    let ioc = &json["drop_tests"][0]["session_one"]["flatten"]["iocs"][0];
+    assert_eq!(
+        (&ioc["sent"], &ioc["came_back"]),
+        (&Value::Bool(true), &Value::Null)
+    );
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "primary (drop)")
+        .unwrap();
+    assert!(!after.flat);
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_flatten_is_recorded_and_ends_nothing() {
+    // The owner presses Ctrl-C as the flatten IOC, which QFEX leaves unanswered, waits for its
+    // deadline: the press is recorded and the flatten runs its course, here to its budget's end,
+    // Flatten(UsedUp), the run's stop over the fill it answered.
+    let model = maker_filled(model::IocAnswer::Silent);
+    let d = pressed_at_place_with(model, "flatten-ctrl-c", 2, attempts("1")).await;
+    let used_up = places::Stop::Flatten(places::Flattening::UsedUp);
+    let flatten = assert_flatten_stopped(&d, used_up, 1);
+    assert_eq!(flatten.presses, 1, "{flatten:?}");
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains("- Presses of Ctrl-C while it ran, each recorded, none ending it: 1"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_taker_flatten_stops_the_run_once_flat() {
+    // The owner presses Ctrl-C as the primary account's flatten IOC after its taker fill goes
+    // out. The flatten takes the press and runs its course, flat, and the press is then the
+    // session's stop (decision 0148 item 8), since the taker IOC's fill is expected and the
+    // flatten gives no stop of its own. The session's Stop cancels as before; the run stops
+    // Interrupted, marked, after the reads after the taker IOC session, and the subaccount's
+    // crossing post-only and taker IOC are never placed.
+    let at = "FLATTEN IOC on primary: one reducing";
+    let d = pressed_at(QfexModel::default(), "take-flatten-ctrl-c", at).await;
+    assert_take_stopped(&d, places::Stop::Interrupted);
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    let run = d.take(0);
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_flattened(flatten, 0);
+    assert_eq!((flatten.after, flatten.presses), (taker::AFTER_TAKER, 1));
+    assert!(run.cancels.is_some(), "the session's Stop: {run:?}");
+    assert_eq!((d.iocs("BUY").len(), d.iocs("SELL").len()), (1, 1));
+    assert!(
+        !d.printed
+            .contains("PLACE the crossing post-only on subaccount")
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_during_a_late_taker_flatten_stops_the_run_once_flat() {
+    // As in a_taker_fill_that_reaches_the_session_after_its_steps_is_flattened_before_the_close,
+    // the primary account's taker IOC fills only as the Stop's cancel of it arrives, and is
+    // flattened then, before the close. The owner presses Ctrl-C as that flatten's IOC goes out:
+    // the flatten ends flat, and the press is the session's stop, so the run stops Interrupted,
+    // marked, and the subaccount's sessions never start.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        ioc_sells: Some(model::IocAnswer::Full),
+        fill_on_cancel: true,
+        ..QfexModel::default()
+    };
+    let at = "FLATTEN IOC on primary: one reducing";
+    let d = pressed_at(model, "take-late-flatten-ctrl-c", at).await;
+    assert_take_stopped(&d, places::Stop::Interrupted);
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    let flatten = d.take(0).flatten.as_ref().expect("a late flatten");
+    assert_flattened(flatten, 0);
+    assert_eq!(
+        (flatten.after, flatten.presses),
+        (taker::AFTER_LATE_TAKER, 1)
+    );
+    assert_eq!((d.iocs("BUY").len(), d.iocs("SELL").len()), (1, 1));
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_taker_sessions_stop_cancels_stops_the_run() {
+    // QFEX acks the primary account's taker IOC and leaves it open, so the session runs its
+    // course with no stop and its Stop cancels the IOC by its venue id (decision 0132 item 7).
+    // That cancel, the run's first, is answered two seconds late, and the owner presses Ctrl-C
+    // while the cancels wait for it: the press ends none of them and is the session's stop
+    // (decision 0148 item 8), so the run stops Interrupted, marked, and the subaccount's
+    // sessions never start.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        cancel_delay: Some(Duration::from_secs(2)),
+        ..QfexModel::default()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "5000");
+    let d = pressed_drop(model, "take-stop-cancels-ctrl-c", rpc, &[" cancel_order"]).await;
+    assert_take_stopped(&d, places::Stop::Interrupted);
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    let cancels = d.take(0).cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 1), "{cancels:?}");
+    assert!(cancels.ended && !cancels.held, "{cancels:?}");
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+}
+
+#[tokio::test]
+async fn a_rate_refusal_before_a_press_during_the_taker_sessions_cancels_is_the_stop() {
+    // QFEX acks the primary account's taker IOC and leaves it open, so the session's Stop cancels
+    // it by its venue id, and QFEX answers that cancel, the run's first, with a RateLimited err,
+    // which settles nothing, so the cancels wait. The owner presses Ctrl-C only once the probe has
+    // met that refusal, the shared limiter counting it: the refusal came first, so it is the
+    // session's stop, and the run's, the press recorded (FBC-su9i's review, on the taker path).
+    let rate_user = user();
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        rate_limit: Some(model::Limited::Cancel),
+        ..QfexModel::default()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "5000");
+    let limiter = shared_limiter(rate_user);
+    let refused = |venue: &Venue| {
+        let log = venue.log();
+        let read = log.iter().any(|e| e.what.ends_with(" cancel_order"));
+        read && limiter.counts().rejected.user > 0
+    };
+    let d = pressed_once_when(model, "take-refused-then-ctrl-c", rate_user, rpc, refused).await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::Session,
+    };
+    assert_take_stopped(&d, refused);
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    let cancels = d.take(0).cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 1), "{cancels:?}");
+    assert!(cancels.held && cancels.blocked, "{cancels:?}");
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    let said = format!("{} in the taker IOC session", refused.name());
+    assert!(stopped.starts_with(&said), "{stopped}");
+}
+
+#[tokio::test]
+async fn ctrl_c_during_taker_stop_cancels_that_the_connections_end_cuts_short_stops_the_run() {
+    // QFEX acks the primary account's taker IOC and leaves it open, so the session's Stop cancels
+    // it by its venue id. QFEX leaves that cancel unanswered and closes the connection once the
+    // owner has pressed Ctrl-C: the press, taken while the cancels wait, came before the
+    // connection's end, so the session's stop is Interrupted, the press and the cancel sent
+    // recorded, though the connection's end cut the cancels short (decision 0148 item 8;
+    // FBC-su9i's review, on the taker path).
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        close_on_cancel: true,
+        hold_cancel: true,
+        ..QfexModel::default()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "5000");
+    let d = pressed_drop(model, "take-cut-cancels-ctrl-c", rpc, &[" cancel_order"]).await;
+    assert_take_stopped(&d, places::Stop::Interrupted);
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    let run = d.take(0);
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED), "{run:?}");
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 1), "{cancels:?}");
+    assert!(
+        cancels.held && cancels.cut_short && !cancels.ended && !cancels.blocked,
+        "{cancels:?}"
+    );
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(section.contains(places::CUT_SHORT), "{section}");
+    let cancels = &json["stage_two"]["takes"][0]["cancels"];
+    assert_eq!(cancels["sent"], 1, "{cancels}");
+    assert_eq!(cancels["cut_short"], true, "{cancels}");
+}
+
+#[tokio::test]
+async fn a_press_as_the_last_read_after_a_taker_session_ends_is_taken_by_those_reads() {
+    // The owner presses Ctrl-C as the last named account's read after the primary account's
+    // taker IOC session prints its line, so the press is made in the poll that ends that read,
+    // which wins the reads' wait for it: the reads still take it as they end, so the run stops
+    // Interrupted after them, marked, and the subaccount's reads before its own crossing session
+    // never begin (FBC-su9i's review, on the taker path).
+    let at = "READ after the taker IOC session: subaccount: ";
+    let d = pressed_at_as(
+        QfexModel::default(),
+        "take-press-last-read",
+        user(),
+        |a| a,
+        at,
+    )
+    .await;
+    assert_take_stopped(&d, places::Stop::Interrupted);
+    let said = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        said.starts_with("Interrupted during the reads after the taker IOC session"),
+        "{said}"
+    );
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    assert_eq!(d.iocs("BUY").len(), 1, "{}", d.printed);
+    let before = (d.ev.reads.iter()).filter(|r| r.before == places::CROSS);
+    assert_eq!(before.count(), 2, "{}", d.printed);
+}
+
+#[tokio::test]
+async fn a_rate_refusal_before_a_press_during_a_flattens_ioc_is_the_stop() {
+    // The primary account's taker IOC fills, so its session flattens: one sell IOC, whose answer
+    // QFEX holds, sending a RateLimited err in its place. The owner presses Ctrl-C only once the
+    // probe has met that refusal, the shared limiter counting it, while the flatten waits for its
+    // IOC; then QFEX answers the IOC filled, and the flatten ends flat. The refusal came before
+    // the press, so it is the session's stop, and the run's, in place of Interrupted (decision
+    // 0148 item 8; FBC-su9i's review, on the flatten's path).
+    let rate_user = user();
+    let model = QfexModel {
+        hold_ioc_sell: true,
+        rate_with_ioc_sell: true,
+        ..QfexModel::default()
+    };
+    let limiter = shared_limiter(rate_user);
+    let refused = |venue: &Venue| {
+        let log = venue.log();
+        let iocs = log.iter().filter(|e| e.what.ends_with("ioc Full")).count();
+        iocs == 2 && limiter.counts().rejected.user > 0
+    };
+    let d = pressed_once_when(
+        model,
+        "flatten-refused-then-ctrl-c",
+        rate_user,
+        |a| a,
+        refused,
+    )
+    .await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::Session,
+    };
+    assert_take_stopped(&d, refused);
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    let flatten = d.take(0).flatten.as_ref().expect("a flatten");
+    assert_flattened(flatten, 0);
+    assert_eq!(flatten.presses, 1, "{flatten:?}");
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    let said = format!("{} in the taker IOC session", refused.name());
+    assert!(stopped.starts_with(&said), "{stopped}");
+}
+
+#[tokio::test]
+async fn a_press_during_a_flattens_ioc_that_the_connections_end_cuts_short_is_counted() {
+    // The primary account's taker IOC fills, so its session flattens: one sell IOC, which QFEX
+    // leaves unanswered, closing the connection once the owner has pressed Ctrl-C while the
+    // flatten waits for it. The connection's end drops the flatten there: the press it took is
+    // the session's stop, Interrupted, and its record counts it (FBC-su9i's review, on the
+    // flatten's path).
+    let model = QfexModel {
+        ioc_sells: Some(model::IocAnswer::Close),
+        hold_ioc_sell: true,
+        ..QfexModel::default()
+    };
+    let d = pressed_drop(model, "flatten-cut-ctrl-c", |a| a, &["ioc Close"]).await;
+    let flatten = d.take(0).flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.presses, 1, "{flatten:?}");
+    assert_eq!(
+        flatten.error.as_deref(),
+        Some(flatten::CONNECTION_ENDED),
+        "{flatten:?}"
+    );
+    assert_eq!(d.take(0).ended_by, Some(stage::CONNECTION_ENDED));
+    assert_eq!(d.stage_two().takes.len(), 1, "{}", d.printed);
+    assert_eq!(
+        d.ev.stop,
+        Some(places::Stop::Interrupted.name()),
+        "{}",
+        d.printed
+    );
+}
+
+#[tokio::test]
+async fn a_flatten_whose_other_orders_are_not_seen_to_end_places_no_ioc() {
+    // Y fills as a maker in drop session two, and QFEX answers the cancel of X NO_SUCH_ORDER,
+    // leaving it open: X not seen to end, no flatten IOC is placed (decision 0148 item 6), and
+    // the run stops on the flatten's own stop, Flatten(NotEnded), in place of the fill's, not
+    // flat, X resting for the owner's hand cancel.
+    let model = QfexModel {
+        on_ack: Some((1, model::OnAck::MakerFill)),
+        cancel_misses: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "flatten-not-ended").await;
+    let not_ended = places::Stop::Flatten(places::Flattening::NotEnded);
+    assert_stopped(&d, not_ended);
+    let flatten = d.two().flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.stop, Some(not_ended.name()));
+    let cancels = flatten.cancels.as_ref().unwrap();
+    assert!(cancels.held && cancels.sent == 1, "{cancels:?}");
+    assert_eq!(flatten.error.as_deref(), Some(flatten::NOT_ENDED));
+    assert_eq!((flatten.exit, flatten.sent()), (None, 0));
+    assert_eq!(events(&d, "ioc Full"), 0);
+    assert!(d.two().resting, "{:?}", d.two());
+}
+
+#[tokio::test]
+async fn a_flatten_with_no_touch_to_price_from_places_no_ioc() {
+    // As X goes out the touch turns crossed: once X fills, the flatten has no touch to price an
+    // IOC from, so none is placed, and the run stops on the flatten's own stop, Flatten(NoTouch),
+    // in place of the fill's, not flat.
+    let crossed = model::Touch {
+        bid: Some(("100.20", "1.00")),
+        ask: Some(("100.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        maker_fill: true,
+        touch_on_place: Some((0, crossed)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "flatten-no-touch").await;
+    let no_touch = places::Stop::Flatten(places::Flattening::NoTouch);
+    let flatten = assert_flatten_stopped(&d, no_touch, 0);
+    assert_eq!(flatten.error.as_deref(), Some(market::CROSSED));
+    assert_eq!((flatten.exit, flatten.iocs.len()), (Some(true), 0));
+    assert_eq!(d.count("add_order"), 1);
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_a_flatten_comparison_stops_it() {
+    // The read after the flatten IOC is refused RateLimited: a provider rate refusal, a stop
+    // (decision 0148 item 8), which the flatten gives its session over the fill it answered. The
+    // refusal is the first page after the flatten IOC came: a comparison after X's place begun
+    // before the session read X's fill is never the one refused (FBC-23ch's third review fix).
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadSocketAfterIoc),
+        ..maker_filled(model::IocAnswer::Full)
+    };
+    let d = dropped(model, "flatten-rate").await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    assert_stopped(&d, refused);
+    let flatten = d.drop_run().flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.stop, Some(refused.name()));
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Filled));
+    let ended: Vec<crate::compare::Ended> = flatten.compared.iter().map(|c| c.ended).collect();
+    assert_eq!(ended, [crate::compare::Ended::Refused]);
+}
+
+#[tokio::test]
+async fn a_fill_during_the_stops_cancels_is_flattened_while_the_session_is_open() {
+    // The owner presses Ctrl-C in drop session one, and QFEX fills X as a maker as the Stop's
+    // cancel of it arrives, answering the cancel NO_SUCH_ORDER: a fill of ours that reached the
+    // session after its steps ended, while it is still open. The flatten follows the Stop's
+    // cancels (0151 item 9): the Stop's Kill lifted, the owner's Flatten into Exit, one reducing
+    // limit IOC within the cap, REST flat; then the market Killed again and disarmed, the close,
+    // and the run stops Interrupted, its first stop, flat.
+    let model = QfexModel {
+        fill_on_cancel: true,
+        ..QfexModel::default()
+    };
+    let d = pressed_at_place(model, "flatten-late", 1).await;
+    assert_stopped(&d, places::Stop::Interrupted);
+    let run = d.drop_run();
+    // The Stop's one cancel, of X: X seen to end by its fill, whether or not NO_SUCH_ORDER was
+    // read before the wait saw it, so held or not.
+    let cancels = run.cancels.as_ref().expect("the Stop's cancels");
+    assert_eq!(cancels.sent, 1, "{cancels:?}");
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    assert_flattened(flatten, 0);
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(events(&d, "ioc Full"), 1);
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "primary (drop)")
+        .unwrap();
+    assert!(after.flat, "{after:?}");
+    assert!(
+        d.printed.contains(
+            "FLATTEN on primary: the Stop's Kill lifted, the market Cancel-only (decision 0012)"
+        ),
+        "{}",
+        d.printed
+    );
+    assert!(
+        d.printed
+            .contains("FLATTEN on primary: the market Killed again, as the Stop left it"),
+        "{}",
+        d.printed
+    );
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(&format!(
+            "After {}, while the session was open",
+            flatten.after
+        )),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_crossing_post_only_filled_during_the_stops_cancels_is_flattened() {
+    // The crossing post-only rests, and QFEX fills it as a maker as the session's Stop cancel of
+    // it arrives: the flatten follows the Stop's cancels while the session is open (0151 item 9),
+    // and the run stops UnexpectedFill, flat.
+    let model = QfexModel {
+        alo_cross: None,
+        fill_on_cancel: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-late-fill").await;
+    assert_cross_stopped(&d, places::Stop::UnexpectedFill);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!(cancels.sent, 1, "{cancels:?}");
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    assert_flattened(flatten, 0);
+    assert_flatten_iocs_within_the_cap(&d, &["SELL"]);
+    let flat = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_CROSS)
+        .all(|r| r.flat);
+    assert!(flat, "{:?}", d.ev.reads);
+}
+
+#[tokio::test]
+async fn a_cancel_answered_cancelled_while_the_order_rests_keeps_the_flatten_ioc_back() {
+    // Y fills as a maker in drop session two, and QFEX answers the flatten's cancel of X
+    // CANCELLED while X still rests: the registry holds X ended, but the comparison after the
+    // flatten's cancels reads it open, a stop (decision 0148 item 8), so no flatten IOC goes out
+    // beside another order of ours (decision 0148 item 6), and the run stops ReadDisagrees, not
+    // flat.
+    let model = QfexModel {
+        on_ack: Some((1, model::OnAck::MakerFill)),
+        cancel_lies: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "flatten-cancel-lies", short_agree).await;
+    assert_eq!(
+        d.ev.stop,
+        Some(places::Stop::ReadDisagrees.name()),
+        "{}",
+        d.printed
+    );
+    let flatten = d.two().flatten.as_ref().expect("a flatten");
+    let cancels = flatten.cancels.as_ref().unwrap();
+    assert!(
+        cancels.ended && !cancels.held && cancels.sent == 1,
+        "{cancels:?}"
+    );
+    let ended: Vec<crate::compare::Ended> = flatten.compared.iter().map(|c| c.ended).collect();
+    assert_eq!(ended, [crate::compare::Ended::Disagreed]);
+    assert_eq!(flatten.stop, Some(places::Stop::ReadDisagrees.name()));
+    assert_eq!(
+        (flatten.exit, flatten.sent(), flatten.flat),
+        (None, 0, false)
+    );
+    assert_eq!(events(&d, "ioc Full"), 0);
+}
+
+#[tokio::test]
+async fn a_flatten_whose_other_order_is_not_acked_by_its_deadline_places_no_ioc() {
+    // As Y's add_order arrives, QFEX fills X as a maker and never answers Y: the flatten's
+    // cancels wait for Y's acknowledgement to cancel it by venue id, which never comes, so by
+    // --rpc-timeout-ms Y is neither cancelled nor seen to end, nothing held. No flatten IOC is
+    // placed beside it (decision 0148 item 6), and the run stops on the flatten's own stop,
+    // Flatten(NotEnded), not flat.
+    let model = QfexModel {
+        fill_other_on_place: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "flatten-unacked").await;
+    let flatten = d.two().flatten.as_ref().expect("a flatten");
+    let cancels = flatten.cancels.as_ref().unwrap();
+    assert!(
+        !cancels.ended && !cancels.held && cancels.sent == 0,
+        "{cancels:?}"
+    );
+    assert_eq!(flatten.error.as_deref(), Some(flatten::NOT_ENDED));
+    assert_eq!(
+        (flatten.exit, flatten.sent(), flatten.flat),
+        (None, 0, false)
+    );
+    assert!(flatten.compared.is_empty(), "{flatten:?}");
+    assert_eq!(events(&d, "ioc Full"), 0);
+    assert_stopped(&d, places::Stop::Flatten(places::Flattening::NotEnded));
+}
+
+#[tokio::test]
+async fn a_named_accounts_read_listing_an_order_keeps_a_flatten_ioc_back() {
+    // X fills as a maker in drop session one, and the first named account's read the flatten
+    // judges by lists an order (a test's hook: every named account reads clean before each
+    // session, so no answer of the QFEX model reaches this): no flatten IOC goes out (decision
+    // 0148 item 6), and the run stops ReadDisagrees, not flat.
+    let listed = probe_args::TestHooks {
+        listed_in_flatten: true,
+        ..probe_args::TestHooks::default()
+    };
+    let model = maker_filled(model::IocAnswer::Full);
+    let d = hooked(model, "flatten-listed", |a| a, listed).await;
+    let flatten = assert_flatten_stopped(&d, places::Stop::ReadDisagrees, 0);
+    let blocked = flatten.blocked.clone().expect("kept back");
+    assert!(
+        blocked.starts_with("primary's never-arming read lists an open order"),
+        "{blocked}"
+    );
+    assert_eq!((flatten.exit, flatten.iocs.len()), (Some(true), 0));
+    assert_eq!(events(&d, "ioc Full"), 0);
+}
+
+// ----- Stage two's taker IOC (FBC-ou9g; decision 0132 item 7, 0148 items 5 and 10, 0151 items 8,
+// 9 and 10) -----
+
+impl Dropped {
+    /// The `n`th taker IOC session, in run order.
+    fn take(&self, n: usize) -> &stage_two::CrossRun {
+        &self.stage_two().takes[n]
+    }
+
+    /// The model's limit IOCs on `side`, in order: the taker IOCs on --side (buy), the flatten
+    /// IOCs on the other.
+    fn iocs(&self, side: &str) -> Vec<model::Order> {
+        let model = self.venue.model.lock().unwrap();
+        let iocs = (model.orders.iter()).filter(|o| o.kind == "LIMIT" && o.tif == "IOC");
+        iocs.filter(|o| o.side == side).cloned().collect()
+    }
+
+    /// The JSON frames of the places-production/ slice's files whose name begins `prefix`, by
+    /// the frame's one top-level member's name.
+    fn sliced(&self, prefix: &str, member: &str) -> Vec<Value> {
+        let places = self.dir.join("evidence").join(stage::PLACES_SLICE);
+        let mut found = Vec::new();
+        let mut names: Vec<String> = (fs::read_dir(&places).unwrap())
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(prefix) && n.ends_with(".json"))
+            .collect();
+        names.sort();
+        for name in names {
+            let v: Value = super::json(&fs::read_to_string(places.join(&name)).unwrap());
+            if let Some(body) = v.get(member) {
+                found.push(body.clone());
+            }
+        }
+        found
+    }
+}
+
+/// The run's lines that say where the taker IOC session on `account` stood, in order: its
+/// fill flattened and REST shown flat while it was open, then its Stop and its end, then the
+/// read of every named account after it.
+fn assert_flattened_before_the_stop(d: &Dropped, account: &str) {
+    let lines = [
+        format!("PLACE the taker IOC on {account}"),
+        format!("TAKEN on {account}: filled whole, its fills settled"),
+        format!("FLATTEN on {account}: the owner's Flatten, the market in Exit"),
+        format!("FLATTENED on {account}: flat"),
+        format!("SESSION {account} (the taker IOC session): arm outcome Accepted"),
+        format!("READ after the taker IOC session: {account} (take)"),
+    ];
+    for pair in lines.windows(2) {
+        assert!(d.at(&pair[0]) < d.at(&pair[1]), "{pair:?}: {}", d.printed);
+    }
+}
+
+#[tokio::test]
+async fn the_taker_ioc_fills_at_the_touch() {
+    // Each named account's drop test passed and the exact-echo gate opened, so after each
+    // account's crossing session, its taker IOC session: one limit IOC at the minimum size at the
+    // far touch, the ask of 100.10, through it, which QFEX fills whole as a taker against the
+    // touch. Its fill is expected, so once flattened it stops nothing: the run ends after the
+    // last account's taker IOC, naming FBC-4plj, with no stop and no marker.
+    let d = dropped(QfexModel::default(), "take-fills").await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert!(stage::NOT_BUILT.contains("FBC-4plj"));
+    assert_eq!(d.stage_two().takes.len(), 2);
+    for (n, account) in ["primary", "subaccount"].into_iter().enumerate() {
+        let run = d.take(n);
+        assert_eq!(run.account, account);
+        assert!(run.authenticated && run.resynced && run.started, "{run:?}");
+        assert_eq!(run.arm.as_deref(), Some("Accepted"));
+        assert!(run.placed.submitted && run.blocked.is_none(), "{run:?}");
+        let taken = run.taken.as_ref().expect("the taker IOC");
+        assert_eq!(taken.ioc, Some(flatten::Ioc::Filled));
+        assert_eq!(taken.fees, [taker::FeeSign::Paid]);
+        assert_eq!(taken.frame_order, Some(taker::FrameOrder::FillFirst));
+        assert!(run.read && !run.resting && !run.counted_resting, "{run:?}");
+        assert_eq!((run.stop, &run.error), (None, &None));
+        assert!(d.printed.contains(&format!(
+            "TAKEN on {account}: filled whole, its fills settled"
+        )));
+    }
+    // The model saw one taker IOC a session: a limit IOC buy at the minimum size at the ask,
+    // filled whole as a taker, on the taker IOC session's own connection.
+    let takers = d.iocs("BUY");
+    assert_eq!(takers.len(), 2);
+    for ioc in &takers {
+        assert_eq!(ioc.quantity, Decimal::new(1, 2));
+        assert_eq!(ioc.price, super::json("100.1"));
+        assert_eq!(
+            (ioc.filled, ioc.state),
+            (ioc.quantity, model::State::Filled)
+        );
+    }
+    assert_eq!(events(&d, "ioc Full"), 4);
+    let conns = d.take_conns();
+    assert_eq!(conns.len(), 2);
+    for conn in &conns {
+        let placed = format!("trade {conn} add_order");
+        assert_eq!(d.what().iter().filter(|w| **w == placed).count(), 2);
+    }
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    for said in [
+        "- The taker IOC: handed to the session yes;",
+        "- How the taker IOC came back: filled whole, its fills settled",
+        "- The taker fee's sign (decision 0148 item 10; no amount): paid",
+        &format!("- What followed: {}", taker::NEXT_ACCOUNT),
+    ] {
+        assert!(section.contains(said), "{said}: {section}");
+    }
+    let last = take_section(&report, "subaccount");
+    assert!(last.contains(&format!("- What followed: {}", taker::LAST_TAKE)));
+    let entry = &json["stage_two"]["takes"][0];
+    assert_eq!(entry["account"], "primary");
+    assert_eq!(
+        entry["taken"]["came_back"],
+        "filled whole, its fills settled"
+    );
+    assert_eq!(entry["taken"]["fee_sign"], "paid");
+    assert_eq!(entry["taker_ioc"]["submitted"], true);
+}
+
+#[tokio::test]
+async fn the_taker_fill_is_flattened_through_exit() {
+    // The taker IOC's fill leaves the take registry long one minimum size. While its session is
+    // open: no other order of ours to cancel, the owner's Flatten into Exit (Start arms only
+    // while flat, so Flatten is what reaches Exit after a fill: decision 0148 item 3), then one
+    // reducing limit IOC at the minimum size that QFEX fills against the bid, the registry's
+    // position read flat, and a never-arming read agreeing with it: REST positions flat, all
+    // before the session's Stop and the read after it (decision 0148 item 5).
+    let d = dropped(QfexModel::default(), "take-flattened").await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    for (n, account) in ["primary", "subaccount"].into_iter().enumerate() {
+        let run = d.take(n);
+        let flatten = run.flatten.as_ref().expect("a flatten");
+        assert_flattened(flatten, 0);
+        assert_eq!(flatten.after, taker::AFTER_TAKER);
+        assert_eq!(flatten.sent(), 1);
+        assert_eq!(flatten.iocs[0].side, "sell");
+        assert_eq!(flatten.compared.len(), 1);
+        assert_eq!(flatten.compared[0].ended, compare::Ended::Agreed);
+        // Then the session's Stop: nothing of ours left to cancel, and a graceful close.
+        let cancels = run.cancels.as_ref().expect("the session's Stop");
+        assert!(cancels.ended && !cancels.held && cancels.sent == 0);
+        assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+        assert_flattened_before_the_stop(&d, account);
+    }
+    // Every read after a taker IOC session showed every named account flat with no open order.
+    let after: Vec<&capture::AccountRead> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_TAKE)
+        .collect();
+    assert_eq!(after.len(), 4);
+    assert!(
+        after.iter().all(|r| r.flat && r.page_orders == 0),
+        "{after:?}"
+    );
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "After {}, while the session was open",
+            taker::AFTER_TAKER
+        )),
+        "{section}"
+    );
+    assert!(section.contains("- The owner's Flatten: pressed: the market in Exit"));
+    let entry = &json["stage_two"]["takes"][1]["flatten"];
+    assert_eq!(
+        (&entry["flat"], &entry["rest_flat"], &entry["exit"]),
+        (&Value::Bool(true), &Value::Bool(true), &Value::Bool(true))
+    );
+}
+
+#[tokio::test]
+async fn the_flatten_prices_within_its_cap() {
+    // Each flatten IOC after a taker fill is a sell, the side that reduces the position, at the
+    // minimum size with no reduce-only flag, priced at most --flatten-cap-bps (10) through the
+    // bid it crosses and still crossing it; the taker IOCs, buys at the ask, sit within the cap
+    // of the ask too, since each is at it (assert_flatten_iocs_within_the_cap).
+    let d = dropped(QfexModel::default(), "take-flatten-cap").await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    assert_flatten_iocs_within_the_cap(&d, &["BUY", "SELL", "BUY", "SELL"]);
+    let flattens = d.iocs("SELL");
+    assert_eq!(flattens.len(), 2);
+    for ioc in &flattens {
+        // Through the bid of 100.00: 99.90 is the cap's floor, snapped up onto the cent grid.
+        let px = Decimal::from_str(&ioc.price.to_string()).unwrap();
+        assert!(
+            px < Decimal::new(100, 0) && px >= Decimal::new(999, 1),
+            "{px}"
+        );
+        assert_eq!(ioc.state, model::State::Filled);
+    }
+    // At the cap's floor exactly, on a cap of 13 bps: 99.87 is on the grid, so the flatten IOC
+    // is priced there and no lower.
+    let d = dropped_in(
+        QfexModel::default(),
+        "take-flatten-cap-13",
+        &primary_only(),
+        |a| set(a, "--flatten-cap-bps", "13"),
+    )
+    .await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let flattens = d.iocs("SELL");
+    assert_eq!(flattens.len(), 1);
+    assert_eq!(flattens[0].price, super::json("99.87"));
+}
+
+#[tokio::test]
+async fn an_ioc_that_expires_unfilled_is_recorded_and_flattens_nothing() {
+    // QFEX expires every limit IOC, IOC_CANCELLED with nothing filled: the taker IOC is recorded
+    // as expired unfilled, nothing is flattened, and the run goes on with no stop, ending after
+    // the last account's taker IOC.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Expire,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-expires").await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(events(&d, "ioc Expire"), 2);
+    assert_eq!(d.iocs("SELL").len(), 0, "no flatten IOC");
+    for (n, account) in ["primary", "subaccount"].into_iter().enumerate() {
+        let run = d.take(n);
+        let taken = run.taken.as_ref().unwrap();
+        assert_eq!(taken.ioc, Some(flatten::Ioc::Expired));
+        assert!(taken.fees.is_empty());
+        assert_eq!(taken.frame_order, Some(taker::FrameOrder::NoFill));
+        assert_eq!(run.flatten, None);
+        assert!(!run.counted_resting && !run.resting && run.read, "{run:?}");
+        assert!(d.printed.contains(&format!(
+            "TAKEN on {account}: expired unfilled: recorded, and nothing flattened"
+        )));
+    }
+    assert!(!d.printed.contains("FLATTEN"), "{}", d.printed);
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    for said in [
+        "- How the taker IOC came back: expired unfilled: recorded, and nothing flattened",
+        "- The taker fee's sign (decision 0148 item 10; no amount): not measured: the taker IOC \
+         brought no fill",
+        "(FBC-tfxk): not measured: no fill_response named the taker IOC",
+    ] {
+        assert!(section.contains(said), "{said}: {section}");
+    }
+    assert!(!section.contains("#### The flatten"), "{section}");
+    assert_eq!(json["stage_two"]["takes"][0]["flatten"], Value::Null);
+    // The reads after each crossing and taker IOC session ran when that session did, so the
+    // refusals each session met say so (FBC-ou9g).
+    let rows = refusals::by_session(&d.ev.read_sockets, &d.ev.sessions, None);
+    for after in [refusals::AFTER_CROSS, refusals::AFTER_TAKE] {
+        let row = rows.iter().find(|(name, ..)| *name == after).unwrap();
+        assert_eq!((row.1, row.2), (0, true), "{rows:?}");
+    }
+    assert!(!report.contains("(its session did not run)"), "{report}");
+}
+
+#[tokio::test]
+async fn a_partial_taker_fill_stops_the_run_not_flat() {
+    // On an instrument of two lots' minimum, QFEX fills one lot of the taker IOC and ends it
+    // IOC_PARTIALLY_FILLED with the rest left, which the adapter decodes as open with a fill:
+    // the run stops IocRemainder, not flat, with no flatten (0151 item 8, until FBC-jdj7). The
+    // session's Stop still cancels by venue id what the registry counts open, and the reads
+    // after it show the position off flat, the owner's to close by hand.
+    let listed = Listed {
+        min: "0.02",
+        ..Listed::trading()
+    };
+    let model = QfexModel {
+        listed: vec![listed],
+        ioc: model::IocAnswer::Partial,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "take-partial", wait_past_a_drop).await;
+    let stop = places::Stop::IocRemainder;
+    assert_stopped(&d, stop);
+    assert_eq!(events(&d, "ioc Partial"), 1);
+    assert_eq!(d.stage_two().takes.len(), 1, "no later account's session");
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    let run = d.take(0);
+    let taken = run.taken.as_ref().unwrap();
+    assert_eq!(taken.ioc, Some(flatten::Ioc::PartOpen));
+    assert_eq!(taken.fees, [taker::FeeSign::Paid]);
+    assert_eq!(run.flatten, None, "no flatten");
+    assert_eq!(d.iocs("SELL").len(), 0);
+    assert_eq!(run.stop, Some("IocRemainder"));
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!(cancels.sent, 1, "{cancels:?}");
+    let after: Vec<&capture::AccountRead> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_TAKE)
+        .collect();
+    assert!(after.iter().any(|r| !r.flat), "{after:?}");
+    let model = d.venue.model.lock().unwrap();
+    let taker = model.orders.last().unwrap();
+    assert_eq!(
+        (taker.quantity, taker.filled),
+        (Decimal::new(2, 2), Decimal::new(1, 2))
+    );
+    drop(model);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("IocRemainder in the taker IOC session"),
+        "{:?}",
+        d.ev.stopped
+    );
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "- How the taker IOC came back: {}",
+            taker::REMAINDER
+        )),
+        "{section}"
+    );
+    assert_eq!(json["stage_two"]["takes"][0]["stop"], "IocRemainder");
+    let declared = declared_section(&report);
+    assert!(
+        declared.contains("a hand close of the position"),
+        "{declared}"
+    );
+    assert_eq!(json["declared"]["hand_actions_left"]["hand_close"], true);
+}
+
+/// The report's section on what the run declares and the owner's part (FBC-ou9g).
+fn declared_section(report: &str) -> String {
+    let heading = "## What the run declares, and the owner's part";
+    let section = report
+        .split(heading)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{report}"));
+    section.split("\n## ").next().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn the_report_names_the_key_declarations_fences_and_fee_sign_and_no_value() {
+    // The report names the key every place-stage session carries, each registry's CodProbeRun
+    // declaration, the fences met, the taker fee's sign on each account, --sole-trader and the
+    // owner's confirmations as unchecked, and every hand action (decision 0148 item 10), and
+    // states the caps, the distance, the flatten cap and the attempts only as fences met, never
+    // as values (0151 item 10): no value the command line gave reaches the section or the
+    // evidence's entry.
+    let values = |argv: Argv| {
+        let argv = set(argv, "--resting-cap-usd", "424242.17");
+        let argv = set(argv, "--inventory-cap-usd", "373737.29");
+        let argv = set(argv, "--away-bps", "47");
+        let argv = set(argv, "--flatten-cap-bps", "13");
+        set(argv, "--flatten-attempts", "2")
+    };
+    let d = dropped_with(QfexModel::default(), "take-declared", values).await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let (report, json) = d.outputs();
+    let section = declared_section(&report);
+    for said in [
+        "- The key: `qfex.exec.production_places = probe_place_stages`, on every place-stage \
+         session's configuration and on no read's (decision 0148 item 4)",
+        "- The CodProbeRun declarations, each on its registry's one market, none a testnet run \
+         (decision 0148 item 3): drop on primary: CodProbeRun::owner_supervised_places; drop on \
+         subaccount: CodProbeRun::owner_supervised_places; cross on primary: \
+         CodProbeRun::owner_supervised_places; take on primary: \
+         CodProbeRun::owner_supervised_places; cross on subaccount: \
+         CodProbeRun::owner_supervised_places; take on subaccount: \
+         CodProbeRun::owner_supervised_places",
+        &format!("- The fences met, never their values: {}", taker::FENCES),
+        "- The taker fee's sign, by account (no amount): primary: paid; subaccount: paid",
+        &format!("- Not checked by the probe: {}", taker::UNCHECKED),
+        "- The hand actions declared: no `--reconciled` declaration was given",
+        "- The hand actions this run leaves the owner: none: the last read of every named \
+         account showed no order of ours and a flat position",
+    ] {
+        assert!(section.contains(said), "{said}: {section}");
+    }
+    // No value: once the record's own fixed fences and decision citations are taken out, no
+    // digit is left in the section.
+    let mut bare = section.clone();
+    for fixed in [
+        "0148",
+        "0151",
+        "0144",
+        "0132",
+        "0113",
+        "0006",
+        "item 10",
+        "item 3",
+        "item 4",
+        "item 7",
+        "item 9",
+        "at least 20 bps",
+        "1 to 3",
+    ] {
+        bare = bare.replace(fixed, "");
+    }
+    assert!(!bare.chars().any(|c| c.is_ascii_digit()), "{bare}");
+    let declared = &json["declared"];
+    assert_eq!(declared["sole_trader_checked"], false);
+    assert_eq!(declared["confirmations_checked"], false);
+    let text = declared.to_string();
+    for value in ["424242", "373737", "47", "13"] {
+        assert!(!text.contains(value), "{value}: {text}");
+    }
+    fn numbers(v: &Value) -> bool {
+        match v {
+            Value::Number(_) => true,
+            Value::Array(a) => a.iter().any(numbers),
+            Value::Object(o) => o.values().any(numbers),
+            _ => false,
+        }
+    }
+    assert!(!numbers(declared), "{declared}");
+    // The report and the evidence pass the privacy check, as does the places-production/ slice,
+    // which holds the taker IOC sessions' frames.
+    let evidence = d.dir.join("evidence");
+    assert_report_and_evidence_pass_the_privacy_check(&evidence);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &evidence.join(stage::PLACES_SLICE)).unwrap();
+    // With --reconciled, the declaration is reported as given and unchecked: a second run after
+    // a stop marker the test writes.
+    let (dir, _removed) = temp_dir("take-declared-reconciled");
+    let venue = Venue::start(QfexModel::default()).await;
+    let leases = leases_of(&dir);
+    fs::create_dir_all(&leases).unwrap();
+    places::tag(&leases).unwrap();
+    assert!(places::write_marker(&leases, places::Stop::NotFlat, &[], "synthetic").unwrap());
+    let asked = set(drop_argv(&dir, &venue), "--reconciled", "hand-close");
+    let (ran, printed) = place_run(&venue, &asked, &primary_only()).await;
+    let ev = stopped(ran, &printed);
+    assert_eq!(ev.stop, None, "{printed}");
+    let (report, _) = outputs_of(&dir);
+    let section = declared_section(&report);
+    assert!(
+        section.contains(
+            "- The hand actions declared: `--reconciled hand-close`, the owner's declaration of \
+             what was done by hand after an earlier run's stop (0151 item 6): recorded as given \
+             and unchecked"
+        ),
+        "{section}"
+    );
+}
+
+#[tokio::test]
+async fn the_fee_sign_knob_gives_the_matching_sign_word() {
+    // QFEX writes the taker fill's fee paid (positive), zero or received (negative): the report
+    // gives its sign as the adapter decodes it into fbc-core's Fee, a cost positive when paid
+    // (decision 0004), never its amount, and the places-production/ slice keeps that fee as its
+    // sign alone (0151 item 7).
+    for (knob, sign, word, kept) in [
+        (model::FeeSign::Paid, taker::FeeSign::Paid, "paid", 1),
+        (model::FeeSign::Zero, taker::FeeSign::Zero, "zero", 0),
+        (
+            model::FeeSign::Received,
+            taker::FeeSign::Received,
+            "received",
+            -1,
+        ),
+    ] {
+        let model = QfexModel {
+            fee_sign: knob,
+            ..QfexModel::default()
+        };
+        let d = dropped_in(model, "take-fee-sign", &primary_only(), |a| a).await;
+        assert_eq!(d.ev.stop, None, "{word}: {}", d.printed);
+        let taken = d.take(0).taken.as_ref().unwrap();
+        assert_eq!(taken.fees, [sign], "{word}");
+        assert!(d.printed.contains(&format!("the taker fee's sign: {word}")));
+        let (report, json) = d.outputs();
+        let section = take_section(&report, "primary");
+        assert!(
+            section.contains(&format!(
+                "- The taker fee's sign (decision 0148 item 10; no amount): {word}\n"
+            )),
+            "{section}"
+        );
+        let declared = declared_section(&report);
+        assert!(declared.contains(&format!("(no amount): primary: {word}\n")));
+        assert_eq!(json["stage_two"]["takes"][0]["taken"]["fee_sign"], word);
+        // The slice's taker fill keeps the fee's sign alone.
+        let fills = d.sliced("primary-the-taker-IOC-session-", "fill_response");
+        assert!(!fills.is_empty());
+        assert_eq!(fills[0]["fee"], kept, "{word}");
+        assert_eq!(fills[0]["execution_type"], "TAKER");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+        let places = d.dir.join("evidence").join(stage::PLACES_SLICE);
+        evidence::privacy_check(&script, &places).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_report_gives_the_iocs_frame_order() {
+    // QFEX sends the taker IOC's fill_response before its final order_response, or after it
+    // (FBC-tfxk asks which): the report gives the order the session heard, and either way the
+    // fill reaches the registry, so the taker fill is flattened and the run ends with no stop.
+    for (knob, order) in [
+        (
+            model::IocFrameOrder::FillFirst,
+            taker::FrameOrder::FillFirst,
+        ),
+        (
+            model::IocFrameOrder::OrderFirst,
+            taker::FrameOrder::OrderFirst,
+        ),
+    ] {
+        let model = QfexModel {
+            ioc_frame_order: knob,
+            ..QfexModel::default()
+        };
+        let d = dropped_in(model, "take-frame-order", &primary_only(), |a| a).await;
+        assert_eq!(d.ev.stop, None, "{order:?}: {}", d.printed);
+        let run = d.take(0);
+        let taken = (run.taken.as_ref()).unwrap_or_else(|| panic!("{run:?}: {}", d.printed));
+        assert_eq!(taken.frame_order, Some(order));
+        assert_eq!(taken.ioc, Some(flatten::Ioc::Filled));
+        assert_flattened(run.flatten.as_ref().unwrap(), 0);
+        let (report, json) = d.outputs();
+        let section = take_section(&report, "primary");
+        assert!(
+            section.contains(&format!(
+                "- The order of its final order_response and its fill_response (FBC-tfxk): {}",
+                order.says()
+            )),
+            "{section}"
+        );
+        assert_eq!(
+            json["stage_two"]["takes"][0]["taken"]["frame_order"],
+            order.says()
+        );
+        // The slice keeps the frames in the order received: the taker session's first
+        // order_response or fill_response is the one QFEX sent first.
+        let places = d.dir.join("evidence").join(stage::PLACES_SLICE);
+        let mut names: Vec<String> = (fs::read_dir(&places).unwrap())
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("primary-the-taker-IOC-session-"))
+            .collect();
+        names.sort_by_key(|n| {
+            let n = n.trim_start_matches("primary-the-taker-IOC-session-");
+            n.split('-').next().unwrap().parse::<u32>().unwrap()
+        });
+        let first = names.iter().find_map(|name| {
+            let v: Value = super::json(&fs::read_to_string(places.join(name)).unwrap());
+            ["fill_response", "order_response"].into_iter().find(|m| {
+                v.get(m)
+                    .is_some_and(|b| b.get("status") != Some(&serde_json::json!("ACK")))
+            })
+        });
+        let want = match order {
+            taker::FrameOrder::FillFirst => "fill_response",
+            _ => "order_response",
+        };
+        assert_eq!(first, Some(want), "{names:?}");
+    }
+}
+
+/// Asserts that `d` stopped with `stop` during or after the primary account's taker IOC session:
+/// its marker written, every named account read after that session, and the report and the
+/// evidence naming it and passing the privacy check.
+fn assert_take_stopped(d: &Dropped, stop: places::Stop) {
+    let name = stop.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let after: Vec<&str> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_TAKE)
+        .map(|r| r.label.as_str())
+        .collect();
+    assert_eq!(after, ["primary (take)", "subaccount"], "{}", d.printed);
+    // Said as met in or after the taker IOC session, never after the crossing session.
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    let when = stopped.split(':').next().unwrap_or_default();
+    assert!(when.starts_with(&format!("{name} ")), "{stopped}");
+    assert!(
+        when.contains("the taker IOC session") && !when.contains("crossing"),
+        "{stopped}"
+    );
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains("| after the taker IOC session | primary (take) |"),
+        "{report}"
+    );
+    assert_eq!(json["stage_two"]["takes"][0]["stop"], name);
+    assert_eq!(d.stage_two().crosses.len(), 1, "no later account's session");
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    assert_no_secret(&d.dir.join("evidence"));
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn an_arm_not_accepted_in_the_taker_ioc_session_places_no_taker_ioc() {
+    // QFEX rejects the taker IOC session's arm (the run's sixth): its connection ends, so no taker
+    // IOC is placed, the end is unplanned, a stop, and the run stops with its reads after it.
+    let model = QfexModel {
+        arm_err_on: Some(5),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-arm-err").await;
+    assert_take_stopped(&d, places::Stop::ConnectionEnded);
+    assert_eq!(d.count("add_order"), 5, "{:?}", d.what());
+    let run = d.take(0);
+    assert_eq!(run.arm.as_deref(), Some("Rejected"));
+    assert!(!run.started && !run.placed.submitted && run.taken.is_none());
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED));
+    let section = take_section(&d.outputs().0, "primary");
+    assert!(
+        section.contains("- How the taker IOC came back: not measured: it was not placed"),
+        "{section}"
+    );
+}
+
+#[tokio::test]
+async fn a_taker_ioc_waits_for_no_other_order_of_ours() {
+    // An order of ours, never sent, held in the primary account's cross registry before the
+    // taker IOC session's check (a test's hook, as for the crossing order): the taker IOC is kept
+    // back, a stop, LeftResting, with no taker IOC (decision 0148 item 6).
+    let hooks = probe_args::TestHooks {
+        take_other_order: Some(0),
+        ..probe_args::TestHooks::default()
+    };
+    let d = hooked(QfexModel::default(), "take-blocked", |a| a, hooks).await;
+    assert_take_stopped(&d, places::Stop::LeftResting);
+    assert_eq!(d.count("add_order"), 5, "{:?}", d.what());
+    let run = d.take(0);
+    let blocked = run.blocked.clone().unwrap();
+    assert!(
+        blocked.starts_with("the cross registry on primary holds an order of ours"),
+        "{blocked}"
+    );
+    assert!(run.started && !run.placed.submitted && run.taken.is_none());
+    assert!(d.printed.contains(&format!(
+        "BLOCKED the taker IOC on primary: {blocked} (decision 0148 item 6)"
+    )));
+    let section = take_section(&d.outputs().0, "primary");
+    assert!(
+        section.contains(&format!(
+            "- No other order of ours (decision 0148 item 6): kept back: {blocked}"
+        )),
+        "{section}"
+    );
+}
+
+#[tokio::test]
+async fn a_taker_ioc_never_answered_is_never_resent_and_stops_the_run() {
+    // QFEX never answers the taker IOC: at its deadline it is Unknown, never resent (decision
+    // 0005) and counted resting, so nothing is flattened, and the take registry still counting
+    // it resting after the session stops the run, LeftResting.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Silent,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-silent").await;
+    assert_take_stopped(&d, places::Stop::LeftResting);
+    assert_eq!(events(&d, "ioc Silent"), 1);
+    let run = d.take(0);
+    assert_eq!(run.taken.as_ref().unwrap().ioc, Some(flatten::Ioc::Unknown));
+    assert_eq!(run.flatten, None);
+    assert!(run.counted_resting && !run.resting, "{run:?}");
+    let section = take_section(&d.outputs().0, "primary");
+    assert!(
+        section.contains("the take registry still counts an order of ours resting"),
+        "{section}"
+    );
+}
+
+#[tokio::test]
+async fn a_taker_ioc_refused_by_an_err_is_recorded_and_stops_the_run() {
+    // QFEX refuses the taker IOC with an err echoing its add_order: recorded as refused, nothing
+    // filled or flattened; the err settles nothing, so the take registry still counts it after
+    // the session, a stop, LeftResting, never resent.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Refuse,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-refused").await;
+    assert_take_stopped(&d, places::Stop::LeftResting);
+    let run = d.take(0);
+    assert_eq!(run.taken.as_ref().unwrap().ioc, Some(flatten::Ioc::Refused));
+    assert_eq!(run.flatten, None);
+    assert!(d.printed.contains("TAKEN on primary: refused by an err"));
+}
+
+#[tokio::test]
+async fn a_taker_ioc_left_resting_is_reported_for_the_hand_cancel() {
+    // QFEX acks the taker IOC and leaves it resting, which no IOC does, and answers the Stop's
+    // cancel of it NO_SUCH_ORDER: the read after the session lists it, an order of ours left
+    // resting, reported for the owner's hand cancel (decision 0132 item 7).
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        cancel_misses: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-rests").await;
+    assert_take_stopped(&d, places::Stop::LeftResting);
+    let run = d.take(0);
+    assert!(run.resting && run.read, "{run:?}");
+    assert_eq!(run.taken.as_ref().unwrap().ioc, Some(flatten::Ioc::Open));
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", taker::HAND_CANCEL_TAKE))
+    );
+    let (report, json) = d.outputs();
+    assert!(take_section(&report, "primary").contains(taker::HAND_CANCEL_TAKE));
+    assert_eq!(
+        json["stage_two"]["takes"][0]["hand_cancel"],
+        taker::HAND_CANCEL_TAKE
+    );
+    let declared = declared_section(&report);
+    assert!(
+        declared.contains("a hand cancel on QFEX production's site"),
+        "{declared}"
+    );
+}
+
+#[tokio::test]
+async fn the_reads_after_a_taker_sessions_held_drop_read_again_until_its_cancel_shows() {
+    // FBC-23ch's third review fix, as the crossing session carries it, carried to the taker IOC
+    // session: QFEX acks the taker IOC and leaves it resting, and refuses the Stop's cancel of
+    // it RateLimited, so the session ends by the abrupt drop (0151 item 11), whose cancel QFEX
+    // makes once it learns of it. Its first read of the account after the drop still shows the
+    // IOC open, as a read made before then would. The reads after the taker IOC session read
+    // every named account again at the comparisons' cadence (0151 item 4), and the next one shows
+    // it gone: nothing of ours is left resting, and the run reports no hand cancel.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        rate_limit: Some(model::Limited::Cancel),
+        // The third drop of the run: each named account's drop session two, then this one.
+        drop_lag: Some((2, 1)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-held-lag").await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::Session,
+    };
+    assert_eq!(d.ev.stop, Some(refused.name()), "{}", d.printed);
+    let run = d.take(0);
+    assert_eq!(run.ended_by, Some(stage::DROPPED), "{run:?}");
+    assert!(!run.resting && run.read, "{run:?}");
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    let line = "READ after the taker IOC session's drop: primary: ";
+    let said = d.printed.lines().find(|l| l.starts_with(line));
+    let said = said.unwrap_or_else(|| panic!("{}", d.printed));
+    assert!(!said.contains(": 1 of at most 5 rounds"), "{said}");
+    assert!(
+        said.ends_with("the last judged listing no order of ours"),
+        "{said}"
+    );
+}
+
+#[tokio::test]
+async fn a_taker_ioc_with_no_touch_to_price_it_is_not_placed() {
+    // As the primary account's crossing post-only goes out the MDS touch turns crossed, so the
+    // taker IOC has no touch to be priced from: it is not placed, a failure that is no stop,
+    // recorded as the taker IOC session's error, and the run ends on it with no marker.
+    let model = QfexModel {
+        crossed_on_place: Some(4),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-no-touch").await;
+    assert_eq!(d.count("add_order"), 5, "{:?}", d.what());
+    let run = d.take(0);
+    assert!(run.started && !run.placed.submitted, "{run:?}");
+    let error = run.error.clone().unwrap();
+    assert_eq!(error, market::CROSSED, "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(error.as_str()));
+    assert_eq!((d.ev.stop, d.marker()), (None, None));
+    assert_eq!(run.taken, None);
+    let section = take_section(&d.outputs().0, "primary");
+    assert!(section.contains(&format!("- Error: {error}")), "{section}");
+}
+
+// ----- FBC-ou9g: what the flatten and the taker IOC stop on when they cannot run their course
+// (decision 0005, 0148 items 5, 6 and 9, 0151 item 9) -----
+
+#[tokio::test]
+async fn a_taker_ioc_whose_fill_never_reaches_the_session_stops_the_run_not_flat() {
+    // QFEX ends the taker IOC FILLED, but its fill_response never reaches the session: at its
+    // deadline the take registry holds it ended with no fill and its position flat, while QFEX's
+    // count states the fill. The flatten would judge the registry's position, which is not
+    // QFEX's, so nothing is flattened and the run stops IocUnsettled, not flat, marked, in the
+    // session, before the reads after it, whatever they show. REST lags the fill, so the
+    // comparison after the IOC agrees with the registry: with one read lagging, the reads after
+    // the session show the position; with three, they show it flat too. REST lags from the
+    // taker IOC, the run's sixth add_order, on: a read before the drop must list Y.
+    for lag in [1, 3] {
+        let model = QfexModel {
+            ioc_frame_order: model::IocFrameOrder::Withheld,
+            rest_lag: lag,
+            rest_lag_from: Some(5),
+            ..QfexModel::default()
+        };
+        let d = dropped(model, "take-unsettled").await;
+        let stop = places::Stop::IocUnsettled;
+        assert_take_stopped(&d, stop);
+        let run = d.take(0);
+        let taken = run.taken.as_ref().unwrap();
+        assert_eq!(taken.ioc, Some(flatten::Ioc::Unsettled), "{lag}");
+        assert!(taken.fees.is_empty());
+        assert_eq!(taken.frame_order, Some(taker::FrameOrder::NoFill));
+        assert_eq!(run.flatten, None, "no flatten");
+        assert_eq!(d.iocs("SELL").len(), 0, "no flatten IOC");
+        assert_eq!(run.stop, Some("IocUnsettled"));
+        let stopped = d.ev.stopped.as_deref().unwrap();
+        assert!(
+            stopped.starts_with("IocUnsettled in the taker IOC session"),
+            "{stopped}"
+        );
+        assert!(
+            d.printed
+                .contains(&format!("TAKEN on primary: {}", taker::UNSETTLED)),
+            "{}",
+            d.printed
+        );
+        // QFEX holds the fill: the model filled the taker IOC whole.
+        let model = d.venue.model.lock().unwrap();
+        let ioc = model.orders.last().unwrap();
+        assert_eq!(
+            (ioc.filled, ioc.state),
+            (ioc.quantity, model::State::Filled)
+        );
+        drop(model);
+        let section = take_section(&d.outputs().0, "primary");
+        assert!(
+            section.contains(&format!(
+                "- How the taker IOC came back: {}",
+                taker::UNSETTLED
+            )),
+            "{section}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_flatten_ioc_whose_fill_never_reaches_the_session_is_the_last_one_sent() {
+    // X fills as a maker in drop session one; QFEX fills the flatten IOC whole, but its
+    // fill_response never reaches the session, and REST lags the fill, so a read agrees with the
+    // registry's stale position. The registry's position is not QFEX's, so no second flatten IOC
+    // is built though a second attempt is left (on QFEX it would cross zero): the run stops
+    // Flatten(Unsettled), not flat (decision 0148 items 5 and 9).
+    let model = QfexModel {
+        ioc_frame_order: model::IocFrameOrder::Withheld,
+        rest_lag: 3,
+        ..maker_filled(model::IocAnswer::Full)
+    };
+    let d = dropped_with(model, "flatten-unsettled", attempts("2")).await;
+    let unsettled = places::Stop::Flatten(places::Flattening::Unsettled);
+    let flatten = assert_flatten_stopped(&d, unsettled, 1);
+    assert_eq!(flatten.iocs.len(), 1, "{flatten:?}");
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Unsettled));
+    assert_eq!(events(&d, "ioc Full"), 1);
+    assert_eq!(d.iocs("SELL").len(), 1);
+}
+
+#[tokio::test]
+async fn a_flatten_after_the_taker_fill_with_no_touch_to_price_from_stops_the_run() {
+    // As the taker IOC goes out the MDS touch turns crossed, though QFEX still fills it: the
+    // flatten has no touch to price an IOC from, so none is sent, and the run stops
+    // Flatten(NoTouch), not flat, marked, in the taker IOC session, though the taker's fill is
+    // expected (0151 item 9).
+    let crossed = model::Touch {
+        bid: Some(("100.20", "1.00")),
+        ask: Some(("100.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        touch_on_place: Some((5, crossed)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-flatten-no-touch").await;
+    let no_touch = places::Stop::Flatten(places::Flattening::NoTouch);
+    assert_take_stopped(&d, no_touch);
+    let run = d.take(0);
+    assert_eq!(run.taken.as_ref().unwrap().ioc, Some(flatten::Ioc::Filled));
+    let flatten = run.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.error.as_deref(), Some(market::CROSSED));
+    assert_eq!(
+        (flatten.exit, flatten.sent(), flatten.stop, flatten.flat),
+        (Some(true), 0, Some(no_touch.name()), false)
+    );
+    assert_eq!(d.iocs("SELL").len(), 0, "no flatten IOC");
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("Flatten(NoTouch) in the taker IOC session"),
+        "{:?}",
+        d.ev.stopped
+    );
+}
+
+#[tokio::test]
+async fn each_flatten_ioc_is_priced_from_a_touch_read_just_before_it() {
+    // X fills as a maker; QFEX expires each flatten IOC, and as the first arrives the touch's bid
+    // moves from 100.00 to 99.00: the second is priced from the touch read just before it,
+    // within --flatten-cap-bps (10) of the new bid, not from the first's touch.
+    let moved = model::Touch {
+        bid: Some(("99.00", "1.00")),
+        ask: Some(("99.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        touch_on_place: Some((1, moved)),
+        ..maker_filled(model::IocAnswer::Expire)
+    };
+    let d = dropped_with(model, "flatten-fresh-touch", attempts("2")).await;
+    let used_up = places::Stop::Flatten(places::Flattening::UsedUp);
+    assert_flatten_stopped(&d, used_up, 2);
+    let prices: Vec<Decimal> = (d.iocs("SELL").iter())
+        .map(|ioc| Decimal::from_str(&ioc.price.to_string()).unwrap())
+        .collect();
+    assert_eq!(prices.len(), 2);
+    let within = |px: Decimal, bid: i64| {
+        let bid = Decimal::new(bid, 0);
+        px <= bid && px >= bid * (Decimal::ONE - Decimal::new(10, 4))
+    };
+    assert!(within(prices[0], 100), "{prices:?}");
+    assert!(within(prices[1], 99), "{prices:?}");
+}
+
+#[tokio::test]
+async fn a_flatten_whose_client_id_is_not_minted_stops_refused() {
+    // The run's mint refuses the flatten IOC's client id (a test's hook): no IOC is built, and
+    // the run stops Flatten(Refused), not flat, the refusal recorded as the flatten's error.
+    let hooks = probe_args::TestHooks {
+        refuse_mint_in_flatten: true,
+        ..probe_args::TestHooks::default()
+    };
+    let model = maker_filled(model::IocAnswer::Full);
+    let d = hooked(model, "flatten-mint-refused", |a| a, hooks).await;
+    let refused = places::Stop::Flatten(places::Flattening::Refused);
+    let flatten = assert_flatten_stopped(&d, refused, 0);
+    assert_eq!(
+        flatten.error.as_deref(),
+        Some("a test's refusal of the flatten's client id")
+    );
+    assert_eq!((flatten.exit, flatten.iocs.len()), (Some(true), 0));
+    assert_eq!(d.count("add_order"), 1, "{:?}", d.what());
+}
+
+#[tokio::test]
+async fn what_followed_a_session_the_run_ended_after_is_the_runs_end() {
+    // The primary account's taker IOC is not placed, no touch to price it from, an error that is
+    // no stop: the run ends on it, so what followed that session is the run's end, not the
+    // subaccount's crossing session, which never ran, nor the run's planned end.
+    let model = QfexModel {
+        crossed_on_place: Some(4),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "followed-take-error").await;
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    let section = take_section(&d.outputs().0, "primary");
+    assert!(
+        section.contains(&format!("- What followed: {}", taker::RUN_ENDED)),
+        "{section}"
+    );
+    assert!(!section.contains(taker::LAST_TAKE), "{section}");
+    // The crossing post-only is not placed, likewise: no taker IOC session followed it.
+    let model = QfexModel {
+        crossed_on_place: Some(3),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "followed-cross-error").await;
+    assert!(d.stage_two().takes.is_empty());
+    let section = cross_section(&d.outputs().0, "primary");
+    assert!(
+        section.contains(&format!("- What followed: {}", taker::RUN_ENDED)),
+        "{section}"
+    );
+    assert!(!section.contains(taker::THEN_TAKE), "{section}");
+}
+
+// ----- FBC-23ch's review fixes of PR #272, carried to the taker IOC and the flatten -----
+
+/// A touch near 400, where caps of [`THREE_MIN_USD`] admit no minimum size.
+fn risen_touch() -> model::Touch {
+    model::Touch {
+        bid: Some(("400.00", "1.00")),
+        ask: Some(("400.10", "2.00")),
+        age_secs: 0,
+    }
+}
+
+/// Both caps at [`THREE_MIN_USD`], three minimum sizes at the model's own touch.
+fn three_min_caps(argv: Argv) -> Argv {
+    let argv = set(argv, "--resting-cap-usd", THREE_MIN_USD);
+    set(argv, "--inventory-cap-usd", THREE_MIN_USD)
+}
+
+#[tokio::test]
+async fn a_touch_that_moves_past_the_caps_before_the_taker_ioc_sends_none() {
+    // PR #272's thread 4605918689, carried to the taker IOC: both caps admit exactly three
+    // minimum sizes at the preflight's touch near 100, where X, Y and the primary account's
+    // crossing post-only are placed; at that account's taker IOC session's arm, the run's sixth,
+    // the touch moves near 400, where they admit none, while the take registry's lot caps, fixed
+    // at the preflight, still admit three. The taker IOC is not sent and never resized, and the
+    // run stops, marked; the session cancels by venue id, nothing of ours resting, and ends by a
+    // graceful close (decision 0113).
+    let model = QfexModel {
+        touch_moves_at_arm: Some((5, risen_touch())),
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "take-caps-moved", three_min_caps).await;
+    assert_eq!(d.count("add_order"), 5, "{:?}", d.what());
+    assert!(d.iocs("BUY").is_empty(), "{:?}", d.what());
+    assert_take_stopped(&d, places::Stop::BeyondCaps);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("BeyondCaps in the taker IOC session"),
+        "{said}"
+    );
+    let run = d.take(0);
+    assert!(run.started && !run.placed.submitted, "{run:?}");
+    assert!(run.taken.is_none(), "{run:?}");
+    assert!(!d.printed.contains("PLACE the taker IOC"), "{}", d.printed);
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!((cancels.sent, cancels.ended), (0, true), "{cancels:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.count("cancel_order"), 0);
+}
+
+#[tokio::test]
+async fn a_flatten_ioc_the_caps_would_not_admit_at_its_touch_is_not_sent_and_stops_not_flat() {
+    // PR #272's thread 4605918689, carried to the flatten IOC: both caps admit exactly three
+    // minimum sizes at the preflight's touch near 100, where X is placed; as X arrives the touch
+    // moves near 400, where they admit none, and X then fills whole as a maker. fbc-oms applies
+    // the caps to reducing orders too (0013 rule 2), so the flatten IOC is not sent and never
+    // resized (decision 0113): the run stops Flatten(BeyondCaps), marked, not flat, the position
+    // the owner's, nothing of the flatten budget spent on it.
+    let model = QfexModel {
+        touch_on_place: Some((0, risen_touch())),
+        ..maker_filled(model::IocAnswer::Full)
+    };
+    let d = dropped_with(model, "flatten-caps-moved", three_min_caps).await;
+    let beyond = places::Stop::Flatten(places::Flattening::BeyondCaps);
+    let flatten = assert_flatten_stopped(&d, beyond, 0);
+    assert_eq!(flatten.exit, Some(true), "{flatten:?}");
+    assert_eq!(flatten.iocs.len(), 1, "{flatten:?}");
+    assert!(!flatten.iocs[0].sent, "{flatten:?}");
+    assert_eq!(d.count("add_order"), 1, "{:?}", d.what());
+    assert!(d.iocs("SELL").is_empty(), "{:?}", d.what());
+    assert!(
+        d.printed
+            .contains("FLATTEN beyond the caps on primary: --resting-cap-usd or"),
+        "{}",
+        d.printed
+    );
+    assert!(beyond.marks() && beyond.says().contains("never resized"));
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_in_a_flatten_comparison_stops_it() {
+    // PR #272's thread 4605918671, carried to the flatten: X fills as a maker, and the read
+    // socket of the comparison after the flatten IOC, the first to authenticate after the IOC
+    // came (so never a comparison's begun before the session read X's fill, FBC-23ch's third
+    // review fix), is answered a RateLimited err echoing its authentication, which the journal
+    // keeps whole (decision 0134 item 2), so the adapter reads no hold from it. The refusal its
+    // frame shows is a stop on the read socket all the same (decision 0135 item 2, 0151 item 4),
+    // which the flatten gives its session over the fill it answered, its comparison reconnecting
+    // for no second read.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEchoAfterIoc),
+        ..maker_filled(model::IocAnswer::Full)
+    };
+    let d = dropped(model, "flatten-rate-whole").await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    assert_stopped(&d, refused);
+    let flatten = d.drop_run().flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.stop, Some(refused.name()));
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Filled));
+    assert_eq!(flatten.compared.len(), 1, "{flatten:?}");
+    let compared = &flatten.compared[0];
+    assert_eq!(compared.ended, compare::Ended::Refused, "{compared:?}");
+    assert_eq!(compared.reads.len(), 1, "{compared:?}");
+    let socket = (d.ev.read_sockets.iter()).find(|r| r.refusals.whole > 0);
+    let refusals = socket.expect("the flatten comparison's socket").refusals;
+    let shown = (refusals.errs, refusals.unread, refusals.whole);
+    assert_eq!(shown, (0, 1, 1), "{refusals:?}");
+}
+
+#[tokio::test]
+async fn a_press_while_the_taker_sessions_close_waits_for_room_is_taken_by_the_reads_after_it() {
+    // PR #272's thread 4605918659, carried to the taker IOC session: QFEX acks the taker IOC and
+    // leaves it resting, and as it reads the Stop's cancel of it, the run's first cancel_order,
+    // the shared budget is held for 6 s, as a provider rate refusal echoing nothing would. The
+    // cancel is answered and the IOC seen to end, but the comparison after the cancels reads
+    // nothing within its wait, and the graceful close waits for room (0151 item 11). The owner
+    // presses Ctrl-C as the market is disarmed, so the close is still waiting. The cancels have
+    // already run, so the wait does not take the press: the session ends by its graceful close
+    // once there is room, and the reads after it take the press, which stops the run, marked,
+    // after every named account was read.
+    let rate_user = user();
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        hold_on_cancel: Some((shared_limiter(rate_user), Duration::from_secs(6))),
+        ..QfexModel::default()
+    };
+    let at = "STOP cancels: Kill, then 1 cancels by venue id (decision 0132 item 7, 0148 item 8)";
+    let d = pressed_at_as(
+        model,
+        "take-press-at-close",
+        rate_user,
+        wait_past_a_drop,
+        at,
+    )
+    .await;
+    assert_take_stopped(&d, places::Stop::Interrupted);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("Interrupted during the reads after the taker IOC session"),
+        "{said}"
+    );
+    let run = d.take(0);
+    assert!(run.placed.submitted, "{run:?}");
+    // One round of cancels, before the wait: none ran again for the press.
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!((cancels.sent, cancels.presses), (1, 0), "{cancels:?}");
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    let steps: Vec<_> = run.compared.iter().map(|c| (c.step, c.ended)).collect();
+    assert_eq!(
+        steps.last(),
+        Some(&("the stop's cancels", compare::Ended::Unread))
+    );
+    // The close waited for room, so its frame was sent and the venue saw the client close it,
+    // after the cancel.
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    let conn = &d.take_conns()[0];
+    let n: usize = conn.parse().unwrap();
+    assert!(d.venue.trade.connections()[n].client_closed);
+    let what = d.what();
+    let at = |w: &str| what.iter().position(|e| e.starts_with(w)).unwrap();
+    let cancel = at(&format!("trade {conn} cancel_order"));
+    assert!(cancel < at(&format!("cod {conn} close")), "{what:?}");
+    assert!(!run.resting && !run.counted_resting && run.read, "{run:?}");
+}
+
+#[tokio::test]
+async fn a_taker_fill_that_reaches_the_session_after_its_steps_is_flattened_before_the_close() {
+    // QFEX acks the primary account's taker IOC and leaves it open, so at its deadline it is
+    // open with no fill, the registry flat, and nothing follows it. The Stop's cancel of it is
+    // the run's first cancel_order, and QFEX fills the order whole as a maker as that cancel
+    // arrives. The flatten IOC, a sell, is filled whole against the bid as QFEX fills an IOC by
+    // default. Its fill is the taker IOC's, expected, and reaches the session only after its
+    // steps ended: it is flattened then, while the session is still open, before its close (0151
+    // item 9), and, once flat, it stops nothing. The subaccount's taker IOC rests too, and its
+    // cancel fills nothing, so the run ends after it with no stop.
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        ioc_sells: Some(model::IocAnswer::Full),
+        fill_on_cancel: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-late-fill").await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    let run = d.take(0);
+    assert_eq!(run.taken.as_ref().unwrap().ioc, Some(flatten::Ioc::Open));
+    assert_eq!(run.stop, None, "{run:?}");
+    // QFEX answers the cancel NO_SUCH_ORDER, its order filled first; the order was seen to end,
+    // whether the wait met that answer (which holds the cancels) or the order's end first.
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.ended), (1, true), "{cancels:?}");
+    let flatten = run.flatten.as_ref().expect("a late flatten");
+    assert_eq!(flatten.after, taker::AFTER_LATE_TAKER, "{}", d.printed);
+    assert_flattened(flatten, 0);
+    assert_eq!(flatten.sent(), 1);
+    assert_eq!(d.iocs("SELL").len(), 1, "one flatten IOC");
+    assert_eq!(d.take(1).flatten, None);
+    // The flatten ran after the Stop's cancel and before the session's close.
+    let conn = &d.take_conns()[0];
+    let what = d.what();
+    let at = |w: &str| what.iter().position(|e| e.starts_with(w)).unwrap();
+    let cancel = at(&format!("trade {conn} cancel_order"));
+    let sells: Vec<usize> = (what.iter().enumerate())
+        .filter(|(_, e)| e.starts_with(&format!("trade {conn} add_order")))
+        .map(|(n, _)| n)
+        .collect();
+    let flatten_ioc = *sells.last().unwrap();
+    assert!(cancel < flatten_ioc, "{what:?}");
+    assert!(flatten_ioc < at(&format!("cod {conn} close")), "{what:?}");
+    let lines = [
+        "STOP cancels: Kill, then 1 cancels by venue id (decision 0132 item 7, 0148 item 8)"
+            .to_owned(),
+        "FLATTENED on primary: flat".to_owned(),
+        "READ after the taker IOC session: primary (take)".to_owned(),
+    ];
+    assert!(d.at(&lines[1]) < d.at(&lines[2]), "{}", d.printed);
+    assert!(d.printed.contains(&lines[0]), "{}", d.printed);
+    let after: Vec<&capture::AccountRead> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_TAKE)
+        .collect();
+    assert!(after.iter().all(|r| r.flat), "{after:?}");
+}
+
+#[tokio::test]
+async fn a_taker_fill_that_reaches_the_session_while_its_close_waits_for_room_is_flattened_first() {
+    // As above, the primary account's taker IOC is acked and left open, and QFEX fills it whole as
+    // a maker as the Stop's cancel of it arrives, the run's first: the FILLED order_response ends
+    // it at once, the cancel answered NO_SUCH_ORDER after it, and the fill_response follows 4 s
+    // later. As QFEX reads that cancel the shared budget is held for 6 s, so the graceful close
+    // waits for room (0151 item 11). Until the fill_response arrives QFEX's count of the IOC's
+    // fills is above the registry's, so nothing is flattened yet; it arrives as the close waits,
+    // after the Stop's cancels and the disarm, and leaves the registry long: it is flattened once
+    // there is room and before the close (0151 item 9), the market disarmed again after it, and,
+    // the fill expected, the run stops nothing.
+    let rate_user = user();
+    let model = QfexModel {
+        ioc: model::IocAnswer::Rest,
+        ioc_sells: Some(model::IocAnswer::Full),
+        hold_on_cancel: Some((shared_limiter(rate_user), Duration::from_secs(6))),
+        fill_on_cancel: true,
+        fill_on_cancel_after: Some(Duration::from_secs(4)),
+        ..QfexModel::default()
+    };
+    let d = held_drop(model, "take-fill-at-close", rate_user, wait_past_a_drop).await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    let run = d.take(0);
+    assert_eq!(run.taken.as_ref().unwrap().ioc, Some(flatten::Ioc::Open));
+    assert_eq!(run.stop, None, "{run:?}");
+    let flatten = run.flatten.as_ref().expect("a late flatten");
+    assert_eq!(flatten.after, taker::AFTER_LATE_TAKER, "{}", d.printed);
+    assert_flattened(flatten, 0);
+    assert_eq!(d.iocs("SELL").len(), 1, "one flatten IOC");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    // The disarm, then the flatten, then the disarm again, all before the session's end.
+    let lines = [
+        "STOP cancels: Kill, then 1 cancels by venue id (decision 0132 item 7, 0148 item 8)",
+        "FLATTEN on primary: the Stop's Kill lifted",
+        "FLATTEN on primary: the owner's Flatten, the market in Exit",
+        "FLATTENED on primary: flat",
+        "FLATTEN on primary: the market disarmed again, as the Stop left it",
+        "SESSION primary (the taker IOC session): arm outcome Accepted, ended by a graceful close",
+        "READ after the taker IOC session: primary (take)",
+    ];
+    for pair in lines.windows(2) {
+        assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
+    }
+    let after: Vec<&capture::AccountRead> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_TAKE)
+        .collect();
+    assert!(after.iter().all(|r| r.flat), "{after:?}");
+}
+
+/// A whole run on `model`, as [`dropped`] runs it, but `then` changes the model once the run first
+/// prints a line holding `at`.
+async fn changed_at(
+    model: QfexModel,
+    what: &str,
+    at: &'static str,
+    then: impl FnMut(&mut QfexModel) + 'static,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let shared = Arc::clone(&venue.model);
+    let mut then = then;
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at,
+        press: Some(Box::new(move || then(&mut shared.lock().unwrap()))),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let none = interrupt::Presses::none();
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, none).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+/// The provider rate refusal `on` names, set on the model for the `ahead`th read of its kind from
+/// now, from 0: a `get_user_orders` page on a read socket, or a `GET /user/positions`; with no
+/// `on`, a position shown on the primary account that no fill made.
+fn refuse_ahead(on: Option<places::RefusedOn>, ahead: usize) -> impl FnMut(&mut QfexModel) {
+    move |m: &mut QfexModel| match on {
+        Some(places::RefusedOn::ReadSocket) => {
+            m.rate_limit = Some(model::Limited::ReadSocket(m.pages_after + ahead));
+        }
+        Some(places::RefusedOn::Rest) => {
+            m.rate_limit = Some(model::Limited::Rest(m.rest_after + ahead));
+        }
+        Some(on) => unreachable!("no case refuses on {on:?}"),
+        // The primary account, keyed by no subaccount id.
+        None => m.moved.push(None),
+    }
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_the_reads_before_the_taker_ioc_session_stops_the_run_marked() {
+    // FBC-23ch's second review fix to the reads before a session (0151 items 4 and 6), carried to
+    // the reads before the taker IOC session: as the primary account's crossing session ends,
+    // the model refuses the third get_user_orders page on a read socket from then, with a
+    // RateLimited err, or the third GET /user/positions with HTTP 429. The reads after the
+    // crossing session read the two named accounts first, so the refusal meets the primary
+    // account's read before its taker IOC session. That provider rate refusal is the run's stop,
+    // marked, so the next run needs --reconciled; no take registry is built and no taker IOC is
+    // sent.
+    let cases = [
+        (
+            places::RefusedOn::ReadSocket,
+            "get_user_orders: QFEX refused the page read: RateLimited",
+        ),
+        (
+            places::RefusedOn::Rest,
+            "GET /user/positions: HTTP 429, a provider rate refusal",
+        ),
+    ];
+    for (on, failed) in cases {
+        let at = "SESSION primary (the crossing session): arm outcome";
+        let d = changed_at(QfexModel::default(), "take-reads-refused", at, {
+            refuse_ahead(Some(on), 2)
+        })
+        .await;
+        let stop = places::Stop::RateRefused { on };
+        let name = stop.name();
+        assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+        let said = d.ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(&format!("{name} in the reads before the taker IOC session")),
+            "{said}"
+        );
+        let marker = d.marker().unwrap_or_default();
+        assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+        // The read failure the refusal made is kept among the errors.
+        let errors = &d.ev.errors;
+        assert!(errors.iter().any(|e| e.ends_with(failed)), "{errors:?}");
+        // The reads after the crossing session were clean; the refusal met the next ones.
+        let after = (d.ev.reads.iter()).filter(|r| r.before == refusals::AFTER_CROSS);
+        assert_eq!(after.count(), 2, "{:?}", d.ev.reads);
+        assert!(!d.printed.contains("REGISTRY take"), "{}", d.printed);
+        let two = d.stage_two();
+        assert_eq!((two.crosses.len(), two.takes.len()), (1, 0), "{two:?}");
+        assert!(d.iocs("BUY").is_empty(), "no taker IOC");
+        d.venue.assert_served();
+    }
+}
+
+#[tokio::test]
+async fn a_stop_the_comparison_after_the_taker_sessions_cancels_raises_ends_the_run_marked() {
+    // FBC-23ch's second review fix to a session's ending order, carried to the taker IOC
+    // session: QFEX expires the primary account's taker IOC unfilled, so no stop comes from its
+    // steps and nothing is flattened; under Policy::Stage its Stop still cancels every order of
+    // ours by venue id and compares the streams with the reads after them. As the IOC is taken,
+    // before those cancels, which read nothing, the model refuses the next get_user_orders page
+    // on a read socket with a RateLimited err, or the next GET /user/positions with HTTP 429, or
+    // shows a position on the primary account that no fill made. That comparison's stop, a
+    // provider rate refusal or ReadDisagrees, is the session's: the run stops, marked, and the
+    // subaccount's crossing post-only is never placed.
+    let cases = [
+        Some(places::RefusedOn::ReadSocket),
+        Some(places::RefusedOn::Rest),
+        None,
+    ];
+    for refused in cases {
+        let model = QfexModel {
+            ioc: model::IocAnswer::Expire,
+            ..QfexModel::default()
+        };
+        let at = "TAKEN on primary";
+        let d = changed_at(model, "take-cancels-compared", at, refuse_ahead(refused, 0)).await;
+        let stop = match refused {
+            Some(on) => places::Stop::RateRefused { on },
+            None => places::Stop::ReadDisagrees,
+        };
+        let name = stop.name();
+        assert_take_stopped(&d, stop);
+        let said = d.ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(&format!("{name} in the taker IOC session")),
+            "{said}"
+        );
+        let take = d.take(0);
+        assert_eq!(
+            take.taken.as_ref().unwrap().ioc,
+            Some(flatten::Ioc::Expired)
+        );
+        assert!(take.cancels.is_some(), "{take:?}");
+        let last = take.compared.last().unwrap();
+        assert_eq!((last.step, last.stop), ("the stop's cancels", Some(stop)));
+        assert_eq!(take.flatten, None);
+        assert_eq!(venue_crossings(&d), 1);
+    }
+}
+
+#[tokio::test]
+async fn a_comparison_stop_after_the_stops_cancels_is_kept_before_a_late_flattens_own() {
+    // The primary account's crossing post-only rests. QFEX answers the Stop's cancel of it
+    // CANCELLED, so the cancels end, each accepted, but it had filled the order whole as a maker
+    // as the cancel arrived, and that fill reaches the session after the answer: a fill of ours
+    // after the Stop's cancels, flattened before the close (0151 item 9). As the session's steps
+    // end, before those cancels, the model refuses the next get_user_orders page on a read
+    // socket, which is the comparison's after the cancels. That comparison's provider rate
+    // refusal is the session's stop, and it stays so through the flatten, whatever the flatten's
+    // own: the run stops RateRefused in the crossing session, marked, and the subaccount's
+    // crossing post-only is never placed.
+    let model = QfexModel {
+        fill_behind_cancel: Some(Duration::ZERO),
+        ..resting_cross()
+    };
+    let on = Some(places::RefusedOn::ReadSocket);
+    let at = "CROSSED on primary";
+    let d = changed_at(model, "cross-refused-late-fill", at, refuse_ahead(on, 0)).await;
+    let stop = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    let name = stop.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with(&format!("{name} in the crossing session")),
+        "{said}"
+    );
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let run = d.cross(0);
+    let last = run.compared.last().unwrap();
+    assert_eq!((last.step, last.stop), ("the stop's cancels", Some(stop)));
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (1, false, true)
+    );
+    // The flatten ran after the comparison, its own outcome kept in its record: flat, or, when
+    // the refusal's hold on the shared budget kept its IOC unsent, Flatten(Refused), not flat.
+    let flatten = run.flatten.as_ref().expect("a late flatten");
+    assert_eq!(flatten.after, flatten::AFTER_LATE_FILL);
+    assert_eq!(flatten.exit, Some(true));
+    let refused = places::Stop::Flatten(places::Flattening::Refused);
+    let own = (flatten.stop, flatten.flat);
+    assert!(
+        own == (None, true) || own == (Some(refused.name()), false),
+        "{flatten:?}"
+    );
+    assert_eq!(run.stop, Some(name), "{run:?}");
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    assert_eq!(venue_crossings(&d), 1);
+}
+
+/// How many crossing post-only orders the model saw.
+fn venue_crossings(d: &Dropped) -> usize {
+    d.venue.model.lock().unwrap().crossings
+}
+
+// ----- FBC-77r8's review of PR #273, carried into the taker IOC and the flatten (FBC-ou9g) -------
+
+/// Whether the run printed the line the reads after the taker IOC session give for an order or a
+/// TWAP not ours.
+fn others_after_take(d: &Dropped) -> bool {
+    let line = format!("READ after the taker IOC session: {}", taker::OTHERS_TAKE);
+    d.printed.contains(&line)
+}
+
+#[tokio::test]
+async fn an_order_not_ours_the_reads_after_a_taker_ioc_session_list_stops_read_disagrees() {
+    // The taker IOC fills and is flattened, flat; but once its connection ended, the primary
+    // account holds an order no run placed, which only the reads after the session see. It is
+    // what the streams did not show, so the run stops ReadDisagrees, marked, said as met after
+    // the taker IOC session, not LeftResting with a hand cancel of an order of ours (FBC-77r8's
+    // review, carried).
+    let model = QfexModel {
+        after_take_end: vec![model::AfterHistoric::Foreign],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-after-foreign").await;
+    assert_take_stopped(&d, places::Stop::ReadDisagrees);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with(&format!("ReadDisagrees {}", stage::TAKE_OTHERS)),
+        "{stopped}"
+    );
+    let run = d.take(0);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert_eq!(run.not_flat_after, Some(false), "{run:?}");
+    assert!(!run.resting && !run.counted_resting && run.read, "{run:?}");
+    assert!(others_after_take(&d), "{}", d.printed);
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(section.contains(taker::OTHERS_TAKE), "{section}");
+    assert!(
+        section.contains("- No other order of ours (decision 0148 item 6): none: it may be placed"),
+        "{section}"
+    );
+    let take = &json["stage_two"]["takes"][0];
+    assert_eq!(take["others_after"], true);
+    assert_eq!(take["other_order_checked"], true);
+    assert!(take["hand_cancel"].is_null());
+}
+
+#[tokio::test]
+async fn a_twap_the_reads_after_a_taker_ioc_session_list_stops_read_disagrees() {
+    // As above, with a TWAP: no order rests, and still the streams did not show it, so the run
+    // stops ReadDisagrees, marked, rather than going on to the next account's crossing.
+    let model = QfexModel {
+        after_take_end: vec![model::AfterHistoric::Twap],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-after-twap").await;
+    assert_take_stopped(&d, places::Stop::ReadDisagrees);
+    let run = d.take(0);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert!(!run.resting && run.read, "{run:?}");
+    assert!(others_after_take(&d), "{}", d.printed);
+}
+
+#[tokio::test]
+async fn a_position_the_reads_after_a_taker_ioc_session_show_is_said_the_owners() {
+    // Once the taker IOC session's connection ended, the primary account shows a position no
+    // order of ours made and an order not ours: a position not flat comes first, so the run
+    // stops NotFlat, the order not ours still recorded, and the report and the evidence say the
+    // position is the owner's (0151 item 9; FBC-77r8's review, carried).
+    let model = QfexModel {
+        after_take_end: vec![
+            model::AfterHistoric::Position,
+            model::AfterHistoric::Foreign,
+        ],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-after-position").await;
+    assert_take_stopped(&d, places::Stop::NotFlat);
+    let run = d.take(0);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert_eq!(run.not_flat_after, Some(true), "{run:?}");
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "- A position not flat in the reads after the session: {}",
+            stage_two::CROSS_POSITION
+        )),
+        "{section}"
+    );
+    let take = &json["stage_two"]["takes"][0];
+    assert_eq!(take["not_flat_after"], true);
+    assert_eq!(take["owners_position"], stage_two::CROSS_POSITION);
+}
+
+#[tokio::test]
+async fn a_flatten_ioc_left_resting_after_a_crossing_session_is_read_as_ours() {
+    // The crossing post-only fills as a taker, and QFEX acks the flatten IOC and leaves it
+    // resting, answering every cancel NO_SUCH_ORDER: the reads after the crossing session list
+    // it. It is ours, a flatten IOC the session sent, so it is an order of ours left resting,
+    // reported for the hand cancel, and not an order the streams did not show (FBC-77r8's
+    // review, carried: the session's orders are its own and its flatten IOCs).
+    let model = QfexModel {
+        alo_cross: Some(model::AloCross::Fills),
+        ioc: model::IocAnswer::Rest,
+        cancel_misses: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-flatten-rests").await;
+    assert_eq!(d.iocs("SELL").len(), 1, "{:?}", d.what());
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    let run = d.cross(0);
+    assert!(run.resting && run.read, "{run:?}");
+    assert_eq!(run.others, Some(false), "{run:?}");
+    assert!(!others_after_cross(&d), "{}", d.printed);
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS)),
+        "{}",
+        d.printed
+    );
+    let json = d.outputs().1;
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["hand_cancel"],
+        stage_two::HAND_CANCEL_CROSS
+    );
+}
+
+#[tokio::test]
+async fn a_taker_session_that_ends_before_its_check_says_the_other_order_not_checked() {
+    // QFEX rejects the taker IOC session's arm (the run's sixth): the session ends before its
+    // check for another order of ours, so the report says that check was not made, and the
+    // evidence says so too, rather than "none" from the session's shape (FBC-77r8's review,
+    // carried).
+    let model = QfexModel {
+        arm_err_on: Some(5),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-not-checked").await;
+    assert_take_stopped(&d, places::Stop::ConnectionEnded);
+    let run = d.take(0);
+    assert!(!run.checked && run.blocked.is_none(), "{run:?}");
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(
+        section.contains(
+            "- No other order of ours (decision 0148 item 6): not checked: the session ended \
+             before it"
+        ),
+        "{section}"
+    );
+    assert_eq!(json["stage_two"]["takes"][0]["other_order_checked"], false);
+    // The crossing session before it reached its check.
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["other_order_checked"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn the_hand_actions_are_not_known_when_a_named_accounts_last_read_failed() {
+    // As a_named_account_not_read_after_a_crossing_session_stops_the_run_marked: the primary
+    // account's read after the subaccount's crossing session fails. Its last read was not made,
+    // so what the run leaves the owner by hand is not known, and the report says so rather than
+    // judging that account by an earlier read (FBC-77r8's review, carried).
+    let model = QfexModel {
+        alo_cross: Some(model::AloCross::Cancelled),
+        silent_after_cross: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "hand-not-known", |argv| {
+        set(argv, "--read-wait-ms", "3000")
+    })
+    .await;
+    assert_eq!(d.ev.stop, Some(places::Stop::LeftResting.name()));
+    assert_eq!(d.ev.last_unread, ["primary"], "{}", d.printed);
+    let (report, json) = d.outputs();
+    let declared = declared_section(&report);
+    assert!(
+        declared.contains(&format!(
+            "- The hand actions this run leaves the owner: {}",
+            taker::HAND_NOT_KNOWN
+        )),
+        "{declared}"
+    );
+    assert_eq!(json["declared"]["hand_actions_left"]["known"], false);
+}
+
+#[tokio::test]
+async fn a_flatten_ioc_left_resting_after_drop_session_one_is_read_as_ours() {
+    // X fills whole as a maker in drop session one, and QFEX acks the flatten IOC and leaves it
+    // open with no fill, answering every cancel NO_SUCH_ORDER; the close cancels nothing. The
+    // second attempt is kept back by it, so the run stops LeftResting, not flat. The reads after
+    // drop session one list the IOC: it is ours, a flatten IOC the session sent, so it is an
+    // order of ours left resting, asked of the owner by hand, and not an order the streams did
+    // not show (the restack's review: the drop sessions' flatten IOCs are read as ours).
+    let model = QfexModel {
+        cancel_misses: true,
+        ..maker_filled(model::IocAnswer::Rest)
+    };
+    let d = dropped_with(model, "drop-flatten-rests", attempts("2")).await;
+    let flatten = assert_flatten_stopped(&d, places::Stop::LeftResting, 1);
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Open));
+    assert!(flatten.blocked.is_some(), "{flatten:?}");
+    let run = d.drop_run();
+    assert!(!run.x_resting && run.x_read, "{run:?}");
+    assert_eq!(run.hand_cancel, Some(places::HAND_CANCEL_ONE_ORDERS));
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "primary (drop)")
+        .unwrap();
+    assert_eq!((after.page_orders, after.page_unknown), (1, 0), "{after:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ONE_ORDERS)),
+        "{}",
+        d.printed
+    );
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!(
+            "- An order of ours (X or a flatten IOC) resting after drop session one: {}",
+            places::HAND_CANCEL_ONE_ORDERS
+        )),
+        "{report}"
+    );
+    assert!(report.contains(flatten::Ioc::Open.says()), "{report}");
+    let one = &json["drop_tests"][0]["session_one"];
+    assert_eq!(one["hand_cancel"], places::HAND_CANCEL_ONE_ORDERS);
+    assert_eq!(
+        one["flatten"]["iocs"][0]["came_back"],
+        flatten::Ioc::Open.says()
+    );
+}
+
+#[tokio::test]
+async fn a_named_accounts_read_made_after_one_that_failed_makes_the_hand_actions_known() {
+    // The subaccount's read after the primary account's drop session one goes unanswered (the
+    // third authentication after X: the comparison's, then the primary account's read after the
+    // session) and fails at --read-wait-ms. The read before drop session two reads it again,
+    // cleanly, and every later read of it is made: its last read was made, so the hand actions
+    // the run leaves the owner are known, and none is asked (the restack's review: a read made
+    // clears an earlier failure, Run::read_one).
+    let model = QfexModel {
+        silent_auth: Some(2),
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "hand-known-again", |argv| {
+        set(argv, "--read-wait-ms", "3000")
+    })
+    .await;
+    let failed: Vec<&String> = (d.ev.errors.iter())
+        .filter(|e| e.starts_with("subaccount could not be read"))
+        .collect();
+    assert_eq!(failed.len(), 1, "{:?}", d.ev.errors);
+    let after_one = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "subaccount")
+        .count();
+    assert_eq!(after_one, 0, "{}", d.printed);
+    assert!(d.ev.last_unread.is_empty(), "{:?}", d.ev.last_unread);
+    let (report, json) = d.outputs();
+    let declared = declared_section(&report);
+    assert!(
+        declared.contains(
+            "- The hand actions this run leaves the owner: none: the last read of every named \
+             account showed no order of ours and a flat position"
+        ),
+        "{declared}"
+    );
+    assert_eq!(json["declared"]["hand_actions_left"]["known"], true);
+}
+
+#[tokio::test]
+async fn a_flatten_ioc_left_resting_after_drop_session_two_is_read_as_ours() {
+    // Y fills whole as a maker in drop session two. The flatten cancels X, which ends, and QFEX
+    // acks its IOC and leaves it open with no fill; the Stop's cancel of the IOC, the run's
+    // second cancel_order, is answered NO_SUCH_ORDER, and the close cancels nothing. The reads
+    // after drop session two list the IOC: it is ours, a flatten IOC the session sent, so it is
+    // an order of ours left resting, and not an order the streams did not show (the restack's
+    // review: the drop sessions' flatten IOCs are read as ours).
+    let model = QfexModel {
+        on_ack: Some((1, model::OnAck::MakerFill)),
+        ioc: model::IocAnswer::Rest,
+        cancel_misses_from: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-flatten-rests").await;
+    let two = d.two();
+    let flatten = two.flatten.as_ref().expect("a flatten");
+    assert_eq!(flatten.sent(), 1, "{flatten:?}");
+    assert_eq!(flatten.iocs[0].came_back, Some(flatten::Ioc::Open));
+    assert_eq!(d.count("cancel_order"), 2, "{:?}", d.what());
+    assert!(two.resting && two.read, "{two:?}");
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
+        .unwrap();
+    assert_eq!((after.page_orders, after.page_unknown), (1, 0), "{after:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS)),
+        "{}",
+        d.printed
+    );
+    let json = d.outputs().1;
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["hand_cancel"],
+        places::HAND_CANCEL_ORDERS
+    );
 }
