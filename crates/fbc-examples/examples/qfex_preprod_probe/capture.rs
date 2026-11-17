@@ -11,11 +11,24 @@
 //! identifiers and credentials (decisions 0028, 0122 item 3) and, in an echo, the spans that
 //! decisions 0132 item 3 and 0134 keep in place of the whole frame, so the arm's own echo is
 //! there as received but its err message. Each frame is placed against the arm: before it was
-//! written, in its window (from its write to its deadline, or the connection's end), or after.
+//! written, in its window (from its write to its own deadline, or the connection's end: the
+//! deadline of another request, a place's, ends no window), or after.
 //! A frame that is not a top-level `ack` or `err` envelope echoing a request has every JSON number
 //! replaced by `0` ([`scrub`], [`zero_numbers`]), so no amount of the account (a position, a
 //! margin, a balance) is published (decision 0009); its member names, strings and nesting are as
 //! received. No frame we wrote is kept.
+//!
+//! **The place stages' scrub** ([`Scrub::Places`], [`scrub_places`]; decision 0148 item 10)
+//! scrubs their frames as FBC-291a's capture was, whose `symbol`s the owner blanked by hand
+//! after the run, except that each fee keeps its sign. Stage one's frames are only the arm's and
+//! the resync's, and stage one's slice keeps its own scrub, so its captures are as before. In
+//! every frame, a top-level echo included, every `symbol`'s string value becomes [`SYMBOL`]. A
+//! top-level echo is otherwise kept as the codec's spans left it. In any other frame, every
+//! number is zeroed and every string that reads, its escapes decoded, as a decimal (an amount
+//! QFEX writes as a string) becomes `"0"`; a `fee` becomes `-1`, `0` or `1` by its sign; and
+//! every `id` or `*_id` member, at any depth, is blanked to `2`s at its length as written,
+//! whether or not the codec's spans (decision 0028, `src/auth`) already did. Member names, other
+//! strings, literals, whitespace and nesting are as received.
 //!
 //! **The resync's pages.** The same read of the journal pairs each `get_user_orders` request a
 //! session wrote with the page that answered it, and records each full page with its page size
@@ -46,6 +59,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+use fbc_core::RpcId;
 use fbc_journal::{ControlEvent, JournalReader, Marker, Opcode, Record};
 use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value};
@@ -314,8 +328,8 @@ pub struct Evidence {
     /// Why the probe stopped before its sessions ended.
     pub stopped: Option<String>,
     pub fixtures: Vec<String>,
-    /// The members whose string value a written fixture keeps as received ([`kept_strings`]):
-    /// names only, for the owner's reading before committing.
+    /// The members whose string value a written fixture keeps as received ([`Scrub::kept`]: none
+    /// a place stage's scrub wrote): names only, for the owner's reading before committing.
     pub strings: Vec<String>,
     /// Fixture files withheld, and what the patterns found in each (never the value).
     pub withheld: Vec<String>,
@@ -414,36 +428,265 @@ pub fn zero_numbers(text: &str) -> String {
     out
 }
 
-/// A fixture's text: as kept when it is a top-level `ack` or `err` envelope echoing a request
-/// (an `incoming_message` in the envelope, as [`kind`] reads it), whose values decisions 0132
-/// item 3 and 0134 already span; otherwise with every number zeroed, an `incoming_message`
-/// nested anywhere else included.
-pub fn scrub(text: &str) -> String {
-    let echoes = match serde_json::from_str::<Value>(text) {
+/// Whether `text` is a top-level `ack` or `err` envelope echoing a request (an
+/// `incoming_message` in the envelope, as [`kind`] reads it), whose values decisions 0132 item 3
+/// and 0134 already span.
+fn echoes(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text) {
         Ok(Value::Object(top)) => {
             envelope(&top).is_some_and(|(_, body)| body.contains_key("incoming_message"))
         }
         _ => false,
-    };
-    match echoes {
+    }
+}
+
+/// A fixture's text: as kept when it is a top-level echo ([`echoes`]); otherwise with every
+/// number zeroed, an `incoming_message` nested anywhere else included. Stage one's scrub.
+pub fn scrub(text: &str) -> String {
+    match echoes(text) {
         true => text.to_owned(),
         false => zero_numbers(text),
     }
 }
 
+/// How a slice scrubs a frame ([`slice_scrubbed`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Scrub {
+    /// Stage one's, [`scrub`].
+    Arm,
+    /// The place stages' (decision 0148 item 10), [`scrub_places`]. FBC-23ch's stages slice with
+    /// it; stage one never does, so nothing in the program names it until they land.
+    #[allow(dead_code)]
+    Places,
+}
+
+impl Scrub {
+    fn apply(self, text: &str) -> String {
+        match self {
+            Scrub::Arm => scrub(text),
+            Scrub::Places => scrub_places(text),
+        }
+    }
+
+    /// The members of a fixture this scrub wrote whose string value it keeps as received
+    /// ([`kept_strings`]). After [`Scrub::Places`], no decimal-shaped string is one: that scrub
+    /// wrote it, `0` or a fee's sign, since it rewrites every one outside an echo, and an echo's
+    /// are the codec's `2`s.
+    pub fn kept(self, text: &str) -> BTreeSet<String> {
+        match self {
+            Scrub::Arm => kept_strings(text),
+            Scrub::Places => kept_but(text, decimal),
+        }
+    }
+}
+
+/// The one placeholder every `symbol` of a place stage's capture becomes, in an echo too: the
+/// one the owner put in place of each of FBC-291a's by hand
+/// (`fixtures/qfex/exec-recorded/arm-production/`), so neither a value nor a file's size tells
+/// two markets apart.
+pub const SYMBOL: &str = "22222222";
+
+/// A place stage's fixture text (decision 0148 item 10), scrubbed member by member
+/// ([`scrub_members`]): a top-level echo ([`echoes`]) as stage one's [`scrub`] keeps one but
+/// each `symbol`, which the codec's spans leave at its length; any other frame whole.
+pub fn scrub_places(text: &str) -> String {
+    scrub_members(text, echoes(text))
+}
+
+/// One level of nesting [`scrub_members`] reads in: an object, with the name of the member it
+/// read last and whether a member name comes next; or an array, with the name of the member that
+/// holds it, whose rule its values take.
+struct Level {
+    object: bool,
+    name: Option<String>,
+    name_next: bool,
+}
+
+/// The name of the member whose value is read at `levels`' innermost level.
+fn under(levels: &[Level]) -> Option<&str> {
+    levels.last().and_then(|level| level.name.as_deref())
+}
+
+/// `text` with each value replaced by the rule of the member it is under: under `symbol`, a
+/// string as [`SYMBOL`]; in an `echo`, every other value as written; under `id` or a name
+/// ending `_id`, a string's characters or a number's blanked to `2`s at its length as written;
+/// under `fee`, a number or a decimal-shaped string as its [`sign`], the string still a string;
+/// under any other name, or none, a number as `0` and a decimal-shaped string ([`decimal`]) as
+/// `"0"`. A string is judged with its escapes decoded ([`decoded`]). An array's values are under
+/// the member that holds it. Member names, other strings, literals, whitespace and nesting are
+/// as they are. It walks the text as written, so a member a parser would overwrite is scrubbed
+/// too; text that is not JSON is walked as far as it reads, its numbers zeroed as
+/// [`zero_numbers`] zeroes them, unless it is an echo.
+fn scrub_members(text: &str, echo: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut levels: Vec<Level> = Vec::new();
+    let mut at = 0;
+    while let Some(c) = text[at..].chars().next() {
+        let end = match c {
+            '"' => {
+                let (end, closed) = string_end(text, at);
+                let quoted = &text[at..end];
+                let raw = &quoted[1..quoted.len() - usize::from(closed)];
+                match levels.last_mut() {
+                    Some(level) if level.object && level.name_next => {
+                        level.name = Some(decoded(quoted, raw));
+                        level.name_next = false;
+                        out.push_str(quoted);
+                    }
+                    _ => {
+                        out.push('"');
+                        out.push_str(&string_value(under(&levels), quoted, raw, echo));
+                        out.push_str(if closed { "\"" } else { "" });
+                    }
+                }
+                end
+            }
+            '-' | '0'..='9' => {
+                let len = text[at..]
+                    .bytes()
+                    .take_while(|b| b.is_ascii_digit() || b"-+.eE".contains(b))
+                    .count();
+                out.push_str(&number_value(under(&levels), &text[at..at + len], echo));
+                at + len
+            }
+            _ => {
+                match c {
+                    '{' => levels.push(Level {
+                        object: true,
+                        name: None,
+                        name_next: true,
+                    }),
+                    '[' => levels.push(Level {
+                        object: false,
+                        name: under(&levels).map(str::to_owned),
+                        name_next: false,
+                    }),
+                    '}' | ']' => {
+                        levels.pop();
+                    }
+                    ',' => {
+                        if let Some(level) = levels.last_mut().filter(|level| level.object) {
+                            level.name_next = true;
+                        }
+                    }
+                    _ => {}
+                }
+                out.push(c);
+                at + c.len_utf8()
+            }
+        };
+        at = end;
+    }
+    out
+}
+
+/// Where the string opening at `at` in `text` ends, just past its closing quote, and whether it
+/// has one: a string the text ends inside ends with it.
+fn string_end(text: &str, at: usize) -> (usize, bool) {
+    let mut escaped = false;
+    for (i, b) in text.bytes().enumerate().skip(at + 1) {
+        match (escaped, b) {
+            (true, _) => escaped = false,
+            (false, b'\\') => escaped = true,
+            (false, b'"') => return (i + 1, true),
+            _ => {}
+        }
+    }
+    (text.len(), false)
+}
+
+/// A member's name or a string value, `quoted` as written: its escapes decoded, or, when it does
+/// not decode (an unknown escape, or the text ending inside it), `raw`, its characters as
+/// written.
+fn decoded(quoted: &str, raw: &str) -> String {
+    serde_json::from_str(quoted).unwrap_or_else(|_| raw.to_owned())
+}
+
+/// Whether a member named `name` names an identifier: `id`, or a name ending `_id`
+/// (`order_id`, `trade_id`, `client_order_id`, `user_id`).
+fn is_id(name: &str) -> bool {
+    name == "id" || name.ends_with("_id")
+}
+
+/// The characters of a string value, `quoted` as written and `raw` its characters between the
+/// quotes, under the member `name`, in an `echo` or not, as [`scrub_members`] writes them.
+fn string_value(name: Option<&str>, quoted: &str, raw: &str, echo: bool) -> String {
+    let text = decoded(quoted, raw);
+    match name {
+        Some("symbol") => SYMBOL.to_owned(),
+        _ if echo => raw.to_owned(),
+        Some(name) if is_id(name) => "2".repeat(raw.len()),
+        Some("fee") if decimal(&text) => sign(&text).to_owned(),
+        _ if decimal(&text) => "0".to_owned(),
+        _ => raw.to_owned(),
+    }
+}
+
+/// A number `run`, under the member `name`, in an `echo` or not, as [`scrub_members`] writes
+/// it.
+fn number_value(name: Option<&str>, run: &str, echo: bool) -> String {
+    match name {
+        _ if echo => run.to_owned(),
+        Some(name) if is_id(name) => "2".repeat(run.len()),
+        Some("fee") => sign(run).to_owned(),
+        _ => "0".to_owned(),
+    }
+}
+
+/// Whether `s` is decimal-shaped: an optional sign, digits with an optional fraction (either
+/// side of the point may be empty, not both), and an optional exponent, whose digits may be
+/// signed but not empty.
+fn decimal(s: &str) -> bool {
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    let s = s.strip_prefix(['-', '+']).unwrap_or(s);
+    let (mantissa, exponent) = match s.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, Some(exponent)),
+        None => (s, None),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let exponent = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['-', '+']).unwrap_or(e);
+        !e.is_empty() && digits(e)
+    });
+    !(whole.is_empty() && fraction.is_empty()) && digits(whole) && digits(fraction) && exponent
+}
+
+/// The sign of the number or decimal string `s`, as `-1`, `0` or `1`: `0` when its mantissa has
+/// no digit but zeros, so `-0.0` and `0e5` are `0`. A fee keeps the sign QFEX wrote it with, and
+/// nothing more (decision 0148 item 10).
+fn sign(s: &str) -> &'static str {
+    let mantissa = s.split(['e', 'E']).next().unwrap_or(s);
+    match (
+        mantissa.bytes().any(|b| (b'1'..=b'9').contains(&b)),
+        mantissa.starts_with('-'),
+    ) {
+        (false, _) => "0",
+        (true, true) => "-1",
+        (true, false) => "1",
+    }
+}
+
 /// The members of the JSON `text` whose string value is kept: every member, at any depth (an
 /// array's strings under the member that holds it), with a string value that is not empty and
-/// not wholly `2`s, the codec's blanking. Names only, never a value.
+/// not wholly `2`s, the codec's blanking. Names only, never a value. Stage one's
+/// ([`Scrub::kept`]).
 pub fn kept_strings(text: &str) -> BTreeSet<String> {
-    fn walk(value: &Value, under: &str, found: &mut BTreeSet<String>) {
+    kept_but(text, |_| false)
+}
+
+/// [`kept_strings`], but for the string values `scrubbed` says a scrub wrote.
+fn kept_but(text: &str, scrubbed: fn(&str) -> bool) -> BTreeSet<String> {
+    fn walk(value: &Value, under: &str, scrubbed: fn(&str) -> bool, found: &mut BTreeSet<String>) {
         match value {
             Value::Object(members) => {
                 for (name, value) in members {
-                    walk(value, name, found);
+                    walk(value, name, scrubbed, found);
                 }
             }
-            Value::Array(items) => items.iter().for_each(|item| walk(item, under, found)),
-            Value::String(s) if !s.chars().all(|c| c == '2') => {
+            Value::Array(items) => {
+                (items.iter()).for_each(|item| walk(item, under, scrubbed, found))
+            }
+            Value::String(s) if !s.chars().all(|c| c == '2') && !scrubbed(s) => {
                 found.insert(under.to_owned());
             }
             _ => {}
@@ -451,7 +694,7 @@ pub fn kept_strings(text: &str) -> BTreeSet<String> {
     }
     let mut found = BTreeSet::new();
     if let Ok(value) = serde_json::from_str::<Value>(text) {
-        walk(&value, "(top level)", &mut found);
+        walk(&value, "(top level)", scrubbed, &mut found);
     }
     found
 }
@@ -602,12 +845,20 @@ fn mark(sessions: &mut [SessionRun], a: usize, b: usize, why: &str) {
     }
 }
 
+/// A session's arm, as its journal shows it: where its frames fall against the arm, and the
+/// request id the arm was written under, whose deadline alone ends its window.
+#[derive(Copy, Clone)]
+struct Window {
+    when: When,
+    arm: Option<RpcId>,
+}
+
 /// Ends the arm's window of connection `conn`, if it is open.
-fn close(window: &mut [When], conn: u16) {
-    if let Some(when) = window.get_mut(usize::from(conn))
-        && *when == When::InWindow
+fn close(window: &mut [Window], conn: u16) {
+    if let Some(window) = window.get_mut(usize::from(conn))
+        && window.when == When::InWindow
     {
-        *when = When::AfterWindow;
+        window.when = When::AfterWindow;
     }
 }
 
@@ -620,15 +871,32 @@ fn close(window: &mut [When], conn: u16) {
 /// A journal that cannot be opened, or read to its end, is an error, returned only once every
 /// session from the one the last record read named through the last is marked partial: a
 /// session the read never reached is partial, never one whose arm was not sent.
+///
+/// Stage one's slice: each frame's text scrubbed by [`scrub`]. [`slice_scrubbed`] takes the
+/// scrub.
 pub fn slice(
     journal: &Path,
     shard: u16,
     ev: &mut Evidence,
 ) -> Result<Vec<(String, String)>, String> {
+    slice_scrubbed(journal, shard, ev, Scrub::Arm)
+}
+
+/// [`slice`], each frame's text scrubbed as `scrub` says.
+pub fn slice_scrubbed(
+    journal: &Path,
+    shard: u16,
+    ev: &mut Evidence,
+    scrub: Scrub,
+) -> Result<Vec<(String, String)>, String> {
     let dropped = ev.dropped[0].saturating_add(ev.dropped[1]);
     let writer_failed = ev.writer_failed.is_some();
     let sessions = &mut ev.sessions[..];
-    let mut window = vec![When::BeforeArm; sessions.len()];
+    let unarmed = Window {
+        when: When::BeforeArm,
+        arm: None,
+    };
+    let mut window = vec![unarmed; sessions.len()];
     // Each frame's session, its place among that session's frames, and its scrubbed text,
     // named once the journal's end has said which captures are partial.
     let mut texts: Vec<(usize, usize, String)> = Vec::new();
@@ -646,7 +914,7 @@ pub fn slice(
                     }
                 };
                 gaps.read(&record, sessions);
-                read(record, sessions, &mut window, &mut texts);
+                read(record, sessions, &mut window, &mut texts, scrub);
             }
         }
     }
@@ -666,20 +934,27 @@ pub fn slice(
 }
 
 /// Adds what `record` shows of the sessions to them: an arm written, its window's end, a frame
-/// QFEX sent (to `texts` too, unnamed), and among those the provider rate refusals and the frames
-/// no refusal can be read from, read from the bytes the journal kept ([`Refusals::count`]).
+/// QFEX sent (to `texts` too, unnamed, scrubbed by `scrub`), and among those the provider rate
+/// refusals and the frames no refusal can be read from, read from the bytes the journal kept
+/// ([`Refusals::count`]).
 fn read(
     record: Record,
     sessions: &mut [SessionRun],
-    window: &mut [When],
+    window: &mut [Window],
     texts: &mut Vec<(usize, usize, String)>,
+    scrub: Scrub,
 ) {
     match record {
-        Record::Outbound { conn, frame, .. } if frame.bytes() == ARM.as_bytes() => {
+        Record::Outbound {
+            conn, rpc, frame, ..
+        } if frame.bytes() == ARM.as_bytes() => {
             let at = usize::from(conn.conn);
             if let Some(run) = sessions.get_mut(at) {
                 run.arm_sent = true;
-                window[at] = When::InWindow;
+                window[at] = Window {
+                    when: When::InWindow,
+                    arm: rpc,
+                };
             }
         }
         // Any other frame a session wrote: one of its resync's pages, or no page.
@@ -688,9 +963,14 @@ fn read(
                 run.pages.sent(frame.bytes());
             }
         }
-        // The arm is the only request with a deadline a session sends: its deadline ends the
-        // window.
-        Record::RpcTimeout { stamp, .. } => close(window, stamp.conn.conn),
+        // The arm's own deadline ends its window. A place stage's session sends places with
+        // deadlines of their own, and a place's ends nothing.
+        Record::RpcTimeout { stamp, rpc } => {
+            let at = usize::from(stamp.conn.conn);
+            if window.get(at).is_some_and(|w| w.arm == Some(rpc)) {
+                close(window, stamp.conn.conn);
+            }
+        }
         // An epoch's close also ends the page its session waits for: a frame journaled after it
         // reached no codec.
         Record::Control {
@@ -719,10 +999,10 @@ fn read(
                 if opcode == Opcode::Text {
                     run.pages.heard(&text);
                 }
-                texts.push((at, run.frames.len(), scrub(&text)));
+                texts.push((at, run.frames.len(), scrub.apply(&text)));
                 run.frames.push(Arrived {
                     kind: kind(&text),
-                    when: window[at],
+                    when: window[at].when,
                     file: String::new(),
                 });
             }
@@ -855,17 +1135,29 @@ pub fn partial_accounts(sessions: &[SessionRun]) -> String {
 }
 
 /// Writes `files` and the README into `dir`, each only when the privacy check's patterns find
-/// nothing in it; one they find something in is withheld and named in `ev`.
+/// nothing in it; one they find something in is withheld and named in `ev`. Stage one's: the
+/// files [`slice`] scrubbed.
 pub fn write_fixtures(
     dir: &Path,
     files: Vec<(String, String)>,
     ev: &mut Evidence,
 ) -> Result<(), String> {
+    write_fixtures_scrubbed(dir, files, ev, Scrub::Arm)
+}
+
+/// [`write_fixtures`] of files `scrub` scrubbed ([`slice_scrubbed`]), whose kept strings are
+/// read as [`Scrub::kept`] reads them.
+pub fn write_fixtures_scrubbed(
+    dir: &Path,
+    files: Vec<(String, String)>,
+    ev: &mut Evidence,
+    scrub: Scrub,
+) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("the fixtures directory: {e}"))?;
     let mut strings = BTreeSet::new();
     for (file, text) in files {
         if write_checked(dir, file, &text, ev)? {
-            strings.extend(kept_strings(&text));
+            strings.extend(scrub.kept(&text));
         }
     }
     ev.strings = strings.into_iter().collect();

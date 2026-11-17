@@ -31,9 +31,14 @@
 //!   its report and evidence say what it heard and pass scripts/privacy-check.sh;
 //! - records in its report and evidence, for each session (FBC-4h1p, decision 0132 item 5), each
 //!   full `get_user_orders` page its resync read, by its page size and offset, read from the
-//!   session's journal, and none for a session whose pages were all short.
+//!   session's journal, and none for a session whose pages were all short;
 //! - builds the place stages' registries as `place_registries.rs` proves (FBC-oxjs, decision
-//!   0148 items 3 and 7).
+//!   0148 items 3 and 7);
+//! - scrubs a place stage's frames (FBC-t45e, decision 0148 item 10, in [`place_scrub`]): every
+//!   `id` and `*_id` member blanked at its length, every number and decimal-shaped string zeroed,
+//!   each fee kept as its sign and every `symbol`, an echo's too, one placeholder, so a slice of
+//!   hand-built place frames passes scripts/privacy-check.sh, stage one's committed capture as it
+//!   is; and ends an arm's window at its own deadline alone, never a place's.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -76,6 +81,9 @@ mod refusals;
 mod report;
 #[path = "../examples/qfex_preprod_probe/stage.rs"]
 mod stage;
+// The place stages' capture scrub and the arm window (FBC-t45e).
+#[path = "qfex_preprod_probe/place_scrub.rs"]
+mod place_scrub;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
