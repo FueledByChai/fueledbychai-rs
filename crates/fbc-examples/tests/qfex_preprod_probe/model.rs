@@ -78,13 +78,39 @@
 //!   FBC-su9i's, on every place: [`QfexModel::ack_echo`]
 //!   ([`Echo`]), how each `ACK` writes the order's client id, [`QfexModel::alo_cross`]
 //!   ([`AloCross`]), how a post-only order priced through the touch is answered, `CANCELLED` by
-//!   default, [`QfexModel::cancel_misses`], every cancel answered `NO_SUCH_ORDER`,
+//!   default, [`QfexModel::cancel_misses`], every cancel answered `NO_SUCH_ORDER` (from a given
+//!   one, [`QfexModel::cancel_misses_from`]),
 //!   [`QfexModel::cancel_lies`], every cancel answered `CANCELLED` with the order left open, and
 //!   [`QfexModel::silent_after_cross`], the primary account's authentications left unanswered
 //!   once a given post-only order through the touch arrived; on the run's first `cancel_order`,
 //!   [`QfexModel::hold_on_cancel`]; once the crossing session's connection ended, for FBC-77r8's
 //!   review, [`QfexModel::after_cross_end`]; for FBC-su9i's review, as a given drop is seen,
 //!   [`QfexModel::rest_fails_after_drop`], and on a given place, [`QfexModel::stop_order_on`].
+//!   FBC-ou9g's, once the run's first limit IOC's connection ended,
+//!   [`QfexModel::after_take_end`]; on every limit IOC: [`QfexModel::ioc`] ([`IocAnswer`]),
+//!   filled whole against the touch it crosses by default, one lot of it, expired, refused by an
+//!   err, unanswered, answered by a server close, or acked and left resting (a sell, the flatten
+//!   IOC after a taker buy, answered as [`QfexModel::ioc_sells`] says when it is set), its fill's
+//!   fee paid, zero or received ([`QfexModel::fee_sign`]) and its `fill_response` before or after
+//!   its final `order_response`, or withheld ([`QfexModel::ioc_frame_order`]);
+//!   on every fill, [`QfexModel::position_push`] ([`PositionPush`]), a `position_response` before
+//!   or after its frames; on one place, [`QfexModel::touch_on_place`], a new touch pushed on the
+//!   MDS before that place's answer; on the first cancel, [`QfexModel::fill_on_cancel`], its
+//!   order filled as a maker as the cancel arrives, and [`QfexModel::fill_on_cancel_after`], that
+//!   fill's `fill_response` pushed later, or [`QfexModel::fill_behind_cancel`], the cancel
+//!   answered `CANCELLED` and the order's maker fill reaching the session after that answer; on
+//!   the first place, [`QfexModel::fill_after`], its
+//!   order filled whole later, and [`QfexModel::touch_after`], the touch pushed again later; and
+//!   on one place,
+//!   [`QfexModel::fill_other_on_place`], another order filled and that place left unanswered;
+//!   and, for FBC-23ch's third review fix, [`QfexModel::rest_lag_from`], the reads lagging from
+//!   one place on, [`QfexModel::ioc_order_after`], a filled IOC's final `order_response` pushed
+//!   later, [`QfexModel::fill_in_resync`], an arm's fills sent with its connection's next page,
+//!   [`QfexModel::resync_page_held`], that page held for the test to release,
+//!   and [`Limited::ReadSocketAfterIoc`] and [`Limited::ReadAuthEchoAfterIoc`], refusals counted
+//!   from the run's first limit IOC; and, for the restack onto FBC-su9i's review fixes,
+//!   [`QfexModel::hold_ioc_sell`], the first sell limit IOC's answer or close held for the test to
+//!   release, and [`QfexModel::rate_with_ioc_sell`], a `RateLimited` err sent with it.
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -221,6 +247,90 @@ pub enum AloCross {
 /// The status [`AloCross::Unmapped`] answers: one the adapter does not map (FBC-jdj7).
 pub const UNMAPPED: &str = "REJECTED";
 
+/// How the model answers a limit IOC ([`QfexModel::ioc`]; FBC-ou9g: every flatten IOC).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum IocAnswer {
+    /// Filled whole against the touch it crosses, at that touch's price, as a taker: its
+    /// `fill_response` then its `FILLED` `order_response`, each naming its client id. One that
+    /// crosses no touch expires, as [`IocAnswer::Expire`].
+    #[default]
+    Full,
+    /// One lot filled against the touch it crosses, the rest cancelled: its `fill_response`
+    /// then its `IOC_PARTIALLY_FILLED` `order_response` with the rest as `quantity_remaining`,
+    /// which the adapter decodes as an order left open with a fill (0151 item 8).
+    Partial,
+    /// Nothing filled: its `IOC_CANCELLED` `order_response`, the unfilled order cancelled.
+    Expire,
+    /// An `err` echoing its `add_order`: no order is made.
+    Refuse,
+    /// No answer at all: no order is made.
+    Silent,
+    /// No answer, and the server closes the connection: no order is made.
+    Close,
+    /// Its `ACK`, and the order left resting, as no IOC is (FBC-ou9g): it stands for one QFEX
+    /// never ends, so the session's Stop cancels it by venue id.
+    Rest,
+}
+
+/// The sign of the fee QFEX writes in a limit IOC's `fill_response` ([`QfexModel::fee_sign`];
+/// FBC-ou9g): QFEX writes a fee we paid positive (the adapter's `VenueFeeSign::PositiveIsCost`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum FeeSign {
+    /// A fee we paid: `0.001`.
+    #[default]
+    Paid,
+    /// No fee: `0`.
+    Zero,
+    /// A rebate: `-0.001`.
+    Received,
+}
+
+impl FeeSign {
+    /// The fee as the model writes it.
+    pub fn fee(self) -> f64 {
+        match self {
+            FeeSign::Paid => 0.001,
+            FeeSign::Zero => 0.0,
+            FeeSign::Received => -0.001,
+        }
+    }
+}
+
+/// Which of a filled limit IOC's frames the model sends first ([`QfexModel::ioc_frame_order`];
+/// FBC-ou9g, for FBC-tfxk).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum IocFrameOrder {
+    /// Its `fill_response`, then its final `order_response`.
+    #[default]
+    FillFirst,
+    /// Its final `order_response`, then its `fill_response`.
+    OrderFirst,
+    /// Its final `order_response` alone, its `fill_response` withheld (and no
+    /// `position_response`): the fill is the model's own, which its positions and trades show,
+    /// but no frame of it reaches the session, as one held past the IOC's deadline would not.
+    Withheld,
+}
+
+/// `fill`, a `fill_response` the model made, with its fee as `sign` gives it.
+fn with_fee(fill: Frame, sign: FeeSign) -> Frame {
+    let Frame::Text(text) = fill else {
+        unreachable!("a text frame")
+    };
+    let mut v: Value = serde_json::from_str(&text).expect("the model's own frame");
+    v["fill_response"]["fee"] = serde_json::json!(sign.fee());
+    Frame::text(v.to_string())
+}
+
+/// When the model pushes a `position_response` after a fill it made ([`QfexModel::position_push`]):
+/// whether QFEX's position frame comes before the fill's frames or after them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PositionPush {
+    /// Before the `fill_response`, so the position shows the fill before the fill does.
+    Before,
+    /// After the fill's `order_response`.
+    After,
+}
+
 /// What the cancel-on-disconnect arm does to its account's open orders
 /// ([`QfexModel::arm_cancels_open`]; decision 0132 items 2 and 4).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -334,6 +444,15 @@ pub enum Limited {
     /// The first `GET /user/historic-orders` once an armed connection dropped, with no close,
     /// answered HTTP 429 (FBC-77r8's review).
     HistoricAfterDrop,
+    /// The first `get_user_orders` page on a read socket once the run's first limit IOC came,
+    /// answered as [`Limited::ReadSocket`] answers one: the read of the comparison after a
+    /// flatten IOC, counted from a frame the session sends only once it read the fill it
+    /// answers, so a comparison begun before that fill reached the session is never the one
+    /// refused (FBC-ou9g).
+    ReadSocketAfterIoc,
+    /// The first trade-socket authentication once the run's first limit IOC came, answered as
+    /// [`Limited::ReadAuthEcho`] answers one, counted as [`Limited::ReadSocketAfterIoc`] is.
+    ReadAuthEchoAfterIoc,
 }
 
 /// What an account's reads answer while [`QfexModel::rest_lag`] holds them back: its open orders
@@ -499,6 +618,16 @@ pub struct QfexModel {
     /// The `n`th arm of the run, from 0, fills every open order of its account whole, as a
     /// maker, its `fill_response` and `FILLED` `order_response` pushed after the arm's ack.
     pub fill_at_arm: Option<usize>,
+    /// As [`QfexModel::fill_at_arm`], but the fills' frames are pushed in the answer to that
+    /// connection's next `get_user_orders` page, before the page: what a session reads when
+    /// QFEX's frames after the arm's ack reach it only once it asked for its resync's pages, as
+    /// a kernel holding them for the client's acknowledgement sends them (FBC-ou9g).
+    pub fill_in_resync: Option<usize>,
+    /// With [`QfexModel::fill_in_resync`], the page its fills go before is held, as
+    /// [`QfexModel::hold_trades`] holds an answer, until the test releases it
+    /// ([`Venue::release_held`]): the fills are sent at once and the session's resync, which
+    /// that short page ends, stays open until then.
+    pub resync_page_held: bool,
     /// An armed connection's drop fills the open orders placed on it whole, as a maker, before
     /// its cancel-on-disconnect; no frame says so, since nothing is open to hear it.
     pub fill_on_drop: bool,
@@ -516,6 +645,10 @@ pub struct QfexModel {
     /// Every `cancel_order` answered `NO_SUCH_ORDER`, the order it names left open, so it still
     /// rests after the session (FBC-su9i: an order left resting).
     pub cancel_misses: bool,
+    /// Every `cancel_order` from the `n`th of the run, from 0, answered `NO_SUCH_ORDER`, the order
+    /// it names left open, as [`QfexModel::cancel_misses`] answers every one (the restack's
+    /// review: a flatten's cancel ends its order, the Stop's cancel of a flatten IOC misses).
+    pub cancel_misses_from: Option<usize>,
     /// Every `cancel_order` of an open order answered `CANCELLED` naming its client id, the order
     /// left open, so the registry holds it ended while the reads list it (FBC-su9i: an order left
     /// resting that only a read shows).
@@ -524,6 +657,56 @@ pub struct QfexModel {
     /// authentication naming no subaccount (the primary account's) is left unanswered, so each
     /// read of the primary account after it waits out `--read-wait-ms` and fails (FBC-su9i).
     pub silent_after_cross: Option<usize>,
+    /// How every limit IOC is answered (FBC-ou9g): filled whole against the touch by default.
+    pub ioc: IocAnswer,
+    /// How every sell limit IOC, the flatten IOC after a taker buy, is answered when set, in place
+    /// of [`QfexModel::ioc`] (FBC-ou9g's restack); none by default.
+    pub ioc_sells: Option<IocAnswer>,
+    /// The run's first sell limit IOC, the flatten IOC after a taker buy, has its answer, or under
+    /// [`IocAnswer::Close`] the close of its connection, held until the test releases it
+    /// ([`Venue::release_held`]), so a test can press Ctrl-C while the flatten waits for it (the
+    /// restack onto FBC-su9i's review fixes).
+    pub hold_ioc_sell: bool,
+    /// With [`QfexModel::hold_ioc_sell`]'s IOC, a `RateLimited` err echoing nothing is sent at
+    /// once, holding the shared budget for a second: a provider rate refusal the session meets
+    /// while the flatten waits for that IOC's answer.
+    pub rate_with_ioc_sell: bool,
+    /// The run's first `cancel_order` of an open order finds it filled whole as a maker as it
+    /// arrives (FBC-ou9g): its `fill_response` and `FILLED` `order_response`, then the cancel
+    /// answered `NO_SUCH_ORDER`, as QFEX answers a cancel landing after its order ended.
+    pub fill_on_cancel: bool,
+    /// With [`QfexModel::fill_on_cancel`], that fill's `fill_response` is pushed this long after
+    /// the cancel's answer instead of with it, the `FILLED` `order_response` that ended the order
+    /// still answered at once (FBC-ou9g: a fill that reaches the session after the Stop's cancels
+    /// ended, while its close waits for room).
+    pub fill_on_cancel_after: Option<Duration>,
+    /// The run's first `cancel_order` of an open order is answered `CANCELLED`, and that order's
+    /// maker fill, made as the cancel arrived, reaches the session this long after the answer:
+    /// its `fill_response` alone (FBC-ou9g's restack: a fill of ours that reaches the session
+    /// after its Stop's cancels ended, each accepted, as the comparison after them reads).
+    pub fill_behind_cancel: Option<Duration>,
+    /// As the `n`th `add_order` of the run, from 0, arrives, the oldest other open order of its
+    /// account is filled whole as a maker, its `fill_response` and `FILLED` `order_response`
+    /// the only answer, and that `add_order`'s order rests unanswered (FBC-ou9g).
+    pub fill_other_on_place: Option<usize>,
+    /// Whether, and where among the fill's frames, a `position_response` with the account's new
+    /// position follows each fill the model makes (FBC-ou9g); none by default.
+    pub position_push: Option<PositionPush>,
+    /// As the `n`th `add_order` of the run, from 0, arrives, the model's touch becomes the one
+    /// given and the MDS pushes it on every MDS connection open; that `add_order`'s answer, its
+    /// knobs' frames with it, follows once the push is written, so the probe reads the new touch
+    /// no later than the answer (FBC-ou9g).
+    pub touch_on_place: Option<(usize, Touch)>,
+    /// The sign of the fee in the `fill_response` of every limit IOC the model fills
+    /// (FBC-ou9g): paid by default.
+    pub fee_sign: FeeSign,
+    /// Which of a filled limit IOC's two frames comes first, its `fill_response` or its final
+    /// `order_response` (FBC-ou9g, for FBC-tfxk), or whether its `fill_response` is withheld:
+    /// its `fill_response` first by default.
+    pub ioc_frame_order: IocFrameOrder,
+    /// With a limit IOC the model fills whole, its final `order_response` pushed this long after
+    /// its `fill_response` and not with it (FBC-ou9g, for FBC-tfxk's frame order).
+    pub ioc_order_after: Option<Duration>,
     pub rate_limit: Option<Limited>,
     /// After the first `ACK`: an `order_response` naming an order no run placed, with
     /// [`STRAY_CID`] (decision 0151 item 13's stray order). With it, as with
@@ -535,7 +718,9 @@ pub struct QfexModel {
     /// After the first `ACK`: that order filled whole, its `fill_response` naming no client id.
     pub stray_fill: bool,
     /// After the first `ACK`: that order filled whole as a maker, its `fill_response` and its
-    /// `FILLED` `order_response` naming its client id.
+    /// `FILLED` `order_response` naming its client id. With [`QfexModel::rest_lag`], the read
+    /// sockets' pages wait from then until that connection's client writes again or its end is
+    /// seen ([`QfexModel::knob_frames_unread`]).
     pub maker_fill: bool,
     /// After the first `add_order`'s answer: the server closes that connection.
     pub server_close: bool,
@@ -558,6 +743,10 @@ pub struct QfexModel {
     /// After each change to an account's orders or position, its next `rest_lag` read-socket
     /// pages and REST positions each answer what it was before the change.
     pub rest_lag: usize,
+    /// With `Some(n)`, [`QfexModel::rest_lag`] holds back only the changes made once the run's
+    /// `n`th `add_order`, from 0, arrived, so a test can lag one session's reads alone and leave
+    /// the drop tests before it read as they are (FBC-ou9g); `None`, every change.
+    pub rest_lag_from: Option<usize>,
     /// `(n, lag)`: after the `n`th drop of an armed connection of the run, from 0, cancels an
     /// account's orders on its cancel-on-disconnect, the account's next `lag` read-socket pages
     /// and REST positions each answer what it was before the drop, as QFEX cancels on a drop
@@ -609,6 +798,11 @@ pub struct QfexModel {
     /// only the reads after the crossing session see it ([`AfterHistoric`]; FBC-su9i, carrying
     /// FBC-77r8's review).
     pub after_cross_end: Vec<AfterHistoric>,
+    /// What the model changes on an account, each in turn, once the trade connection the run's
+    /// first limit IOC arrived on ended, after its cancel-on-disconnect, so only the reads after
+    /// that session see it ([`AfterHistoric`]; FBC-ou9g, carrying FBC-77r8's review to the
+    /// taker IOC session).
+    pub after_take_end: Vec<AfterHistoric>,
     /// `(n, ok)`: once the `n`th drop of an armed connection of the run, from 0, is seen, its
     /// account's `GET /user/positions` answers its next `ok` reads, then HTTP 500 to every one
     /// after them, as a read that fails with no provider rate refusal (FBC-su9i's review: a
@@ -651,6 +845,13 @@ pub struct QfexModel {
     /// partial fill) pushed on its connection this long after it, naming its client id; the
     /// model's positions and pages show the fill at once.
     pub part_fill_after: Option<Duration>,
+    /// With the first `add_order`, that order fills whole as a maker, its `fill_response` and
+    /// its `FILLED` `order_response` pushed on its connection this long after it, naming its
+    /// client id; the model's positions and pages show the fill at once (FBC-ou9g).
+    pub fill_after: Option<Duration>,
+    /// This long after the first `add_order`, the MDS pushes the model's touch again on every
+    /// MDS connection then open, stamped as it is pushed (FBC-ou9g).
+    pub touch_after: Option<Duration>,
     /// With the first `add_order`, the server closes that connection this long after it.
     pub close_after: Option<Duration>,
     /// As the first `get_user_trades` page is asked, the run's first order fills whole as a
@@ -712,21 +913,28 @@ pub struct QfexModel {
     /// The trades whose `get_user_trades` rows carry neither `order_id` nor `client_order_id`
     /// ([`StrayTrade::Unnamed`]), by trade id.
     pub unnamed: Vec<String>,
-    /// The answers [`QfexModel::hold_trades`] and [`QfexModel::hold_cancel`] held: each
-    /// connection and frame.
+    /// The answers [`QfexModel::hold_trades`], [`QfexModel::resync_page_held`],
+    /// [`QfexModel::hold_cancel`] and [`QfexModel::hold_ioc_sell`] held: each connection and frame.
     pub(super) held: Vec<(usize, Frame)>,
-    /// The connections [`QfexModel::hold_cancel`] holds a close of, closed once released.
+    /// The connections [`QfexModel::hold_cancel`] or [`QfexModel::hold_ioc_sell`] holds a close
+    /// of, closed once released.
     pub(super) held_closes: Vec<usize>,
     /// The connection each order was placed on, by its id ([`Reach::Own`]).
     pub(super) placed_on: HashMap<String, usize>,
     /// The connection the first `add_order` came on.
     pub(super) first_placed_on: Option<usize>,
-    /// The connection [`OnAck::MakerFill`]'s fill came on, and how many data frames its client
-    /// had sent by then, as the stub's record shows.
+    /// The connection [`OnAck::MakerFill`]'s fill came on, or [`QfexModel::maker_fill`]'s with
+    /// [`QfexModel::rest_lag`], and how many data frames its client had sent by then, as the
+    /// stub's record shows.
     pub(super) fill_after_ack_on: Option<(usize, usize)>,
     /// The read sockets' pages [`QfexModel::knob_frames_unread`] held: each connection and
     /// frame.
     pub(super) held_pages: Vec<(usize, Frame)>,
+    /// The limit IOCs that came so far ([`Limited::ReadSocketAfterIoc`]).
+    pub(super) iocs: usize,
+    /// [`QfexModel::fill_in_resync`]'s frames, with the connection whose next page they go
+    /// before.
+    pub(super) resync_fills: Option<(usize, Vec<Frame>)>,
     pub(super) lagging: HashMap<Option<String>, Stale>,
     /// The accounts [`QfexModel::position_after_close`] moved.
     pub(super) moved: Vec<Option<String>>,
@@ -751,6 +959,9 @@ pub struct QfexModel {
     /// The trade connections a post-only through the touch arrived on
     /// ([`QfexModel::after_cross_end`]).
     pub(super) crossed_on: Vec<usize>,
+    /// The trade connection the run's first limit IOC arrived on
+    /// ([`QfexModel::after_take_end`]).
+    pub(super) first_ioc_on: Option<usize>,
     /// The account [`QfexModel::rest_fails_after_drop`] fails, once its drop was seen, and how
     /// many of its reads are still answered.
     pub(super) failing: Option<(Option<String>, usize)>,
@@ -792,14 +1003,30 @@ impl Default for QfexModel {
             ack_delay: None,
             ack_delay_on: 0,
             fill_at_arm: None,
+            fill_in_resync: None,
+            resync_page_held: false,
             fill_on_drop: false,
             historic_omits_last: false,
             historic_fails: false,
             ack_echo: Echo::Exact,
             alo_cross: Some(AloCross::Cancelled),
             cancel_misses: false,
+            cancel_misses_from: None,
             cancel_lies: false,
             silent_after_cross: None,
+            ioc: IocAnswer::Full,
+            ioc_sells: None,
+            hold_ioc_sell: false,
+            rate_with_ioc_sell: false,
+            fill_on_cancel: false,
+            fill_on_cancel_after: None,
+            fill_behind_cancel: None,
+            fill_other_on_place: None,
+            position_push: None,
+            touch_on_place: None,
+            fee_sign: FeeSign::Paid,
+            ioc_frame_order: IocFrameOrder::FillFirst,
+            ioc_order_after: None,
             rate_limit: None,
             stray_order: false,
             cid_absent_update: false,
@@ -812,6 +1039,7 @@ impl Default for QfexModel {
             on_ack: None,
             crossed_on_place: None,
             rest_lag: 0,
+            rest_lag_from: None,
             drop_lag: None,
             drops: 0,
             rest_fails: Vec::new(),
@@ -829,6 +1057,7 @@ impl Default for QfexModel {
             hold_on_place: None,
             hold_on_cancel: None,
             after_cross_end: Vec::new(),
+            after_take_end: Vec::new(),
             rest_fails_after_drop: None,
             stop_order_on: None,
             failing: None,
@@ -843,6 +1072,8 @@ impl Default for QfexModel {
             hold_cancel: false,
             stray_after: None,
             part_fill_after: None,
+            fill_after: None,
+            touch_after: None,
             close_after: None,
             fill_on_trades: false,
             fill_on_trades_page: None,
@@ -866,6 +1097,8 @@ impl Default for QfexModel {
             first_placed_on: None,
             fill_after_ack_on: None,
             held_pages: Vec::new(),
+            iocs: 0,
+            resync_fills: None,
             lagging: HashMap::new(),
             moved: Vec::new(),
             places: 0,
@@ -878,6 +1111,7 @@ impl Default for QfexModel {
             trades_asked: 0,
             crossings: 0,
             crossed_on: Vec::new(),
+            first_ioc_on: None,
             next_id: 0,
         }
     }
@@ -1055,6 +1289,18 @@ impl QfexModel {
         if !touched && !moved {
             return self.positions[account].clone();
         }
+        let position = self.position(account);
+        let stop = usize::from(self.stop_ordered.contains(account));
+        let open = self.open_of(account).len() + stop;
+        serde_json::json!({"balance": {}, "positions": [
+            {"symbol": SYMBOL, "position": number(position), "open_orders": open}
+        ]})
+        .to_string()
+    }
+
+    /// `account`'s position on [`SYMBOL`] as its fills make it, a hand trade
+    /// ([`QfexModel::position_after_close`]) included.
+    fn position(&self, account: &Option<String>) -> Decimal {
         let filled: Decimal = (self.fills.iter())
             .filter(|f| f.account == *account)
             .map(|f| match f.order.side.as_str() {
@@ -1062,13 +1308,28 @@ impl QfexModel {
                 _ => f.quantity,
             })
             .sum();
-        let position = filled + if moved { Decimal::ONE } else { Decimal::ZERO };
-        let stop = usize::from(self.stop_ordered.contains(account));
-        let open = self.open_of(account).len() + stop;
-        serde_json::json!({"balance": {}, "positions": [
-            {"symbol": SYMBOL, "position": number(position), "open_orders": open}
-        ]})
-        .to_string()
+        let moved = self.moved.contains(account);
+        filled + if moved { Decimal::ONE } else { Decimal::ZERO }
+    }
+
+    /// The frames of one fill on `account`: `fill` and `order`, the fill's `fill_response` and
+    /// its `order_response`, with a `position_response` showing the account's position after
+    /// it before or after them, as [`QfexModel::position_push`] says.
+    fn filled_frames(&self, account: &Option<String>, fill: Frame, order: Frame) -> Vec<Frame> {
+        let position = || {
+            let frame = serde_json::json!({"position_response": {
+                "id": "66666666-6666-4666-8666-666666666666", "symbol": SYMBOL,
+                "position": number(self.position(account)), "margin_alloc": 0.0,
+                "realised_pnl": 0.0, "unrealised_pnl": 0.0, "net_funding": 0.0,
+                "open_orders": self.open_of(account).len(), "average_price": 100.0
+            }});
+            Frame::text(frame.to_string())
+        };
+        match self.position_push {
+            None => vec![fill, order],
+            Some(PositionPush::Before) => vec![position(), fill, order],
+            Some(PositionPush::After) => vec![fill, order, position()],
+        }
     }
 
     /// `account`'s open orders, oldest first.
@@ -1096,7 +1357,7 @@ impl QfexModel {
     /// Keeps what `account`'s reads answer now, for its next [`QfexModel::rest_lag`] reads of
     /// each kind, as a change to it is made.
     fn before_change(&mut self, account: &Option<String>) {
-        if self.rest_lag == 0 {
+        if self.rest_lag == 0 || self.rest_lag_from.is_some_and(|n| self.places <= n) {
             return;
         }
         let stale = Stale {
@@ -1139,6 +1400,10 @@ impl QfexModel {
                 if self.places > 0 && self.rate_limit == Some(Limited::ReadAuthEcho(n)) {
                     return Ok(vec![Frame::text(limited(text, 3))]);
                 }
+                if self.iocs > 0 && self.rate_limit == Some(Limited::ReadAuthEchoAfterIoc) {
+                    self.rate_limit = None;
+                    return Ok(vec![Frame::text(limited(text, 3))]);
+                }
                 if let Some(touch) = self.touch_moves.take() {
                     self.move_touch(touch);
                 }
@@ -1176,12 +1441,18 @@ impl QfexModel {
                         false => self.touch_moves_at_arm = Some((at, touch)),
                     }
                 }
-                if self.fill_at_arm == Some(n) {
+                if self.fill_at_arm == Some(n) || self.fill_in_resync == Some(n) {
                     let open = self.open_of(&self.account_of(conn));
+                    let mut fills = Vec::new();
                     for order in open {
                         let filled = self.fill(&order.id);
-                        frames.push(fill_response(&filled, true));
-                        frames.push(order_response(&filled.order, "FILLED", true));
+                        let fill = fill_response(&filled, true);
+                        let update = order_response(&filled.order, "FILLED", true);
+                        fills.extend(self.filled_frames(&filled.account, fill, update));
+                    }
+                    match self.fill_in_resync == Some(n) {
+                        true => self.resync_fills = Some((conn, fills)),
+                        false => frames.extend(fills),
                     }
                 }
                 Ok(frames)
@@ -1191,6 +1462,16 @@ impl QfexModel {
             "get_user_orders" => {
                 let session = self.conns.get(&conn).is_some_and(|c| c.session);
                 let page = Frame::text(self.orders_page(conn, &v));
+                if let Some((on, fills)) = self.resync_fills.take() {
+                    match on == conn {
+                        true if self.resync_page_held => {
+                            self.held.push((conn, page));
+                            return Ok(fills);
+                        }
+                        true => return Ok(fills.into_iter().chain([page]).collect()),
+                        false => self.resync_fills = Some((on, fills)),
+                    }
+                }
                 if !session && self.knob_frames_unread() {
                     self.held_pages.push((conn, page));
                     return Ok(Vec::new());
@@ -1260,6 +1541,10 @@ impl QfexModel {
     /// next frame, the cancels (0151 item 2), so a read held this way cannot end before the
     /// session heard the fill. The drop comes only after that read, so its end never releases
     /// the hold first.
+    ///
+    /// So, too, with [`QfexModel::maker_fill`] and [`QfexModel::rest_lag`] (FBC-ou9g), whose
+    /// reads do not show the fill yet: the flatten the fill raises sends the next frame, so a
+    /// comparison after X's place cannot agree before the session heard the fill.
     pub(super) fn knob_frames_unread(&self) -> bool {
         let knob = self.stray_order || self.cid_absent_update;
         let stray = knob && self.first_placed_on.is_some_and(|n| !self.conn_ended(n));
@@ -1482,6 +1767,11 @@ impl QfexModel {
                 self.after_historic(account.clone(), change);
             }
         }
+        if self.first_ioc_on == Some(n) {
+            for change in std::mem::take(&mut self.after_take_end) {
+                self.after_historic(account.clone(), change);
+            }
+        }
         let failing = self
             .rest_fails_after_drop
             .filter(|(on, _)| !graceful && *on == self.drops);
@@ -1496,6 +1786,45 @@ impl QfexModel {
     /// Rests the order `v`, whose frame is `text`, on `conn`'s account and answers it, with the
     /// knobs' frames after its `ACK` on the run's first.
     fn add_order(&mut self, conn: usize, v: &Value, text: &str) -> Vec<Frame> {
+        let n = self.places;
+        let frames = self.answer_order(conn, v, text);
+        match self.touch_on_place.take() {
+            Some((at, touch)) if at == n => {
+                self.touch = touch;
+                self.after_touch(conn, frames);
+                Vec::new()
+            }
+            other => {
+                self.touch_on_place = other;
+                frames
+            }
+        }
+    }
+
+    /// Pushes the model's touch on every MDS connection open, logged as `mds touch`, then, once
+    /// every push is written, `frames` on trade connection `conn`.
+    fn after_touch(&mut self, conn: usize, frames: Vec<Frame>) {
+        let frame = Frame::text(self.touch.frame(SYMBOL));
+        let mds = self.views.as_ref().map(|(_, mds)| mds.connections());
+        let open: Vec<usize> = (mds.unwrap_or_default().iter().enumerate())
+            .filter(|(_, c)| c.open)
+            .map(|(n, _)| n)
+            .collect();
+        let mds = self.mds_pusher.clone().expect("the MDS stub is up");
+        let trade = self.pusher.clone().expect("the stub is up");
+        self.event("mds touch".to_owned(), None);
+        tokio::spawn(async move {
+            for n in open {
+                let _ = mds.push(n, frame.clone()).await;
+            }
+            for frame in frames {
+                let _ = trade.push(conn, frame).await;
+            }
+        });
+    }
+
+    /// [`QfexModel::add_order`]'s answer.
+    fn answer_order(&mut self, conn: usize, v: &Value, text: &str) -> Vec<Frame> {
         self.places += 1;
         let first = self.places == 1;
         if first {
@@ -1559,6 +1888,9 @@ impl QfexModel {
         if let Some(how) = self.alo_cross.filter(|_| self.crosses(&order)) {
             return self.cross(order, how, text);
         }
+        if order.kind == "LIMIT" && order.tif == "IOC" {
+            return self.ioc(conn, order, text);
+        }
         if first && self.cancel_place {
             let ended = Order {
                 state: State::Cancelled,
@@ -1568,6 +1900,17 @@ impl QfexModel {
             return vec![order_response(&ended, "CANCELLED", true)];
         }
         self.orders.push(order.clone());
+        if self.fill_other_on_place == Some(self.places - 1) {
+            let other = (self.orders.iter())
+                .find(|o| o.account == account && o.state == State::Open && o.id != order.id)
+                .map(|o| o.id.clone());
+            if let Some(other) = other {
+                let filled = self.fill(&other);
+                let fill = fill_response(&filled, true);
+                let update = order_response(&filled.order, "FILLED", true);
+                return self.filled_frames(&account, fill, update);
+            }
+        }
         let mut frames = std::mem::take(&mut self.late_cancels);
         frames.push(echoed(&order, "ACK", self.ack_echo));
         match self.on_ack {
@@ -1580,8 +1923,9 @@ impl QfexModel {
             Some((n, OnAck::MakerFill)) if n + 1 == self.places => {
                 self.fill_after_ack_on = Some((conn, self.sent_on(conn)));
                 let filled = self.fill(&order.id);
-                frames.push(fill_response(&filled, true));
-                frames.push(order_response(&filled.order, "FILLED", true));
+                let fill = fill_response(&filled, true);
+                let update = order_response(&filled.order, "FILLED", true);
+                frames.extend(self.filled_frames(&account, fill, update));
             }
             _ => {}
         }
@@ -1599,6 +1943,13 @@ impl QfexModel {
             );
         }
         if first {
+            // A maker fill the reads do not show yet ([`QfexModel::rest_lag`]) leaves a
+            // comparison free to agree before the session read it, so the read sockets' pages
+            // wait until this connection's client writes again, the flatten's first frame, or
+            // its end is seen ([`QfexModel::knob_frames_unread`]).
+            if self.maker_fill && self.rest_lag > 0 {
+                self.fill_after_ack_on = Some((conn, self.sent_on(conn)));
+            }
             frames.extend(self.knobs(&order));
             if self.position_on_place && !self.moved.contains(&account) {
                 self.moved.push(account.clone());
@@ -1619,6 +1970,17 @@ impl QfexModel {
                 order_response(&filled.order, "FILLED", true),
             ];
             self.later(conn, frames, after, false);
+        }
+        if let Some(after) = self.fill_after.filter(|_| first) {
+            let filled = self.fill(&order.id);
+            let frames = vec![
+                fill_response(&filled, true),
+                order_response(&filled.order, "FILLED", true),
+            ];
+            self.later(conn, frames, after, false);
+        }
+        if let Some(after) = self.touch_after.filter(|_| first) {
+            self.touch_later(after);
         }
         if let Some(after) = self.close_after.filter(|_| first) {
             self.later(conn, Vec::new(), after, true);
@@ -1689,10 +2051,155 @@ impl QfexModel {
             AloCross::Fills => {
                 self.orders.push(order.clone());
                 let filled = self.fill(&order.id);
-                vec![
-                    taker_fill(&filled),
-                    order_response(&filled.order, "FILLED", true),
-                ]
+                let fill = taker_fill(&filled);
+                let update = order_response(&filled.order, "FILLED", true);
+                self.filled_frames(&filled.account, fill, update)
+            }
+        }
+    }
+
+    /// The touch level a limit IOC `order` crosses, when it crosses one: the ask for a buy at or
+    /// above it, the bid for a sell at or below it.
+    fn crossed_level(&self, order: &Order) -> Option<Decimal> {
+        let price = Decimal::from_str(&order.price.to_string()).ok()?;
+        let level = |side: Option<(&str, &str)>| side.and_then(|(px, _)| px.parse().ok());
+        match order.side.as_str() {
+            "BUY" => level(self.touch.ask).filter(|ask| price >= *ask),
+            _ => level(self.touch.bid).filter(|bid| price <= *bid),
+        }
+    }
+
+    /// The answer to `order`, a limit IOC whose frame is `text`, as [`QfexModel::ioc`] says, or,
+    /// for a sell, [`QfexModel::ioc_sells`] when set, logged as `ioc <how>`; the first sell's
+    /// held, with a `RateLimited` err sent in its place, as [`QfexModel::hold_ioc_sell`] and
+    /// [`QfexModel::rate_with_ioc_sell`] say.
+    fn ioc(&mut self, conn: usize, order: Order, text: &str) -> Vec<Frame> {
+        let sell = order.side == "SELL";
+        if !(sell && self.hold_ioc_sell) {
+            return self.ioc_answer(conn, order, text);
+        }
+        self.hold_ioc_sell = false;
+        let close = self.ioc_sells.unwrap_or(self.ioc) == IocAnswer::Close;
+        // The connection's close is held in place of the one the answer would push at once.
+        let answer = match close {
+            true => {
+                let how = IocAnswer::Close;
+                self.iocs += 1;
+                self.first_ioc_on.get_or_insert(conn);
+                self.event(format!("ioc {how:?}"), None);
+                self.placed_on.remove(&order.id);
+                self.held_closes.push(conn);
+                Vec::new()
+            }
+            false => self.ioc_answer(conn, order, text),
+        };
+        self.held
+            .extend(answer.into_iter().map(|frame| (conn, frame)));
+        match self.rate_with_ioc_sell {
+            true => {
+                let err = concat!(
+                    r#"{"type":"Err","error_code":"RateLimited","#,
+                    r#""message":"Rate limit exceeded, retry after 1 seconds"}"#,
+                );
+                vec![Frame::text(err)]
+            }
+            false => Vec::new(),
+        }
+    }
+
+    /// The answer to `order`, a limit IOC whose frame is `text`, as [`QfexModel::ioc`] gives it.
+    fn ioc_answer(&mut self, conn: usize, order: Order, text: &str) -> Vec<Frame> {
+        let sells = self.ioc_sells.filter(|_| order.side == "SELL");
+        let how = sells.unwrap_or(self.ioc);
+        self.iocs += 1;
+        self.first_ioc_on.get_or_insert(conn);
+        self.event(format!("ioc {how:?}"), None);
+        let level = self.crossed_level(&order);
+        let account = order.account.clone();
+        match (how, level) {
+            (IocAnswer::Rest, _) => {
+                self.orders.push(order.clone());
+                vec![echoed(&order, "ACK", self.ack_echo)]
+            }
+            (IocAnswer::Silent, _) => {
+                self.placed_on.remove(&order.id);
+                Vec::new()
+            }
+            (IocAnswer::Close, _) => {
+                self.placed_on.remove(&order.id);
+                self.later(conn, Vec::new(), Duration::ZERO, true);
+                Vec::new()
+            }
+            (IocAnswer::Refuse, _) => {
+                self.placed_on.remove(&order.id);
+                vec![Frame::text(format!(
+                    concat!(
+                        r#"{{"type":"Err","error_code":"InvalidOrder","message":"synthetic","#,
+                        r#""incoming_message":{text}}}"#,
+                    ),
+                    text = text
+                ))]
+            }
+            (IocAnswer::Expire, _) | (_, None) => {
+                self.before_change(&account);
+                let ended = Order {
+                    state: State::Cancelled,
+                    ..order
+                };
+                self.orders.push(ended.clone());
+                vec![order_response(&ended, "IOC_CANCELLED", true)]
+            }
+            (how, Some(px)) => {
+                self.before_change(&account);
+                let lot = (self.listed.first())
+                    .and_then(|l| Decimal::from_str(l.lot).ok())
+                    .unwrap_or(order.quantity);
+                let qty = match how {
+                    IocAnswer::Partial => lot.min(order.quantity),
+                    _ => order.quantity,
+                };
+                let whole = qty == order.quantity;
+                let ended = Order {
+                    filled: qty,
+                    state: if whole {
+                        State::Filled
+                    } else {
+                        State::Cancelled
+                    },
+                    ..order.clone()
+                };
+                self.orders.push(ended.clone());
+                let filled = Filled {
+                    account: account.clone(),
+                    trade_id: format!("55555555-5555-4555-8555-{:012x}", self.fills.len() + 1),
+                    // The order as its fill leaves it: all of `qty` filled, nothing remaining,
+                    // since an IOC rests no remainder.
+                    order: Order {
+                        quantity: qty,
+                        filled: qty,
+                        price: number(px),
+                        ..order
+                    },
+                    quantity: qty,
+                    at: now_secs(),
+                };
+                self.fills.push(filled.clone());
+                let status = if whole {
+                    "FILLED"
+                } else {
+                    "IOC_PARTIALLY_FILLED"
+                };
+                let update = order_response(&ended, status, true);
+                let fill = with_fee(taker_fill(&filled), self.fee_sign);
+                if let Some(after) = self.ioc_order_after.filter(|_| whole) {
+                    self.later(conn, vec![update], after, false);
+                    return vec![fill];
+                }
+                match self.ioc_frame_order {
+                    IocFrameOrder::FillFirst => self.filled_frames(&account, fill, update),
+                    IocFrameOrder::OrderFirst => self.filled_frames(&account, update, fill),
+                    IocFrameOrder::Withheld => vec![update],
+                }
             }
         }
     }
@@ -1721,9 +2228,13 @@ impl QfexModel {
         if self.stray_fill || self.maker_fill {
             let named = self.maker_fill;
             let filled = self.fill(&order.id);
-            frames.push(fill_response(&filled, named));
-            if named {
-                frames.push(order_response(&filled.order, "FILLED", true));
+            let fill = fill_response(&filled, named);
+            match named {
+                true => {
+                    let update = order_response(&filled.order, "FILLED", true);
+                    frames.extend(self.filled_frames(&filled.account, fill, update));
+                }
+                false => frames.push(fill),
             }
         }
         frames
@@ -1803,6 +2314,22 @@ impl QfexModel {
             .map_or(0, |(_, mds)| mds.connections().len());
         tokio::spawn(async move {
             for conn in 0..conns {
+                let _ = pusher.push(conn, frame.clone()).await;
+            }
+        });
+    }
+
+    /// Pushes the model's touch again after `after` on every MDS connection then open, its frame
+    /// stamped as it is pushed ([`QfexModel::touch_after`]).
+    fn touch_later(&mut self, after: Duration) {
+        let touch = self.touch.clone();
+        let pusher = self.mds_pusher.clone().expect("the MDS stub is up");
+        let mds = self.views.as_ref().map(|(_, mds)| mds.clone());
+        let mds = mds.expect("the stubs are up");
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            let frame = Frame::text(touch.frame(SYMBOL));
+            for conn in 0..mds.connections().len() {
                 let _ = pusher.push(conn, frame.clone()).await;
             }
         });
@@ -1901,11 +2428,41 @@ impl QfexModel {
         let id = v["params"]["order_id"].as_str().unwrap_or_default();
         let at = (self.orders.iter())
             .position(|o| o.id == id && o.account == account && o.state == State::Open);
-        let Some(n) = at.filter(|_| !self.cancel_misses) else {
+        let missing = || {
             let missing = serde_json::json!({"order_response": {
                 "order_id": id, "status": "NO_SUCH_ORDER"
             }});
-            return vec![Frame::text(missing.to_string())];
+            Frame::text(missing.to_string())
+        };
+        if let Some(n) = at.filter(|_| self.fill_on_cancel && self.cancels == 1) {
+            let order_id = self.orders[n].id.clone();
+            let filled = self.fill(&order_id);
+            let fill = fill_response(&filled, true);
+            let update = order_response(&filled.order, "FILLED", true);
+            if let Some(after) = self.fill_on_cancel_after {
+                self.later(conn, vec![fill], after, false);
+                return vec![update, missing()];
+            }
+            let mut frames = self.filled_frames(&account, fill, update);
+            frames.push(missing());
+            return frames;
+        }
+        if let Some(n) = at.filter(|_| self.cancels == 1)
+            && let Some(after) = self.fill_behind_cancel
+        {
+            let told = Order {
+                state: State::Cancelled,
+                ..self.orders[n].clone()
+            };
+            let order_id = told.id.clone();
+            let filled = self.fill(&order_id);
+            self.later(conn, vec![fill_response(&filled, true)], after, false);
+            return vec![order_response(&told, "CANCELLED", true)];
+        }
+        let misses =
+            self.cancel_misses || self.cancel_misses_from.is_some_and(|n| self.cancels > n);
+        let Some(n) = at.filter(|_| !misses) else {
+            return vec![missing()];
         };
         if self.cancel_lies {
             let told = Order {
@@ -1957,6 +2514,11 @@ impl QfexModel {
             if self.rate_limit == Some(Limited::PageKeptWhole(n)) {
                 let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
                 return limited(&echo.to_string(), 3).replace("exceeded,", "exceeded\\u002c");
+            }
+            if self.rate_limit == Some(Limited::ReadSocketAfterIoc) && self.iocs > 0 {
+                self.rate_limit = None;
+                let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
+                return limited(&echo.to_string(), 3);
             }
             if self.rate_limit == Some(Limited::ReadSocketAfterSession) && self.session_ended() {
                 self.rate_limit = None;
@@ -2255,9 +2817,10 @@ impl Venue {
         self.model.lock().unwrap().log.clone()
     }
 
-    /// Sends each answer [`QfexModel::hold_trades`] and [`QfexModel::hold_cancel`] held, in
-    /// order, on its connection, then closes each connection whose close
-    /// [`QfexModel::hold_cancel`] held.
+    /// Sends each answer [`QfexModel::hold_trades`], [`QfexModel::resync_page_held`],
+    /// [`QfexModel::hold_cancel`] and [`QfexModel::hold_ioc_sell`] held, in order, on its
+    /// connection, then closes each connection whose close [`QfexModel::hold_cancel`] or
+    /// [`QfexModel::hold_ioc_sell`] held.
     pub async fn release_held(&self) {
         let (held, closes, pusher) = {
             let mut model = self.model.lock().unwrap();

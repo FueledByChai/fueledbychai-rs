@@ -587,7 +587,6 @@ pub fn far_touch(spec: &InstrumentSpec, side: Side, quote: Quote) -> Result<Tick
 /// A flatten IOC's price on `side`, the other of `--side`'s: at most `cap_bps` through the touch
 /// it crosses, measured from that touch (the bid for a sell, the ask for a buy), and snapped
 /// back toward it, so it is never further through than the cap.
-#[allow(dead_code)] // the driver prices each flatten IOC (FBC-ou9g)
 pub fn flatten_price(
     spec: &InstrumentSpec,
     side: Side,
@@ -704,9 +703,9 @@ const FENCES: &str = "--production; --sole-trader (decision 0148 item 7); --rest
 
 /// What the place stages do after the preflight, and do not do yet, as the report says it.
 const NOT_BUILT: &str = "After the preflight, decision 0132 item 4's drop test runs on each \
-     named account in turn (FBC-23ch and FBC-77r8), then stage two's crossing post-only on each \
-     (FBC-su9i), and the run ends after the last account's: stage two's taker IOC and the stages \
-     after it are not built yet (FBC-ou9g and the slices after it)";
+     named account in turn (FBC-23ch and FBC-77r8), then stage two's crossing post-only and \
+     taker IOC on each in turn (FBC-su9i and FBC-ou9g), and the run ends after the last \
+     account's taker IOC: stage three is not built yet (FBC-4plj builds it)";
 
 /// The report's section on the place stages' preflight.
 pub fn markdown(s: &mut String, pre: &Preflight) {

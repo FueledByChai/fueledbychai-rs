@@ -134,7 +134,6 @@ impl Presses {
     }
 
     /// How many presses it has taken.
-    #[allow(dead_code)] // the presses' tests read it; a stop's cancels count their own
     pub fn taken(&self) -> u32 {
         self.taken
     }

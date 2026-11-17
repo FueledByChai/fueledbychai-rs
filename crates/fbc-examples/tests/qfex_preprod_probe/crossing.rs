@@ -1532,14 +1532,15 @@ fn the_reads_after_a_crossing_session_stop_the_run_on_what_they_show() {
         ),
         ((None, false, false, false, false), None),
     ] {
-        let got = stage::cross_read_stop(refused, pressed, not_flat, (resting, unread_too));
+        let got =
+            stage::stage_read_stop(false, (refused, pressed), (not_flat, resting, unread_too));
         assert_eq!(got, want);
     }
 }
 
 #[test]
 fn the_reads_after_a_crossing_session_order_an_order_not_ours_after_a_position_and_before_ours() {
-    // stage::cross_after_stop: a provider rate refusal, then the owner's Ctrl-C, then a position
+    // stage::stage_after_stop: a provider rate refusal, then the owner's Ctrl-C, then a position
     // not flat, then an order or a TWAP not ours (ReadDisagrees), then an order of ours resting
     // or an account not read (LeftResting), each outranking every one after it (decision 0148
     // item 8; FBC-su9i's review).
@@ -1590,8 +1591,12 @@ fn the_reads_after_a_crossing_session_order_an_order_not_ours_after_a_position_a
         ),
         ((None, false, false, false, false, false), None),
     ] {
-        let got =
-            stage::cross_after_stop(refused, pressed, not_flat, unexpected, (resting, not_read));
+        let got = stage::stage_after_stop(
+            false,
+            (refused, pressed),
+            (not_flat, unexpected),
+            (resting, not_read),
+        );
         assert_eq!(
             got, want,
             "{refused:?} {pressed} {not_flat} {unexpected} {resting} {not_read}"
@@ -1781,13 +1786,25 @@ fn stage_twos_report_and_evidence_say_each_crossing_with_no_id_or_value() {
         // Not read after it, and the run's last.
         cross_run("primary"),
     ];
+    // The primary account's taker IOC session followed its crossing sessions (FBC-ou9g); none
+    // followed the subaccount's, so the run ended first.
     let two = stage_two::StageTwo {
         gate: Some(true),
         crosses,
+        takes: vec![cross_run("primary")],
         ..stage_two::StageTwo::default()
     };
     let mut report = String::new();
     stage_two::markdown(&mut report, &two);
+    let fourth = report
+        .split("### The crossing post-only on subaccount")
+        .nth(2)
+        .and_then(|after| after.split("\n### ").next())
+        .unwrap();
+    assert!(
+        fourth.contains(&format!("- What followed: {}", taker::RUN_ENDED)),
+        "{fourth}"
+    );
     for said in [
         "## Stage two (FBC-su9i, decision 0132 item 7)",
         "- The exact-echo gate: open: an ACK in this run echoed",
@@ -1796,7 +1813,7 @@ fn stage_twos_report_and_evidence_say_each_crossing_with_no_id_or_value() {
         "reduce_only (FBC-blcw): not read",
         "  - ACK: none heard",
         "- How QFEX refused it: refused: an order_response CANCELLED before any ACK",
-        &format!("- What followed: {}", stage_two::NEXT_CROSS),
+        &format!("- What followed: {}", taker::THEN_TAKE),
         "every order they named was seen to end; 1 press of Ctrl-C while they ran",
         &format!(
             "filled: it crossed and traded, a stop (UnexpectedFill, 0151 item 9); {}",
@@ -1816,7 +1833,7 @@ fn stage_twos_report_and_evidence_say_each_crossing_with_no_id_or_value() {
         "- The Stop's cancels: none: the session's connection ended first",
         "- Ended by: it did not open",
         "- How QFEX refused it: not measured: it was not placed",
-        &format!("- What followed: {}", stage_two::LAST_CROSS),
+        &format!("- What followed: {}", taker::THEN_TAKE),
         "| the crossing post-only | 1 | 5 ms | agreed |",
     ] {
         assert!(report.contains(said), "{said}: {report}");

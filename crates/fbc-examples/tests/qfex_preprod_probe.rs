@@ -62,7 +62,16 @@
 //!   account and every stop it brings; judges the drop test at function level (in `verdict.rs`'s
 //!   own tests); and gives the QFEX model an arm that cancels open orders, reported or not, a
 //!   cancel-on-disconnect whose reach is the account's, its own connection's or the earlier
-//!   ones', and fills at an arm or a drop (in [`drop_two`]).
+//!   ones', and fills at an arm or a drop (in [`drop_two`]);
+//! - flattens every fill of ours but a flatten IOC's while its session is open (FBC-ou9g,
+//!   decisions 0148 items 5, 6, 8 and 9 and 0151 item 9, in [`place_stages`], its pure parts and
+//!   the QFEX model's IOC answers in [`flatten_run`]): the owner's Flatten into Exit, reducing
+//!   limit IOCs within the cap under the account's one budget, REST flat, and each flatten stop;
+//! - places stage two's taker IOC on each account after its crossing session (FBC-ou9g, decision
+//!   0132 item 7, 0148 items 5 and 10, 0151 items 8 and 10, in [`place_stages`], its pure parts,
+//!   the report's declarations and the QFEX model's fee_sign and ioc_frame_order knobs in
+//!   [`taker_run`]): filled at the touch and flattened through Exit, expired and recorded, left
+//!   open with a fill and stopped not flat, the taker fee's sign and the order of its frames.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -92,6 +101,12 @@ mod drop_two;
 #[allow(dead_code)]
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
+// The flatten's pure parts and its record (FBC-ou9g), tested in `flatten_run.rs` and run in
+// `place_stages.rs`.
+#[path = "../examples/qfex_preprod_probe/flatten.rs"]
+mod flatten;
+#[path = "qfex_preprod_probe/flatten_run.rs"]
+mod flatten_run;
 #[path = "../examples/qfex_preprod_probe/hold.rs"]
 mod hold;
 #[path = "../examples/qfex_preprod_probe/interrupt.rs"]
@@ -141,6 +156,12 @@ mod crossing;
 // The place stages' capture scrub and the arm window (FBC-t45e).
 #[path = "qfex_preprod_probe/place_scrub.rs"]
 mod place_scrub;
+// Stage two's taker IOC (FBC-ou9g): its pure parts and the report's items it brings, tested in
+// [`taker_run`] and run in [`place_stages`].
+#[path = "../examples/qfex_preprod_probe/taker.rs"]
+mod taker;
+#[path = "qfex_preprod_probe/taker_run.rs"]
+mod taker_run;
 // The journal's tee (FBC-23ch), tested in its own unit tests.
 #[allow(dead_code)]
 #[path = "../examples/qfex_preprod_probe/tee.rs"]
@@ -3645,7 +3666,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
         "{report}"
     );
     assert!(
-        report.contains("| primary | primary | 1.25s | no | full | 0 | 0 | 0 | 0 | 0 | 0 |"),
+        report.contains("| primary | primary | 1250 ms | no | full | 0 | 0 | 0 | 0 | 0 | 0 |"),
         "{report}"
     );
     let v = json(&evidence);
@@ -3673,13 +3694,13 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     );
     assert!(
         report.contains(
-            "| subaccount | drop test 1 | 10s | no | at 1762000000000000000 (venue ns) | 6 | 1 | 2 \
+            "| subaccount | drop test 1 | 10000 ms | no | at 1762000000000000000 (venue ns) | 6 | 1 | 2 \
              | 3 | 4 | 5 |"
         ),
         "{report}"
     );
     assert!(
-        report.contains("| subaccount | drop test 2 | 20s | no | lost | 7 |"),
+        report.contains("| subaccount | drop test 2 | 20000 ms | no | lost | 7 |"),
         "{report}"
     );
     let v = json(&evidence);
@@ -3770,7 +3791,7 @@ async fn a_registry_whose_session_ends_at_its_age_bound_has_not_held_them_though
         "{report}"
     );
     assert!(
-        report.contains("| primary | second | 10s | 5s | full | 1 | 0 | 0 | 0 | 0 | 0 |"),
+        report.contains("| primary | second | 10000 ms | 5000 ms | full | 1 | 0 | 0 | 0 | 0 | 0 |"),
         "{report}"
     );
     let v = json(&evidence);

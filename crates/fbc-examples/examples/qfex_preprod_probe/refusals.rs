@@ -84,12 +84,18 @@ pub const AFTER_DROP_TWO: &str = "after drop session two";
 /// (FBC-su9i) are reported under.
 pub const AFTER_CROSS: &str = "after the crossing session";
 
+/// What the reads of every named account after stage two's taker IOC session on an account
+/// (FBC-ou9g) are reported under.
+pub const AFTER_TAKE: &str = "after the taker IOC session";
+
 /// When a read was made, as the report and the evidence say it: `after the hold`, `after drop
-/// session one` or `two`, `after the crossing session`, or before the session or the hold
-/// `before` names.
+/// session one` or `two`, `after the crossing session`, `after the taker IOC session`, or before
+/// the session or the hold `before` names.
 pub fn read_when(before: &str) -> String {
     match before {
-        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS => before.to_owned(),
+        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS | AFTER_TAKE => {
+            before.to_owned()
+        }
         _ => format!("before {before}"),
     }
 }
@@ -242,9 +248,11 @@ pub fn met(ev: &Evidence, sessions: &[SessionRun]) -> u64 {
 /// starts none). The hold is one of them, under [`HOLD`], with the read sockets before it and its
 /// own connection, and the read sockets after it are another, under [`AFTER_HOLD`]; so are the
 /// read sockets after the place stages' drop session one and two, under [`AFTER_DROP_ONE`] and
-/// [`AFTER_DROP_TWO`], which ran when that session did. A place stage's session counts the read
-/// sockets of its comparisons with those before it, since they are reported under its name, and
-/// its name is every named account's: those sessions are counted together.
+/// [`AFTER_DROP_TWO`], and after stage two's crossing and taker IOC sessions, under
+/// [`AFTER_CROSS`] and [`AFTER_TAKE`] (FBC-ou9g), which ran when that session did. A place
+/// stage's session counts the read sockets of its comparisons with those before it, since they
+/// are reported under its name, and its name is every named account's: those sessions are
+/// counted together.
 pub fn by_session(
     reads: &[ReadSocket],
     sessions: &[SessionRun],
@@ -264,10 +272,12 @@ pub fn by_session(
         let (own, went) = match *name {
             HOLD => (hold.map(|hold| hold.refusals.met()), hold.is_some()),
             AFTER_HOLD => (None, hold.is_some()),
-            AFTER_DROP_ONE | AFTER_DROP_TWO => {
+            AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS | AFTER_TAKE => {
                 let session = match *name {
                     AFTER_DROP_ONE => crate::places::DROP_ONE,
-                    _ => crate::places::DROP_TWO,
+                    AFTER_DROP_TWO => crate::places::DROP_TWO,
+                    AFTER_CROSS => crate::places::CROSS,
+                    _ => crate::places::TAKE,
                 };
                 let ran = sessions.iter().any(|run| run.label() == session);
                 (None, ran)
