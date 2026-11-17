@@ -2,7 +2,7 @@
 //! (`fixtures/`, to commit as `fixtures/qfex/exec-recorded/arm/`, or a production run's as
 //! `fixtures/qfex/exec-recorded/arm-production/`, decision 0143 item 4). The report
 //! (`report.md`) and the same machine-readable (`evidence.json`) are written by
-//! [`crate::report`], whose writers this module re-exports. A run that holds a connection first
+//! [`crate::report`]. A run that holds a connection first
 //! (decision 0146) reports the hold too ([`crate::hold`]); the hold's frames are not journaled,
 //! so the slice holds none of them.
 //!
@@ -59,22 +59,19 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use fbc_core::RpcId;
+use fbc_core::{CidMatch, ClientOrderId, RpcId, SpecTable, VenueOrderId};
 use fbc_journal::{ControlEvent, JournalReader, Marker, Opcode, Record};
+use fbc_venue_qfex::account_reads::PageOrder;
 use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value};
 
+use crate::auth_qfex::Armed;
 use crate::evidence::privacy_hits;
 use crate::hold::HoldRun;
 use crate::ledger::RegistryRun;
 use crate::market::Preflight;
 use crate::pages::Pages;
 use crate::refusals::{ReadSocket, Refusals};
-pub use crate::report::outputs;
-// The report's other two writers, which stage one's tests read through this module; the program
-// reads them only through [`outputs`].
-#[allow(unused_imports)]
-pub use crate::report::{markdown, to_json};
 
 /// What one account's reads showed before a session or the hold, or after the hold.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -95,28 +92,71 @@ pub struct AccountRead {
     pub page_twaps: usize,
     /// Whether the page was full, so another may have followed.
     pub page_full: bool,
+    /// How many of the page's orders were the one order the read admits ([`AllowedOrder`]):
+    /// none unless one was admitted on this account.
+    pub page_allowed: usize,
 }
 
 impl AccountRead {
     /// Why no session may start on it, or `None` when one may: no open order or TWAP on the
-    /// page, every position flat, and no open order counted by REST. Decision 0132 item 7 asks an
-    /// empty `get_user_orders` page and flat REST positions. The probe reads it strictly: a REST
-    /// `open_orders` count above zero refuses too, since an order the page does not list (a stop
+    /// page but the one order it admits, if any ([`AccountRead::page_allowed`]), every position
+    /// flat, and no open order counted by REST beyond that one. Decision 0132 item 7 asks an
+    /// empty `get_user_orders` page and flat REST positions, but before the drop test's second
+    /// session, when X alone may be open. The probe reads it strictly: a REST `open_orders` count
+    /// above the orders admitted refuses too, since an order the page does not list (a stop
     /// order, which no page says it covers) could be cancelled by the arm (item 2) and its
     /// `CANCELLED` report would then confound the arm's capture.
     pub fn refusal(&self) -> Option<String> {
-        if !self.flat || self.page_orders > 0 || self.page_twaps > 0 {
+        let unadmitted = self.page_orders.saturating_sub(self.page_allowed);
+        let admitted = u64::try_from(self.page_allowed).unwrap_or(u64::MAX);
+        let page = match self.page_allowed {
+            0 => "shows no open order on get_user_orders",
+            _ => "shows no open order on get_user_orders but the one the read admits",
+        };
+        if !self.flat || unadmitted > 0 || self.page_twaps > 0 {
             Some("holds an open order, a TWAP or a position that is not flat".to_owned())
-        } else if self.rest_open_orders > 0 {
+        } else if self.rest_open_orders > admitted {
             Some(format!(
-                "shows no open order on get_user_orders, but GET /user/positions counts {}; \
-                 the probe reads that disagreement strictly, since an order the page does not \
-                 list could be cancelled by the arm and confound its capture",
+                "{page}, but GET /user/positions counts {}; the probe reads that disagreement \
+                 strictly, since an order the page does not list could be cancelled by the arm \
+                 and confound its capture",
                 self.rest_open_orders
             ))
         } else {
             None
         }
+    }
+}
+
+/// The one order of ours a read of every named account before a session may show open, on its
+/// account alone: decision 0132 item 7's one exception, X before the drop test's second session
+/// (FBC-77r8). Every other read admits none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllowedOrder {
+    pub account: Armed,
+    pub cid: ClientOrderId,
+    /// Its venue id, once the streams named it.
+    pub venue: Option<VenueOrderId>,
+}
+
+impl AllowedOrder {
+    /// Whether a page's order, `order` with the client id `client` decoded under our namespace,
+    /// is it: its client id ours and its own, and its venue id its own when that is known.
+    pub fn matches(&self, order: &VenueOrderId, client: &CidMatch) -> bool {
+        let venue = self.venue.as_ref().is_none_or(|v| v == order);
+        venue && *client == CidMatch::Ours(self.cid)
+    }
+
+    /// How many of `orders`, a page of `account`'s, are it ([`AccountRead::page_allowed`]): none
+    /// when `allowed` admits none or is on another account, and never more than one, since
+    /// decision 0132 item 7 admits the one order X; a page listing it twice then holds one
+    /// order the read does not admit.
+    pub fn count(allowed: Option<&AllowedOrder>, account: Armed, orders: &[PageOrder]) -> usize {
+        let matching = |a: &AllowedOrder| {
+            let of = orders.iter();
+            of.filter(|o| a.matches(&o.order, &o.client)).count().min(1)
+        };
+        allowed.filter(|a| a.account == account).map_or(0, matching)
     }
 }
 
@@ -159,6 +199,10 @@ pub const UNVERIFIED: &str = "position unverified";
 pub struct SessionRun {
     /// `primary` or `subaccount`.
     pub account: &'static str,
+    /// The session's name in the report, when it is not its account's: a place stage's
+    /// (`places::DROP_ONE`), since a place-stage account runs several sessions; empty for stage
+    /// one's, which run one per account ([`SessionRun::label`]).
+    pub name: &'static str,
     /// Whether the codec reported the stream authenticated: authentication succeeded and QFEX
     /// confirmed the three subscriptions (decision 0132 item 1).
     pub authenticated: bool,
@@ -214,6 +258,24 @@ const PARTIAL: &str = "The capture is partial: the journal may be missing record
      nothing decides (decision 0132 item 1).";
 
 impl SessionRun {
+    /// How the report, the evidence and the refusals' table name it: its [`SessionRun::name`],
+    /// or its account's when it has none.
+    pub fn label(&self) -> &'static str {
+        match self.name.is_empty() {
+            true => self.account,
+            false => self.name,
+        }
+    }
+
+    /// The prefix of its fixture files: its account's name, then its own as words joined by
+    /// `-` when it has one, so two sessions of one account never share a file.
+    pub fn slug(&self) -> String {
+        match self.name.is_empty() {
+            true => self.account.to_owned(),
+            false => format!("{}-{}", self.account, self.name.replace(' ', "-")),
+        }
+    }
+
     /// Whether the session did what stage one asks: the stream authenticated, the arm was
     /// written and its outcome reported, once, with no second connection attempt, and the
     /// journal kept every record of it.
@@ -333,6 +395,18 @@ pub struct Evidence {
     pub read_sockets: Vec<ReadSocket>,
     /// Why the probe stopped before its sessions ended.
     pub stopped: Option<String>,
+    /// The place stages' stop, by name, when one stopped the run (`places::Stop`, FBC-23ch):
+    /// never an id or an amount.
+    pub stop: Option<&'static str>,
+    /// What a place-stage run did with stop markers (0151 item 6), once it opened its lease
+    /// directory.
+    pub marker: Option<crate::places::MarkerRun>,
+    /// What drop session one did and what its reads showed (FBC-23ch), once its registry was
+    /// built: names, flags, counts and times alone.
+    pub drop_one: Option<crate::places::DropRun>,
+    /// Each place-stage registry built: its step, its declaration, its bounds as fences, and its
+    /// ledger at each of its sessions' ends (decision 0132 item 5).
+    pub place_registries: Vec<crate::ledger::PlaceRun>,
     pub fixtures: Vec<String>,
     /// The members whose string value a written fixture keeps as received ([`Scrub::kept`]: none
     /// a place stage's scrub wrote): names only, for the owner's reading before committing.
@@ -359,6 +433,10 @@ impl Evidence {
     pub fn ok(&self) -> bool {
         self.stopped.is_none()
             && self.registries.iter().all(RegistryRun::held)
+            && self
+                .place_registries
+                .iter()
+                .all(crate::ledger::PlaceRun::held)
             && self.withheld.is_empty()
             && self.errors.is_empty()
             && self.dropped == [0, 0]
@@ -460,9 +538,8 @@ pub fn scrub(text: &str) -> String {
 pub enum Scrub {
     /// Stage one's, [`scrub`].
     Arm,
-    /// The place stages' (decision 0148 item 10), [`scrub_places`]. FBC-23ch's stages slice with
-    /// it; stage one never does, so nothing in the program names it until they land.
-    #[allow(dead_code)]
+    /// The place stages' (decision 0148 item 10), [`scrub_places`], which their slice takes
+    /// ([`slice_places`]); stage one never does.
     Places,
 }
 
@@ -888,12 +965,36 @@ pub fn slice(
     slice_scrubbed(journal, shard, ev, Scrub::Arm)
 }
 
-/// [`slice`], each frame's text scrubbed as `scrub` says.
+/// [`slice`], each frame's text scrubbed as `scrub` says, its sessions' pages read on an empty
+/// spec table, as stage one's sessions run.
 pub fn slice_scrubbed(
     journal: &Path,
     shard: u16,
     ev: &mut Evidence,
     scrub: Scrub,
+) -> Result<Vec<(String, String)>, String> {
+    slice_with(journal, shard, ev, scrub, &SpecTable::new())
+}
+
+/// A place-stage run's slice (decision 0148 item 10): [`slice`], each frame's text scrubbed by
+/// [`Scrub::Places`], and each page its sessions' resyncs read judged on `specs`, the spec table
+/// those sessions held, as their codec read it ([`crate::pages::rows_on`]).
+pub fn slice_places(
+    journal: &Path,
+    shard: u16,
+    ev: &mut Evidence,
+    specs: &SpecTable,
+) -> Result<Vec<(String, String)>, String> {
+    slice_with(journal, shard, ev, Scrub::Places, specs)
+}
+
+/// [`slice_scrubbed`], each page judged on `specs`.
+fn slice_with(
+    journal: &Path,
+    shard: u16,
+    ev: &mut Evidence,
+    scrub: Scrub,
+    specs: &SpecTable,
 ) -> Result<Vec<(String, String)>, String> {
     let dropped = ev.dropped[0].saturating_add(ev.dropped[1]);
     let writer_failed = ev.writer_failed.is_some();
@@ -920,7 +1021,7 @@ pub fn slice_scrubbed(
                     }
                 };
                 gaps.read(&record, sessions);
-                read(record, sessions, &mut window, &mut texts, scrub);
+                read(record, sessions, &mut window, &mut texts, (scrub, specs));
             }
         }
     }
@@ -931,7 +1032,7 @@ pub fn slice_scrubbed(
             true => run.frames[i].when.slug(),
             false => "partial",
         };
-        let file = format!("{}-{:03}-{when}.json", run.account, i + 1);
+        let file = format!("{}-{:03}-{when}.json", run.slug(), i + 1);
         run.frames[i].file.clone_from(&file);
         (file, text)
     });
@@ -942,13 +1043,13 @@ pub fn slice_scrubbed(
 /// Adds what `record` shows of the sessions to them: an arm written, its window's end, a frame
 /// QFEX sent (to `texts` too, unnamed, scrubbed by `scrub`), and among those the provider rate
 /// refusals and the frames no refusal can be read from, read from the bytes the journal kept
-/// ([`Refusals::count`]).
+/// ([`Refusals::count`]), and each page of a resync judged on `specs`, the sessions' spec table.
 fn read(
     record: Record,
     sessions: &mut [SessionRun],
     window: &mut [Window],
     texts: &mut Vec<(usize, usize, String)>,
-    scrub: Scrub,
+    (scrub, specs): (Scrub, &SpecTable),
 ) {
     match record {
         Record::Outbound {
@@ -1003,7 +1104,7 @@ fn read(
                 // The codec reads a page only from a text frame: a binary one it refuses as no
                 // JSON object, ending its epoch, whatever its bytes hold.
                 if opcode == Opcode::Text {
-                    run.pages.heard(&text);
+                    run.pages.heard_on(&text, specs);
                 }
                 texts.push((at, run.frames.len(), scrub.apply(&text)));
                 run.frames.push(Arrived {
@@ -1036,15 +1137,11 @@ fn readme_unarmed(ev: &Evidence) -> String {
     )
 }
 
-/// The fixture directory's README.
-pub fn readme(ev: &Evidence) -> String {
-    if ev.arms.is_empty() && ev.hold_asked {
-        return readme_unarmed(ev);
-    }
-    let accounts: Vec<&str> = ev.sessions.iter().map(|s| s.account).collect();
+/// What a fixture directory's README says of a gap in the journal: nothing when it has none.
+fn gap_note(ev: &Evidence) -> String {
     let [normal, safety] = ev.dropped;
     let sessions = shown(ev);
-    let gap = match (
+    match (
         has_gap(ev),
         sessions.iter().any(|run| !run.partial.is_empty()),
     ) {
@@ -1063,7 +1160,62 @@ pub fn readme(ev: &Evidence) -> String {
              nothing is concluded from its absence.\n",
             partial_accounts(&sessions)
         ),
+    }
+}
+
+/// The README of a place-stage run's fixture directory (`drop-production/`, 0151 item 7): what
+/// its frames are and how they were scrubbed (decision 0148 item 10), never a value.
+fn readme_places(ev: &Evidence) -> String {
+    let sessions: Vec<String> = (ev.sessions.iter())
+        .map(|run| format!("{} on {}", run.label(), run.account))
+        .collect();
+    let sessions = match sessions.is_empty() {
+        true => "no session ran, so this directory holds no frame".to_owned(),
+        false => sessions.join(" then "),
     };
+    format!(
+        "# QFEX trade-socket frames: the drop test's first session\n\n\
+         Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
+         `qfex_preprod_probe` (crates/fbc-examples, FBC-23ch, a slice of FBC-9sk2; decisions \
+         0148 and 0151): the place stages' drop session one of decision 0132 item 4's drop test \
+         ({sessions}), on an account named by the run's configuration, not listed by QFEX \
+         (decision 0144). These are recorded frames, not synthetic ones: this directory carries \
+         no SYNTHETIC marker.\n\n\
+         Each file is one frame QFEX sent on a session's trade socket, in the order received, \
+         named `<account>-<session>-<n>-<when>.json` against the session's arm: `before-arm`, \
+         `in-window` (from the arm's write to its own deadline or the connection's end) or \
+         `after-window`, or `partial` for a partial capture.\n\n\
+         Method: the sessions' journal (decision 0006), read back with every span the codec \
+         named blanked to `2`s (decisions 0028 and 0122 item 3), then scrubbed member by member \
+         as decision 0148 item 10 asks and 0151 item 7 reads it: in every frame each `symbol` \
+         becomes `{SYMBOL}`; a top-level ack or err echo is otherwise as the codec's spans left \
+         it; in any other frame every number and every decimal string is zeroed, each `fee` is \
+         kept as its sign alone (-1, 0 or 1), and every `id` and `*_id` member is blanked to \
+         `2`s at its length. No frame we wrote is kept. Every file passed the privacy check's \
+         patterns before it was written, and scripts/privacy-check.sh then scanned the \
+         directory. Those patterns know credential and address shapes only, so the owner reads \
+         every file before committing this directory as \
+         `fixtures/qfex/exec-recorded/drop-production/`, starting from the members the run \
+         found keeping a string value: {}.\n{}",
+        ev.started.get(..10).unwrap_or(""),
+        ev.environment,
+        ev.mode,
+        ev.target,
+        list(&ev.strings),
+        gap_note(ev),
+    )
+}
+
+/// The fixture directory's README.
+pub fn readme(ev: &Evidence) -> String {
+    if ev.places_asked {
+        return readme_places(ev);
+    }
+    if ev.arms.is_empty() && ev.hold_asked {
+        return readme_unarmed(ev);
+    }
+    let accounts: Vec<&str> = ev.sessions.iter().map(|s| s.account).collect();
+    let gap = gap_note(ev);
     format!(
         "# QFEX trade-socket frames: what answered the cancel-on-disconnect arm\n\n\
          Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \

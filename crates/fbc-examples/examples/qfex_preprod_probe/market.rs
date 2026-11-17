@@ -14,8 +14,8 @@
 //!   evidence).
 //! - **The count bound** ([`count_bound`]): `--ledger-max-entries` above each place registry's
 //!   fill ceiling (`ledger::PlaceBounds`), which only the instrument's minimum size gives, so it
-//!   is checked after the `/refdata` read and before any account connects (FBC-fqv5 item 3). Its
-//!   refusal shows no ceiling, since a ceiling counts `--flatten-attempts` (FBC-fqv5 item 10).
+//!   is checked after the `/refdata` read and before any account connects (0151 item 3). Its
+//!   refusal shows no ceiling, since a ceiling counts `--flatten-attempts` (0151 item 10).
 //! - **The touch** ([`Touch`]): fbc-runtime's `MdVenue` on the guarded configuration's MDS
 //!   origin with the discovered spec table, subscribed to the instrument's `bbo` alone, with a
 //!   rate limiter of its own (QFEX's market data declares no limit), one connection attempt (as
@@ -31,8 +31,9 @@
 //!   for a sell, the ask for a buy). Each is moved in whole ticks, exactly, and snapped to the
 //!   grid on its safe side as `InstrumentSpec::quantize` snaps, flooring a buy and ceiling a
 //!   sell, so a resting order is never nearer the touch, and a flatten never further through it,
-//!   than asked, however many ticks the price spans. Only the resting price is taken now, for
-//!   the caps; the driver prices the others (FBC-23ch).
+//!   than asked, however many ticks the price spans. The resting price is taken for the caps
+//!   and for X (FBC-23ch, from the touch [`Touch::drive`] keeps current, [`TouchView`]); later
+//!   slices price the others.
 //! - **The caps** ([`place_caps`]): each of `--resting-cap-usd` and `--inventory-cap-usd` in lots
 //!   with `testnet::cap_lots`, at `testnet::inventory_price` of the resting price and the touch,
 //!   the highest price any order of the stages takes, and refused below three of the
@@ -40,7 +41,7 @@
 //!   minimum (item 4).
 //!
 //! The report and the evidence say which of these the run passed ([`Preflight`]), never a value:
-//! no cap, distance, flatten cap or attempt count, and no symbol (FBC-fqv5 item 10).
+//! no cap, distance, flatten cap or attempt count, and no symbol (0151 item 10).
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -266,9 +267,9 @@ pub fn resolve(
 
 /// The place registries' ledger bounds: the command line's `parsed`, its count bound held above
 /// each place registry's fill ceiling, every order of its list at `found`'s minimum size with
-/// `--flatten-attempts` of `places` (`ledger::PlaceBounds::accept`; FBC-fqv5 item 3). Refused
+/// `--flatten-attempts` of `places` (`ledger::PlaceBounds::accept`; 0151 item 3). Refused
 /// naming `--ledger-max-entries` and showing no ceiling, since a ceiling counts the attempts
-/// (FBC-fqv5 item 10).
+/// (0151 item 10).
 pub fn count_bound(
     parsed: &Bounds,
     found: &Discovered,
@@ -278,7 +279,7 @@ pub fn count_bound(
     PlaceBounds::accept(parsed, &lists).map_err(|_| {
         "--ledger-max-entries must be above each place registry's fill ceiling, every order its \
          list may place counted at the instrument's minimum size in size steps (decision 0132 \
-         item 5, FBC-fqv5 item 3; no value is shown)"
+         item 5, 0151 item 3; no value is shown)"
             .to_owned()
     })
 }
@@ -491,6 +492,35 @@ impl Touch {
 
     /// The touch to price from now ([`TouchState::judge`]).
     pub fn now(&self, max_age: Duration) -> Result<Quote, String> {
+        self.view().now(max_age)
+    }
+
+    /// What its connection gives, to judge while [`Touch::drive`] runs it.
+    pub fn view(&self) -> TouchView {
+        TouchView {
+            state: Rc::clone(&self.state),
+        }
+    }
+
+    /// Drives the touch's connection on, as [`Touch::first`] began it, so each later touch
+    /// reaches its [`TouchView`] (FBC-23ch: the drop session prices X from it). It resolves
+    /// never, but after the connection ended, from which no touch then arrives and the view says
+    /// so.
+    pub async fn drive(&mut self) {
+        let _ = self.venue.run().await;
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The touch [`Touch::drive`] keeps current, read without the venue it runs on.
+#[derive(Clone)]
+pub struct TouchView {
+    state: Rc<RefCell<TouchState>>,
+}
+
+impl TouchView {
+    /// The touch to price from now ([`TouchState::judge`]).
+    pub fn now(&self, max_age: Duration) -> Result<Quote, String> {
         let state = self.state.borrow();
         state.judge(Instant::now(), testnet::wall_now(), max_age)
     }
@@ -546,7 +576,7 @@ pub fn rest_price(
 
 /// A crossing order's price on `side`, the crossing post-only's and the taker IOC's: the far
 /// touch (the ask for a buy, the bid for a sell).
-#[allow(dead_code)] // the driver prices the crossing post-only and the taker IOC (FBC-23ch)
+#[allow(dead_code)] // the driver prices the crossing post-only and the taker IOC (FBC-su9i)
 pub fn far_touch(spec: &InstrumentSpec, side: Side, quote: Quote) -> Result<Ticks, String> {
     match side {
         Side::Buy => snapped(spec, side, i128::from(quote.ask.0)),
@@ -557,7 +587,7 @@ pub fn far_touch(spec: &InstrumentSpec, side: Side, quote: Quote) -> Result<Tick
 /// A flatten IOC's price on `side`, the other of `--side`'s: at most `cap_bps` through the touch
 /// it crosses, measured from that touch (the bid for a sell, the ask for a buy), and snapped
 /// back toward it, so it is never further through than the cap.
-#[allow(dead_code)] // the driver prices each flatten IOC (FBC-23ch)
+#[allow(dead_code)] // the driver prices each flatten IOC (FBC-ou9g)
 pub fn flatten_price(
     spec: &InstrumentSpec,
     side: Side,
@@ -605,7 +635,6 @@ pub fn place_caps(places: &Places, found: &Discovered, quote: Quote) -> Result<P
 }
 
 /// The pre-trade caps of a place registry on `inst`: `caps` both ways.
-#[allow(dead_code)] // the driver builds each place registry with them (FBC-23ch)
 pub fn pre_trade_caps(inst: InstrumentId, caps: PlaceCaps) -> PreTradeCaps {
     let config = MarketCapsConfig {
         inventory: Some(caps.inventory),
@@ -621,7 +650,7 @@ pub const DISCOVERED: &str = "the instrument's spec from this run's GET /refdata
      0148 item 4)";
 /// The count bound cleared each place registry's fill ceiling.
 pub const COUNTED: &str = "--ledger-max-entries above each place registry's fill ceiling \
-     (FBC-fqv5 item 3)";
+     (0151 item 3)";
 /// A touch of the MDS connection's current epoch, fresh and not crossed.
 pub const TOUCHED: &str = "a touch from the guarded MDS origin, of the connection's current \
      epoch, with both sides, not crossed or locked, and no older than --touch-max-age-ms";
@@ -630,24 +659,25 @@ pub const CAPPED: &str = "each cap at least three of the instrument's minimum si
      (decisions 0113 and 0148 item 7)";
 
 /// What the place stages' preflight passed, in order, for the report and the evidence: never a
-/// value (FBC-fqv5 item 10).
+/// value (0151 item 10).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preflight {
     pub passed: Vec<&'static str>,
 }
 
 /// The fences the command line met before anything connected, as the report names them: met,
-/// never a value (FBC-fqv5 item 10).
+/// never a value (0151 item 10).
 const FENCES: &str = "--production; --sole-trader (decision 0148 item 7); --resting-cap-usd and \
      --inventory-cap-usd set and positive (decision 0113); --away-bps at least 20; \
      --flatten-cap-bps at least 1 and below --away-bps; --flatten-attempts 1 to 3; \
      --registry-span at most 3600 s and above the drop test's floor; at most 10 reads per \
      comparison; and every origin a loopback test stub's, until FBC-4plj";
 
-/// What the place stages do not do yet, as the report says it.
-const NOT_BUILT: &str = "The place stages after the preflight are not built yet (FBC-23ch and \
-     the slices after it): nothing authenticated connected for a place stage, no account was read \
-     for one, and nothing was placed";
+/// What the place stages do after the preflight, and do not do yet, as the report says it.
+const NOT_BUILT: &str = "After the preflight, drop session one of decision 0132 item 4's drop \
+     test runs on the first named account alone (FBC-23ch), and the run ends after its reads: \
+     drop session two and the stages after it are not built yet (FBC-77r8 and the slices after \
+     it)";
 
 /// The report's section on the place stages' preflight.
 pub fn markdown(s: &mut String, pre: &Preflight) {

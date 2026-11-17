@@ -29,34 +29,35 @@
 //! its ledger's horizon and replay counts ([`RegistryRun`]), so a run shows the bounds held.
 //!
 //! **The place stages' registries** (FBC-9sk2; decision 0148 items 3 and 7, FBC-5hif). On
-//! production alone (item 1 of FBC-fqv5's record, read as proposed until the record lands), each
-//! named account gets four registries in run order, one per [`Step`]: the drop test's, which
-//! serves both its sessions, the crossing post-only's, the taker IOC's and stage three's.
-//! [`PlaceLists`] gives each its [`MayPlace`] list in size steps, every order at the instrument's
-//! minimum size (0148 item 4): the lists' entries other than the flatten IOCs sum to 0148 item
-//! 7's most per account, and every list carries `--flatten-attempts` flatten IOCs, since an
-//! unexpected fill may need a flatten from any registry (item 9 of FBC-fqv5's record), while the
-//! account's flatten IOCs across its registries share one budget of that many
-//! ([`PlaceLists::flatten_budget`]), which this file states and the driver's Allowance spends
-//! (FBC-23ch): nothing here spends it. [`PlaceBounds::accept`] holds the command line's bounds to
-//! each list's ceiling. [`PlaceRegistry`] builds each registry with its caps, declared
-//! `CodProbeRun::owner_supervised_places` on its one market and never a testnet run, under its
-//! lease names and bound to its account; gives the journal its `CancelOnlyTrip`
-//! ([`PlaceRegistry::trip_on`], decision 0139); and hands the registry and its one fill ledger to
-//! one `Link` (`src/link.rs`) for the registry's life ([`PlaceRegistry::into_link`]). The `Link`
-//! routes every fill of the registry's sessions through that ledger and lists each one the ledger
-//! refuses for its time (`Link::fill_refusals`), and [`PlaceRun::session_ended`] reads the
-//! ledger back from it.
+//! production alone (0151 item 1), each named account gets four registries in run order, one per
+//! [`Step`]: the drop test's, which serves both its sessions, the crossing post-only's, the taker
+//! IOC's and stage three's. [`PlaceLists`] gives each its [`MayPlace`] list in size steps, every
+//! order at the instrument's minimum size (0148 item 4): the lists' entries other than the
+//! flatten IOCs sum to 0148 item 7's most per account, and every list carries
+//! `--flatten-attempts` flatten IOCs, since an unexpected fill may need a flatten from any
+//! registry (0151 item 9), while the account's flatten IOCs across its registries share one
+//! budget of that many ([`PlaceLists::flatten_budget`]), which this file states and
+//! `places::Allowance` spends (FBC-23ch): nothing here spends it. [`PlaceBounds::accept`] holds
+//! the command line's bounds to each list's ceiling. [`PlaceRegistry`] builds each registry with
+//! its caps, declared `CodProbeRun::owner_supervised_places` on its one market and never a
+//! testnet run, under its lease names and bound to its account; gives the journal its
+//! `CancelOnlyTrip` ([`PlaceRegistry::trip_on`], decision 0139); and hands the registry and its
+//! one fill ledger to one `Link` (`src/link.rs`) for the registry's life
+//! ([`PlaceRegistry::into_link`]). The `Link` routes every fill of the registry's sessions through
+//! that ledger and lists each one the ledger refuses for its time (`Link::fill_refusals`), and
+//! [`PlaceRun::session_ended`] reads the ledger back from it.
 //!
-//! What the place stages' driver (FBC-23ch) still does with them: it spends each list and the
-//! shared flatten budget as it authorizes places, and builds no place beyond them; it seeds each
-//! market flat after clean reads of every named account and arms it under the market lease; it
-//! gives each registry's trip to the journal before any market arms; it serves the drop test's
-//! two sessions from one registry (one [`PlaceRun::session_ended`] each, one deadline for both);
-//! it stops on a fill the `Link` lists as refused; and it begins its cancels by venue id one
-//! `--rpc-timeout-ms` before the span bound, since the bound is when a session is stopped and the
-//! session ends after it ([`AtEnd::past_span`] records by how much; [`RegistryRun::held`] fails a
-//! registry whose session ended at or past the age bound).
+//! What the place stages' driver does with them (FBC-23ch's drop session one, in `stage.rs`): it
+//! spends each list and the shared flatten budget as it authorizes places, and builds no place
+//! beyond them; it seeds each market flat after clean reads of every named account and arms it
+//! under the market lease; it gives each registry's trip to the journal before any market arms;
+//! it stops on a fill the `Link` lists as refused; and it records the ledger at each session's
+//! end ([`PlaceRun::session_ended`]), which the report renders with its list and ceiling as
+//! fences met ([`place_markdown`]). Still to come: the drop test's second session on the same
+//! registry (one deadline for both, FBC-77r8), and the cancels by venue id begun one
+//! `--rpc-timeout-ms` before the span bound outside the drop test, since the bound is when a
+//! session is stopped and the session ends after it ([`AtEnd::past_span`] records by how much;
+//! [`RegistryRun::held`] fails a registry whose session ended at or past the age bound).
 //!
 //! The span bound's floor, which the command line holds above a session's reach to its arm's
 //! deadline, counts one session per registry: the drop test's two need it counted twice, with
@@ -251,7 +252,7 @@ fn mono_at(origin: tokio::time::Instant, at: tokio::time::Instant) -> MonoNs {
 }
 
 /// When a registry's first session started, on each clock the registry reads.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Opened {
     /// On the run's monotonic clock ([`mono_since`]): the runtime's, as the ledger's ages are.
     pub mono: MonoNs,
@@ -434,9 +435,8 @@ pub const PAGED: &str = "stage-three post-only GTC";
 /// A flatten's reducing limit IOC (decision 0148 item 5).
 pub const FLATTEN: &str = "flatten limit IOC";
 
-/// One place-stage registry of an account, in run order (item 5 of FBC-fqv5's record): each
+/// One place-stage registry of an account, in run order (0151 item 5): each
 /// has its own [`MayPlace`] list, fill ledger and span bound.
-#[allow(dead_code)] // built by the place stages' preflight and driver (FBC-c6kw, FBC-23ch)
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Step {
     /// The drop test (decision 0132 item 4): X in its first session, Y in its second.
@@ -449,7 +449,6 @@ pub enum Step {
     Pages,
 }
 
-#[allow(dead_code)] // the place stages' preflight and driver use it (FBC-c6kw, FBC-23ch)
 impl Step {
     /// Every step, in run order.
     pub const ALL: [Step; 4] = [Step::Drop, Step::Cross, Step::Take, Step::Pages];
@@ -478,7 +477,6 @@ impl Step {
 
 /// The [`MayPlace`] list of each place-stage registry of an account, every order at the traded
 /// instrument's minimum size, in size steps (decision 0148 items 4 and 7).
-#[allow(dead_code)] // built by the place stages' preflight (FBC-c6kw)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PlaceLists {
     /// The instrument's minimum size, in size steps: the size of every place.
@@ -487,7 +485,6 @@ pub struct PlaceLists {
     attempts: u64,
 }
 
-#[allow(dead_code)] // the place stages' preflight and driver use it (FBC-c6kw, FBC-23ch)
 impl PlaceLists {
     /// The lists for an instrument whose minimum size is `min_size` (in size steps, as this
     /// run's discovery gives it) and `--flatten-attempts` of `attempts`. Refused, naming the
@@ -513,8 +510,8 @@ impl PlaceLists {
     }
 
     /// What `step`'s registry's sessions may place: its own orders, then `--flatten-attempts`
-    /// flatten IOCs, since an unexpected fill may need a flatten from any registry (item 9 of
-    /// FBC-fqv5's record). Every order is one minimum size.
+    /// flatten IOCs, since an unexpected fill may need a flatten from any registry (0151 item
+    /// 9). Every order is one minimum size.
     pub fn list(&self, step: Step) -> Vec<MayPlace> {
         let may = |what, orders| MayPlace {
             what,
@@ -531,8 +528,8 @@ impl PlaceLists {
     /// The flatten IOCs an account may place in a run, across all of its registries: one
     /// budget of `--flatten-attempts`, which each registry's list repeats but which the account
     /// spends once (decision 0148 items 5 and 7). This states the budget and spends none of it:
-    /// the driver's Allowance (FBC-23ch) holds the account's flatten IOCs across its registries
-    /// to it, so the account's total never exceeds it.
+    /// `places::Allowance` (FBC-23ch) holds the account's flatten IOCs across its registries to
+    /// it, so the account's total never exceeds it.
     pub fn flatten_budget(&self) -> u64 {
         self.attempts
     }
@@ -540,20 +537,18 @@ impl PlaceLists {
 
 /// The fill-ledger bounds of each place-stage registry, accepted against its list
 /// ([`PlaceBounds::accept`]): the only way a [`PlaceRegistry`] gets them.
-#[allow(dead_code)] // built by the place stages' preflight (FBC-c6kw)
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaceBounds {
     each: Vec<(Step, Bounds)>,
 }
 
-#[allow(dead_code)] // the place stages' preflight and driver use it (FBC-c6kw, FBC-23ch)
 impl PlaceBounds {
     /// The bounds `parsed` (the command line's, which it accepts against stage one's ceiling
     /// alone) held to each list of `lists`: the age and span bounds as given, and the count
     /// bound above every list's fill ceiling, refused naming `--ledger-max-entries` and the
     /// registry, never a value (decision 0132 item 5). The ceiling is known only once the
     /// traded instrument's minimum size is, so this runs after discovery and before any
-    /// account connects (item 3 of FBC-fqv5's record).
+    /// account connects (0151 item 3).
     pub fn accept(parsed: &Bounds, lists: &PlaceLists) -> Result<PlaceBounds, String> {
         let bounds = |step: Step| {
             Bounds::new(
@@ -584,17 +579,15 @@ impl PlaceBounds {
 pub const PLACES_DECLARATION: &str = "CodProbeRun::owner_supervised_places";
 
 /// One place-stage registry, built ([`PlaceRegistry::new`]) and not yet handed to its `Link`.
-#[allow(dead_code)] // built by the place stages' driver (FBC-23ch)
 pub struct PlaceRegistry {
     run: PlaceRun,
     reg: Registry,
     ledger: FillLedger,
 }
 
-#[allow(dead_code)] // the place stages' driver uses it (FBC-23ch)
 impl PlaceRegistry {
-    /// `step`'s registry of `account` (the account key `acct`), on production alone (item 1 of
-    /// FBC-fqv5's record): built with `caps` (`Registry::with_caps`), declared
+    /// `step`'s registry of `account` (the account key `acct`), on production alone (0151 item
+    /// 1): built with `caps` (`Registry::with_caps`), declared
     /// `CodProbeRun::owner_supervised_places(inst)` on its one market `inst` (decision 0148 item
     /// 3) and never a testnet run, under the lease names `keys`, and bound to `acct` (decision
     /// 0082), with an empty ledger under its step's bounds of `bounds`, opened as its first
@@ -639,11 +632,13 @@ impl PlaceRegistry {
     }
 
     /// The registry, to read before it goes to its `Link`.
+    #[allow(dead_code)] // the registries' tests read it
     pub fn registry(&self) -> &Registry {
         &self.reg
     }
 
     /// What the report and the evidence say of it.
+    #[allow(dead_code)] // the registries' tests read it
     pub fn run(&self) -> &PlaceRun {
         &self.run
     }
@@ -669,11 +664,10 @@ impl PlaceRegistry {
 ///
 /// Its [`RegistryRun`] is private, so [`markdown`] and [`to_json`] never render it: they print
 /// each [`MayPlace`]'s count, the flatten IOCs' `--flatten-attempts` included, and a ceiling
-/// that counts it, with stage one's prose. Item 10 of FBC-fqv5's record, as proposed, shows the
-/// attempts only as a fence met, so the place stages' report (FBC-23ch) writes its own rendering
-/// here, beside them, with the flatten entry and the ceiling as fences met.
-#[allow(dead_code)] // the place stages' driver and report use it (FBC-23ch)
-#[derive(Clone, Debug)]
+/// that counts it, with stage one's prose. 0151 item 10 shows the attempts only as a fence met,
+/// so the place stages' report writes its own rendering here, beside them, with the flatten
+/// entry and the ceiling as fences met ([`place_markdown`], [`place_to_json`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaceRun {
     pub step: Step,
     /// The probe declaration it carries ([`PLACES_DECLARATION`]).
@@ -685,12 +679,16 @@ pub struct PlaceRun {
     opened: Opened,
 }
 
-#[allow(dead_code)] // the place stages' driver uses it (FBC-23ch)
 impl PlaceRun {
     /// The instant on the runtime's clock its span bound ends at, as
     /// [`RegistryLedger::deadline`]'s.
     pub fn deadline(&self) -> tokio::time::Instant {
         self.opened.at + self.registry.bounds.span
+    }
+
+    /// Whether its bounds held, as [`RegistryRun::held`] judges them.
+    pub fn held(&self) -> bool {
+        self.registry.held()
     }
 
     /// Records `link`'s ledger, the registry's, as the session `session` ended, at `now` on the
@@ -706,6 +704,108 @@ impl PlaceRun {
     pub fn registry_run(&self) -> &RegistryRun {
         &self.registry
     }
+}
+
+/// What the report and the evidence say of a place-stage registry's count bound and fill
+/// ceiling: a fence met, never a value, since the ceiling counts `--flatten-attempts` (0151 item
+/// 10).
+pub const PLACE_CEILING: &str = "above the registry's fill ceiling, every order its list may \
+     place counted at the instrument's minimum size, its flatten IOCs --flatten-attempts (a \
+     fence met; neither the ceiling nor the attempts is shown, 0151 item 10)";
+
+/// The report's section on the place stages' registries (FBC-23ch; decision 0132 item 5, 0148
+/// items 3 and 7, 0151 item 10): each registry's step, account, declaration, bounds and whether
+/// they held, then its ledger at each of its sessions' ends. Its list and ceiling are fences met,
+/// never values.
+pub fn place_markdown(s: &mut String, runs: &[PlaceRun]) {
+    if runs.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        s,
+        "## The place stages' registries\n\n\
+         Decision 0148 items 3 and 7: one registry per account and step, declared \
+         `{PLACES_DECLARATION}` on its one market, never a testnet run (decision 0143 item 3), \
+         bound to its account, its fills through one fill ledger across every session it serves \
+         (decision 0132 item 5). Its `MayPlace` list holds one minimum size per order and the \
+         account's flatten IOCs, a fence met. The bounds held for a registry when, at each of \
+         its sessions' ends, its horizon was still full and the session ended within the age \
+         bound of the registry's first session's start.\n\n\
+         | registry | account | declaration | testnet run | max age | span bound | max entries \
+         | held |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- |"
+    );
+    for run in runs {
+        let r = &run.registry;
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {:?} | {:?} | {PLACE_CEILING} | {} |",
+            run.step.name(),
+            r.account,
+            run.declaration,
+            if r.testnet_run { "yes" } else { "no" },
+            r.bounds.max_age,
+            r.bounds.span,
+            if r.held() { "yes" } else { "NO" }
+        );
+    }
+    let _ = writeln!(
+        s,
+        "\n| registry | session ended | after its first session's start | past the span bound \
+         | horizon | fills held | replays applied | duplicate | before watermark | beyond horizon \
+         | untimed |\n\
+         | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+    );
+    for run in runs {
+        let r = &run.registry;
+        for e in &r.ends {
+            let c = e.replays;
+            let past = (e.past_span(r.bounds.span)).map_or("no".to_owned(), |d| format!("{d:?}"));
+            let _ = writeln!(
+                s,
+                "| {} | {} | {:?} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                run.step.name(),
+                e.session,
+                e.after,
+                past,
+                horizon(e.horizon),
+                e.held,
+                c.applied,
+                c.duplicate,
+                c.before_watermark,
+                c.beyond_horizon,
+                c.untimed
+            );
+        }
+    }
+    let _ = writeln!(s);
+}
+
+/// The evidence's entry for the place stages' registries: as [`place_markdown`], the list and
+/// the ceiling as fences met.
+pub fn place_to_json(runs: &[PlaceRun]) -> Value {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let runs: Vec<Value> = (runs.iter())
+        .map(|run| {
+            let r = &run.registry;
+            let ends: Vec<Value> = (r.ends.iter())
+                .map(|e| {
+                    let c = e.replays;
+                    json!({"session": e.session, "after_ms": ms(e.after),
+                        "past_span_ms": e.past_span(r.bounds.span).map(ms),
+                        "horizon": horizon(e.horizon), "fills_held": e.held,
+                        "replays": {"applied": c.applied, "duplicate": c.duplicate,
+                            "before_watermark": c.before_watermark,
+                            "beyond_horizon": c.beyond_horizon, "untimed": c.untimed}})
+                })
+                .collect();
+            json!({"step": run.step.name(), "account": r.account,
+                "declaration": run.declaration, "testnet_run": r.testnet_run,
+                "ledger_max_age_ms": ms(r.bounds.max_age), "registry_span_ms": ms(r.bounds.span),
+                "ledger_max_entries": PLACE_CEILING, "held": r.held(), "session_ends": ends})
+        })
+        .collect();
+    Value::Array(runs)
 }
 
 /// A horizon as the report and the evidence name it.

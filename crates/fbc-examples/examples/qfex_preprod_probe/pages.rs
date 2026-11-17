@@ -23,10 +23,16 @@
 //!   and a `twaps` array (`account_reads::page_rows`), no more of them together than the page
 //!   size, each TWAP an object and each order row an object naming a string `order_id` and,
 //!   unless its `type` is one of the two stop kinds the resync leaves out, a non-empty string
-//!   `symbol` (`Resync::orders_page` and `private::snapshot`). The probe's sessions run on an
-//!   empty spec table, so every symbol is one the table does not hold and the codec reads nothing
-//!   more of a row. The codec sends a page only while no other is in flight and reads the first
-//!   such frame as its answer, so the pairing is the codec's own;
+//!   `symbol` (`Resync::orders_page` and `private::snapshot`). On a symbol the session's spec
+//!   table does not hold, the codec reads nothing more of a row: stage one's sessions run on an
+//!   empty table. A place stage's sessions hold the traded spec (FBC-23ch), so a row on its
+//!   symbol, X's for one, is read as the codec reads an open order of its snapshot ([`held`]):
+//!   its `order_id` a UUID, its `side` `BUY` or `SELL`, its `price` and `quantity` positive
+//!   numbers on the spec's grid and in whole size steps, its `quantity_remaining` a number from
+//!   zero to its quantity leaving a filled part in whole size steps, and its `client_order_id`
+//!   absent, null or a string; a row that is not is refused, and so is its page. The codec sends
+//!   a page only while no other is in flight and reads the first such frame as its answer, so the
+//!   pairing is the codec's own;
 //! - **a full page** is one whose orders and TWAPs together are as many as its page size, as the
 //!   codec counts it; a shorter one, an empty one included, ends the paging and is recorded as
 //!   no full page.
@@ -40,7 +46,10 @@
 //! or an amount (decision 0009).
 use std::collections::HashSet;
 
-use serde_json::{Value, json};
+use fbc_core::{InstrumentSpec, PxExact, SpecTable};
+use fbc_venue_qfex::exec::is_venue_order_id;
+use rust_decimal::Decimal;
+use serde_json::{Map, Value, json};
 
 /// The two stop kinds of QFEX's [enums page](https://docs.qfex.com/api-reference/enums), whose
 /// order rows the codec's resync leaves out of its snapshot unread (its `STOP_KINDS`).
@@ -82,14 +91,22 @@ impl Pages {
         self.waiting = None;
     }
 
-    /// Reads `text`, a text frame QFEX sent the session as its journal kept it: the answer to the
-    /// page waiting, when it is a page ([`rows`]), recorded when it is full. A binary frame is
-    /// never offered, since the codec reads no page from one.
+    /// Reads `text`, a text frame QFEX sent a stage-one session, which holds no spec, as its
+    /// journal kept it ([`Pages::heard_on`] on an empty spec table).
+    #[allow(dead_code)] // stage one's tests read pages through it
     pub fn heard(&mut self, text: &str) {
+        self.heard_on(text, &SpecTable::new());
+    }
+
+    /// Reads `text`, a text frame QFEX sent the session as its journal kept it: the answer to the
+    /// page waiting, when it is a page as the codec reads one on the session's spec table `specs`
+    /// ([`rows_on`]), recorded when it is full. A binary frame is never offered, since the codec
+    /// reads no page from one.
+    pub fn heard_on(&mut self, text: &str, specs: &SpecTable) {
         let Some(page) = self.waiting else {
             return;
         };
-        let Some(listed) = rows(text, page.size) else {
+        let Some(listed) = rows_on(text, page.size, specs) else {
             return;
         };
         self.waiting = None;
@@ -143,13 +160,20 @@ pub fn ask(frame: &[u8]) -> Option<Page> {
     Some(Page { size, offset })
 }
 
-/// How many orders and TWAPs together `text` lists, when it is a page answering an ask of page
-/// size `size` as the codec reads one on the probe's sessions: JSON repeating no member
-/// ([`repeats`]), one `all_orders_response` holding exactly an `orders` and a `twaps` array, at
-/// most `size` together, each TWAP an object, each order row an object naming a string
-/// `order_id` and, unless its `type` is a stop kind, a non-empty string `symbol`. `None` for any
-/// other frame.
+/// [`rows_on`] on an empty spec table, as stage one's sessions run: no row is read past its
+/// symbol.
+#[allow(dead_code)] // stage one's tests read pages through it
 pub fn rows(text: &str, size: u16) -> Option<usize> {
+    rows_on(text, size, &SpecTable::new())
+}
+
+/// How many orders and TWAPs together `text` lists, when it is a page answering an ask of page
+/// size `size` as the codec reads one on a session whose spec table is `specs`: JSON repeating
+/// no member ([`repeats`]), one `all_orders_response` holding exactly an `orders` and a `twaps`
+/// array, at most `size` together, each TWAP an object, each order row an object naming a string
+/// `order_id` and, unless its `type` is a stop kind, a non-empty string `symbol`, and a row on a
+/// symbol `specs` holds read as [`held`] reads it. `None` for any other frame.
+pub fn rows_on(text: &str, size: u16, specs: &SpecTable) -> Option<usize> {
     let Ok(Value::Object(top)) = serde_json::from_str::<Value>(text) else {
         return None;
     };
@@ -161,15 +185,68 @@ pub fn rows(text: &str, size: u16) -> Option<usize> {
     let (orders, twaps) = (list("orders")?, list("twaps")?);
     let read = |row: &Value| {
         let text = |key: &str| row.get(key).and_then(Value::as_str);
+        let symbol = text("symbol").filter(|symbol| !symbol.is_empty());
+        let on = |symbol: &str| match (specs.by_symbol(symbol), row.as_object()) {
+            (None, _) => true,
+            (Some(spec), Some(row)) => held(row, spec),
+            (Some(_), None) => false,
+        };
         text("order_id").is_some()
             && (text("type").is_some_and(|kind| STOP_KINDS.contains(&kind))
-                || text("symbol").is_some_and(|symbol| !symbol.is_empty()))
+                || symbol.is_some_and(on))
     };
     let shaped = page.len() == 2
         && orders.iter().all(read)
         && twaps.iter().all(Value::is_object)
         && orders.len() + twaps.len() <= usize::from(size);
     shaped.then_some(orders.len() + twaps.len())
+}
+
+/// Whether `row`, an order row on `spec`'s symbol, reads as the codec reads an open order of its
+/// resync's snapshot (`private::snapshot`): its `order_id` a UUID, its `side` `BUY` or `SELL`,
+/// its `price` a positive number exactly on `spec`'s grid, its `quantity` a positive number in
+/// whole size steps, its `quantity_remaining` a number from zero to the quantity whose filled
+/// part is in whole size steps, and its `client_order_id` absent, null or a string.
+pub fn held(row: &Map<String, Value>, spec: &InstrumentSpec) -> bool {
+    let number = |key: &str| match row.get(key) {
+        Some(Value::Number(n)) => exact(&n.to_string()),
+        _ => None,
+    };
+    let steps = |size: Decimal| {
+        let step = spec.size_step.get();
+        let n = size.checked_div(step);
+        n.is_some_and(|n| n.fract().is_zero() && n.checked_mul(step) == Some(size))
+    };
+    let order = row.get("order_id").and_then(Value::as_str);
+    let side = row.get("side").and_then(Value::as_str);
+    let price = number("price").filter(|p| *p > Decimal::ZERO);
+    let on_grid = price
+        .and_then(PxExact::from_decimal)
+        .is_some_and(|px| spec.price_grid.ticks_exact(px).is_some());
+    let quantity = number("quantity").filter(|q| *q > Decimal::ZERO && steps(*q));
+    let remaining = number("quantity_remaining").filter(|r| *r >= Decimal::ZERO);
+    let left = match (quantity, remaining) {
+        (Some(q), Some(r)) => r <= q && steps(q - r),
+        _ => false,
+    };
+    let cid = matches!(
+        row.get("client_order_id"),
+        None | Some(Value::Null | Value::String(_))
+    );
+    order.is_some_and(is_venue_order_id)
+        && matches!(side, Some("BUY" | "SELL"))
+        && on_grid
+        && left
+        && cid
+}
+
+/// A JSON number's text as a `Decimal`, exactly, as the codec reads one: a plain decimal or one
+/// with an exponent, `None` for one a `Decimal` cannot hold without rounding.
+fn exact(raw: &str) -> Option<Decimal> {
+    match raw.contains(['e', 'E']) {
+        true => Decimal::from_scientific(raw).ok(),
+        false => Decimal::from_str_exact(raw).ok(),
+    }
 }
 
 /// Whether an object anywhere in `text`, JSON serde_json has parsed, names a member twice, as

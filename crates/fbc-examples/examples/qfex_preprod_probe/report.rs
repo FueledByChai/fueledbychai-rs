@@ -2,7 +2,11 @@
 //! stage one found ([`Evidence`], [`crate::capture`]), each through the privacy check's patterns
 //! before it is written ([`outputs`]). The report answers what decision 0132 items 1, 3 and 7 ask
 //! of stage one, for each session and account read; a run that holds a connection first (decision
-//! 0146) reports the hold too ([`crate::hold`]).
+//! 0146) reports the hold too ([`crate::hold`]). A place-stage run's (FBC-9sk2) reports its
+//! preflight, its stop marker, drop session one (what answered its arm, whether its graceful
+//! close cancelled X, its comparisons, any stop by name: [`crate::places`]) and its registries
+//! ([`crate::ledger::place_markdown`]), every cap, distance and attempt count as a fence met, never
+//! a value (0151 item 10).
 
 use std::fmt::Write as _;
 
@@ -10,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::capture::{Evidence, SessionRun, has_gap, list, partial_accounts, shown};
 use crate::evidence::privacy_hits;
-use crate::{hold, ledger, market, refusals};
+use crate::{hold, ledger, market, places, refusals};
 
 /// Where the accounts read came from, as `evidence.json` says it (decision 0144 item 3).
 const ACCOUNTS_NOTE: &str = "named by the run's configuration, not listed by QFEX: the probe \
@@ -48,8 +52,8 @@ pub fn markdown(ev: &Evidence) -> String {
     };
     let title = match ev.places_asked {
         true => format!(
-            "# QFEX {} place stages: the preflight\n\n\
-             FBC-c6kw, the first slice of FBC-9sk2, decision 0148.",
+            "# QFEX {} place stages: the preflight and drop session one\n\n\
+             FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0132 item 4, 0148 and 0151.",
             ev.environment
         ),
         false => format!(
@@ -73,6 +77,13 @@ pub fn markdown(ev: &Evidence) -> String {
         let _ = writeln!(
             s,
             "**The probe stopped before its sessions ended:** {why}\n"
+        );
+    }
+    if let Some(stop) = ev.stop {
+        let _ = writeln!(
+            s,
+            "**The place stages' stop:** {stop}. No further session runs (decision 0132 item \
+             7).\n"
         );
     }
     let (gap, partial) = match has_gap(ev) {
@@ -145,21 +156,26 @@ pub fn markdown(ev: &Evidence) -> String {
     if let Some(pre) = &ev.preflight {
         market::markdown(&mut s, pre);
     }
-    let asked_none = ev.arms.is_empty() && (ev.hold_asked || ev.places_asked);
+    if let Some(marker) = &ev.marker {
+        places::markdown(&mut s, marker);
+    }
+    if let Some(run) = &ev.drop_one {
+        places::drop_markdown(&mut s, run);
+    }
+    let asked_none = ev.arms.is_empty() && ev.hold_asked && !ev.places_asked;
     let _ = writeln!(s, "## The sessions\n");
-    match (asked_none, ev.places_asked) {
-        // The place stages would open sessions; this slice stops before them (FBC-c6kw).
-        (true, true) => {
+    match (asked_none, ev.places_asked && sessions.is_empty()) {
+        // A place-stage run opens drop session one once its preflight and reads pass.
+        (_, true) => {
             let _ = writeln!(
                 s,
-                "None: no session opened: the place stages after the preflight are not built \
-                 yet (FBC-23ch).\n"
+                "None: no session opened: the run stopped before drop session one.\n"
             );
         }
         (true, false) => {
             let _ = writeln!(s, "None: the run asked for no session (no --arm).\n");
         }
-        (false, _) => {}
+        (false, false) => {}
     }
     for run in &sessions {
         let arm = run.arm.as_deref().unwrap_or("none reported");
@@ -182,7 +198,7 @@ pub fn markdown(ev: &Evidence) -> String {
              {}\n\n\
              **What it shows:** {}\n\n\
              | n | when | what | file |\n| --- | --- | --- | --- |",
-            run.account,
+            heading(run),
             yn(run.authenticated),
             arm_written(run).map_or("not shown (the capture is partial)", yn),
             run.ended_by,
@@ -207,8 +223,10 @@ pub fn markdown(ev: &Evidence) -> String {
         let _ = writeln!(s);
     }
     refusals::markdown(&mut s, ev, &sessions);
-    if !asked_none {
-        ledger::markdown(&mut s, &ev.registries);
+    match ev.places_asked {
+        true => ledger::place_markdown(&mut s, &ev.place_registries),
+        false if !asked_none => ledger::markdown(&mut s, &ev.registries),
+        false => {}
     }
     let _ = writeln!(
         s,
@@ -217,17 +235,41 @@ pub fn markdown(ev: &Evidence) -> String {
          Members whose string value a fixture keeps as received: {}. The privacy check knows \
          credential and address shapes only: read every fixture for an identifying string (an \
          email, a user name, an address in another form) before committing it.\n\n\
-         Not measured by stage one (FBC-9sk2's stages): whether arming cancels open orders (a \
-         session starts only on accounts whose reads above show none), whether a graceful close \
-         or a drop cancels, and everything decision 0132 asks of a place. Not checked by the \
-         probe: whether the user has a subaccount the configuration does not name (the owner \
-         must confirm none before the run, which the probe does not record: decision 0144).",
+         {}",
         list(&ev.fixtures),
         list(&ev.withheld),
         list(&ev.errors),
         list(&ev.strings),
+        match ev.places_asked {
+            true => PLACES_NOT_MEASURED,
+            false => STAGE_ONE_NOT_MEASURED,
+        },
     );
     s
+}
+
+/// What stage one does not measure, as its report says it.
+const STAGE_ONE_NOT_MEASURED: &str = "Not measured by stage one (FBC-9sk2's stages): whether \
+     arming cancels open orders (a session starts only on accounts whose reads above show none), \
+     whether a graceful close or a drop cancels, and everything decision 0132 asks of a place. \
+     Not checked by the probe: whether the user has a subaccount the configuration does not name \
+     (the owner must confirm none before the run, which the probe does not record: decision \
+     0144).";
+
+/// What a place-stage run does not measure yet, as its report says it.
+const PLACES_NOT_MEASURED: &str = "Not measured until FBC-77r8 builds drop session two: whether \
+     enabling cancel-on-disconnect cancels open orders, whether the abrupt drop cancels X and Y, \
+     and the drop test's verdict; nor anything of stages two and three. Not checked by the probe: \
+     whether the user has a subaccount the configuration does not name, and `--sole-trader`'s \
+     declaration that nothing else trades on the named accounts (the owner confirms both before \
+     the run, which the probe does not record: decisions 0144 and 0148 item 7).";
+
+/// A session's heading: its account, and its name when it has one of its own.
+fn heading(run: &SessionRun) -> String {
+    match run.name.is_empty() {
+        true => run.account.to_owned(),
+        false => format!("{} ({})", run.name, run.account),
+    }
 }
 
 /// What the run asked for: the accounts it arms on and whether it holds, and, for a place-stage
@@ -262,22 +304,35 @@ pub fn to_json(ev: &Evidence) -> Value {
                 .iter()
                 .map(|f| json!({"when": run.position(f), "what": f.kind, "file": f.file}))
                 .collect();
-            json!({"account": run.account, "authenticated": run.authenticated,
+            let mut session = json!({"account": run.account, "authenticated": run.authenticated,
                 "arm_sent": arm_written(run), "arm_outcome": run.arm, "ended_by": run.ended_by,
                 "attempts": run.attempts, "failed_attempts": run.failed_attempts,
                 "arm_failures": run.arm_failures, "decode_errors": run.decode_errors,
                 "error": run.error, "answer": run.answer(), "ok": run.ok(),
                 "capture": if run.partial.is_empty() { "whole" } else { "partial" },
                 "partial_because": run.partial, "orders_pages": run.pages.to_json(),
-                "frames": frames})
+                "frames": frames});
+            // A place stage's session is named (FBC-23ch): stage one's runs one per account.
+            if !run.name.is_empty() {
+                session["session"] = Value::from(run.name);
+            }
+            session
         })
         .collect();
     let [normal, safety] = ev.dropped;
-    json!({"ticket": "FBC-l931", "started": ev.started, "environment": ev.environment,
+    // A place-stage run is FBC-9sk2's; stage one's and the hold's are FBC-l931's.
+    let ticket = if ev.places_asked {
+        "FBC-9sk2"
+    } else {
+        "FBC-l931"
+    };
+    json!({"ticket": ticket, "started": ev.started, "environment": ev.environment,
         "exec_mode": ev.mode, "target": ev.target, "ok": ev.ok(),
         "journal_dropped": {"normal": normal, "safety": safety},
         "journal_writer_failed": ev.writer_failed,
         "stopped": ev.stopped,
+        "stop": ev.stop,
+        "stop_marker": ev.marker.as_ref().map(places::to_json),
         "accounts": {"source": "configuration", "named": ev.accounts,
             "count": ev.accounts.len(), "others_checked": false, "note": ACCOUNTS_NOTE},
         "asked": asked(ev),
@@ -287,6 +342,8 @@ pub fn to_json(ev: &Evidence) -> Value {
         "sessions": sessions,
         "provider_rate_refusals": refusals::to_json(ev, &shown),
         "registries": ledger::to_json(&ev.registries),
+        "place_registries": ledger::place_to_json(&ev.place_registries),
+        "drop_session_one": ev.drop_one.as_ref().map(places::drop_to_json),
         "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
 }

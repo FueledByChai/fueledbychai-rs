@@ -1,10 +1,9 @@
 //! FBC-oxjs's done line: the place stages' registries (`ledger.rs`; decision 0148 items 3 and 7,
-//! FBC-5hif), built to items 1, 9 and 12 of FBC-fqv5's record as it proposes them. Declared by
-//! path in `tests/qfex_preprod_probe.rs`, so this proof is part of the test binary decision
-//! 0148's Consequences name (item 12 of FBC-fqv5's record) and Cargo builds no target of its own
-//! for it. Nothing connects: each registry, its `Link` and the journal it trips are driven in
-//! memory, every fill handed to the `Link` as a session hands it one, and every key, id, cap and
-//! size is synthetic.
+//! FBC-5hif), built to 0151 items 1, 9 and 12. Declared by path in `tests/qfex_preprod_probe.rs`,
+//! so this proof is part of the test binary decision 0148's Consequences name (0151 item 12) and
+//! Cargo builds no target of its own for it. Nothing connects: each registry, its `Link` and the
+//! journal it trips are driven in memory, every fill handed to the `Link` as a session hands it
+//! one, and every key, id, cap and size is synthetic.
 //!
 //! - each place-stage registry carries `CodProbeRun::owner_supervised_places` of its one market
 //!   and no `TestnetRun`, its Start arming only while the position is flat and its Flatten
@@ -177,7 +176,7 @@ fn place_stage_registries_carry_owner_supervised_places_of_their_market() {
         let built = place_registry(step, "primary", PRIMARY, start);
         let reg = built.registry();
         // The one market the declaration names, and no testnet declaration (decision 0148
-        // item 3; item 1 of FBC-fqv5's record builds no pre-production place path).
+        // item 3; 0151 item 1 builds no pre-production place path).
         assert_eq!(reg.cod_probe(), Some(INST), "{step:?}");
         assert!(!reg.testnet_run(), "{step:?}");
         let run = built.run();
@@ -287,8 +286,7 @@ fn the_lists_hold_decision_0148s_per_account_maximum_with_one_flatten_budget() {
             // Every place is one minimum size (decision 0148 item 4).
             assert!(list.iter().all(|p| p.largest_steps == 2), "{list:?}");
             // Each list ends with the flatten IOCs: --flatten-attempts of them, since an
-            // unexpected fill may need a flatten from any registry (item 9 of FBC-fqv5's
-            // record).
+            // unexpected fill may need a flatten from any registry (0151 item 9).
             let (last, rest) = list.split_last().unwrap();
             let flatten = MayPlace {
                 what: FLATTEN,

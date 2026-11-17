@@ -12,17 +12,25 @@
 //! close is over is the hold's ([`interrupt`]): one before the hold ended ends it as its duration
 //! does, its close, the reads after it and the report following, and one while it closes is read
 //! as it drops the interrupt; either stops a run that also arms, so no session starts. Ctrl-C at
-//! any other time ends the program at once, writing no report, as it always has. An owner-run
+//! any other time ends the program at once, writing no report, as it always has, except in a
+//! place-stage run, which it stops with its report ([`interrupt::Presses`]). An owner-run
 //! program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
-//! With `--place-stages` (FBC-c6kw, the first slice of FBC-9sk2; decision 0148) it runs the
-//! place stages' preflight alone, on production (`--production`) and, until FBC-4plj, only
-//! against a loopback test stub: a `CAPS` line first, the hold first when `--hold-secs` asks,
-//! then the traded instrument's spec from this run's `GET /refdata`, the ledger's count bound
-//! against each place registry's ceiling, the MDS touch and the caps at it ([`market`]), then it
-//! stops, its outcome not ok: the place stages after the preflight are not built yet, so it
-//! places nothing and connects nothing authenticated for a place stage.
+//! With `--place-stages` (FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0148 and 0151)
+//! it runs the place stages on production (`--production`) and, until FBC-4plj, only against a
+//! loopback test stub: a `CAPS` line first, its lease directory opened ([`places`]: tagged
+//! production, a stop marker held to `--reconciled`, the namespace lease taken; 0151 items 1 and
+//! 6), the hold first when `--hold-secs` asks, then the traded instrument's spec from this run's
+//! `GET /refdata`, the ledger's count bound against each place registry's ceiling, the MDS touch
+//! and the caps at it ([`market`]), with `--reconciled` the reads that clear the marker, then
+//! drop session one on the first named account (`stage.rs`): X, one post-only GTC at the
+//! minimum size behind the touch, compared with never-arming reads ([`compare`]), the journal's
+//! frames read on their way by the tee ([`tee`]), then a graceful close and the reads after it.
+//! The run ends there, its outcome not ok, until FBC-77r8 builds drop session two: X still
+//! resting is reported for the owner's hand cancel, and every stop of the place stages (Ctrl-C
+//! among them) writes the report and the stop marker. Ctrl-C from the hold's first read to its
+//! last is the hold's: it stops the run before its preflight, with its report and no stop marker.
 //!
 //! ```text
 //! export QFEX_PUBLIC_KEY=...       # the primary account's credential, for the environment run on
@@ -46,6 +54,9 @@
 #[path = "../../src/auth_qfex.rs"]
 mod auth_qfex;
 mod capture;
+// The place stages' comparisons of the streams with the reads (FBC-23ch), which drop session one
+// takes after each step.
+mod compare;
 mod ledger;
 // paradex_testnet_acceptance's privacy patterns, privacy check and UTC clock, reused by path,
 // with the glue whose withholding of credential-shaped words they name a frame's text by.
@@ -59,10 +70,13 @@ mod interrupt;
 mod link;
 mod market;
 mod pages;
+mod places;
 mod probe_args;
 mod refusals;
 mod report;
 mod stage;
+// The journal's tee (FBC-23ch), whose stops drop session one waits on.
+mod tee;
 // The Paradex testnet samples' shared command-line pieces and cap conversion, reused by path:
 // the place stages take their caps, lease directory and decimals as those samples do.
 #[allow(dead_code)]
@@ -107,27 +121,37 @@ fn main() -> ExitCode {
         }
     };
     let out: stage::Out = Rc::new(RefCell::new(std::io::stdout()));
-    // A run that holds takes the owner's Ctrl-C during the hold's connection as the hold's
-    // ([`interrupt`]); any other run, and any interrupt outside that connection, ends the
-    // program at once with status 130, writing no report, as it always has.
-    let interrupt: stage::Interrupt = match opts.hold {
-        Some(_) => {
-            let (presses, interrupt) = interrupt::wire(ctrl_c(), || {
+    // A place-stage run never ends the program at a press: each one the hold's connection does
+    // not take goes to the run, which stops with its report ([`interrupt::Presses`], FBC-23ch).
+    // The runtime has one thread, which `stage.rs` relies on to give the hold's connection every
+    // press from its opening (`Run::hold`). A stage-one
+    // run that holds takes the owner's Ctrl-C during the hold's connection as the hold's
+    // ([`interrupt`]); any other stage-one run, and any interrupt outside that connection, ends
+    // the program at once with status 130, writing no report, as it always has.
+    let (interrupt, presses): (stage::Interrupt, _) = match (&places, opts.hold) {
+        (Some(_), _) => {
+            let (outside, presses) = interrupt::Presses::channel();
+            let (task, interrupt) = interrupt::wire(ctrl_c(), outside);
+            runtime.spawn(task);
+            (interrupt, presses)
+        }
+        (None, Some(_)) => {
+            let (task, interrupt) = interrupt::wire(ctrl_c(), || {
                 eprintln!(
                     "qfex_preprod_probe: interrupted outside the hold's connection: the program \
                      ends now and writes no report"
                 );
                 std::process::exit(130);
             });
-            runtime.spawn(presses);
-            interrupt
+            runtime.spawn(task);
+            (interrupt, interrupt::Presses::none())
         }
-        None => Box::pin(std::future::pending()),
+        (None, None) => (Box::pin(std::future::pending()), interrupt::Presses::none()),
     };
     let ran = match &places {
         None => runtime.block_on(stage::run_until(&opts, &lookup, out, interrupt)),
         Some(places) => runtime.block_on(stage::run_places_until(
-            &opts, places, &lookup, out, interrupt,
+            &opts, places, &lookup, out, interrupt, presses,
         )),
     };
     match ran {
