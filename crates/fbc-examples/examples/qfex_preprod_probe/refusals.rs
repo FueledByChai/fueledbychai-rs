@@ -14,7 +14,9 @@
 //!   codec's errs in every state. The limiter is user-scoped only (decision 0123,
 //!   `RateLimiter::for_user`), so its user count is every refusal it counted. Nothing else counts
 //!   on it meanwhile: the sessions and reads run one after the other, and the run's provider user
-//!   is its own;
+//!   is its own. The one exception is a place stage's comparison, whose read socket runs beside
+//!   its session: its count is each refusal it held the budget for itself, and the session's is
+//!   the rise less those, so no refusal is counted twice (FBC-23ch);
 //! - **the RateLimited errs**: frames in an `err` envelope whose `error_code` is `RateLimited`;
 //! - **the RATE_LIMITED order responses**: frames whose one member is an `order_response` with
 //!   `status` `RATE_LIMITED`, the state QFEX reports a rate-refused order in. A read socket
@@ -69,11 +71,16 @@ pub const HOLD: &str = "the hold";
 /// place of the session they would read before.
 pub const AFTER_HOLD: &str = "after the hold";
 
-/// When a read was made, as the report and the evidence say it: `after the hold`, or before the
-/// session or the hold `before` names.
+/// What the reads of every named account after the place stages' drop session one (FBC-23ch),
+/// and the read of X and its trades, are reported under, in place of a session they would read
+/// before.
+pub const AFTER_DROP_ONE: &str = "after drop session one";
+
+/// When a read was made, as the report and the evidence say it: `after the hold`, `after drop
+/// session one`, or before the session or the hold `before` names.
 pub fn read_when(before: &str) -> String {
     match before {
-        AFTER_HOLD => AFTER_HOLD.to_owned(),
+        AFTER_HOLD | AFTER_DROP_ONE => before.to_owned(),
         _ => format!("before {before}"),
     }
 }
@@ -81,7 +88,9 @@ pub fn read_when(before: &str) -> String {
 /// The provider rate refusals one session or read socket met.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Refusals {
-    /// How much the run's limiter's `counts().rejected` rose while it ran.
+    /// How much the run's limiter's `counts().rejected` rose while it ran, or, for a
+    /// comparison's read socket and the session beside it, its own share of the rise (the
+    /// module's list).
     pub limiter: u64,
     /// Frames in an `err` envelope whose `error_code` is `RateLimited`.
     pub errs: u64,
@@ -212,10 +221,13 @@ pub fn met(ev: &Evidence, sessions: &[SessionRun]) -> u64 {
     total(&ev.read_sockets, sessions).saturating_add(hold)
 }
 
-/// What each session met, with the read sockets before it, in run order: its name, the count,
-/// and whether it ran (a probe stopped by a read before it starts none). The hold is one of
-/// them, under [`HOLD`], with the read sockets before it and its own connection, and the read
-/// sockets after it are another, under [`AFTER_HOLD`].
+/// What each session met, with the read sockets before it, in run order: its name
+/// (`SessionRun::label`), the count, and whether it ran (a probe stopped by a read before it
+/// starts none). The hold is one of them, under [`HOLD`], with the read sockets before it and its
+/// own connection, and the read sockets after it are another, under [`AFTER_HOLD`]; so are the
+/// read sockets after the place stages' drop session one, under [`AFTER_DROP_ONE`], which ran
+/// when that session did. A place stage's session counts the read sockets of its comparisons
+/// with those before it, since they are reported under its name.
 pub fn by_session(
     reads: &[ReadSocket],
     sessions: &[SessionRun],
@@ -224,7 +236,7 @@ pub fn by_session(
     let mut by: Vec<(&'static str, u64, bool)> = Vec::new();
     let names = reads.iter().map(|r| r.before);
     let held = hold.map(|_| HOLD);
-    for name in (held.into_iter().chain(names)).chain(sessions.iter().map(|run| run.account)) {
+    for name in (held.into_iter().chain(names)).chain(sessions.iter().map(SessionRun::label)) {
         if by.iter().all(|(seen, ..)| *seen != name) {
             by.push((name, 0, false));
         }
@@ -235,8 +247,14 @@ pub fn by_session(
         let (own, went) = match *name {
             HOLD => (hold.map(|hold| hold.refusals.met()), hold.is_some()),
             AFTER_HOLD => (None, hold.is_some()),
+            AFTER_DROP_ONE => {
+                let ran = sessions
+                    .iter()
+                    .any(|run| run.label() == crate::places::DROP_ONE);
+                (None, ran)
+            }
             _ => {
-                let run = sessions.iter().find(|run| run.account == *name);
+                let run = sessions.iter().find(|run| run.label() == *name);
                 (run.map(|run| run.refusals.met()), run.is_some())
             }
         };
@@ -434,7 +452,7 @@ pub fn markdown(s: &mut String, ev: &Evidence, sessions: &[SessionRun]) {
             let whole = hold.refusals.whole.to_string();
             row(s, name, &on, &hold.refusals, &whole, "not journaled");
         }
-        for run in sessions.iter().filter(|run| run.account == name) {
+        for run in sessions.iter().filter(|run| run.label() == name) {
             let on = match run.partial.is_empty() {
                 true => "the session",
                 false => "the session (capture partial: its frames' counts may be short)",
@@ -473,7 +491,7 @@ pub fn to_json(ev: &Evidence, sessions: &[SessionRun]) -> Value {
         .collect();
     let shown: Vec<Value> = (sessions.iter())
         .map(|run| {
-            json!({"session": run.account, "capture_whole": run.partial.is_empty(),
+            json!({"session": run.label(), "capture_whole": run.partial.is_empty(),
                 "counts": counts(&run.refusals, None), "frames": files(run, ev)})
         })
         .collect();

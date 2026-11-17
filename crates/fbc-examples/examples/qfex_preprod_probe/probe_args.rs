@@ -4,7 +4,7 @@
 //! `--place-stages` (FBC-c6kw, the first slice of FBC-9sk2) parses into [`Places`] beside the
 //! [`Options`] every run takes ([`Parsed::Places`]): the place stages' flags, each refused before
 //! anything connects, naming the flag and never its value (decisions 0113 and 0148 item 7, and
-//! FBC-fqv5 items 1 and 4).
+//! 0151 items 1 and 4).
 
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
@@ -40,25 +40,64 @@ qfex_preprod_probe: stage one of the QFEX probe (decision 0132 item 7, FBC-l931)
 PRE-PRODUCTION environment, or with --production on QFEX PRODUCTION (decision 0143), an
 owner-assisted run that arms cancel-on-disconnect once per account and records what answers
 the arm: on pre-production a declared testnet run (decision 0067), on production with no such
-declaration (decision 0143). It places nothing and sends no command but each session's arm,
-its resync's reads (one GET /user/positions and get_user_orders pages, decision 0132 item 5)
-and the probe's own reads. With --hold-secs it first holds one trade connection that never
-arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming at all.
+declaration (decision 0143). A stage-one run places nothing and sends no command but each
+session's arm, its resync's reads (one GET /user/positions and get_user_orders pages, decision
+0132 item 5) and the probe's own reads. With --hold-secs it first holds one trade connection
+that never arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming
+at all.
 
-With --place-stages (FBC-c6kw, the first slice of FBC-9sk2; decision 0148) it runs the place
-stages' preflight alone and places nothing: on production alone (--production; FBC-fqv5 item
-1), and, until FBC-4plj lands every stop decisions 0132 item 7 and 0148 item 8 require, only
-against a loopback test stub, every origin (trade, REST and MDS) a loopback address. It prints a
-CAPS line with the environment and both caps first, before any request; runs the hold first,
-alone, when --hold-secs is given; reads the instrument --symbol names from this run's
-GET /refdata on the guarded REST origin, refusing one that is not listed, not trading, or that
-does not list both a post-only GTC and a limit IOC (decision 0148 item 4); holds
---ledger-max-entries above each place registry's fill ceiling (FBC-fqv5 item 3); opens the MDS
-touch (bbo) on the guarded MDS origin and refuses a touch older than --touch-max-age-ms, a
-crossed or locked one, or one from before the MDS connection's current epoch; and refuses
-either cap below three of the instrument's minimum size at the touch. Then it stops, its
-outcome not ok: the place stages after the preflight are not built yet, so nothing
-authenticated connects for a place stage, and no account is read but by the hold.
+With --place-stages (FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0148 and 0151) it
+runs the place stages' preflight, then drop session one of decision 0132 item 4's drop test: on
+production alone (--production; 0151 item 1), and, until FBC-4plj lands every stop decisions
+0132 item 7 and 0148 item 8 require, only against a loopback test stub, every origin (trade,
+REST and MDS) a loopback address. It prints a CAPS line with the environment and both caps
+first, before any request; runs the hold first, alone, when --hold-secs is given; reads the
+instrument --symbol names from this run's GET /refdata on the guarded REST origin, refusing one
+that is not listed, not trading, or that does not list both a post-only GTC and a limit IOC
+(decision 0148 item 4); holds --ledger-max-entries above each place registry's fill ceiling
+(0151 item 3); opens the MDS touch (bbo) on the guarded MDS origin and refuses a touch older
+than --touch-max-age-ms, a crossed or locked one, or one from before the MDS connection's
+current epoch; and refuses either cap below three of the instrument's minimum size at the
+touch.
+
+Drop session one runs on the first named account: every named account read clean, the drop
+registry built (CodProbeRun::owner_supervised_places on its one market, its CancelOnlyTrip given
+to the journal before any market arms, decision 0139) and seeded flat (decision 0148 item 3);
+one session that arms cancel-on-disconnect, its arm accepted and its resync applied; Start under
+the market lease; X, one post-only GTC at the instrument's minimum size --away-bps behind the
+touch, its client id minted under the run's namespace lease, as an fbc-oms authorization (until
+an ACK echoes our client id, a session places at most one post-only GTC far from the touch,
+decision 0132 item 7); X's ACK or its deadline; the streams compared with never-arming reads at
+--read-interval-ms, at most 10 within --agree-wait-ms, every frame charged to the shared limiter
+first; a graceful close; then the read of every named account and of X and its trades. The run
+then ends, its outcome not ok, until FBC-77r8 builds drop session two: X still resting is
+reported for your hand cancel on QFEX's site and the stop marker written (LeftResting).
+
+Each stop decisions 0132 item 7 and 0148 item 8 name stops the run by name, with the read of
+every named account after it, the report and the stop marker: an order event or fill of ours
+without our client id, an order_response naming no order of ours (0151 item 13), a replayed
+fill refused for its time, a resync that disagrees or leaves a fill unsettled, a provider rate
+refusal on the session, a read socket or REST, a read showing an order or a position the streams
+did not, an unplanned end of the connection, the span bound, a fill of X, a position not flat,
+an order left resting, and Ctrl-C. In a drop session only Ctrl-C and a fill of ours cancel (0151
+item 2): Kill, every order of ours cancelled by venue id, a wait of up to --rpc-timeout-ms for
+each to end (a second Ctrl-C meanwhile recorded), the market disarmed, then a graceful close;
+cancels held by a provider rate refusal or refused locally end it by a graceful close too (0151
+item 11). Every other stop sends no cancel and ends the session by a graceful close.
+
+Before anything connects, a place-stage run opens its lease directory (0151 items 1 and 6): it
+tags the directory production on its first use and refuses one tagged for another environment;
+it refuses to start while a stop marker an earlier place-stage run wrote is in it or in
+production's default lease directory, unless --reconciled is given, and refuses --reconciled
+when there is none; and it takes the client-id namespace's lease there for the run, refused
+while another run holds it, beside the high-water mark its ids are minted above. With
+--reconciled it reads every named account after the preflight and clears the marker only if
+every read is clean; the declaration is the owner's, which the probe does not check. A run that
+stops (any stop but NoEcho, each named in its report) writes a marker with the stop's name and
+its start time. In a place-stage run Ctrl-C outside the hold's connection never ends the
+program: a press from the hold's first read to its last, its connecting included, is the hold's
+(below), and a press during the preflight, the reads, drop session one or its stop's cancels
+stops the run, Interrupted, and its report and its marker are written.
 
 Before anything connects it refuses any origin but the environment's own (or, for a test stub,
 all of them loopback addresses): without --production, a production origin is refused; with it,
@@ -91,8 +130,11 @@ with no reconnection. Once its connection is over, whatever ended it, the named 
 read again, and the report gives both reads. Ctrl-C is the hold's from its connection's opening
 until its close and the read of the echo are over: before the hold ended it ends the hold, and
 while the hold closes it is recorded; either stops a run that also arms, so no session starts.
-Ctrl-C at any other time ends the program at once, writing no report, as it always has; in a
-place-stage run, Ctrl-C on the hold stops it before its preflight. A run that holds needs no
+Ctrl-C at any other time ends the program at once, writing no report, as it always has, except
+in a place-stage run. There Ctrl-C from the hold's first read to its last stops the run before its
+preflight, with its report and no stop marker: one before the connection opens keeps it from
+opening, and one during the reads after it lets them end first. Ctrl-C at any other time stops
+it with its report (above). A run that holds needs no
 --arm, and one with neither --arm nor --place-stages takes no --registry-span, --ledger-max-age
 or --ledger-max-entries.
 
@@ -120,7 +162,10 @@ Options:
                            or as fixtures/qfex/exec-recorded/arm-production/ with --production);
                            a run that only holds writes no frame, and its report.md is committed
                            under fixtures/qfex/exec-recorded/hold/, or hold-production/ with
-                           --production, beside the owner's README (decision 0146 item 6)
+                           --production, beside the owner's README (decision 0146 item 6); a
+                           place-stage run writes its scrubbed slice into drop-production/, to
+                           commit as fixtures/qfex/exec-recorded/drop-production/ once every
+                           file is read (0151 item 7)
   --arm <ACCOUNT>          once or twice, in run order: primary, or subaccount (the one
                            {SUB_ID_VAR} names); required unless --hold-secs is given, or
                            --place-stages, which refuses it
@@ -159,9 +204,10 @@ Options:
                            two sessions, each --connect-wait-ms, QFEX's 60 s authentication
                            deadline, the longer of --rpc-timeout-ms and the resync's {resync} s
                            deadline and --agree-wait-ms, and the reads of every named account
-                           between them, each --read-wait-ms (FBC-fqv5 item 3)
-  --place-stages           the place stages' preflight (above): refused with --arm, and without
-                           --production; needs every flag below, each of which it alone takes
+                           between them, each --read-wait-ms (0151 item 3)
+  --place-stages           the place stages' preflight and drop session one (above): refused
+                           with --arm, and without --production; needs every flag below, each
+                           of which it alone takes
   --symbol <SYMBOL>        required: the venue symbol traded, at most 32 ASCII letters, digits
                            and punctuation; never written to the report, the evidence or a
                            fixture
@@ -181,12 +227,19 @@ Options:
   --namespace <N>          required: the client-id namespace, 1 to 65535
   --lease-dir <DIR>        the place stages' lease directory, an absolute path (default
                            $HOME/.fueledbychai/{LEASE_DIR_NAME}); never the Paradex testnet
-                           samples' default
-  --agree-wait-ms <MS>     required, 1 to 60000: how long a read may lag the streams
+                           samples' default; tagged production on its first use, and refused
+                           tagged otherwise (0151 item 1)
+  --reconciled <WHAT>      hand-cancel, hand-close, both or none: what the owner did by hand
+                           after an earlier place-stage run's stop, which the probe does not
+                           check; required while that run's stop marker exists, and refused
+                           otherwise (0151 item 6)
+  --agree-wait-ms <MS>     required, 1 to 60000: how long a read may lag the streams, after
+                           each place, cancel and fill of drop session one
   --read-interval-ms <MS>  required, 1000 to 60000: the time between two reads of a comparison;
                            one read, then one each --read-interval-ms within --agree-wait-ms,
-                           at most {MAX_READS} in all (FBC-fqv5 item 4)
-  --touch-max-age-ms <MS>  required, 1 to 60000: a touch older than this is not priced from
+                           at most {MAX_READS} in all (0151 item 4)
+  --touch-max-age-ms <MS>  required, 1 to 60000: a touch older than this is not priced from,
+                           in the preflight and when X is priced
   --trade-url <URL>        default {PREPROD_TRADE}, or {PRODUCTION_TRADE} with --production
   --rest-url <URL>         default {PREPROD_REST}, or {PRODUCTION_REST} with --production
   --mds-url <URL>          default {PREPROD_MDS}, or {PRODUCTION_MDS} with --production
@@ -270,11 +323,11 @@ fn environment(production: bool) -> Environment {
 
 /// The place stages' lease directory's name under `$HOME/.fueledbychai`: production's own, apart
 /// from the Paradex testnet samples' (decision 0148 item 7). No pre-production place path is
-/// built (FBC-fqv5 item 1), so there is no pre-production one.
+/// built (0151 item 1), so there is no pre-production one.
 pub const LEASE_DIR_NAME: &str = "qfex_probe_production";
 
 /// The most reads one comparison of the streams against the reads makes: one, then one each
-/// `--read-interval-ms` within `--agree-wait-ms` (FBC-fqv5 item 4).
+/// `--read-interval-ms` within `--agree-wait-ms` (0151 item 4).
 pub const MAX_READS: u64 = 10;
 
 /// The longest `--registry-span` a place-stage run takes: an hour (decision 0148 item 7).
@@ -304,21 +357,79 @@ pub struct Places {
     pub flatten_cap_bps: u32,
     /// `--flatten-attempts`: the flatten IOCs an account may place in a run, 1 to 3.
     pub flatten_attempts: u64,
-    /// `--namespace`: the client-id namespace. The driver (FBC-23ch) mints under its lease.
-    #[allow(dead_code)]
+    /// `--namespace`: the client-id namespace, which the run mints under its lease in
+    /// `lease_dir` (`places::Mint`).
     pub namespace: u16,
-    /// `--lease-dir`, or its default under `$HOME` ([`LEASE_DIR_NAME`]). The driver (FBC-23ch)
-    /// holds its leases there.
-    #[allow(dead_code)]
+    /// `--lease-dir`, or its default under `$HOME` ([`LEASE_DIR_NAME`]): the run's lease
+    /// directory, where it holds its leases and writes its stop marker (`places`, 0151 items 1
+    /// and 6).
     pub lease_dir: PathBuf,
+    /// Production's default lease directory under `$HOME`, when `$HOME` gives one: a stop marker
+    /// there holds a run as one in `lease_dir` does (0151 item 6).
+    pub default_lease_dir: Option<PathBuf>,
+    /// `--reconciled`: what the owner declares was done by hand after an earlier run's stop
+    /// (0151 item 6), which the probe does not check.
+    pub reconciled: Option<Reconciled>,
     /// `--agree-wait-ms`: how long a read may lag the streams (FBC-23ch's comparisons), which
     /// the span bound's floor counts.
     pub agree_wait: Duration,
     /// `--read-interval-ms`: the time between two reads of one comparison (FBC-23ch).
-    #[allow(dead_code)]
     pub read_interval: Duration,
     /// `--touch-max-age-ms`: a touch older than this is not priced from.
     pub touch_max_age: Duration,
+    /// What a test asks of the run beyond its flags ([`TestHooks`]): never in the program.
+    #[cfg(test)]
+    pub test: TestHooks,
+}
+
+/// What a place-stage test asks of the run beyond its command line, to reach a path no flag and
+/// no answer of the QFEX model reaches. Compiled into the test binary alone, so the program has
+/// none, and every parsed run has each off.
+#[cfg(test)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestHooks {
+    /// X spent from the drop registry's list before drop session one runs, so its place is
+    /// beyond the list (`places::Stop::BeyondList`).
+    pub x_spent: bool,
+    /// The run's journal answering every Normal record dropped (`tee::Tee::refusing_normal`), so
+    /// its soft limit is reached on the session's first Normal record (decision 0139).
+    pub refuse_normal: bool,
+}
+
+/// What `--reconciled` declares the owner did by hand after an earlier place-stage run's stop
+/// (0151 item 6): 0132 item 7's hand cancel, 0148 item 9's hand close, both, or neither.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Reconciled {
+    HandCancel,
+    HandClose,
+    Both,
+    None,
+}
+
+impl Reconciled {
+    /// As `--reconciled` takes it and the report gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Reconciled::HandCancel => "hand-cancel",
+            Reconciled::HandClose => "hand-close",
+            Reconciled::Both => "both",
+            Reconciled::None => "none",
+        }
+    }
+}
+
+/// `hand-cancel`, `hand-close`, `both` or `none`.
+fn reconciled(value: &str) -> Result<Reconciled, String> {
+    let all = [
+        Reconciled::HandCancel,
+        Reconciled::HandClose,
+        Reconciled::Both,
+        Reconciled::None,
+    ];
+    let found = all.into_iter().find(|r| r.name() == value);
+    found.ok_or_else(|| {
+        "--reconciled: hand-cancel, hand-close, both or none (the value is not shown)".to_owned()
+    })
 }
 
 /// What the command line asked for.
@@ -349,6 +460,7 @@ struct PlaceArgs {
     flatten_attempts: Option<u64>,
     namespace: Option<u16>,
     lease_dir: Option<PathBuf>,
+    reconciled: Option<Reconciled>,
     agree_wait: Option<Duration>,
     read_interval: Option<Duration>,
     touch_max_age: Option<Duration>,
@@ -412,6 +524,10 @@ impl PlaceArgs {
                 self.lease_dir = Some(testnet::absolute(&value()?)?);
                 "--lease-dir"
             }
+            "--reconciled" => {
+                self.reconciled = Some(reconciled(&value()?)?);
+                "--reconciled"
+            }
             "--agree-wait-ms" => {
                 let ms = number(flag, &value()?, 1, 60_000)?;
                 self.agree_wait = Some(Duration::from_millis(ms));
@@ -434,10 +550,11 @@ impl PlaceArgs {
     }
 }
 
-/// The place stages' flags `args` put together, every one but `--lease-dir` required, for a run
+/// The place stages' flags `args` put together, every one but `--lease-dir` and `--reconciled`
+/// required, for a run
 /// on production (`production`) that arms nothing (`arms`); `home` is `$HOME`, for the lease
 /// directory's default and the testnet samples' default it must not be. Refused naming the flag,
-/// never its value (decisions 0113 and 0148 item 7, FBC-fqv5 items 1 and 4).
+/// never its value (decisions 0113 and 0148 item 7, 0151 items 1 and 4).
 fn places(
     args: PlaceArgs,
     production: bool,
@@ -454,7 +571,7 @@ fn places(
     if !production {
         return Err(
             "--place-stages runs on QFEX production alone: give --production. No \
-                    pre-production place path is built (FBC-fqv5 item 1), since decision 0144 item \
+                    pre-production place path is built (0151 item 1), since decision 0144 item \
                     6 leaves which accounts the place stages read on pre-production undecided"
                 .to_owned(),
         );
@@ -486,9 +603,10 @@ fn places(
         return Err(format!(
             "--agree-wait-ms with --read-interval-ms allows more than {MAX_READS} reads per \
              comparison: one read, then one each --read-interval-ms within --agree-wait-ms \
-             (FBC-fqv5 item 4; the values are not shown)"
+             (0151 item 4; the values are not shown)"
         ));
     }
+    let default_lease_dir = testnet::lease_dir_named(home.clone(), LEASE_DIR_NAME).ok();
     let lease_dir = match args.lease_dir {
         Some(dir) if dir.components().any(|c| c == Component::ParentDir) => {
             return Err(
@@ -525,11 +643,15 @@ fn places(
             .ok_or_else(|| need("--flatten-attempts"))?,
         namespace: args.namespace.ok_or_else(|| need("--namespace"))?,
         lease_dir,
+        default_lease_dir,
+        reconciled: args.reconciled,
         agree_wait,
         read_interval,
         touch_max_age: args
             .touch_max_age
             .ok_or_else(|| need("--touch-max-age-ms"))?,
+        #[cfg(test)]
+        test: TestHooks::default(),
     })
 }
 
@@ -541,14 +663,14 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// The reads one comparison makes within `agree_wait` at `read_interval`: one, then one each
-/// interval (FBC-fqv5 item 4).
+/// interval (0151 item 4).
 pub fn reads(agree_wait: Duration, read_interval: Duration) -> u64 {
     let each = read_interval.as_millis().max(1);
     let more = agree_wait.as_millis() / each;
     u64::try_from(more).unwrap_or(u64::MAX).saturating_add(1)
 }
 
-/// The floor a place-stage run's `--registry-span` must be above (FBC-fqv5 item 3): the drop
+/// The floor a place-stage run's `--registry-span` must be above (0151 item 3): the drop
 /// test's two sessions, each opening within `--connect-wait-ms`, authenticating within QFEX's
 /// deadline, waiting out the longer of `--rpc-timeout-ms` and the resync's deadline, and its
 /// reads lagging the streams by up to `--agree-wait-ms`, and between them the reads of each of
@@ -562,7 +684,7 @@ pub fn place_span_floor(opts: &Options, places: &Places, accounts: usize) -> Dur
 
 /// Refuses a place-stage run whose span bound is not above [`place_span_floor`] for its
 /// `accounts` named accounts, naming `--registry-span` and never a value: the span bound could
-/// otherwise stop the drop test's second session before its reads end (FBC-fqv5 item 3).
+/// otherwise stop the drop test's second session before its reads end (0151 item 3).
 pub fn check_place_span(opts: &Options, places: &Places, accounts: usize) -> Result<(), String> {
     let span = opts.ledger.as_ref().map(Bounds::span);
     match span.is_some_and(|span| span > place_span_floor(opts, places, accounts)) {
@@ -572,7 +694,7 @@ pub fn check_place_span(opts: &Options, places: &Places, accounts: usize) -> Res
              --connect-wait-ms, QFEX's {} s authentication deadline, the longer of \
              --rpc-timeout-ms and the resync's {} s deadline and --agree-wait-ms, and the reads of \
              every named account between them, each --read-wait-ms, or the span bound could stop \
-             its second session before its reads end (FBC-fqv5 item 3; the values are not shown)",
+             its second session before its reads end (0151 item 3; the values are not shown)",
             AUTH_DEADLINE.as_secs(),
             RESYNC_TIMEOUT.as_secs()
         )),

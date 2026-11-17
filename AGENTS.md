@@ -807,7 +807,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     alone), reports an order or fill frame on it, ends at its duration, the owner's Ctrl-C (an
     injected `stage::Interrupt`; `interrupt.rs` hands each Ctrl-C from tokio's `ctrl_c` to the
     hold from its connection's opening until its close is over, a press while it closes
-    recorded, and otherwise ends the program with no report, as before), a server close, the
+    recorded, and otherwise ends the program with no report, as before, except in a place-stage
+    run, whose `interrupt::Presses` take it), a server close, the
     connection's end or a refusal, with no reconnection, then reads every named account again,
     whatever ended it; the report gives both reads, states the owner's two unchecked conditions
     (no subaccount left out, 0144 item 2; nothing traded from the first read to the last) and
@@ -815,8 +816,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     close and that a lifetime longer than the hold was not measured; a hold that fails, an order
     or fill frame on it, an account read after it that is not clean, or Ctrl-C on the hold in a
     run that also arms stops the run, so no session starts. For FBC-9sk2's place stages
-    `ledger.rs` also holds, not yet used by a run (FBC-oxjs; decision 0148 items 3 and 7, built
-    to items 1, 9 and 12 of FBC-fqv5's record as proposed), the place registries: four per named
+    `ledger.rs` also holds (FBC-oxjs; decision 0148 items 3 and 7, built to 0151 items 1, 9 and
+    12) the place registries, drop session one building the first: four per named
     account, one per `Step` (drop, cross, take, pages), each a `PlaceRegistry` built with its
     caps, declared `CodProbeRun::owner_supervised_places` on its one market and never a testnet
     run (production only), under its lease names and bound to its account, its `CancelOnlyTrip`
@@ -825,10 +826,11 @@ holds two of them for one pull request. The rules after the three roles bind all
     `MayPlace` list from `PlaceLists`, every order at the minimum size in size steps, the
     entries other than the flatten IOCs summing to 0148 item 7's most per account and every list
     carrying `--flatten-attempts` flatten IOCs under one budget per account, which the driver
-    spends (FBC-23ch); and its count bound above that list's ceiling (`PlaceBounds::accept`),
+    spends (FBC-23ch); and its count bound above that list's ceiling (`PlaceBounds::accept`), the
+    report showing the list and the ceiling as fences met (`place_markdown`, 0151 item 10),
     held in `tests/qfex_preprod_probe/place_registries.rs`, which `tests/qfex_preprod_probe.rs`
-    declares by path. With `--place-stages` (FBC-c6kw, the first slice of FBC-9sk2) it runs the
-    place stages' preflight alone and places nothing: on production alone (`--production`) and,
+    declares by path. With `--place-stages` (FBC-c6kw and FBC-23ch, slices of FBC-9sk2) it runs
+    the place stages' preflight, then drop session one: on production alone (`--production`) and,
     until FBC-4plj, only against a loopback test stub (every origin loopback, refused otherwise
     before anything connects); every place-stage flag (`--symbol`, `--side`, `--sole-trader`,
     both caps, `--away-bps` 20 to 10000, `--flatten-cap-bps` below it, `--flatten-attempts` 1 to
@@ -840,7 +842,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     samples' default); a
     `CAPS` line with the environment and both caps first, before any request, the caps on
     standard output alone (0113, 0148 item 7); the hold first, alone, when `--hold-secs` asks,
-    the owner's Ctrl-C on it stopping the run before its preflight; then `market.rs`: the traded
+    the owner's Ctrl-C from its first read to its last stopping the run before its preflight
+    with no stop marker (one before its connection opens keeping it from opening, one during the
+    reads after it letting them end); then `market.rs`: the traded
     spec from this run's `GET /refdata` through the adapter's discovery on the guarded
     configuration, charged to the run's limiter and sent within `--read-wait-ms` (a symbol not
     listed, not trading or not listing both a post-only GTC and a limit IOC refused, never
@@ -851,20 +855,100 @@ holds two of them for one pull request. The rules after the three roles bind all
     priced at the resting price; `market.rs` also holds the pure prices, tested, each moved and
     snapped to its safe side in whole ticks (a resting order `--away-bps` behind the touch, the
     crossing orders at the far touch, a flatten IOC at most `--flatten-cap-bps` through the touch
-    it crosses), of which only the resting price is used now, for the caps; then it stops, not ok, since the stages after the preflight are not built, and
-    connects nothing authenticated for a place stage. `stage::place_config` adds
+    it crosses), of which the resting price is used now, for the caps and X, the touch kept
+    current by `Touch::drive` through drop session one. `stage::place_config` adds
     `qfex.exec.production_places` to a place stage's session configuration alone (0148 item 4).
-    Its report and evidence give the fences met and the steps passed, never a value. Held in
-    `tests/qfex_preprod_probe/place_stages.rs`, against a QFEX model in
-    `tests/qfex_preprod_probe/model.rs` on the conformance stub's serving scripts (0150), both
-    declared by path. The probe's credentials come from the environment through
-    `src/auth_qfex.rs`, a review path, which also hands each signed read to the connector; the
-    probe reuses `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs`
-    (the caps' conversion to lots and the lease directory) by
-    path. The samples that trade share
-    `src/link.rs` (the glue; `Link::ledger` shows its fill ledger and `Link::fill_refusals` lists
-    each fill that ledger refuses for its time) and `src/testnet.rs` (guard and wiring), and the
-    mainnet ones `src/mainnet.rs` (the mainnet guard), included by path.
+    Its report and evidence give the fences met and the steps passed, never a value, and its
+    evidence's ticket is FBC-9sk2. FBC-23ch's foundation is `places.rs` (0151 items 1, 2, 6 and
+    9): before anything connects the run opens its lease directory, tagging it production on its
+    first use and refusing one tagged otherwise, refusing to start while a stop marker (`stopped`,
+    the stop's name and the run's start) is in it or in production's default unless
+    `--reconciled <hand-cancel|hand-close|both|none>` is given, and `--reconciled` when there is
+    none, and taking one `NamespaceLease` for the run beside one `CidMint` across its accounts,
+    whose `HighWater` mark is written off the runtime's thread before an id is returned
+    (`Mint`); `start` and `flatten` take the `MarketLease` (no account lease); `Stop` names every
+    stop of 0132 item 7 and 0148 item 8 (plus `BeyondList` and `NoEcho`), none with an id or an
+    amount, only `Interrupted` and a fill of ours cancelling in a drop session, whichever stop
+    came first; `Allowance`
+    spends each registry's list and the account's one flatten budget, refusing a place beyond
+    them; with `--reconciled` the run reads every named account after the preflight and clears
+    the marker only if every read is clean, the declaration reported unchecked; and `main.rs`
+    hands a place-stage run each Ctrl-C the hold does not take (`interrupt::Presses`), so a press
+    during the preflight or those reads stops it, `Interrupted`, with its report and its marker,
+    which keeps the stops of a marker it replaces unless the run cleared it. `tee.rs` wraps the
+    run's journal sink (`Tee`, every call delegated, `open_gap` included, so 0139's trip holds),
+    reads each record with its spans blanked and keeps no frame: each `add_order`'s client id and
+    whether it carried `take_profit`, `stop_loss` or `reduce_only`, each `order_response`'s status
+    and each `fill_response`'s fee sign, whether each names one of our client ids byte for byte,
+    and an echo's client-id span compared raw, for the report alone; it raises `NotOurCid` (an
+    order event or fill of ours without our client id, but not a `NO_SUCH_ORDER` answering a
+    cancel of ours, a cancel reject), `StrayOrder` (one naming no order of ours, 0151 item 13)
+    and `RateRefused` (a `RateLimited` err, a frame whose blanked text is no JSON object, as
+    0134 item 2 keeps one whole, read once more in memory as it arrived for that alone, as 0135
+    item 2 reads a read socket's, a `RATE_LIMITED` status, a resync's 429 or 418); `StrayOrder`
+    also covers a first frame of X naming no client id of ours before X's venue id is known.
+    `compare.rs` compares the streams with never-arming reads after each step (0109, 0132 item
+    7, 0151 item 4), each socket's limiter count the refusals it held the budget for itself, so
+    a session's met meanwhile is counted once, as the session's: one socket
+    per comparison, `get_user_orders` from offset 0 until a short page and REST positions under
+    `--namespace`, every frame and request charged to the shared limiter first and one without
+    room skipping that read, each read `--read-interval-ms` after the last began, at most 10
+    within `--agree-wait-ms`, the first agreeing read timed, `ReadDisagrees` at the end of the
+    wait and lag recorded, a provider refusal on the read socket or REST a stop.
+    `stage::check_accounts_allowing` admits one order of ours (`capture::AllowedOrder`, at most
+    one row) on its account alone, for FBC-77r8; every read before a session so far admits none.
+    Drop session one (FBC-23ch, `stage.rs`'s `Run::drop_one`; 0132 items 4 and 7, 0151 items 2,
+    4, 9, 11 and 13) runs on the first named account alone (a session on another would start
+    with X resting, until FBC-77r8): every named account read clean (or by the
+    reads that cleared a marker), the drop registry built, its trip given to the journal before
+    any market arms, seeded flat; one unchanged `ExecSession` on `place_config` with the
+    discovered spec table, the run's `--namespace`, one `RpcIds` for the run, the run's next
+    session number, an `AccountWideCodAuthority` for its own account and one connection attempt,
+    its handler `places::PlaceHandler` (the shared `LinkHandler`, as `paradex_testnet_acceptance`'s
+    `Tap` wraps it, noting authentication, the arm, the resync and the connection's close, and
+    stopping on a resync's `Desync` or `Unsettled`, a ledger's `Untimed` or `BeyondHorizon`
+    refusal, a fill of ours and an unplanned end); once the arm is accepted and the resync
+    applied, Start under the market lease, then X, one post-only GTC at the minimum size
+    `--away-bps` behind the touch, minted under the namespace lease and an fbc-oms authorization
+    through `Link::submit`, the one place before an ACK echoes our client id, a stop or a press
+    already made before it placing nothing; X's ACK or its deadline; a comparison; a graceful
+    close, waited for the shared limiter's room after a provider refusal so it stays graceful
+    (with no room within the patience, `stage::NO_ROOM_TO_CLOSE`, not counted graceful); then
+    the read of every named account and of X and its trades (`account_reads`' trades and
+    historic-orders reads, FBC-be57), waiting out a rate hold rather than skipping, a provider
+    refusal or a Ctrl-C during them a stop. The first stop ends the steps, and one raised as the
+    session closes is still the run's; only Ctrl-C and a fill of ours cancel in
+    a drop session (Kill, `cancel_everything` by venue id, a wait up to `--rpc-timeout-ms` with a
+    second Ctrl-C recorded, disarm; cancels held by a rate refusal or refused locally end by a
+    graceful close, 0151 item 11), every other stop sending none. The run then ends with its stop
+    and marker, `NotFlat` on a position after the session, or, with none, X still resting
+    reported for the owner's hand cancel and marked `LeftResting`, its line naming FBC-77r8,
+    which builds drop session two. The report and the evidence (`"ticket"` FBC-9sk2) give drop
+    session one (what answered the arm, whether the graceful close cancelled X, each frame's
+    client-id echo as a verdict, whether `add_order` went out as encoded, the stop's cancels, each
+    comparison, X's reads), the place registries, each session's and read socket's refusals
+    (`refusals.rs`, a session named by `SessionRun::label`) and its resync's full pages, read on
+    the traded spec (`pages::rows_on`); its slice is `drop-production/`, scrubbed by
+    `Scrub::Places`, with a README of its own.
+    Held in `tests/qfex_preprod_probe/place_stages.rs` and `compare_reads.rs`, against a QFEX
+    model in `tests/qfex_preprod_probe/model.rs` on the conformance stub's serving scripts
+    (0150), whose trade sockets learn each connection's account from its authentication, answer
+    the arm, `add_order`, `cancel_order` and the two pages, cancel an armed account's orders on a
+    graceful close or a drop as their knobs say, and take the knobs `ack_delay`, `rate_limit`,
+    `stray_order`, `cid_absent_update`, `stray_fill`, `maker_fill`, `server_close`, `rest_lag`,
+    `rest_fails`, `cancel_delay`, `close_on_place`, `arm_err`, `foreign_order`,
+    `position_on_place`, `position_after_close`, `hold_on_place`, `cancel_place`,
+    `venue_cancel`, `close_on_cancel`, `stray_after` and `hold_trades`, all declared by path; two
+    paths no flag or answer reaches, X spent from its list and the journal past its soft limit,
+    are a test's `probe_args::TestHooks`, compiled into the test binary alone. The
+    probe's credentials come from the environment through `src/auth_qfex.rs`, a review path,
+    which also hands each signed read to the connector; the probe reuses
+    `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs` (the caps'
+    conversion to lots and the lease directory) by path. The samples
+    that trade share `src/link.rs` (the glue; `Link::ledger` shows its fill ledger and
+    `Link::fill_refusals` lists each fill that ledger refuses for its time) and `src/testnet.rs`
+    (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet guard), included by
+    path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:

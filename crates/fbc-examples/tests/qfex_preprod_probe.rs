@@ -37,13 +37,24 @@
 //! - runs the place stages' preflight (FBC-c6kw, decision 0148, in [`place_stages`], against the
 //!   QFEX model in [`model`]): every place-stage flag refused naming it and never its value, the
 //!   CAPS line first, the hold before the preflight, the spec from this run's `GET /refdata`, the
-//!   MDS touch and the caps at it, each on the guarded origins, and nothing authenticated for a
-//!   place stage, only ever on loopback origins;
+//!   MDS touch and the caps at it, each on the guarded origins, only ever on loopback origins;
 //! - scrubs a place stage's frames (FBC-t45e, decision 0148 item 10, in [`place_scrub`]): every
 //!   `id` and `*_id` member blanked at its length, every number and decimal-shaped string zeroed,
 //!   each fee kept as its sign and every `symbol`, an echo's too, one placeholder, so a slice of
 //!   hand-built place frames passes scripts/privacy-check.sh, stage one's committed capture as it
-//!   is; and ends an arm's window at its own deadline alone, never a place's.
+//!   is; and ends an arm's window at its own deadline alone, never a place's;
+//! - reads a place stage's frames through the journal's tee (FBC-23ch, decision 0151 item 13,
+//!   in `tee.rs`'s own tests): every call handed on, nothing but what the stops and the report
+//!   need kept, and an order event without our client id, one naming no order of ours and a
+//!   provider rate refusal each raising its stop; and compares the streams with never-arming
+//!   reads (0151 item 4, in `compare.rs`'s own tests and [`compare_reads`], against the QFEX
+//!   model's trade sockets): every frame and request charged first, one without room skipping
+//!   its read, pages until a short one, the cadence, the cap, the first agreeing read timed and a
+//!   read that still disagrees a stop;
+//! - runs the place stages' drop session one against the QFEX model (FBC-23ch, decisions 0132
+//!   item 4, 0148 and 0151, in [`place_stages`]): X placed at the minimum size as an fbc-oms
+//!   authorization, the streams compared with the reads, a graceful close, the reads after it,
+//!   and every stop with its after-session read, report and stop marker.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -59,6 +70,13 @@
 mod auth_qfex;
 #[path = "../examples/qfex_preprod_probe/capture.rs"]
 mod capture;
+// The place stages' comparisons of the streams with the reads (FBC-23ch), tested in its own unit
+// tests and, against the QFEX model, in [`compare_reads`].
+#[allow(dead_code)]
+#[path = "../examples/qfex_preprod_probe/compare.rs"]
+mod compare;
+#[path = "qfex_preprod_probe/compare_reads.rs"]
+mod compare_reads;
 #[allow(dead_code)]
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
@@ -80,13 +98,17 @@ mod model;
 #[path = "../examples/qfex_preprod_probe/pages.rs"]
 mod pages;
 // The place stages' registries' proof (FBC-oxjs), declared by path so it is part of this test
-// binary, as decision 0148's Consequences name it (item 12 of FBC-fqv5's record), and Cargo
+// binary, as decision 0148's Consequences name it (0151 item 12), and Cargo
 // builds no target of its own for it.
 #[path = "qfex_preprod_probe/place_registries.rs"]
 mod place_registries;
-// The place stages' preflight's proof (FBC-c6kw), declared by path as `place_registries` is.
+// The place stages' preflight's proof (FBC-c6kw) and drop session one's (FBC-23ch), declared by
+// path as `place_registries` is.
 #[path = "qfex_preprod_probe/place_stages.rs"]
 mod place_stages;
+// The place stages' leases, mint, stops, allowance and stop marker (FBC-23ch).
+#[path = "../examples/qfex_preprod_probe/places.rs"]
+mod places;
 #[path = "../examples/qfex_preprod_probe/probe_args.rs"]
 mod probe_args;
 #[path = "../examples/qfex_preprod_probe/refusals.rs"]
@@ -98,6 +120,10 @@ mod stage;
 // The place stages' capture scrub and the arm window (FBC-t45e).
 #[path = "qfex_preprod_probe/place_scrub.rs"]
 mod place_scrub;
+// The journal's tee (FBC-23ch), tested in its own unit tests.
+#[allow(dead_code)]
+#[path = "../examples/qfex_preprod_probe/tee.rs"]
+mod tee;
 #[allow(dead_code)]
 #[path = "../src/testnet.rs"]
 mod testnet;
@@ -2201,7 +2227,7 @@ fn a_degraded_marker_in_a_sessions_window_makes_its_capture_partial_and_the_run_
     assert!(!ev.ok());
     // Even counts the sink never reported could not make it complete.
     assert!(!run_of(ev.sessions.clone(), [0, 0]).ok());
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(report.contains("Result: INCOMPLETE."), "{report}");
     assert!(report.contains("**The journal is incomplete** (decision 0006)"));
     assert!(report.contains("1 Normal, 0 Safety. Sessions whose capture is partial: subaccount."));
@@ -2221,7 +2247,7 @@ fn a_degraded_marker_in_a_sessions_window_makes_its_capture_partial_and_the_run_
         ),
         "{readme}"
     );
-    let evidence = capture::to_json(&ev);
+    let evidence = report::to_json(&ev);
     assert_eq!(evidence["ok"], false);
     assert_eq!(evidence["journal_dropped"]["normal"], 1);
     assert_eq!(evidence["journal_writer_failed"], Value::Null);
@@ -2297,7 +2323,7 @@ fn a_drop_the_journal_holds_no_marker_for_leaves_no_session_shown_whole() {
     );
     assert_eq!(ev.dropped, [0, 0]);
     assert!(ev.ok(), "{ev:#?}");
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(report.contains("Result: complete."), "{report}");
     assert!(
         report.contains("dropped: 0 Normal, 0 Safety. Sessions whose capture is partial: none.")
@@ -2328,7 +2354,7 @@ fn a_drop_the_journal_holds_no_marker_for_leaves_no_session_shown_whole() {
         assert!(run.answer().starts_with("The capture is partial"));
     }
     assert!(!ev.ok());
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(report.contains("Result: INCOMPLETE."), "{report}");
     assert!(report.contains("**The journal is incomplete** (decision 0006)"));
     assert!(report.contains(
@@ -2340,7 +2366,7 @@ fn a_drop_the_journal_holds_no_marker_for_leaves_no_session_shown_whole() {
         !report.contains("An ack echoing the arm arrived"),
         "{report}"
     );
-    assert_eq!(capture::to_json(&ev)["journal_dropped"]["safety"], 1);
+    assert_eq!(report::to_json(&ev)["journal_dropped"]["safety"], 1);
     assert!(capture::readme(&ev).contains("**This capture is partial**"));
 }
 
@@ -2367,7 +2393,7 @@ fn a_writer_stopped_by_a_failed_roll_leaves_the_sessions_it_could_hold_partial()
     assert!(ev.errors[0].starts_with("the journal's writer: "), "{ev:?}");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
     stage::write_slice(&dir, &mut ev, &script).unwrap();
-    let (report, evidence) = capture::outputs(&mut ev);
+    let (report, evidence) = report::outputs(&mut ev);
 
     // Every record written precedes the subaccount's arm, so whatever the writer did not write
     // came after it: the primary account's capture is whole and its ack stands.
@@ -2457,7 +2483,7 @@ fn drops_after_the_writer_stopped_reach_no_marker_and_no_session_is_shown_whole(
             "{run:?}"
         );
     }
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(report.contains("**The journal is incomplete** (decision 0006)"));
     assert!(
         report.contains("Sessions whose capture is partial: primary; subaccount."),
@@ -2499,7 +2525,7 @@ fn a_journal_cut_inside_a_record_leaves_every_session_from_the_cut_on_partial() 
         "{sub:?}"
     );
     assert!(sub.answer().starts_with("The capture is partial"));
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(report.contains("Sessions whose capture is partial: subaccount."));
     assert!(!report.contains("Nothing arrived"), "{report}");
 
@@ -2520,15 +2546,12 @@ fn a_journal_cut_inside_a_record_leaves_every_session_from_the_cut_on_partial() 
     let answer = sub.answer();
     assert!(answer.starts_with("The capture is partial"), "{answer}");
     assert!(!answer.contains("No arm was sent"), "{answer}");
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(report.contains("Sessions whose capture is partial: subaccount."));
     assert!(report.contains("- Arm written: not shown (the capture is partial)"));
     assert!(!report.contains("No arm was sent"), "{report}");
-    assert_eq!(
-        capture::to_json(&ev)["sessions"][1]["arm_sent"],
-        Value::Null
-    );
-    assert_eq!(capture::to_json(&ev)["sessions"][0]["arm_sent"], true);
+    assert_eq!(report::to_json(&ev)["sessions"][1]["arm_sent"], Value::Null);
+    assert_eq!(report::to_json(&ev)["sessions"][0]["arm_sent"], true);
 }
 
 #[test]
@@ -2570,7 +2593,7 @@ fn a_partial_sessions_frames_are_named_and_listed_with_no_position_against_its_a
         "{answer}"
     );
     assert!(!answer.contains("in-window"), "{answer}");
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(
         report.contains(
             "| 2 | position unverified | ack echoing the arm | subaccount-002-partial.json |"
@@ -2581,7 +2604,7 @@ fn a_partial_sessions_frames_are_named_and_listed_with_no_position_against_its_a
         report.contains("| 2 | in-window | ack echoing the arm | primary-002-in-window.json |")
     );
     assert!(!report.contains("subaccount-002-in-window"), "{report}");
-    let evidence = capture::to_json(&ev);
+    let evidence = report::to_json(&ev);
     assert_eq!(evidence["sessions"][0]["frames"][1]["when"], "in-window");
     assert_eq!(
         evidence["sessions"][1]["frames"][1]["when"],
@@ -2636,7 +2659,7 @@ fn a_gap_placed_on_no_session_is_never_shown_beside_a_whole_capture() {
     // journal was never sliced, has a gap on no session. Its report never says, beside the
     // gap, that no capture is partial.
     let ev = run_of(Vec::new(), [2, 0]);
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(
         report.contains("**The journal is incomplete** (decision 0006)"),
         "{report}"
@@ -2667,7 +2690,7 @@ fn a_gap_placed_on_no_session_is_never_shown_beside_a_whole_capture() {
         file: "primary-001-in-window.json".to_owned(),
     });
     let ev = run_of(sessions, [0, 1]);
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(
         report.contains("Sessions whose capture is partial: primary; subaccount."),
         "{report}"
@@ -2678,7 +2701,7 @@ fn a_gap_placed_on_no_session_is_never_shown_beside_a_whole_capture() {
         "{report}"
     );
     assert!(report.contains("| 1 | position unverified | ack echoing the arm |"));
-    let evidence = capture::to_json(&ev);
+    let evidence = report::to_json(&ev);
     assert_eq!(evidence["sessions"][0]["capture"], "partial");
     assert_eq!(evidence["sessions"][0]["arm_sent"], true);
     assert_eq!(evidence["sessions"][1]["arm_sent"], Value::Null);
@@ -2733,7 +2756,7 @@ fn a_file_the_privacy_patterns_find_something_in_is_withheld() {
 
     // A stop reason the patterns find something in withholds the report and the evidence.
     ev.stopped = Some(format!("{}{}", "ey", "J0b2tlbiI6InN5bnRoZXRpYyJ9"));
-    let (report, json) = capture::outputs(&mut ev);
+    let (report, json) = report::outputs(&mut ev);
     assert!(report.starts_with("withheld:") && json.starts_with("withheld:"));
     assert_eq!(ev.errors.len(), 2, "{:?}", ev.errors);
 }
@@ -2958,8 +2981,9 @@ fn the_command_line_takes_each_flag_and_refuses_without_showing_a_value() {
          Unknown at its deadline) and the resync has ended, or at the connection's end, \
          --session-wait or its registry's span bound, the program stops it, through its stop \
          control",
-        "sends no command but each session's arm, its resync's reads (one GET /user/positions \
-         and get_user_orders pages, decision 0132 item 5) and the probe's own reads",
+        "A stage-one run places nothing and sends no command but each session's arm, its \
+         resync's reads (one GET /user/positions and get_user_orders pages, decision 0132 item \
+         5) and the probe's own reads",
         "the longer of --rpc-timeout-ms and the resync's 30 s deadline together, so the \
          program never stops a session while its arm or its resync is in flight",
     ] {
@@ -3585,7 +3609,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     let mut ev = run_of(sessions, [0, 0]);
     ev.registries = vec![held.clone()];
     assert!(ev.ok(), "{ev:#?}");
-    let (report, evidence) = capture::outputs(&mut ev);
+    let (report, evidence) = report::outputs(&mut ev);
     assert!(
         report.contains("## The fill ledger of each registry"),
         "{report}"
@@ -3615,7 +3639,7 @@ fn the_report_and_the_evidence_carry_each_registrys_bounds_horizons_and_replay_c
     // the run is incomplete.
     ev.registries.push(forgot);
     assert!(!ev.ok());
-    let (report, evidence) = capture::outputs(&mut ev);
+    let (report, evidence) = report::outputs(&mut ev);
     assert!(report.contains("Result: INCOMPLETE"), "{report}");
     assert!(
         report.contains(
@@ -3715,7 +3739,7 @@ async fn a_registry_whose_session_ends_at_its_age_bound_has_not_held_them_though
     // The run is incomplete, and the report and the evidence say so.
     ev.registries = vec![registry.run().clone()];
     assert!(!ev.ok());
-    let (report, evidence) = capture::outputs(&mut ev);
+    let (report, evidence) = report::outputs(&mut ev);
     assert!(report.contains("Result: INCOMPLETE"), "{report}");
     assert!(
         report.contains("| primary | 10s | 5 | 5s | 0 | no order: its sessions place none | NO |"),
@@ -4165,7 +4189,7 @@ fn a_refusal_frames_fixture_is_named_as_written_withheld_or_not_written() {
     ev.withheld = vec![format!("{withheld}: a JWT")];
 
     // Each refusal frame's file is named as the run left it, in the report and the evidence.
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(
         report.contains(
             "| primary | the session | 3 | 0 | 3 | 0 | not seen | 3 | primary-001-in-window.json; \
@@ -4176,7 +4200,7 @@ fn a_refusal_frames_fixture_is_named_as_written_withheld_or_not_written() {
     assert!(report.contains(
         "The fixtures that hold a session's refusal frames are named in the table below."
     ));
-    let evidence = capture::to_json(&ev);
+    let evidence = report::to_json(&ev);
     assert_eq!(
         evidence["provider_rate_refusals"]["sessions"][0]["frames"],
         json(
@@ -4187,7 +4211,7 @@ fn a_refusal_frames_fixture_is_named_as_written_withheld_or_not_written() {
     // With no fixture written (the privacy check removed the directory), none is said to hold
     // a refusal frame.
     ev.fixtures.clear();
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(!report.contains("The fixtures that hold"), "{report}");
     assert!(report.contains("| 3 | primary-001-in-window.json (not written); "));
 }
@@ -4318,7 +4342,7 @@ fn a_provider_rate_refusal_is_a_rate_limited_err_or_a_rate_limited_order_respons
     // A probe stopped before any read socket opened met none, and the report says so.
     let ev = run_of(Vec::new(), [0, 0]);
     assert_eq!(refusals::total(&ev.read_sockets, &ev.sessions), 0);
-    let report = capture::markdown(&ev);
+    let report = report::markdown(&ev);
     assert!(
         report.contains(
             "Met by each session, at least, with the read sockets before it: none (no read \
@@ -7298,11 +7322,11 @@ fn a_run_that_holds_is_complete_only_when_its_hold_is() {
     let mut stopped = hold_only(None);
     assert!(!stopped.ok());
     stopped.stopped = Some("stopped before the hold".to_owned());
-    let report = capture::markdown(&stopped);
+    let report = report::markdown(&stopped);
     assert!(report.contains("The run asked for a hold, but it did not start"));
     assert!(report.contains("None: the run asked for no session (no --arm)."));
     // A run that asked for no hold reads as stage one always did.
-    let report = capture::markdown(&Evidence::default());
+    let report = report::markdown(&Evidence::default());
     assert!(report.contains(": what answers the cancel-on-disconnect arm\n"));
     assert!(!report.contains("liveness hold"));
 }
