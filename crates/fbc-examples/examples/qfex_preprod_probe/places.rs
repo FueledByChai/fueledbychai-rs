@@ -23,7 +23,8 @@
 //! - **The allowance** ([`Allowance`]; decision 0148 item 7): each registry's `MayPlace` list as
 //!   counts left by kind, and one flatten budget of `--flatten-attempts` for the account across
 //!   its registries. A place whose kind has none left is not built, and the run stops
-//!   ([`Stop::BeyondList`]).
+//!   ([`Stop::BeyondList`]); nor is one the USD caps would not admit at the touch it is priced
+//!   at ([`Stop::BeyondCaps`], decision 0113).
 //! - **The stop marker** ([`write_marker`], [`RunLeases::open`]; 0151 item 6): on any stop but
 //!   [`Stop::NoEcho`], the run writes [`MARKER`] in its lease directory with the stop's name and
 //!   the run's start, and the stops of the marker it found there, unless it cleared them, so a
@@ -91,7 +92,8 @@ pub enum Stop {
     ResyncDesync,
     /// A resync with a fill unsettled across it (`Unsettled`).
     ResyncUnsettled,
-    /// A session that ended with a position that is not flat.
+    /// A session that ended with a position that is not flat, or a fill of ours seen after it
+    /// with no session open (0151 item 9).
     NotFlat,
     /// An order of ours still resting after a session.
     LeftResting,
@@ -110,6 +112,10 @@ pub enum Stop {
     UnexpectedFill,
     /// A place beyond its registry's list, or a flatten IOC beyond the account's budget.
     BeyondList,
+    /// A place the USD caps would not admit at the touch it is priced at: the registry's lot
+    /// caps, fixed at the preflight's touch, above what either cap admits there, or the order
+    /// itself above it (decision 0113). It is not sent, and never resized.
+    BeyondCaps,
     /// No `ACK` in the run echoed one of our client ids byte for byte: not a fault (FBC-su9i).
     NoEcho,
 }
@@ -136,7 +142,7 @@ pub enum RefusedOn {
 
 impl Stop {
     /// Every stop, in the order the report lists them.
-    pub const ALL: [Stop; 19] = [
+    pub const ALL: [Stop; 20] = [
         Stop::NotOurCid,
         Stop::StrayOrder,
         Stop::ReplayRefused(Replay::Untimed),
@@ -163,6 +169,7 @@ impl Stop {
         Stop::ConnectionEnded,
         Stop::UnexpectedFill,
         Stop::BeyondList,
+        Stop::BeyondCaps,
         Stop::NoEcho,
     ];
 
@@ -189,6 +196,7 @@ impl Stop {
             Stop::ConnectionEnded => "ConnectionEnded",
             Stop::UnexpectedFill => "UnexpectedFill",
             Stop::BeyondList => "BeyondList",
+            Stop::BeyondCaps => "BeyondCaps",
             Stop::NoEcho => "NoEcho",
         }
     }
@@ -224,7 +232,9 @@ impl Stop {
                 "a resync with a fill unsettled across it (decision 0132 item 7)"
             }
             Stop::NotFlat => {
-                "a session that ended with a position that is not flat (decision 0132 item 7)"
+                "a session that ended with a position that is not flat, or a fill of ours seen \
+                 after it with no session open, the position the owner's (decisions 0132 item 7, \
+                 0151 item 9)"
             }
             Stop::LeftResting => {
                 "an order of ours still resting after a session (decision 0132 item 7)"
@@ -259,6 +269,11 @@ impl Stop {
             Stop::BeyondList => {
                 "a place beyond its registry's list, or a flatten IOC beyond the account's \
                  --flatten-attempts, which was not built (decision 0148 item 7)"
+            }
+            Stop::BeyondCaps => {
+                "a place --resting-cap-usd or --inventory-cap-usd would not admit at the touch it \
+                 is priced at, the registry's lot caps fixed at the preflight's touch: not sent \
+                 and never resized (decision 0113)"
             }
             Stop::NoEcho => {
                 "no ACK in this run echoed one of our client ids byte for byte, so no crossing \
@@ -973,8 +988,9 @@ pub struct DropRun {
     pub compared: Vec<crate::compare::Compared>,
     /// How the session ended: a graceful close, or its connection's own end.
     pub ended_by: Option<&'static str>,
-    /// Whether the graceful close cancelled X: the read of the account after it no longer
-    /// listing X, which rested before it with no cancel of ours; `None` when not measured.
+    /// Whether the graceful close cancelled X: the read of X's own account after it no longer
+    /// listing X, which rested before it with no cancel of ours; `None` when not measured, that
+    /// account's read not made included.
     pub close_cancelled_x: Option<bool>,
     /// Whether X still rested once the session ended, for the owner's hand cancel (decision
     /// 0132 item 7).
@@ -1061,8 +1077,8 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
         }
         Some(false) => "no: X rested before it and still did after it",
         None => {
-            "not measured (X did not rest before the close, a cancel of ours was sent, or the \
-                 read after it was not made)"
+            "not measured (X did not rest before the close, a cancel of ours was sent, or X's \
+                 account was not read after it)"
         }
     };
     let cancels = match &run.cancels {

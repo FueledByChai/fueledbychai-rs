@@ -867,9 +867,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     none, and taking one `NamespaceLease` for the run beside one `CidMint` across its accounts,
     whose `HighWater` mark is written off the runtime's thread before an id is returned
     (`Mint`); `start` and `flatten` take the `MarketLease` (no account lease); `Stop` names every
-    stop of 0132 item 7 and 0148 item 8 (plus `BeyondList` and `NoEcho`), none with an id or an
-    amount, only `Interrupted` and a fill of ours cancelling in a drop session, whichever stop
-    came first; `Allowance`
+    stop of 0132 item 7 and 0148 item 8 (plus `BeyondList`, `BeyondCaps` and `NoEcho`), none
+    with an id or an amount, only `Interrupted` and a fill of ours cancelling in a drop session,
+    whichever stop came first; `Allowance`
     spends each registry's list and the account's one flatten budget, refusing a place beyond
     them; with `--reconciled` the run reads every named account after the preflight and clears
     the marker only if every read is clean, the declaration reported unchecked; and `main.rs`
@@ -894,7 +894,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     `--namespace`, every frame and request charged to the shared limiter first and one without
     room skipping that read, each read `--read-interval-ms` after the last began, at most 10
     within `--agree-wait-ms`, the first agreeing read timed, `ReadDisagrees` at the end of the
-    wait and lag recorded, a provider refusal on the read socket or REST a stop.
+    wait and lag recorded, a provider refusal on the read socket (one in a frame the journal
+    keeps whole, which holds no budget, included: `Refusals::shown`) or REST a stop.
     `stage::check_accounts_allowing` admits one order of ours (`capture::AllowedOrder`, at most
     one row) on its account alone, for FBC-77r8; every read before a session so far admits none.
     Drop session one (FBC-23ch, `stage.rs`'s `Run::drop_one`; 0132 items 4 and 7, 0151 items 2,
@@ -911,20 +912,28 @@ holds two of them for one pull request. The rules after the three roles bind all
     applied, Start under the market lease, then X, one post-only GTC at the minimum size
     `--away-bps` behind the touch, minted under the namespace lease and an fbc-oms authorization
     through `Link::submit`, the one place before an ACK echoes our client id, a stop or a press
-    already made before it placing nothing; X's ACK or its deadline; a comparison; a graceful
-    close, waited for the shared limiter's room after a provider refusal so it stays graceful
-    (with no room within the patience, `stage::NO_ROOM_TO_CLOSE`, not counted graceful); then
-    the read of every named account and of X and its trades (`account_reads`' trades and
-    historic-orders reads, FBC-be57), waiting out a rate hold rather than skipping, a provider
-    refusal or a Ctrl-C during them a stop. The first stop ends the steps, and one raised as the
+    already made before it placing nothing, and sent only while both USD caps admit the
+    registry's lot caps, fixed at the preflight's touch, and X at the touch X is priced at
+    (`market::caps_admit`; otherwise `BeyondCaps`, nothing sent or resized, 0113); X's ACK or
+    its deadline; a comparison; a graceful close, waited for the shared limiter's room after a
+    provider refusal so it stays graceful (with no room within the patience,
+    `stage::NO_ROOM_TO_CLOSE`, not counted graceful), a Ctrl-C during that wait, and a stop the
+    tee or the handler raised during it once a fill of ours came, taken before the close, its
+    cancels sent once there is room, or, with none within the patience, held as 0151 item 11
+    says; then the read of every named account and of X
+    and its trades (`account_reads`' trades and historic-orders reads, FBC-be57), waiting out a
+    rate hold rather than skipping, a provider refusal (one kept whole included) or a Ctrl-C
+    during them a stop. The first stop ends the steps, and one raised as the
     session closes is still the run's; only Ctrl-C and a fill of ours cancel in
     a drop session (Kill, `cancel_everything` by venue id, a wait up to `--rpc-timeout-ms` with a
     second Ctrl-C recorded, disarm; cancels held by a rate refusal or refused locally end by a
     graceful close, 0151 item 11), every other stop sending none. The run then ends with its stop
-    and marker, `NotFlat` on a position after the session, or, with none, X still resting
+    and marker, `NotFlat` on a position after the session or a trade naming X (a fill seen with
+    no session open, 0151 item 9), or, with none, X still resting
     reported for the owner's hand cancel and marked `LeftResting`, its line naming FBC-77r8,
     which builds drop session two. The report and the evidence (`"ticket"` FBC-9sk2) give drop
-    session one (what answered the arm, whether the graceful close cancelled X, each frame's
+    session one (what answered the arm, whether the graceful close cancelled X, measured on a
+    read of X's own account alone, each frame's
     client-id echo as a verdict, whether `add_order` went out as encoded, the stop's cancels, each
     comparison, X's reads), the place registries, each session's and read socket's refusals
     (`refusals.rs`, a session named by `SessionRun::label`) and its resync's full pages, read on
@@ -938,7 +947,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     `stray_order`, `cid_absent_update`, `stray_fill`, `maker_fill`, `server_close`, `rest_lag`,
     `rest_fails`, `cancel_delay`, `close_on_place`, `arm_err`, `foreign_order`,
     `position_on_place`, `position_after_close`, `hold_on_place`, `cancel_place`,
-    `venue_cancel`, `close_on_cancel`, `stray_after` and `hold_trades`, all declared by path; two
+    `venue_cancel`, `close_on_cancel`, `stray_after`, `part_fill_after`, `close_after`,
+    `fill_on_trades`, `touch_moves` and `hold_trades`, all declared by path; two
     paths no flag or answer reaches, X spent from its list and the journal past its soft limit,
     are a test's `probe_args::TestHooks`, compiled into the test binary alone. The
     probe's credentials come from the environment through `src/auth_qfex.rs`, a review path,

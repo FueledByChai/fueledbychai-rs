@@ -11,7 +11,9 @@
 //!   and skips that read ([`Attempt::Skipped`]), which is not waited for (decision 0135 item 1).
 //!   A `RateLimited` err answering the authentication or a page holds the shared budget, as the
 //!   adapter asks of its caller (decision 0126), and is a stop, [`Stop::RateRefused`] on
-//!   [`RefusedOn::ReadSocket`]; so is any rise in the limiter's `rejected.user` count during a
+//!   [`RefusedOn::ReadSocket`]; so is every other refusal the frame's count shows, one the
+//!   journal keeps whole, which holds no budget, included (decision 0135 item 2,
+//!   [`Refusals::shown`]), and any rise in the limiter's `rejected.user` count during a
 //!   read; a REST answer with status 429 or 418 is one on [`RefusedOn::Rest`] (decision 0148
 //!   item 8). Each frame the socket reads is counted as a read socket's ([`Refusals`]). A read
 //!   whose socket failed drops it, and the next read opens another.
@@ -373,11 +375,14 @@ impl<'a> Socket<'a> {
     }
 
     /// Counts `frame` as a read socket's ([`Refusals::hear`]), and holds the shared budget for a
-    /// `RateLimited` err, as the adapter asks: `true` for one.
+    /// `RateLimited` err, as the adapter asks: `true` for a provider rate refusal, that one or
+    /// any other its count shows ([`Refusals::shown`]), one in a frame the journal keeps whole
+    /// included, from which the adapter reads no hold (decision 0134 items 2 and 6).
     fn heard(&mut self, frame: &Data) -> bool {
         let raw = frame.raw();
         let spans = account_reads::redact_inbound(self.reader, Inbound::Frame(raw));
         let kept = refusals::kept(raw, &spans);
+        let shown = self.heard.shown();
         (self.heard).hear(&kept, &String::from_utf8_lossy(raw.bytes()));
         match account_reads::socket_err(self.reader, raw) {
             Some(SocketErr::RateLimited(hold)) => {
@@ -386,7 +391,7 @@ impl<'a> Socket<'a> {
                 self.heard.limiter += 1;
                 true
             }
-            _ => false,
+            _ => self.heard.shown() > shown,
         }
     }
 
@@ -445,7 +450,9 @@ impl<'a> Socket<'a> {
             let ask = ask.map_err(|e| failed(e.to_string()))?;
             let write = account_reads::user_orders(cfg, ask).map_err(|e| failed(e.to_string()))?;
             let reply = self.ask(&write).await?;
-            self.heard(&reply);
+            if self.heard(&reply) {
+                return Err(Attempt::Refused(RefusedOn::ReadSocket));
+            }
             let (caps, ns) = (self.io.caps, self.io.ns);
             let page = dispatch(caps, ns, |scope| {
                 account_reads::orders_page(reader, reply.raw(), ask, scope)

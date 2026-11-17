@@ -4810,3 +4810,416 @@ fn a_refusal_is_named_by_its_variant_alone() {
     );
     assert_eq!(places::variant_name(&"text"), "");
 }
+
+// ----- PR #272's review findings (FBC-23ch) -----
+
+/// A run of `argv` against `model` whose owner presses Ctrl-C once, as the line holding `at`
+/// is printed ([`PressAt`]), under the provider user `rate_user`.
+async fn pressed_at(
+    model: QfexModel,
+    what: &str,
+    rate_user: RateUserKey,
+    argv: impl Fn(Argv) -> Argv,
+    at: &'static str,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&argv(drop_argv(&dir, &venue))).unwrap();
+    opts.rate_user = rate_user;
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let (press, presses) = interrupt::Presses::channel();
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at,
+        press: Some(Box::new(press)),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+#[tokio::test]
+async fn a_press_while_the_close_waits_for_room_cancels_x_before_the_close() {
+    // Thread 4605918659. As QFEX reads X, the shared budget is held for 5 s, so the comparison
+    // reads nothing within its one second and the close waits for room; the owner presses
+    // Ctrl-C as that comparison ends, so the close is still waiting: the press is the run's
+    // stop, and its cancels (Kill, X by its venue id, the disarm) go out once there is room,
+    // before the graceful close (0151 item 2).
+    let rate_user = user();
+    let model = QfexModel {
+        hold_on_place: Some((shared_limiter(rate_user), Duration::from_secs(5))),
+        ..QfexModel::default()
+    };
+    let wait = |argv| set(argv, "--agree-wait-ms", "1000");
+    let d = pressed_at(
+        model,
+        "drop-press-at-close",
+        rate_user,
+        wait,
+        "COMPARE after X's place",
+    )
+    .await;
+    assert_eq!(d.drop_run().compared[0].ended, compare::Ended::Unread);
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    assert_stopped(&d, places::Stop::Interrupted);
+    let run = d.drop_run();
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (1, false, true)
+    );
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(!run.x_resting && run.close_cancelled_x.is_none(), "{run:?}");
+    // The cancels were the stop's whole: Kill first, the market disarmed after, both printed
+    // before the session's end by its graceful close.
+    let cancels = d.at(
+        "STOP cancels: Kill, then 1 cancels by venue id (0151 item 2), every order they named \
+         seen to end; the market disarmed",
+    );
+    assert!(cancels < d.at(&format!("ended by {}", stage::GRACEFUL)));
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Cancelled);
+    let at = |what: &str| model.log.iter().position(|e| e.what.contains(what));
+    let (cancel, close) = (at(" cancel_order").unwrap(), at("cod ").unwrap());
+    assert!(cancel < close, "{:?}", model.log);
+}
+
+/// A place-stage run of `argv` against `model`, under the provider user `rate_user`, that
+/// reached drop session one.
+async fn held_drop(
+    model: QfexModel,
+    what: &str,
+    rate_user: RateUserKey,
+    argv: impl Fn(Argv) -> Argv,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&argv(drop_argv(&dir, &venue))).unwrap();
+    opts.rate_user = rate_user;
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let ran = stage::run_places(&opts, &places, &lookup, out).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    assert!(ev.drop_one.is_some(), "{printed}");
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+#[tokio::test]
+async fn a_fill_of_ours_while_the_close_waits_for_room_cancels_x_before_the_close() {
+    // Thread 4605918659's twin. As QFEX reads X, the shared budget is held for 5 s, so the
+    // comparison reads nothing within its one second and the close waits for room; at 2.5 s,
+    // while it waits, half of X fills as a maker, the rest resting: a fill of ours, so the
+    // stop it raises cancels (0151 item 2), Kill, X's rest by its venue id and the disarm,
+    // once there is room and before the graceful close. X is ten lots of 0.001 here, so half
+    // of it can fill.
+    let rate_user = user();
+    let model = QfexModel {
+        listed: vec![model::Listed {
+            lot: "0.001",
+            ..model::Listed::trading()
+        }],
+        hold_on_place: Some((shared_limiter(rate_user), Duration::from_secs(5))),
+        part_fill_after: Some(Duration::from_millis(2500)),
+        ..QfexModel::default()
+    };
+    let wait = |argv| set(argv, "--agree-wait-ms", "1000");
+    let d = held_drop(model, "drop-fill-at-close", rate_user, wait).await;
+    assert_eq!(d.drop_run().compared[0].ended, compare::Ended::Unread);
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    let run = d.drop_run();
+    let cancels = run.cancels.as_ref().expect("a fill of ours cancels");
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (1, false, true)
+    );
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(!run.x_resting && run.close_cancelled_x.is_none(), "{run:?}");
+    let cancels = d.at(
+        "STOP cancels: Kill, then 1 cancels by venue id (0151 item 2), every order they named \
+         seen to end; the market disarmed",
+    );
+    assert!(cancels < d.at(&format!("ended by {}", stage::GRACEFUL)));
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Cancelled);
+    assert_eq!(model.fills.len(), 1);
+    let at = |what: &str| model.log.iter().position(|e| e.what.contains(what));
+    let (cancel, close) = (at(" cancel_order").unwrap(), at("cod ").unwrap());
+    assert!(cancel < close, "{:?}", model.log);
+}
+
+#[tokio::test]
+async fn a_press_while_the_close_waits_is_the_stop_when_the_connection_ends_in_that_wait() {
+    // As the twin above, the owner presses Ctrl-C as the comparison after X ends, while the
+    // close waits for room; at 2.5 s, before the hold lifts, the server closes the session's
+    // connection: nothing is left to cancel on, but the press is still the run's stop, marked,
+    // not the connection's end that followed it.
+    let rate_user = user();
+    let model = QfexModel {
+        hold_on_place: Some((shared_limiter(rate_user), Duration::from_secs(5))),
+        close_after: Some(Duration::from_millis(2500)),
+        ..QfexModel::default()
+    };
+    let wait = |argv| set(argv, "--agree-wait-ms", "1000");
+    let d = pressed_at(
+        model,
+        "drop-press-then-end",
+        rate_user,
+        wait,
+        "COMPARE after X's place",
+    )
+    .await;
+    assert_eq!(d.drop_run().compared[0].ended, compare::Ended::Unread);
+    assert_stopped(&d, places::Stop::Interrupted);
+    let run = d.drop_run();
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED), "{run:?}");
+    assert_eq!(run.cancels, None);
+    assert_eq!(d.count("cancel_order"), 0);
+}
+
+#[tokio::test]
+async fn a_close_is_measured_only_on_a_read_of_xs_own_account() {
+    // Thread 4605918661. The after-session read of X's account, the primary, fails on a
+    // RateLimited err while the subaccount's is made: whether the graceful close cancelled X is
+    // not measured, since nothing read X's account after it.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadSocketAfterSession),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-close-unread").await;
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(!run.x_read, "{run:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    let (report, json) = d.outputs();
+    assert_eq!(json["drop_session_one"]["close_cancelled_x"], Value::Null);
+    assert!(
+        report.contains("Whether the graceful close cancelled X: not measured"),
+        "{report}"
+    );
+}
+
+/// Asserts `d` stopped on a read socket, met `when`, as [`assert_stopped`] asserts a stop but
+/// for the reads after the session, which the caller asserts, its socket labelled `label`
+/// showing one refusal in a frame kept whole and none in clear, and no cancel sent.
+fn assert_refused_whole(d: &Dropped, when: &str, label: &str) {
+    let stop = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    let name = stop.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+    assert_eq!(json["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    assert_no_secret(&d.dir.join("evidence"));
+    d.venue.assert_served();
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with(&format!("{} {when}", stop.name())),
+        "{said}"
+    );
+    // The last socket so labelled: the primary's before the session is labelled alike.
+    let socket = (d.ev.read_sockets.iter()).rev().find(|r| r.label == label);
+    let refusals = socket.unwrap_or_else(|| panic!("{label}")).refusals;
+    let shown = (refusals.errs, refusals.unread, refusals.whole);
+    assert_eq!(shown, (0, 1, 1), "{refusals:?}");
+    assert_eq!(d.count("cancel_order"), 0);
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_on_the_comparison_socket_stops_the_run() {
+    // Thread 4605918671. The comparison's authentication after X is answered a RateLimited err
+    // echoing it, which the journal keeps whole (decision 0134 item 2), so the adapter reads no
+    // hold from it: the refusal its frame shows is a stop on the read socket all the same
+    // (decision 0135 item 2, 0151 item 4), the comparison reconnecting for no second read.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEcho(0)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-rate-whole").await;
+    let compared = &d.drop_run().compared[0];
+    assert_eq!(compared.ended, compare::Ended::Refused, "{compared:?}");
+    assert_eq!(compared.reads.len(), 1);
+    let label = "primary (the comparison after X's place)";
+    assert_refused_whole(&d, "in drop session one", label);
+    assert_after_reads(&d);
+    assert_no_cancel_and_x_resting(&d);
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_in_the_reads_after_the_session_stops_the_run() {
+    // The twin on the after-session reads: the primary's read socket, the second to
+    // authenticate after X (the comparison's first), is answered that err.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEcho(1)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-rate-whole-after").await;
+    let when = "in the reads after drop session one";
+    assert_refused_whole(&d, when, "primary (drop)");
+    // The primary's read failed on the refusal; the subaccount's was still made.
+    let after: Vec<&str> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_DROP_ONE)
+        .map(|r| r.label.as_str())
+        .collect();
+    assert_eq!(after, ["subaccount"], "{}", d.printed);
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_on_xs_read_socket_stops_the_run() {
+    // The twin on X's read after the session: its socket, the fourth to authenticate after X
+    // (the comparison's, then the primary's and the subaccount's reads), is answered that err.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEcho(3)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-rate-whole-x").await;
+    let when = "reading X after drop session one";
+    assert_refused_whole(&d, when, "primary (X and its trades)");
+    assert_after_reads(&d);
+}
+
+#[tokio::test]
+async fn a_fill_of_x_seen_only_by_its_trade_read_stops_the_run_not_flat() {
+    // Thread 4605918676. X fills as its trades are read after the session, after the reads
+    // that showed every account flat: a fill seen with no session open, so the run stops not
+    // flat, marked, the position the owner's (0151 item 9), and sends no cancel.
+    let model = QfexModel {
+        fill_on_trades: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-fill-unseen").await;
+    let after = d.drop_run().after.as_ref().unwrap();
+    assert_eq!(after.trades_naming_x, 1, "{after:?}");
+    assert!(
+        (d.ev.reads.iter())
+            .filter(|r| r.before == refusals::AFTER_DROP_ONE)
+            .all(|r| r.flat)
+    );
+    assert_stopped(&d, places::Stop::NotFlat);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(said.starts_with("NotFlat after drop session one"), "{said}");
+    // What it prints says the cause it met: a fill seen with no session open.
+    assert!(
+        said.contains("a fill of ours seen after it with no session open"),
+        "{said}"
+    );
+    assert_eq!(d.count("cancel_order"), 0);
+}
+
+#[tokio::test]
+async fn a_touch_that_moves_past_the_caps_after_the_preflight_sends_no_x() {
+    // Thread 4605918689. Both caps admit exactly three minimum sizes at the preflight's touch
+    // near 100; by X's place the touch is near 400, where they admit none, while the registry's
+    // lot caps, fixed at the preflight, still admit three: X is not sent, and the run stops,
+    // marked, its session ended by a graceful close with no cancel (decision 0113).
+    let moved = model::Touch {
+        bid: Some(("400.00", "1.00")),
+        ask: Some(("400.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        touch_moves: Some(moved),
+        ..QfexModel::default()
+    };
+    let caps = |argv| {
+        let argv = set(argv, "--resting-cap-usd", THREE_MIN_USD);
+        set(argv, "--inventory-cap-usd", THREE_MIN_USD)
+    };
+    let d = dropped_with(model, "drop-caps-moved", caps).await;
+    assert_eq!(d.count("add_order"), 0, "{:?}", d.what());
+    let run = d.drop_run();
+    assert!(run.started && !run.x.submitted, "{run:?}");
+    assert!(!d.printed.contains("PLACE X"), "{}", d.printed);
+    assert_stopped(&d, places::Stop::BeyondCaps);
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(run.cancels, None);
+}
+
+#[test]
+fn the_caps_are_asked_again_at_the_touch_a_place_is_priced_at() {
+    // Thread 4605918689's arithmetic (decision 0113): at the model's touch, caps of three
+    // minimum sizes are three lots, which admit those lots and X at that touch and at one
+    // below it, where a lot costs less, but not at a touch where three minimum sizes cost more.
+    let found = spec_of(Listed::trading());
+    let argv = set(parse_only(), "--resting-cap-usd", THREE_MIN_USD);
+    let (_, places) = parsed(&set(argv, "--inventory-cap-usd", THREE_MIN_USD)).unwrap();
+    let caps = market::place_caps(&places, &found, QUOTE).unwrap();
+    let x = found.min_size;
+    assert!(market::caps_admit(&places, &found, QUOTE, caps, x));
+    let lower = Quote {
+        bid: Ticks(QUOTE.bid.0 / 2),
+        ask: Ticks(QUOTE.ask.0 / 2),
+    };
+    assert!(market::caps_admit(&places, &found, lower, caps, x));
+    let risen = Quote {
+        bid: Ticks(QUOTE.bid.0 * 4),
+        ask: Ticks(QUOTE.ask.0 * 4),
+    };
+    assert!(!market::caps_admit(&places, &found, risen, caps, x));
+    // A touch a tick above the preflight's admits fewer lots than the registry's three: the
+    // registry would admit more than the USD caps allow there, so nothing goes out.
+    let tick = Quote {
+        bid: Ticks(QUOTE.bid.0 + 1),
+        ask: Ticks(QUOTE.ask.0 + 1),
+    };
+    assert!(!market::caps_admit(&places, &found, tick, caps, x));
+    // With the caps unequal, each comparison alone refuses that touch: the tight cap admits
+    // fewer lots there than the registry's three, the other cap admitting them all.
+    let three = Lots::new(x.get() * 3).unwrap();
+    let lots = market::PlaceCaps {
+        resting: three,
+        inventory: three,
+    };
+    for (resting, inventory) in [("1000", THREE_MIN_USD), (THREE_MIN_USD, "1000")] {
+        let argv = set(parse_only(), "--resting-cap-usd", resting);
+        let (_, places) = parsed(&set(argv, "--inventory-cap-usd", inventory)).unwrap();
+        assert!(market::caps_admit(&places, &found, QUOTE, lots, x));
+        let admitted = market::caps_admit(&places, &found, tick, lots, x);
+        assert!(
+            !admitted,
+            "--resting-cap-usd {resting}, --inventory-cap-usd {inventory}"
+        );
+    }
+    // And an order above what the caps admit at the touch is refused whatever the registry's
+    // lot caps.
+    let small = market::PlaceCaps {
+        resting: x,
+        inventory: x,
+    };
+    let two = Lots::new(x.get() * 2).unwrap();
+    assert!(!market::caps_admit(
+        &places,
+        &found,
+        QUOTE,
+        small,
+        Lots::new(4).unwrap()
+    ));
+    assert!(market::caps_admit(&places, &found, QUOTE, small, two));
+}

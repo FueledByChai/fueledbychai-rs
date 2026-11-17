@@ -40,8 +40,11 @@
 //!   [`QfexModel::foreign_order`], [`QfexModel::position_on_place`] and
 //!   [`QfexModel::position_after_close`], [`QfexModel::cancel_place`],
 //!   [`QfexModel::venue_cancel`],
-//!   [`QfexModel::close_on_cancel`] and [`QfexModel::stray_after`]; on every read socket,
-//!   [`QfexModel::auth_fails`], [`QfexModel::stuck_pages`] and [`QfexModel::hold_trades`].
+//!   [`QfexModel::close_on_cancel`], [`QfexModel::stray_after`],
+//!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`] and
+//!   [`QfexModel::fill_on_trades`]; at the first trade-socket authentication,
+//!   [`QfexModel::touch_moves`]; on every read socket, [`QfexModel::auth_fails`],
+//!   [`QfexModel::stuck_pages`] and [`QfexModel::hold_trades`].
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -119,6 +122,8 @@ pub struct Filled {
     pub account: Option<String>,
     pub trade_id: String,
     pub order: Order,
+    /// What it filled: the order's whole quantity, or part of it ([`QfexModel::part_fill_after`]).
+    pub quantity: Decimal,
     pub at: i64,
 }
 
@@ -146,6 +151,15 @@ pub enum Limited {
     /// a connection shows itself a session only by subscribing after it: aimed at a read socket
     /// after a session authenticated, `n` counts that session's authentication.
     ReadAuth(usize),
+    /// The `n`th trade-socket authentication after the first `add_order`, from 0, counted as
+    /// [`Limited::ReadAuth`] counts them, answered a `RateLimited` err echoing it, which the
+    /// journal keeps whole (decision 0134 item 2), so the adapter reads no hold from it.
+    ReadAuthEcho(usize),
+    /// The `n`th `get_user_orders` page on a read socket after the first `add_order`, from 0,
+    /// answered a `RateLimited` err echoing it whose `message` holds a JSON escape, which the
+    /// journal keeps whole (decision 0134 item 2), so the adapter reads neither a hold nor a
+    /// refusal from it.
+    PageKeptWhole(usize),
 }
 
 /// What an account's reads answer while [`QfexModel::rest_lag`] holds them back: its open orders
@@ -357,6 +371,21 @@ pub struct QfexModel {
     /// This long after the first `add_order`, an `order_response` naming an order no run placed
     /// is pushed on its connection ([`QfexModel::stray_order`]'s frame, later).
     pub stray_after: Option<Duration>,
+    /// With the first `add_order`, half of that order fills as a maker, the rest left open, its
+    /// `fill_response` and its `FILLED` `order_response` (`quantity_remaining` above zero, a
+    /// partial fill) pushed on its connection this long after it, naming its client id; the
+    /// model's positions and pages show the fill at once.
+    pub part_fill_after: Option<Duration>,
+    /// With the first `add_order`, the server closes that connection this long after it.
+    pub close_after: Option<Duration>,
+    /// As the first `get_user_trades` page is asked, the run's first order fills whole as a
+    /// maker, no frame telling any socket: a fill after the reads that showed its account flat.
+    pub fill_on_trades: bool,
+    /// With the first trade-socket authentication, the touch becomes this one, pushed on every
+    /// MDS connection: a touch that moved after the preflight read it.
+    pub touch_moves: Option<Touch>,
+    /// The MDS stub's push handle, once it is up ([`QfexModel::touch_moves`]).
+    pub mds_pusher: Option<Pusher>,
     /// The answers [`QfexModel::hold_trades`] held: each connection and frame.
     pub(super) held: Vec<(usize, Frame)>,
     pub(super) lagging: HashMap<Option<String>, Stale>,
@@ -423,6 +452,11 @@ impl Default for QfexModel {
             close_on_cancel: false,
             hold_trades: false,
             stray_after: None,
+            part_fill_after: None,
+            close_after: None,
+            fill_on_trades: false,
+            touch_moves: None,
+            mds_pusher: None,
             held: Vec::new(),
             lagging: HashMap::new(),
             moved: Vec::new(),
@@ -536,8 +570,8 @@ impl QfexModel {
         let filled: Decimal = (self.fills.iter())
             .filter(|f| f.account == *account)
             .map(|f| match f.order.side.as_str() {
-                "SELL" => -f.order.quantity,
-                _ => f.order.quantity,
+                "SELL" => -f.quantity,
+                _ => f.quantity,
             })
             .sum();
         let position = filled + if moved { Decimal::ONE } else { Decimal::ZERO };
@@ -606,6 +640,12 @@ impl QfexModel {
                     let err = r#"{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 3 seconds"}"#;
                     return Ok(vec![Frame::text(err)]);
                 }
+                if self.places > 0 && self.rate_limit == Some(Limited::ReadAuthEcho(n)) {
+                    return Ok(vec![Frame::text(limited(text, 3))]);
+                }
+                if let Some(touch) = self.touch_moves.take() {
+                    self.move_touch(touch);
+                }
                 match (self.reads_silent, self.auth_fails) {
                     (true, _) => Ok(Vec::new()),
                     (false, true) => Ok(vec![Frame::text(r#"{"type":"auth","result":"failure"}"#)]),
@@ -633,7 +673,13 @@ impl QfexModel {
                 self.held.push((conn, page));
                 Ok(Vec::new())
             }
-            "get_user_trades" => Ok(vec![Frame::text(self.trades_page(conn, &v))]),
+            "get_user_trades" => {
+                if std::mem::take(&mut self.fill_on_trades) {
+                    let id = self.orders.first().map(|o| o.id.clone());
+                    self.fill(&id.expect("an order to fill"));
+                }
+                Ok(vec![Frame::text(self.trades_page(conn, &v))])
+            }
             _ => Err(format!("the model answers no {kind}")),
         }
     }
@@ -773,6 +819,17 @@ impl QfexModel {
                 self.orders.push(foreign);
             }
         }
+        if let Some(after) = self.part_fill_after.filter(|_| first) {
+            let filled = self.fill_part(&order.id, order.quantity / Decimal::TWO);
+            let frames = vec![
+                fill_response(&filled, true),
+                order_response(&filled.order, "FILLED", true),
+            ];
+            self.later(conn, frames, after, false);
+        }
+        if let Some(after) = self.close_after.filter(|_| first) {
+            self.later(conn, Vec::new(), after, true);
+        }
         if first && self.close_on_place {
             self.later(conn, Vec::new(), Duration::ZERO, true);
             return Vec::new();
@@ -828,19 +885,50 @@ impl QfexModel {
             .iter()
             .position(|o| o.id == id)
             .expect("an order");
+        let quantity = self.orders[n].quantity - self.orders[n].filled;
+        self.fill_part(id, quantity)
+    }
+
+    /// Fills `quantity` of the open order `id` as a maker, which ends it once nothing is left.
+    fn fill_part(&mut self, id: &str, quantity: Decimal) -> Filled {
+        let n = self
+            .orders
+            .iter()
+            .position(|o| o.id == id)
+            .expect("an order");
         let account = self.orders[n].account.clone();
         self.before_change(&account);
         let order = &mut self.orders[n];
-        order.filled = order.quantity;
-        order.state = State::Filled;
+        order.filled += quantity;
+        if order.filled >= order.quantity {
+            order.state = State::Filled;
+        }
         let filled = Filled {
             account,
             trade_id: format!("55555555-5555-4555-8555-{:012x}", self.fills.len() + 1),
             order: order.clone(),
+            quantity,
             at: now_secs(),
         };
         self.fills.push(filled.clone());
         filled
+    }
+
+    /// Makes `touch` the touch, pushed at once on every MDS connection open
+    /// ([`QfexModel::touch_moves`]).
+    fn move_touch(&mut self, touch: Touch) {
+        let frame = Frame::text(touch.frame(SYMBOL));
+        self.touch = touch;
+        let pusher = self.mds_pusher.clone().expect("the MDS stub is up");
+        let conns = self
+            .views
+            .as_ref()
+            .map_or(0, |(_, mds)| mds.connections().len());
+        tokio::spawn(async move {
+            for conn in 0..conns {
+                let _ = pusher.push(conn, frame.clone()).await;
+            }
+        });
     }
 
     /// Pushes `frames` on `conn` after `after`, then, with `close`, closes it.
@@ -901,6 +989,10 @@ impl QfexModel {
             if self.rate_limit == Some(Limited::ReadSocket(n)) {
                 let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
                 return limited(&echo.to_string(), 3);
+            }
+            if self.rate_limit == Some(Limited::PageKeptWhole(n)) {
+                let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
+                return limited(&echo.to_string(), 3).replace("exceeded,", "exceeded\\u002c");
             }
             if self.rate_limit == Some(Limited::ReadSocketAfterSession) && self.session_ended() {
                 self.rate_limit = None;
@@ -1031,10 +1123,11 @@ fn fill_response(filled: &Filled, cid: bool) -> Frame {
     let order = &filled.order;
     let mut members = serde_json::json!({
         "trade_id": filled.trade_id, "user_id": USER_ID, "symbol": SYMBOL,
-        "price": order.price, "quantity": number(order.quantity), "side": order.side,
+        "price": order.price, "quantity": number(filled.quantity), "side": order.side,
         "aggressor_side": if order.side == "BUY" { "SELL" } else { "BUY" },
         "order_id": order.id, "fee": 0.001, "order_type": order.kind, "tif": order.tif,
-        "order_price": order.price, "remaining_quantity": 0, "take_profit": 0.0,
+        "order_price": order.price, "remaining_quantity": number(order.quantity - order.filled),
+        "take_profit": 0.0,
         "stop_loss": 0.0, "execution_type": "MAKER", "timestamp": filled.at, "realised_pnl": 0.0
     });
     if cid {
@@ -1048,7 +1141,7 @@ fn trade_row(filled: &Filled) -> Value {
     let order = &filled.order;
     serde_json::json!({
         "trade_id": filled.trade_id, "symbol": SYMBOL, "price": order.price,
-        "quantity": number(order.quantity), "side": order.side, "order_id": order.id,
+        "quantity": number(filled.quantity), "side": order.side, "order_id": order.id,
         "client_order_id": order.cid, "fee": 0.001, "timestamp": filled.at,
         "order_type": order.kind, "tif": order.tif
     })
@@ -1119,10 +1212,11 @@ impl Venue {
         }
         let trade = StubServer::start(script, router).await.unwrap();
         let m = Arc::clone(&model);
-        let (script, _push) = WsScript::serving(move |conn| {
+        let (script, push) = WsScript::serving(move |conn| {
             let m = Arc::clone(&m);
             Responder::new(move |frame| m.lock().unwrap().mds(conn, frame))
         });
+        model.lock().unwrap().mds_pusher = Some(push);
         let mds = StubServer::start(script, HttpRouter::new()).await.unwrap();
         model.lock().unwrap().views = Some((trade.connections_view(), mds.connections_view()));
         Venue { trade, mds, model }

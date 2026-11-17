@@ -245,6 +245,7 @@ async fn a_read_pages_until_a_short_page_and_reads_the_position_on_the_traded_sy
         model.fills.push(model::Filled {
             account: None,
             trade_id: "55555555-5555-4555-8555-000000000001".to_owned(),
+            quantity: filled.quantity,
             order: filled,
             at: 0,
         });
@@ -997,4 +998,73 @@ async fn the_model_answers_a_place_late_and_closes_as_its_knobs_say() {
     };
     assert!(closed);
     venue.assert_served();
+}
+
+#[tokio::test]
+async fn an_authentication_refused_in_a_frame_kept_whole_refuses_on_the_read_socket() {
+    // PR #272's thread 4605918671: a RateLimited err echoing the authentication, which the
+    // journal keeps whole (decision 0134 item 2), holds no budget, since the adapter reads no
+    // hold from it, but its refusal is one all the same (decision 0135 item 2).
+    let bench = Bench::start(QfexModel {
+        rate_limit: Some(Limited::ReadAuthEcho(0)),
+        ..QfexModel::default()
+    })
+    .await;
+    placed(&mut bench.model());
+    let limiter = bench.limiter();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut socket = Socket::new(
+        bench.io(&limiter, 1000),
+        &bench.cfg,
+        &bench.reader,
+        &mut ctx,
+    );
+    assert_eq!(socket.read().await, Attempt::Refused(RefusedOn::ReadSocket));
+    let heard = socket.close().await;
+    assert_eq!(
+        (heard.errs, heard.unread, heard.whole),
+        (0, 1, 1),
+        "{heard:?}"
+    );
+    assert_eq!(heard.limiter, 0);
+    // Nothing but the authentication was written.
+    assert_eq!(bench.received(0).len(), 1);
+    bench.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_page_refused_in_a_frame_kept_whole_refuses_on_the_read_socket() {
+    // The twin on the page: a RateLimited err echoing it whose message holds a JSON escape,
+    // which the journal keeps whole (decision 0134 item 2), so the adapter reads neither a hold
+    // nor a refusal from it, nor a page: its refusal is one all the same (decision 0135 item 2),
+    // not a failed read that would reconnect, and no REST read follows it.
+    let bench = Bench::start(QfexModel {
+        rate_limit: Some(Limited::PageKeptWhole(0)),
+        ..QfexModel::default()
+    })
+    .await;
+    placed(&mut bench.model());
+    let limiter = bench.limiter();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut socket = Socket::new(
+        bench.io(&limiter, 1000),
+        &bench.cfg,
+        &bench.reader,
+        &mut ctx,
+    );
+    assert_eq!(socket.read().await, Attempt::Refused(RefusedOn::ReadSocket));
+    let heard = socket.close().await;
+    assert_eq!(
+        (heard.errs, heard.unread, heard.whole),
+        (0, 1, 1),
+        "{heard:?}"
+    );
+    assert_eq!(heard.limiter, 0);
+    // The authentication and the one page, on the one connection; no REST read.
+    assert_eq!(bench.received(0).len(), 2);
+    assert_eq!(bench.venue.trade.connections().len(), 1);
+    assert_eq!(bench.positions_read(), 0);
+    bench.venue.assert_served();
 }
