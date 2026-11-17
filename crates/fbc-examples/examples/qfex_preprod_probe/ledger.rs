@@ -60,9 +60,10 @@
 //!
 //! The span bound's floor, which the command line holds above a session's reach to its arm's
 //! deadline, counts one session per registry: the drop test's two need it counted twice, with
-//! the read between them (FBC-c6kw). FBC-39ks's hold opens no session and places nothing, so it
-//! builds no registry and adds nothing to the ceiling; held between two sessions of one
-//! registry, it would count in that registry's span.
+//! the reads between them, which a place-stage run holds its span bound above before anything
+//! connects (`probe_args::check_place_span`, FBC-c6kw). FBC-39ks's hold opens no session and
+//! places nothing, so it builds no registry and adds nothing to the ceiling; held between two
+//! sessions of one registry, it would count in that registry's span.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -169,6 +170,12 @@ impl Bounds {
             places: places.to_vec(),
             ceiling,
         })
+    }
+
+    /// The span bound (`--registry-span`), which a place-stage run holds above the drop test's
+    /// floor (`probe_args::check_place_span`, FBC-c6kw).
+    pub fn span(&self) -> Duration {
+        self.span
     }
 
     /// The ledger's configuration.
@@ -412,7 +419,6 @@ impl RegistryRun {
 
 /// The most flatten IOCs `--flatten-attempts` takes for an account in a run (decision 0148 item
 /// 7).
-#[allow(dead_code)] // the flag's parse uses it (FBC-c6kw)
 pub const MAX_FLATTEN_ATTEMPTS: u64 = 3;
 
 /// The drop test's first resting order (decision 0132 item 4), as a list names it.

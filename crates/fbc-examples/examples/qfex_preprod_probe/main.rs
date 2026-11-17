@@ -16,6 +16,14 @@
 //! program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
+//! With `--place-stages` (FBC-c6kw, the first slice of FBC-9sk2; decision 0148) it runs the
+//! place stages' preflight alone, on production (`--production`) and, until FBC-4plj, only
+//! against a loopback test stub: a `CAPS` line first, the hold first when `--hold-secs` asks,
+//! then the traded instrument's spec from this run's `GET /refdata`, the ledger's count bound
+//! against each place registry's ceiling, the MDS touch and the caps at it ([`market`]), then it
+//! stops, its outcome not ok: the place stages after the preflight are not built yet, so it
+//! places nothing and connects nothing authenticated for a place stage.
+//!
 //! ```text
 //! export QFEX_PUBLIC_KEY=...       # the primary account's credential, for the environment run on
 //! export QFEX_SECRET_KEY=...
@@ -25,6 +33,13 @@
 //!     --registry-span <S> --ledger-max-age <S> --ledger-max-entries <N>
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
 //!     --evidence-dir /abs/new/dir --hold-secs <S> --socks5 <HOST:PORT>
+//! cargo run -p fbc-examples --example qfex_preprod_probe -- --production --place-stages \
+//!     --evidence-dir /abs/new/dir --trade-url <LOOPBACK> --rest-url <LOOPBACK> \
+//!     --mds-url <LOOPBACK> --symbol <SYMBOL> --side <buy|sell> --sole-trader \
+//!     --resting-cap-usd <USD> --inventory-cap-usd <USD> --away-bps <BPS> \
+//!     --flatten-cap-bps <BPS> --flatten-attempts <N> --namespace <N> --agree-wait-ms <MS> \
+//!     --read-interval-ms <MS> --touch-max-age-ms <MS> --registry-span <S> \
+//!     --ledger-max-age <S> --ledger-max-entries <N>
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --help
 //! ```
 
@@ -42,11 +57,17 @@ mod interrupt;
 #[allow(dead_code)]
 #[path = "../../src/link.rs"]
 mod link;
+mod market;
 mod pages;
 mod probe_args;
 mod refusals;
 mod report;
 mod stage;
+// The Paradex testnet samples' shared command-line pieces and cap conversion, reused by path:
+// the place stages take their caps, lease directory and decimals as those samples do.
+#[allow(dead_code)]
+#[path = "../../src/testnet.rs"]
+mod testnet;
 
 use std::cell::RefCell;
 use std::process::ExitCode;
@@ -62,8 +83,9 @@ fn ctrl_c() -> impl futures_util::Stream<Item = ()> + Send + 'static {
 }
 
 fn main() -> ExitCode {
-    let opts = match probe_args::parse(std::env::args().skip(1)) {
-        Ok(Parsed::Run(opts)) => *opts,
+    let (opts, places) = match probe_args::parse(std::env::args().skip(1)) {
+        Ok(Parsed::Run(opts)) => (*opts, None),
+        Ok(Parsed::Places(opts, places)) => (*opts, Some(*places)),
         Ok(Parsed::Help) => {
             print!("{}", probe_args::usage());
             return ExitCode::SUCCESS;
@@ -102,7 +124,13 @@ fn main() -> ExitCode {
         }
         None => Box::pin(std::future::pending()),
     };
-    match runtime.block_on(stage::run_until(&opts, &lookup, out, interrupt)) {
+    let ran = match &places {
+        None => runtime.block_on(stage::run_until(&opts, &lookup, out, interrupt)),
+        Some(places) => runtime.block_on(stage::run_places_until(
+            &opts, places, &lookup, out, interrupt,
+        )),
+    };
+    match ran {
         Ok(outcome) if outcome.ok => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(e) => {

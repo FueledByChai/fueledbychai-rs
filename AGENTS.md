@@ -794,7 +794,7 @@ holds two of them for one pull request. The rules after the three roles bind all
     conformance stub).
     With `--hold-secs` (FBC-39ks, 0146), on either environment, it first holds one trade
     connection that never arms (`hold.rs`; `--arm` then optional, the ledger flags required only
-    with it): after the named accounts' reads, before any session and with no other connection
+    with it or `--place-stages`): after the named accounts' reads, before any session and with no other connection
     open, on the account `--hold-account` names (the primary by default), it sends its
     authentication and the three subscriptions a session sends through the adapter's
     `account_reads` and the shared limiter, then nothing but the pongs and close reply the
@@ -827,9 +827,40 @@ holds two of them for one pull request. The rules after the three roles bind all
     carrying `--flatten-attempts` flatten IOCs under one budget per account, which the driver
     spends (FBC-23ch); and its count bound above that list's ceiling (`PlaceBounds::accept`),
     held in `tests/qfex_preprod_probe/place_registries.rs`, which `tests/qfex_preprod_probe.rs`
-    declares by path. The probe's credentials come from the environment through
+    declares by path. With `--place-stages` (FBC-c6kw, the first slice of FBC-9sk2) it runs the
+    place stages' preflight alone and places nothing: on production alone (`--production`) and,
+    until FBC-4plj, only against a loopback test stub (every origin loopback, refused otherwise
+    before anything connects); every place-stage flag (`--symbol`, `--side`, `--sole-trader`,
+    both caps, `--away-bps` 20 to 10000, `--flatten-cap-bps` below it, `--flatten-attempts` 1 to
+    3, `--namespace`, `--lease-dir` never the testnet samples', `--agree-wait-ms` and
+    `--read-interval-ms` at most 10 reads per comparison, `--touch-max-age-ms`, the ledger flags,
+    `--registry-span` at most an hour and above the drop test's two sessions and the reads between
+    them) refused naming the flag, never its value, and refused given twice (`probe_args::Places`,
+    `Parsed::Places`; `--lease-dir` refused with a `..` or as a symbolic link to the testnet
+    samples' default); a
+    `CAPS` line with the environment and both caps first, before any request, the caps on
+    standard output alone (0113, 0148 item 7); the hold first, alone, when `--hold-secs` asks,
+    the owner's Ctrl-C on it stopping the run before its preflight; then `market.rs`: the traded
+    spec from this run's `GET /refdata` through the adapter's discovery on the guarded
+    configuration, charged to the run's limiter and sent within `--read-wait-ms` (a symbol not
+    listed, not trading or not listing both a post-only GTC and a limit IOC refused, never
+    named), the count bound against each place
+    registry's ceiling, the MDS touch (`bbo` on an `MdVenue` of its own on the guarded MDS origin,
+    a touch from before the connection's current epoch, one-sided, crossed or locked, or older
+    than `--touch-max-age-ms` refused) and each cap at least three minimum sizes at the touch,
+    priced at the resting price; `market.rs` also holds the pure prices, tested, each moved and
+    snapped to its safe side in whole ticks (a resting order `--away-bps` behind the touch, the
+    crossing orders at the far touch, a flatten IOC at most `--flatten-cap-bps` through the touch
+    it crosses), of which only the resting price is used now, for the caps; then it stops, not ok, since the stages after the preflight are not built, and
+    connects nothing authenticated for a place stage. `stage::place_config` adds
+    `qfex.exec.production_places` to a place stage's session configuration alone (0148 item 4).
+    Its report and evidence give the fences met and the steps passed, never a value. Held in
+    `tests/qfex_preprod_probe/place_stages.rs`, against a QFEX model in
+    `tests/qfex_preprod_probe/model.rs` on the conformance stub's serving scripts (0150), both
+    declared by path. The probe's credentials come from the environment through
     `src/auth_qfex.rs`, a review path, which also hands each signed read to the connector; the
-    probe reuses `paradex_testnet_acceptance`'s privacy patterns by
+    probe reuses `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs`
+    (the caps' conversion to lots and the lease directory) by
     path. The samples that trade share
     `src/link.rs` (the glue; `Link::ledger` shows its fill ledger and `Link::fill_refusals` lists
     each fill that ledger refuses for its time) and `src/testnet.rs` (guard and wiring), and the

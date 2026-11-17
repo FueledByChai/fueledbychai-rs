@@ -1,18 +1,27 @@
 //! qfex_preprod_probe's command line, parsed by hand (no argument-parsing dependency). No value
 //! typed is ever echoed: a key pasted into the wrong flag would be printed.
+//!
+//! `--place-stages` (FBC-c6kw, the first slice of FBC-9sk2) parses into [`Places`] beside the
+//! [`Options`] every run takes ([`Parsed::Places`]): the place stages' flags, each refused before
+//! anything connects, naming the flag and never its value (decisions 0113 and 0148 item 7, and
+//! FBC-fqv5 items 1 and 4).
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use fbc_core::Side;
 use fbc_runtime::{ProxyConfig, RateUserKey};
 use fbc_venue_qfex::exec::AUTH_DEADLINE;
 use fbc_venue_qfex::probe::{
     Environment, PREPROD_MDS, PREPROD_PROBE, PREPROD_REST, PREPROD_TRADE, PRODUCTION_MDS,
     PRODUCTION_PROBE, PRODUCTION_REST, PRODUCTION_TRADE,
 };
+use rust_decimal::Decimal;
 
 use crate::auth_qfex::{Armed, PUBLIC_VAR, SECRET_VAR, SUB_ID_VAR, SUB_PUBLIC_VAR, SUB_SECRET_VAR};
-use crate::ledger::{self, Bounds, MAX_AGE_S, MAX_ENTRIES, MAX_SPAN_S};
+use crate::ledger::{self, Bounds, MAX_AGE_S, MAX_ENTRIES, MAX_FLATTEN_ATTEMPTS, MAX_SPAN_S};
+use crate::testnet;
 
 /// The provider user a run's rate limiter counts for: one user, its accounts sharing QFEX's
 /// buckets (decision 0123). The program's own numbering: a process probes one user.
@@ -35,6 +44,21 @@ declaration (decision 0143). It places nothing and sends no command but each ses
 its resync's reads (one GET /user/positions and get_user_orders pages, decision 0132 item 5)
 and the probe's own reads. With --hold-secs it first holds one trade connection that never
 arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming at all.
+
+With --place-stages (FBC-c6kw, the first slice of FBC-9sk2; decision 0148) it runs the place
+stages' preflight alone and places nothing: on production alone (--production; FBC-fqv5 item
+1), and, until FBC-4plj lands every stop decisions 0132 item 7 and 0148 item 8 require, only
+against a loopback test stub, every origin (trade, REST and MDS) a loopback address. It prints a
+CAPS line with the environment and both caps first, before any request; runs the hold first,
+alone, when --hold-secs is given; reads the instrument --symbol names from this run's
+GET /refdata on the guarded REST origin, refusing one that is not listed, not trading, or that
+does not list both a post-only GTC and a limit IOC (decision 0148 item 4); holds
+--ledger-max-entries above each place registry's fill ceiling (FBC-fqv5 item 3); opens the MDS
+touch (bbo) on the guarded MDS origin and refuses a touch older than --touch-max-age-ms, a
+crossed or locked one, or one from before the MDS connection's current epoch; and refuses
+either cap below three of the instrument's minimum size at the touch. Then it stops, its
+outcome not ok: the place stages after the preflight are not built yet, so nothing
+authenticated connects for a place stage, and no account is read but by the hold.
 
 Before anything connects it refuses any origin but the environment's own (or, for a test stub,
 all of them loopback addresses): without --production, a production origin is refused; with it,
@@ -67,9 +91,10 @@ with no reconnection. Once its connection is over, whatever ended it, the named 
 read again, and the report gives both reads. Ctrl-C is the hold's from its connection's opening
 until its close and the read of the echo are over: before the hold ended it ends the hold, and
 while the hold closes it is recorded; either stops a run that also arms, so no session starts.
-Ctrl-C at any other time ends the program at once, writing no report, as it always has. A run
-that holds needs no --arm, and one with no --arm takes no --registry-span, --ledger-max-age or
---ledger-max-entries.
+Ctrl-C at any other time ends the program at once, writing no report, as it always has; in a
+place-stage run, Ctrl-C on the hold stops it before its preflight. A run that holds needs no
+--arm, and one with neither --arm nor --place-stages takes no --registry-span, --ledger-max-age
+or --ledger-max-entries.
 
 To hold on QFEX production (decision 0146 item 1), with no session:
 
@@ -97,11 +122,12 @@ Options:
                            under fixtures/qfex/exec-recorded/hold/, or hold-production/ with
                            --production, beside the owner's README (decision 0146 item 6)
   --arm <ACCOUNT>          once or twice, in run order: primary, or subaccount (the one
-                           {SUB_ID_VAR} names); required unless --hold-secs is given
+                           {SUB_ID_VAR} names); required unless --hold-secs is given, or
+                           --place-stages, which refuses it
   --hold-secs <S>          hold one trade connection that never arms for S whole seconds from
                            its opening, 1 to {MAX_HOLD_S} (a day), before any session (decision
                            0146); no default: without it there is no hold, and a run with
-                           neither it nor --arm is refused
+                           none of it, --arm and --place-stages is refused
   --hold-account <ACCOUNT> the account the hold authenticates as: primary (the default with
                            --hold-secs), or subaccount (the one {SUB_ID_VAR} names)
   --rpc-timeout-ms <MS>    the arm's deadline, its window of capture: 501 to 60000 (default
@@ -114,20 +140,53 @@ Options:
                            authentication deadline and the longer of --rpc-timeout-ms and the
                            resync's {resync} s deadline together, so the program never stops a
                            session while its arm or its resync is in flight
-  --registry-span <S>      required with --arm, no default, refused without it: the longest
-                           from a registry's first session's start to its last session's end,
-                           1 to {MAX_SPAN_S}; a session that
+  --registry-span <S>      required with --arm, no default, refused without it or
+                           --place-stages: the longest from a registry's first session's start
+                           to its last session's end, 1 to {MAX_SPAN_S}; a session that
                            reaches it is stopped. Longer than --connect-wait-ms, QFEX's 60 s
                            authentication deadline and the longer of --rpc-timeout-ms and the
                            resync's {resync} s deadline together, as --session-wait is. Stage
                            one gives each session its own registry
-  --ledger-max-age <S>     required with --arm, no default, refused without it: how long each
-                           registry's fill ledger keeps a fill, 1 to {MAX_AGE_S}; longer than
-                           --registry-span (decision 0132 item 5)
-  --ledger-max-entries <N> required with --arm, no default, refused without it: the most
-                           fills it keeps, 1 to {MAX_ENTRIES}; above the fill ceiling, every
-                           order a registry's sessions may place at its largest size in size
-                           steps (stage one places nothing: 0)
+  --ledger-max-age <S>     required with --arm, no default, refused without it or
+                           --place-stages: how long each registry's fill ledger keeps a fill,
+                           1 to {MAX_AGE_S}; longer than --registry-span (decision 0132 item 5)
+  --ledger-max-entries <N> required with --arm, no default, refused without it or
+                           --place-stages: the most fills it keeps, 1 to {MAX_ENTRIES}; above
+                           the fill ceiling, every order a registry's sessions may place at its
+                           largest size in size steps (stage one places nothing: 0)
+                           With --place-stages the three are required too, --registry-span is
+                           at most 3600 (decision 0148 item 7) and longer than the drop test's
+                           two sessions, each --connect-wait-ms, QFEX's 60 s authentication
+                           deadline, the longer of --rpc-timeout-ms and the resync's {resync} s
+                           deadline and --agree-wait-ms, and the reads of every named account
+                           between them, each --read-wait-ms (FBC-fqv5 item 3)
+  --place-stages           the place stages' preflight (above): refused with --arm, and without
+                           --production; needs every flag below, each of which it alone takes
+  --symbol <SYMBOL>        required: the venue symbol traded, at most 32 ASCII letters, digits
+                           and punctuation; never written to the report, the evidence or a
+                           fixture
+  --side <SIDE>            required, buy or sell, no default: the side of every place but a
+                           flatten's, which takes the other
+  --sole-trader            required: no other process, Java or Rust, trades any account of the
+                           user (decision 0148 item 7)
+  --resting-cap-usd <USD>  required, positive, no default: the resting cap (decision 0113)
+  --inventory-cap-usd <USD>
+                           required, positive, no default: the inventory cap; both caps are
+                           printed on the CAPS line before any request, and neither is written
+                           to the report or the evidence
+  --away-bps <BPS>         required: how far behind the touch a resting order rests, 20 to 10000
+  --flatten-cap-bps <BPS>  required: how far through the touch it crosses a flatten IOC may be
+                           priced, at least 1 and below --away-bps
+  --flatten-attempts <N>   required: the flatten IOCs an account may place in a run, 1 to 3
+  --namespace <N>          required: the client-id namespace, 1 to 65535
+  --lease-dir <DIR>        the place stages' lease directory, an absolute path (default
+                           $HOME/.fueledbychai/{LEASE_DIR_NAME}); never the Paradex testnet
+                           samples' default
+  --agree-wait-ms <MS>     required, 1 to 60000: how long a read may lag the streams
+  --read-interval-ms <MS>  required, 1000 to 60000: the time between two reads of a comparison;
+                           one read, then one each --read-interval-ms within --agree-wait-ms,
+                           at most {MAX_READS} in all (FBC-fqv5 item 4)
+  --touch-max-age-ms <MS>  required, 1 to 60000: a touch older than this is not priced from
   --trade-url <URL>        default {PREPROD_TRADE}, or {PRODUCTION_TRADE} with --production
   --rest-url <URL>         default {PREPROD_REST}, or {PRODUCTION_REST} with --production
   --mds-url <URL>          default {PREPROD_MDS}, or {PRODUCTION_MDS} with --production
@@ -209,15 +268,352 @@ fn environment(production: bool) -> Environment {
     }
 }
 
+/// The place stages' lease directory's name under `$HOME/.fueledbychai`: production's own, apart
+/// from the Paradex testnet samples' (decision 0148 item 7). No pre-production place path is
+/// built (FBC-fqv5 item 1), so there is no pre-production one.
+pub const LEASE_DIR_NAME: &str = "qfex_probe_production";
+
+/// The most reads one comparison of the streams against the reads makes: one, then one each
+/// `--read-interval-ms` within `--agree-wait-ms` (FBC-fqv5 item 4).
+pub const MAX_READS: u64 = 10;
+
+/// The longest `--registry-span` a place-stage run takes: an hour (decision 0148 item 7).
+pub const MAX_PLACE_SPAN_S: u64 = 3600;
+
+/// The longest venue symbol `--symbol` takes.
+pub const MAX_SYMBOL: usize = 32;
+
+/// What a place-stage run asks for (`--place-stages`, FBC-c6kw), beside the [`Options`] every
+/// run takes: each value the owner's, with no default but the lease directory's, and refused
+/// before anything connects (decisions 0113 and 0148 item 7). `--sole-trader` is required, so a
+/// parsed run always gave it; it is not kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Places {
+    /// `--symbol`: the venue symbol traded, shape-checked only, and never written to a fixture,
+    /// the report or the evidence.
+    pub symbol: String,
+    /// `--side`: the side of every place but a flatten's, which takes the other.
+    pub side: Side,
+    /// `--resting-cap-usd` and `--inventory-cap-usd`: positive, printed on the CAPS line alone.
+    pub resting_cap_usd: Decimal,
+    pub inventory_cap_usd: Decimal,
+    /// `--away-bps`: how far behind the touch a resting order rests, 20 to 10000.
+    pub away_bps: u32,
+    /// `--flatten-cap-bps`: how far through the touch it crosses a flatten IOC may be priced, at
+    /// least 1 and below `away_bps`.
+    pub flatten_cap_bps: u32,
+    /// `--flatten-attempts`: the flatten IOCs an account may place in a run, 1 to 3.
+    pub flatten_attempts: u64,
+    /// `--namespace`: the client-id namespace. The driver (FBC-23ch) mints under its lease.
+    #[allow(dead_code)]
+    pub namespace: u16,
+    /// `--lease-dir`, or its default under `$HOME` ([`LEASE_DIR_NAME`]). The driver (FBC-23ch)
+    /// holds its leases there.
+    #[allow(dead_code)]
+    pub lease_dir: PathBuf,
+    /// `--agree-wait-ms`: how long a read may lag the streams (FBC-23ch's comparisons), which
+    /// the span bound's floor counts.
+    pub agree_wait: Duration,
+    /// `--read-interval-ms`: the time between two reads of one comparison (FBC-23ch).
+    #[allow(dead_code)]
+    pub read_interval: Duration,
+    /// `--touch-max-age-ms`: a touch older than this is not priced from.
+    pub touch_max_age: Duration,
+}
+
 /// What the command line asked for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Parsed {
     Help,
     Run(Box<Options>),
+    /// A place-stage run (`--place-stages`): its options, and what the place stages ask for.
+    Places(Box<Options>, Box<Places>),
 }
 
-/// Parses the arguments after the program name.
+/// The place stages' flags as typed, each checked as it is read, before they are put together
+/// ([`places`]).
+#[derive(Default)]
+struct PlaceArgs {
+    /// `--place-stages`.
+    asked: bool,
+    /// The place-stage flags typed so far, in order: the first for the refusal of one given
+    /// without `--place-stages`, each for the refusal of one given twice.
+    seen: Vec<&'static str>,
+    symbol: Option<String>,
+    side: Option<Side>,
+    sole_trader: bool,
+    resting_cap_usd: Option<Decimal>,
+    inventory_cap_usd: Option<Decimal>,
+    away_bps: Option<u32>,
+    flatten_cap_bps: Option<u32>,
+    flatten_attempts: Option<u64>,
+    namespace: Option<u16>,
+    lease_dir: Option<PathBuf>,
+    agree_wait: Option<Duration>,
+    read_interval: Option<Duration>,
+    touch_max_age: Option<Duration>,
+}
+
+impl PlaceArgs {
+    /// Reads `flag`, a place stage's, taking its value from `value` when it has one: `Ok(false)`
+    /// when `flag` is none of them. A flag given twice is refused, naming it and neither value,
+    /// rather than the last one kept: each sets the direction or the size of real orders.
+    fn read(
+        &mut self,
+        flag: &str,
+        value: &mut dyn FnMut() -> Result<String, String>,
+    ) -> Result<bool, String> {
+        // Only a place-stage flag is ever seen, so a flag seen before is one given twice.
+        if self.seen.contains(&flag) {
+            return Err(format!(
+                "{flag} is given twice: each place-stage flag is given once (the values are not \
+                 shown)"
+            ));
+        }
+        let name: &'static str = match flag {
+            "--symbol" => {
+                self.symbol = Some(symbol(&value()?)?);
+                "--symbol"
+            }
+            "--side" => {
+                self.side = Some(side(&value()?)?);
+                "--side"
+            }
+            "--sole-trader" => {
+                self.sole_trader = true;
+                "--sole-trader"
+            }
+            "--resting-cap-usd" => {
+                self.resting_cap_usd = Some(testnet::positive(flag, &value()?)?);
+                "--resting-cap-usd"
+            }
+            "--inventory-cap-usd" => {
+                self.inventory_cap_usd = Some(testnet::positive(flag, &value()?)?);
+                "--inventory-cap-usd"
+            }
+            "--away-bps" => {
+                self.away_bps = Some(number(flag, &value()?, 20, 10_000)? as u32);
+                "--away-bps"
+            }
+            "--flatten-cap-bps" => {
+                self.flatten_cap_bps = Some(number(flag, &value()?, 1, 9_999)? as u32);
+                "--flatten-cap-bps"
+            }
+            "--flatten-attempts" => {
+                let attempts = number(flag, &value()?, 1, MAX_FLATTEN_ATTEMPTS)?;
+                self.flatten_attempts = Some(attempts);
+                "--flatten-attempts"
+            }
+            "--namespace" => {
+                self.namespace = Some(number(flag, &value()?, 1, 65_535)? as u16);
+                "--namespace"
+            }
+            "--lease-dir" => {
+                self.lease_dir = Some(testnet::absolute(&value()?)?);
+                "--lease-dir"
+            }
+            "--agree-wait-ms" => {
+                let ms = number(flag, &value()?, 1, 60_000)?;
+                self.agree_wait = Some(Duration::from_millis(ms));
+                "--agree-wait-ms"
+            }
+            "--read-interval-ms" => {
+                let ms = number(flag, &value()?, 1_000, 60_000)?;
+                self.read_interval = Some(Duration::from_millis(ms));
+                "--read-interval-ms"
+            }
+            "--touch-max-age-ms" => {
+                let ms = number(flag, &value()?, 1, 60_000)?;
+                self.touch_max_age = Some(Duration::from_millis(ms));
+                "--touch-max-age-ms"
+            }
+            _ => return Ok(false),
+        };
+        self.seen.push(name);
+        Ok(true)
+    }
+}
+
+/// The place stages' flags `args` put together, every one but `--lease-dir` required, for a run
+/// on production (`production`) that arms nothing (`arms`); `home` is `$HOME`, for the lease
+/// directory's default and the testnet samples' default it must not be. Refused naming the flag,
+/// never its value (decisions 0113 and 0148 item 7, FBC-fqv5 items 1 and 4).
+fn places(
+    args: PlaceArgs,
+    production: bool,
+    arms: &[Armed],
+    home: Option<OsString>,
+) -> Result<Places, String> {
+    if !arms.is_empty() {
+        return Err(
+            "--place-stages and --arm: the place stages arm their own sessions on each \
+                    named account in turn; give one or the other"
+                .to_owned(),
+        );
+    }
+    if !production {
+        return Err(
+            "--place-stages runs on QFEX production alone: give --production. No \
+                    pre-production place path is built (FBC-fqv5 item 1), since decision 0144 item \
+                    6 leaves which accounts the place stages read on pre-production undecided"
+                .to_owned(),
+        );
+    }
+    let need = |flag: &str| format!("{flag} is required with --place-stages: it has no default");
+    if !args.sole_trader {
+        return Err(format!(
+            "{}: no other process, Java or Rust, may trade any account of the user while the place \
+             stages run (decision 0148 item 7)",
+            need("--sole-trader")
+        ));
+    }
+    let away_bps = args.away_bps.ok_or_else(|| need("--away-bps"))?;
+    let flatten_cap_bps = args
+        .flatten_cap_bps
+        .ok_or_else(|| need("--flatten-cap-bps"))?;
+    if flatten_cap_bps >= away_bps {
+        return Err(
+            "--flatten-cap-bps must be below --away-bps (decision 0148 item 7; the values \
+                    are not shown)"
+                .to_owned(),
+        );
+    }
+    let agree_wait = args.agree_wait.ok_or_else(|| need("--agree-wait-ms"))?;
+    let read_interval = args
+        .read_interval
+        .ok_or_else(|| need("--read-interval-ms"))?;
+    if reads(agree_wait, read_interval) > MAX_READS {
+        return Err(format!(
+            "--agree-wait-ms with --read-interval-ms allows more than {MAX_READS} reads per \
+             comparison: one read, then one each --read-interval-ms within --agree-wait-ms \
+             (FBC-fqv5 item 4; the values are not shown)"
+        ));
+    }
+    let lease_dir = match args.lease_dir {
+        Some(dir) if dir.components().any(|c| c == Component::ParentDir) => {
+            return Err(
+                "--lease-dir: a path with a `..` component, which could name the Paradex \
+                 testnet samples' default lease directory: give it without one (the path is not \
+                 shown)"
+                    .to_owned(),
+            );
+        }
+        Some(dir) => dir,
+        None => testnet::lease_dir_named(home.clone(), LEASE_DIR_NAME)?,
+    };
+    if testnet::lease_dir_under(home).is_ok_and(|testnet| same_dir(&testnet, &lease_dir)) {
+        return Err(
+            "--lease-dir: the Paradex testnet samples' default lease directory: the place \
+                    stages keep their leases apart from it (decision 0148 item 7; the path is not \
+                    shown)"
+                .to_owned(),
+        );
+    }
+    Ok(Places {
+        symbol: args.symbol.ok_or_else(|| need("--symbol"))?,
+        side: args.side.ok_or_else(|| need("--side"))?,
+        resting_cap_usd: args
+            .resting_cap_usd
+            .ok_or_else(|| need("--resting-cap-usd"))?,
+        inventory_cap_usd: args
+            .inventory_cap_usd
+            .ok_or_else(|| need("--inventory-cap-usd"))?,
+        away_bps,
+        flatten_cap_bps,
+        flatten_attempts: args
+            .flatten_attempts
+            .ok_or_else(|| need("--flatten-attempts"))?,
+        namespace: args.namespace.ok_or_else(|| need("--namespace"))?,
+        lease_dir,
+        agree_wait,
+        read_interval,
+        touch_max_age: args
+            .touch_max_age
+            .ok_or_else(|| need("--touch-max-age-ms"))?,
+    })
+}
+
+/// Whether `a` and `b` are one directory: equal as written (a trailing slash or a `.` aside), or,
+/// where both exist, once each symbolic link is resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let resolved = |p: &Path| std::fs::canonicalize(p).ok();
+    a == b || resolved(a).is_some_and(|a| resolved(b) == Some(a))
+}
+
+/// The reads one comparison makes within `agree_wait` at `read_interval`: one, then one each
+/// interval (FBC-fqv5 item 4).
+pub fn reads(agree_wait: Duration, read_interval: Duration) -> u64 {
+    let each = read_interval.as_millis().max(1);
+    let more = agree_wait.as_millis() / each;
+    u64::try_from(more).unwrap_or(u64::MAX).saturating_add(1)
+}
+
+/// The floor a place-stage run's `--registry-span` must be above (FBC-fqv5 item 3): the drop
+/// test's two sessions, each opening within `--connect-wait-ms`, authenticating within QFEX's
+/// deadline, waiting out the longer of `--rpc-timeout-ms` and the resync's deadline, and its
+/// reads lagging the streams by up to `--agree-wait-ms`, and between them the reads of each of
+/// the `accounts` named accounts, each within `--read-wait-ms`.
+pub fn place_span_floor(opts: &Options, places: &Places, accounts: usize) -> Duration {
+    let settled = Duration::from_millis(opts.rpc_timeout_ms).max(RESYNC_TIMEOUT);
+    let session = opts.connect_wait + AUTH_DEADLINE + settled + places.agree_wait;
+    let reads = opts.read_wait * u32::try_from(accounts).unwrap_or(u32::MAX);
+    session * 2 + reads
+}
+
+/// Refuses a place-stage run whose span bound is not above [`place_span_floor`] for its
+/// `accounts` named accounts, naming `--registry-span` and never a value: the span bound could
+/// otherwise stop the drop test's second session before its reads end (FBC-fqv5 item 3).
+pub fn check_place_span(opts: &Options, places: &Places, accounts: usize) -> Result<(), String> {
+    let span = opts.ledger.as_ref().map(Bounds::span);
+    match span.is_some_and(|span| span > place_span_floor(opts, places, accounts)) {
+        true => Ok(()),
+        false => Err(format!(
+            "--registry-span must be longer than the drop test's two sessions, each \
+             --connect-wait-ms, QFEX's {} s authentication deadline, the longer of \
+             --rpc-timeout-ms and the resync's {} s deadline and --agree-wait-ms, and the reads of \
+             every named account between them, each --read-wait-ms, or the span bound could stop \
+             its second session before its reads end (FBC-fqv5 item 3; the values are not shown)",
+            AUTH_DEADLINE.as_secs(),
+            RESYNC_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// A venue symbol as `--symbol` takes it: non-empty, ASCII graphic, at most [`MAX_SYMBOL`]
+/// bytes. Its shape only: discovery says whether QFEX lists it. Refused, never shown.
+fn symbol(value: &str) -> Result<String, String> {
+    let shaped = !value.is_empty()
+        && value.len() <= MAX_SYMBOL
+        && value.bytes().all(|b| b.is_ascii_graphic());
+    match shaped {
+        true => Ok(value.to_owned()),
+        false => Err(format!(
+            "--symbol: not a venue symbol of at most {MAX_SYMBOL} ASCII letters, digits and \
+             punctuation (the value is not shown)"
+        )),
+    }
+}
+
+/// `buy` or `sell`.
+fn side(value: &str) -> Result<Side, String> {
+    match value {
+        "buy" => Ok(Side::Buy),
+        "sell" => Ok(Side::Sell),
+        _ => Err("--side: buy or sell (the value is not shown)".to_owned()),
+    }
+}
+
+/// Parses the arguments after the program name, `$HOME` read for a place-stage run's lease
+/// directory ([`places`]).
 pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
+    parse_with_home(argv, std::env::var_os("HOME"))
+}
+
+/// Parses the arguments after the program name, `home` standing for `$HOME`.
+pub fn parse_with_home(
+    argv: impl IntoIterator<Item = String>,
+    home: Option<OsString>,
+) -> Result<Parsed, String> {
     let mut evidence_dir = None;
     let mut arms = Vec::new();
     let mut production = false;
@@ -232,6 +628,8 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
     let (mut span, mut max_age, mut max_entries) = (None, None, None);
     // The hold: none unless --hold-secs asks for one.
     let (mut hold_secs, mut hold_account) = (None, None);
+    // The place stages' flags (FBC-c6kw): none unless --place-stages asks for them.
+    let mut place = PlaceArgs::default();
     let mut argv = argv.into_iter();
     while let Some(arg) = argv.next() {
         let mut value = || {
@@ -240,9 +638,13 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
                 .filter(|v| !v.is_empty() && !v.starts_with("--"));
             value.ok_or_else(|| format!("{arg} needs a value"))
         };
+        if place.read(&arg, &mut value)? {
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--production" => production = true,
+            "--place-stages" => place.asked = true,
             "--evidence-dir" => evidence_dir = Some(absolute(&value()?)?),
             "--arm" => arms.push(armed(&value()?, &arms)?),
             "--hold-secs" => hold_secs = Some(secs(&arg, &value()?, MAX_HOLD_S)?),
@@ -275,18 +677,34 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         }
         (None, None) => None,
     };
-    if arms.is_empty() && hold.is_none() {
+    if let (false, Some(flag)) = (place.asked, place.seen.first()) {
+        return Err(format!(
+            "{flag} is a place stage's flag: give --place-stages too"
+        ));
+    }
+    if arms.is_empty() && hold.is_none() && !place.asked {
         return Err(
-            "--arm or --hold-secs is required: arm on primary, subaccount or both, hold a \
-             connection, or both"
+            "--arm or --hold-secs is required, or --place-stages: arm on primary, subaccount or \
+             both, hold a connection, run the place stages' preflight, or hold first"
                 .to_owned(),
         );
     }
-    let ledger = match arms.is_empty() {
+    let places = match place.asked {
+        true => Some(places(place, production, &arms, home)?),
+        false => None,
+    };
+    if places.is_some() && span.is_some_and(|span| span > Duration::from_secs(MAX_PLACE_SPAN_S)) {
+        return Err(format!(
+            "--registry-span: at most {MAX_PLACE_SPAN_S} s with --place-stages (decision 0148 \
+             item 7; the value is not shown)"
+        ));
+    }
+    let ledger = match arms.is_empty() && places.is_none() {
         true if span.is_some() || max_age.is_some() || max_entries.is_some() => {
             return Err(
                 "--registry-span, --ledger-max-age and --ledger-max-entries bound the \
-                        registries --arm builds: a run with no --arm takes none of them"
+                        registries --arm and --place-stages build: a run with no --arm takes none \
+                        of them, unless it runs --place-stages"
                     .to_owned(),
             );
         }
@@ -299,7 +717,7 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         )?),
     };
     let [trade, rest, mds] = environment(production).origins();
-    Ok(Parsed::Run(Box::new(Options {
+    let opts = Box::new(Options {
         evidence_dir,
         arms,
         hold,
@@ -315,7 +733,11 @@ pub fn parse(argv: impl IntoIterator<Item = String>) -> Result<Parsed, String> {
         session_wait,
         ledger,
         rate_user: USER,
-    })))
+    });
+    Ok(match places {
+        Some(places) => Parsed::Places(opts, Box::new(places)),
+        None => Parsed::Run(opts),
+    })
 }
 
 /// The ledger's bounds of a run that arms, from its three flags, each required, and the waits
