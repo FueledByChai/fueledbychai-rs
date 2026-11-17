@@ -47,14 +47,14 @@
 //! that ledger and lists each one the ledger refuses for its time (`Link::fill_refusals`), and
 //! [`PlaceRun::session_ended`] reads the ledger back from it.
 //!
-//! What the place stages' driver does with them (FBC-23ch's drop session one, in `stage.rs`): it
-//! spends each list and the shared flatten budget as it authorizes places, and builds no place
-//! beyond them; it seeds each market flat after clean reads of every named account and arms it
-//! under the market lease; it gives each registry's trip to the journal before any market arms;
-//! it stops on a fill the `Link` lists as refused; and it records the ledger at each session's
-//! end ([`PlaceRun::session_ended`]), which the report renders with its list and ceiling as
-//! fences met ([`place_markdown`]). Still to come: the drop test's second session on the same
-//! registry (one deadline for both, FBC-77r8), and the cancels by venue id begun one
+//! What the place stages' driver does with them (FBC-23ch's and FBC-77r8's drop test, in
+//! `stage.rs`): it spends each list and the shared flatten budget as it authorizes places, and
+//! builds no place beyond them; it seeds each market flat after clean reads of every named account
+//! and arms it under the market lease; it gives each registry's trip to the journal before any
+//! market arms; it stops on a fill the `Link` lists as refused; and it records the ledger at each
+//! session's end ([`PlaceRun::session_ended`]), which the report renders with its list and ceiling
+//! as fences met ([`place_markdown`]). The drop test's two sessions share its account's drop
+//! registry and one deadline (FBC-77r8). Still to come: the cancels by venue id begun one
 //! `--rpc-timeout-ms` before the span bound outside the drop test, since the bound is when a
 //! session is stopped and the session ends after it ([`AtEnd::past_span`] records by how much;
 //! [`RegistryRun::held`] fails a registry whose session ended at or past the age bound).

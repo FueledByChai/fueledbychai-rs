@@ -12,7 +12,10 @@
 //! decisions 0132 item 3 and 0134 keep in place of the whole frame, so the arm's own echo is
 //! there as received but its err message. Each frame is placed against the arm: before it was
 //! written, in its window (from its write to its own deadline, or the connection's end: the
-//! deadline of another request, a place's, ends no window), or after.
+//! deadline of another request, a place's, ends no window), or after. A session's end is taken
+//! as its connection's end when the journal holds no `Closed` control for it, as after an abrupt
+//! drop (FBC-77r8): the first record of a later session ends it, its window and the page it waits
+//! for alike.
 //! A frame that is not a top-level `ack` or `err` envelope echoing a request has every JSON number
 //! replaced by `0` ([`scrub`], [`zero_numbers`]), so no amount of the account (a position, a
 //! margin, a balance) is published (decision 0009); its member names, strings and nesting are as
@@ -61,7 +64,7 @@ use std::path::Path;
 
 use fbc_core::{CidMatch, ClientOrderId, RpcId, SpecTable, VenueOrderId};
 use fbc_journal::{ControlEvent, JournalReader, Marker, Opcode, Record};
-use fbc_venue_qfex::account_reads::PageOrder;
+use fbc_venue_qfex::account_reads::{OrdersPage, PageOrder, Positions};
 use fbc_venue_qfex::exec::ARM;
 use serde_json::{Map, Value};
 
@@ -99,9 +102,46 @@ pub struct AccountRead {
     /// it, whatever client id its row carries ([`AllowedOrder::names`]): what the reads after a
     /// session say of whether X rests, apart from what a read before a session admits.
     pub page_lists_it: bool,
+    /// The `open_orders` GET /user/positions counts on symbols other than the admitted order's,
+    /// when the page listed it ([`AccountRead::of`]): none otherwise.
+    pub rest_open_elsewhere: u64,
 }
 
 impl AccountRead {
+    /// What one account's reads showed: `positions`, its GET /user/positions, and `page`, one
+    /// `get_user_orders` page on a socket of its own that never armed, counting the orders that
+    /// are `allowed` when it is on `account` ([`AllowedOrder::count`]), whether it lists that
+    /// order at all ([`AllowedOrder::listed`]) and, when the page admits that order, the REST
+    /// `open_orders` on every other symbol than its own.
+    pub fn of(
+        positions: &Positions,
+        page: &OrdersPage,
+        allowed: Option<&AllowedOrder>,
+        account: Armed,
+    ) -> AccountRead {
+        let rows = positions.rows();
+        let on = allowed.filter(|a| a.account == account).and_then(|a| {
+            let mut listed = page.orders().iter();
+            listed.find(|o| a.matches(&o.order, &o.client))
+        });
+        let elsewhere = on.map_or(0, |order| {
+            let others = rows.iter().filter(|row| row.symbol != order.symbol);
+            others.map(|row| row.open_orders).sum()
+        });
+        AccountRead {
+            rows: rows.len(),
+            flat: positions.is_flat(),
+            rest_open_orders: rows.iter().map(|row| row.open_orders).sum(),
+            page_orders: page.orders().len(),
+            page_twaps: page.twaps(),
+            page_full: page.is_full(),
+            page_allowed: AllowedOrder::count(allowed, account, page.orders()),
+            page_lists_it: AllowedOrder::listed(allowed, account, page.orders()),
+            rest_open_elsewhere: elsewhere,
+            ..AccountRead::default()
+        }
+    }
+
     /// Why no session may start on it, or `None` when one may: no open order or TWAP on the
     /// page but the one order it admits, if any ([`AccountRead::page_allowed`]), every position
     /// flat, and no open order counted by REST beyond that one. Decision 0132 item 7 asks an
@@ -109,7 +149,9 @@ impl AccountRead {
     /// session, when X alone may be open. The probe reads it strictly: a REST `open_orders` count
     /// above the orders admitted refuses too, since an order the page does not list (a stop
     /// order, which no page says it covers) could be cancelled by the arm (item 2) and its
-    /// `CANCELLED` report would then confound the arm's capture.
+    /// `CANCELLED` report would then confound the arm's capture. With X admitted and listed, REST
+    /// must count exactly it, one open order on its symbol and none on another (0132 item 7, 0144
+    /// item 4).
     pub fn refusal(&self) -> Option<String> {
         let unadmitted = self.page_orders.saturating_sub(self.page_allowed);
         let admitted = u64::try_from(self.page_allowed).unwrap_or(u64::MAX);
@@ -125,6 +167,13 @@ impl AccountRead {
                  strictly, since an order the page does not list could be cancelled by the arm \
                  and confound its capture",
                 self.rest_open_orders
+            ))
+        } else if self.rest_open_orders < admitted || self.rest_open_elsewhere > 0 {
+            Some(format!(
+                "{page}, but GET /user/positions counts {} open orders, {} of them on another \
+                 symbol than its own: the read admits it alone, as one open order on its symbol \
+                 (decision 0132 item 7)",
+                self.rest_open_orders, self.rest_open_elsewhere
             ))
         } else {
             None
@@ -425,9 +474,10 @@ pub struct Evidence {
     /// What a place-stage run did with stop markers (0151 item 6), once it opened its lease
     /// directory.
     pub marker: Option<crate::places::MarkerRun>,
-    /// What drop session one did and what its reads showed (FBC-23ch), once its registry was
-    /// built: names, flags, counts and times alone.
-    pub drop_one: Option<crate::places::DropRun>,
+    /// Each named account's drop test, in run order, once its registry was built (FBC-23ch,
+    /// FBC-77r8): what its two sessions did, what its reads showed and its verdict, names, flags,
+    /// counts and times alone.
+    pub drops: Vec<crate::places::DropRun>,
     /// Each place-stage registry built: its step, its declaration, its bounds as fences, and its
     /// ledger at each of its sessions' ends (decision 0132 item 5).
     pub place_registries: Vec<crate::ledger::PlaceRun>,
@@ -1075,6 +1125,18 @@ fn read(
     texts: &mut Vec<(usize, usize, String)>,
     (scrub, specs): (Scrub, &SpecTable),
 ) {
+    // The sessions run one after the other, session `n` on connection `n`, so a record of a later
+    // session ends every earlier one: its end is taken as its close, its epoch journaled closed
+    // or not, since an abrupt drop (decision 0132 item 4's) may journal no `Closed` control.
+    if let Some(later) = conn_of(&record) {
+        let earlier = sessions.iter_mut().zip(window.iter_mut());
+        for (run, window) in earlier.take(usize::from(later)) {
+            run.pages.closed();
+            if window.when == When::InWindow {
+                window.when = When::AfterWindow;
+            }
+        }
+    }
     match record {
         Record::Outbound {
             conn, rpc, frame, ..
@@ -1198,13 +1260,16 @@ fn readme_places(ev: &Evidence) -> String {
         false => sessions.join(" then "),
     };
     format!(
-        "# QFEX trade-socket frames: the drop test's first session\n\n\
+        "# QFEX trade-socket frames: the drop test's sessions\n\n\
          Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
-         `qfex_preprod_probe` (crates/fbc-examples, FBC-23ch, a slice of FBC-9sk2; decisions \
-         0148 and 0151): the place stages' drop session one of decision 0132 item 4's drop test \
-         ({sessions}), on an account named by the run's configuration, not listed by QFEX \
-         (decision 0144). These are recorded frames, not synthetic ones: this directory carries \
-         no SYNTHETIC marker.\n\n\
+         `qfex_preprod_probe` (crates/fbc-examples, FBC-23ch and FBC-77r8, slices of FBC-9sk2; \
+         decisions 0148 and 0151): both sessions of each named account's drop test of decision \
+         0132 item 4 ({sessions}), on accounts named by the run's configuration, not listed by \
+         QFEX (decision 0144). Drop session one ends by a graceful close; drop session two by \
+         an abrupt drop, with no WebSocket close, so its frames end at the drop and its \
+         connection's end is taken as the next session's first record, or the journal's end. \
+         These are recorded frames, not synthetic ones: this directory carries no SYNTHETIC \
+         marker.\n\n\
          Each file is one frame QFEX sent on a session's trade socket, in the order received, \
          named `<account>-<session>-<n>-<when>.json` against the session's arm: `before-arm`, \
          `in-window` (from the arm's write to its own deadline or the connection's end) or \

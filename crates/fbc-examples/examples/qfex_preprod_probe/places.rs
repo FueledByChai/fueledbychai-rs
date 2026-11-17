@@ -33,6 +33,11 @@
 //!   without `--reconciled`, and refuses `--reconciled` when none exists. With it, the run reads every named account first and clears
 //!   the marker only if every read is clean; the declaration is the owner's, which the probe does
 //!   not check, and the report says so. Stage one and the hold neither read nor write it.
+//! - **The drop test's record** ([`DropRun`], [`TwoRun`], [`Traded`]; FBC-23ch, FBC-77r8): each
+//!   named account's two drop sessions, the reads after them and the verdict, as the report and
+//!   the evidence show them ([`drop_markdown`], [`drop_to_json`]): names, flags, counts, status
+//!   and member names, and times, never an id, a price or a size. A later session of a
+//!   registry's watches only what follows its start ([`Watched::after`]).
 
 use std::cell::RefCell;
 use std::fmt::Write as _;
@@ -75,6 +80,10 @@ pub const MINT_ACCOUNT: AccountKey = testnet::ACCT;
 /// `--reconciled`, the reads that clear the stop marker.
 pub const DROP_ONE: &str = "drop session one";
 
+/// The reads of every named account before drop session two, which admit X alone (decision
+/// 0132 item 7, 0144 item 4), as the report names them, and drop session two's own name.
+pub const DROP_TWO: &str = "drop session two";
+
 /// Why the place stages stopped (decisions 0132 item 7 and 0148 item 8): each reported by name
 /// ([`Stop::name`]) and by what it is ([`Stop::says`]), never with an id or an amount.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -92,6 +101,11 @@ pub enum Stop {
     ResyncDesync,
     /// A resync with a fill unsettled across it (`Unsettled`).
     ResyncUnsettled,
+    /// The drop test failed: the reads after the drop did not show X and Y ended
+    /// (`verdict::DropVerdict`).
+    DropFailed,
+    /// The read before the drop showed X cancelled by the arm with no report of it.
+    ArmCancelUnreported,
     /// A session that ended with a position that is not flat, or a fill of ours seen after it
     /// with no session open (0151 item 9).
     NotFlat,
@@ -142,13 +156,15 @@ pub enum RefusedOn {
 
 impl Stop {
     /// Every stop, in the order the report lists them.
-    pub const ALL: [Stop; 20] = [
+    pub const ALL: [Stop; 22] = [
         Stop::NotOurCid,
         Stop::StrayOrder,
         Stop::ReplayRefused(Replay::Untimed),
         Stop::ReplayRefused(Replay::BeyondHorizon),
         Stop::ResyncDesync,
         Stop::ResyncUnsettled,
+        Stop::DropFailed,
+        Stop::ArmCancelUnreported,
         Stop::NotFlat,
         Stop::LeftResting,
         Stop::RateRefused {
@@ -182,6 +198,8 @@ impl Stop {
             Stop::ReplayRefused(Replay::BeyondHorizon) => "ReplayRefused(BeyondHorizon)",
             Stop::ResyncDesync => "ResyncDesync",
             Stop::ResyncUnsettled => "ResyncUnsettled",
+            Stop::DropFailed => "DropFailed",
+            Stop::ArmCancelUnreported => "ArmCancelUnreported",
             Stop::NotFlat => "NotFlat",
             Stop::LeftResting => "LeftResting",
             Stop::RateRefused { on } => match on {
@@ -230,6 +248,16 @@ impl Stop {
             }
             Stop::ResyncUnsettled => {
                 "a resync with a fill unsettled across it (decision 0132 item 7)"
+            }
+            Stop::DropFailed => {
+                "the drop test failed: the reads after the drop did not show X and Y absent from \
+                 get_user_orders, named by no get_user_trades row and listed by GET \
+                 /user/historic-orders (decision 0132 items 4 and 7, 0151 item 13)"
+            }
+            Stop::ArmCancelUnreported => {
+                "the read before the drop showed X cancelled by drop session two's arm with no \
+                 CANCELLED report of it, recorded and stopped on after the drop (decision 0132 \
+                 items 4 and 7)"
             }
             Stop::NotFlat => {
                 "a session that ended with a position that is not flat, or a fill of ours seen \
@@ -801,6 +829,17 @@ pub struct Watched {
 }
 
 impl Watched {
+    /// What a later session of `link`'s registry watches (FBC-77r8: drop session two): nothing
+    /// seen yet, the notes and fill refusals of the sessions before it already read, so none of
+    /// theirs is taken for its own.
+    pub fn after(link: &crate::link::Link) -> Watched {
+        Watched {
+            read: link.notes().len(),
+            refused: link.fill_refusals().len(),
+            ..Watched::default()
+        }
+    }
+
     /// The first stop the handler raised.
     pub fn stop(&self) -> Option<Stop> {
         self.stops.first().copied()
@@ -968,12 +1007,112 @@ pub struct XAfter {
     /// X's `terminal_status` on historic-orders when a row names its client id, as a status
     /// name (capitals, digits and underscores) or `(not a status name)`.
     pub terminal_status: Option<String>,
+    /// The member names a `get_user_trades` row read carried, every row's, in order: names
+    /// alone, never a value (decision 0132 item 5).
+    pub fields: Vec<String>,
     /// Why a read could not be made, when one could not.
     pub error: Option<String>,
 }
 
-/// Drop session one, as the report and the evidence show it (FBC-23ch): names, flags, counts and
-/// times alone.
+/// The reads of the drop test's orders after a session (FBC-be57, FBC-77r8): the
+/// `get_user_trades` rows since X's send and `GET /user/historic-orders`, for X alone after drop
+/// session one and for X then Y after the drop, counts and status names alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Traded {
+    /// The trades rows read since X's send.
+    pub trades: usize,
+    /// The rows naming each order read, in order, by its venue or client id.
+    pub naming: Vec<usize>,
+    /// Each order's `terminal_status` on historic-orders when a row names its client id, as a
+    /// status name ([`crate::verdict::status_name`]).
+    pub terminal: Vec<Option<String>>,
+    /// The member names a trades row read carried, every row's, in order.
+    pub fields: Vec<String>,
+    /// Whether every trades page was read, and every historic-orders page.
+    pub trades_whole: bool,
+    pub historic_whole: bool,
+    /// Why a read could not be made, when one could not.
+    pub error: Option<String>,
+}
+
+impl Traded {
+    /// What it read of X, the first order, as drop session one's reads report it.
+    pub fn x_after(&self) -> XAfter {
+        XAfter {
+            trades: self.trades,
+            trades_naming_x: self.naming.first().copied().unwrap_or(0),
+            trades_read: self.trades_whole,
+            terminal_status: self.terminal.first().cloned().flatten(),
+            fields: self.fields.clone(),
+            error: self.error.clone(),
+        }
+    }
+}
+
+/// `member` as the report keeps a member name a `get_user_trades` row carries: a name of lower
+/// case letters, digits and underscores, at most 32, or `(not a member name)`, so no other text
+/// QFEX writes there reaches an output.
+pub fn member_name(member: &str) -> String {
+    let named = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_';
+    match (1..=32).contains(&member.len()) && member.chars().all(named) {
+        true => member.to_owned(),
+        false => "(not a member name)".to_owned(),
+    }
+}
+
+/// Drop session two (FBC-77r8; decision 0132 item 4), as the report and the evidence show it:
+/// names, flags, counts and times alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TwoRun {
+    pub authenticated: bool,
+    /// The arm's outcome, as the session reported it.
+    pub arm: Option<String>,
+    pub resynced: bool,
+    /// Whether an `order_response` naming X reported it `CANCELLED` in the arm's window: from
+    /// the session's opening to the end of the read before the drop, since no report settles
+    /// nothing until that read and nothing of ours cancels in the drop test (decision 0132 item
+    /// 4).
+    pub x_cancel_reported: bool,
+    /// Whether an `order_response` naming X reported it `CANCELLED` in the session before the
+    /// drop: then the drop did not end X, and its reach over X is not measured (decision 0132
+    /// item 4).
+    pub x_cancelled_before_drop: bool,
+    /// Whether Y was still open in the registry as the connection dropped, with no `CANCELLED`
+    /// of it heard in the session: the drop then had Y of its own to cancel (0151 item 13).
+    pub y_open_at_drop: bool,
+    pub y: XRun,
+    /// What the read before the drop listed, X then Y, on a socket that never arms; `None` when
+    /// it was not made.
+    pub before_drop: Option<[bool; 2]>,
+    /// The stop's cancels, when a stop that cancels in a drop session came (0151 item 2).
+    pub cancels: Option<Cancels>,
+    /// Each comparison of the streams with the reads: after the stop's cancels alone.
+    pub compared: Vec<crate::compare::Compared>,
+    /// How the session ended: the abrupt drop, a graceful close after a stop, or its
+    /// connection's own end.
+    pub ended_by: Option<&'static str>,
+    /// The reads after the drop, until X and Y are absent or the wait ends (0151 item 4).
+    pub after_drop: Option<crate::verdict::AfterDrop>,
+    /// X's and Y's trades and historic-orders rows after the drop, or after drop session two
+    /// failed with no stop, Y's once it was submitted.
+    pub after: Option<Traded>,
+    /// Whether an order rested on the account once the session ended, as the read of every
+    /// named account after it showed, for the owner's hand cancel (decision 0132 item 7).
+    pub resting: bool,
+    /// Whether the account was read after the session.
+    pub read: bool,
+    /// Why the session could not run its course, when that was no stop: never an id or value.
+    pub error: Option<String>,
+    /// How QFEX gave back our client id on the session, frame by frame ([`DropRun::echoes`]).
+    pub echoes: Vec<String>,
+    /// Whether Y's `add_order` went out as encoded (FBC-blcw); `None` when none was sent.
+    pub as_encoded: Option<bool>,
+}
+
+/// One named account's drop test (FBC-23ch, FBC-77r8; decision 0132 item 4), as the report and
+/// the evidence show it: drop session one's items here, drop session two's in
+/// [`DropRun::two`], and the verdict, judged in this run on this account alone and kept in
+/// memory (decision 0148 item 2). Names, flags, counts and times alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DropRun {
     /// The account it ran on, as the configuration names it.
@@ -1014,6 +1153,19 @@ pub struct DropRun {
     /// Whether every `add_order` the session sent went out as encoded, carrying none of
     /// `take_profit`, `stop_loss` and `reduce_only` (FBC-blcw); `None` when none was sent.
     pub as_encoded: Option<bool>,
+    /// Whether the read before drop session two listed X on its account: X open as that session
+    /// armed; `None` when that read was not made.
+    pub x_before_two: Option<bool>,
+    /// Drop session two, once it was built.
+    pub two: Option<TwoRun>,
+    /// The drop test's verdict, once the reads after the drop were made (decision 0132 item 4,
+    /// 0151 item 13).
+    pub verdict: Option<crate::verdict::DropVerdict>,
+    /// Whether every read of the other named accounts during this drop test was clean (no open
+    /// order, no TWAP, flat); `None` when the configuration names no other account.
+    pub others_clean: Option<bool>,
+    /// The run's stop, by name, when one came during this drop test: nothing more is placed.
+    pub stop: Option<&'static str>,
 }
 
 /// Why the graceful close's cancel of X was not measured ([`close_verdict`]).
@@ -1133,15 +1285,16 @@ pub fn close_verdict(run: &DropRun, x: XAccountRead) -> Result<bool, CloseUnmeas
     }
 }
 
-/// How each frame the tee heard gave back our client id ([`DropRun::echoes`]).
-pub fn echoes(kept: &crate::tee::Kept) -> Vec<String> {
+/// How each frame the tee heard from its `from`th on gave back our client id
+/// ([`DropRun::echoes`]).
+pub fn echoes(kept: &crate::tee::Kept, from: usize) -> Vec<String> {
     use crate::tee::{EchoCid, Heard};
     let echo = |cid: EchoCid| match cid {
         EchoCid::Exact => "exact",
         EchoCid::Differs => "not byte for byte",
         EchoCid::Absent => "absent",
     };
-    (kept.heard.iter())
+    (kept.heard.iter().skip(from))
         .map(|h| match h {
             Heard::Order { status, cid, .. } => format!("order_response {status}: {}", cid.name()),
             Heard::Fill { cid, .. } => format!("fill_response: {}", cid.name()),
@@ -1150,9 +1303,10 @@ pub fn echoes(kept: &crate::tee::Kept) -> Vec<String> {
         .collect()
 }
 
-/// Whether every `add_order` in `kept` went out as encoded ([`DropRun::as_encoded`]).
-pub fn as_encoded(kept: &crate::tee::Kept) -> Option<bool> {
-    let sent = kept.sent();
+/// Whether every `add_order` in `kept` from its `from`th on went out as encoded
+/// ([`DropRun::as_encoded`]).
+pub fn as_encoded(kept: &crate::tee::Kept, from: usize) -> Option<bool> {
+    let sent = kept.sent().get(from..).unwrap_or_default();
     let carried = |s: &crate::tee::Sent| s.take_profit || s.stop_loss || s.reduce_only;
     (!sent.is_empty()).then(|| !sent.iter().any(carried))
 }
@@ -1189,11 +1343,132 @@ pub fn variant_name(value: &impl std::fmt::Debug) -> String {
     named[..end.unwrap_or(named.len())].to_owned()
 }
 
-/// The report's section on drop session one.
-pub fn drop_markdown(s: &mut String, run: &DropRun) {
-    let yn = |b: bool| if b { "yes" } else { "no" };
-    let arm = run.arm.as_deref().unwrap_or("none reported");
-    let close = match (run.close_cancelled_x, run.close_not_measured) {
+/// What the report says of an order of ours, X or Y, resting once drop session two ended
+/// short of its drop or after it, for the owner (decision 0132 item 7, on production's site as
+/// decision 0143 item 4 reads it).
+pub const HAND_CANCEL_ORDERS: &str = "an order rests on the account after drop session two: \
+     cancel every order of ours (X, Y) by hand on QFEX production's site, then give the next \
+     place-stage run --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
+
+/// What follows a drop test that did not stop the run: the next named account's.
+pub const NEXT_ACCOUNT: &str = "the next named account's drop test, which starts only after \
+     every named account reads clean again";
+
+/// What follows the last named account's drop test that did not stop the run: the run's end.
+pub const LAST_ACCOUNT: &str = "the run's end: stage two is not built yet (FBC-su9i builds it)";
+
+/// What the report says of a fill a drop test's reads after the drop show (0151 item 9).
+pub const OWNERS_POSITION: &str = "the run stops not flat, and the position is the owner's \
+     (0151 item 9)";
+
+fn yn(b: bool) -> &'static str {
+    if b { "yes" } else { "no" }
+}
+
+fn ms(d: Duration) -> String {
+    format!("{} ms", d.as_millis())
+}
+
+/// The report's section on one named account's drop test: what it answers (decision 0148 item
+/// 10), then drop session one, then drop session two. `last` is whether its account is the last
+/// named.
+pub fn drop_markdown(s: &mut String, run: &DropRun, last: bool) {
+    let two = run.two.as_ref();
+    let arm_two = two
+        .and_then(|t| t.arm.as_deref())
+        .unwrap_or("none reported");
+    let enabling = match (&run.verdict, two) {
+        (Some(v), _) => v.arm.says(),
+        (None, Some(t)) if t.x_cancel_reported => {
+            "yes, reported: a CANCELLED of X came in the arm's window".to_owned()
+        }
+        _ => "not measured: drop session two did not reach its drop".to_owned(),
+    };
+    let verdict = match &run.verdict {
+        Some(v) => v.says(),
+        None => "not judged: the drop test ended before its drop (decision 0132 item 4), so it \
+                 did not pass"
+            .to_owned(),
+    };
+    let reach = run.verdict.as_ref().map_or_else(
+        || "not measured: the drop test ended before its drop".to_owned(),
+        |v| v.reach.says(),
+    );
+    let fill = match run.stop {
+        Some("UnexpectedFill" | "NotFlat") if run.verdict.is_some() => {
+            format!("; {OWNERS_POSITION}")
+        }
+        _ => String::new(),
+    };
+    let others = match run.others_clean {
+        None => "no other account is named",
+        Some(true) => "yes: every read of every other named account was clean",
+        Some(false) => "no: a read of another named account was not clean (the reads below)",
+    };
+    let terminal = |n: usize| {
+        let after = two.and_then(|t| t.after.as_ref());
+        let status = after.and_then(|a| a.terminal.get(n).cloned().flatten());
+        let one = run.after.as_ref().and_then(|a| a.terminal_status.clone());
+        let status = if n == 0 { status.or(one) } else { status };
+        status.unwrap_or_else(|| "not listed".to_owned())
+    };
+    let mut fields: Vec<&str> = Vec::new();
+    let read = run.after.iter().flat_map(|a| a.fields.iter());
+    let read = read.chain(
+        two.and_then(|t| t.after.as_ref())
+            .into_iter()
+            .flat_map(|a| &a.fields),
+    );
+    for field in read {
+        if !fields.contains(&field.as_str()) {
+            fields.push(field);
+        }
+    }
+    let fields = match fields.is_empty() {
+        true => "not shown: no row was read".to_owned(),
+        false => fields.join(", "),
+    };
+    let followed = match (run.stop, last) {
+        (Some(stop), _) => format!(
+            "the run's stop, {stop}: nothing more is placed on this account, and no later named \
+             account's drop test runs (decision 0132 item 7)"
+        ),
+        (None, false) => NEXT_ACCOUNT.to_owned(),
+        (None, true) => LAST_ACCOUNT.to_owned(),
+    };
+    let _ = writeln!(
+        s,
+        "## The drop test on {} (FBC-23ch and FBC-77r8, decision 0132 item 4)\n\n\
+         On {} (named by the run's configuration), after every named account before it. Its \
+         verdict is judged in this run on this account's reads alone and kept in memory, never \
+         carried to another account or run (decision 0148 item 2).\n\n\
+         - What answers the arm: drop session one {}; drop session two {arm_two}\n\
+         - Whether enabling cancel-on-disconnect cancels open orders, and whether QFEX reports \
+           it: {enabling}\n\
+         - The drop test: {verdict}{fill}\n\
+         - The drop's reach over X, an order of an earlier connection: {reach}\n\
+         - Whether a graceful close cancels: {}\n\
+         - Whether the other named accounts stayed clean: {others}\n\
+         - terminal_status on GET /user/historic-orders: X {}; Y {}\n\
+         - The members a get_user_trades row carries: {fields}\n\
+         - What followed: {followed}\n",
+        run.account,
+        run.account,
+        run.arm.as_deref().unwrap_or("none reported"),
+        close_said(run),
+        terminal(0),
+        terminal(1),
+    );
+    one_markdown(s, run);
+    if let Some(two) = two {
+        two_markdown(s, run, two);
+    }
+}
+
+/// Whether drop session one's graceful close cancelled X ([`close_verdict`]), as the report
+/// says it: not measured with its reason when it was not.
+fn close_said(run: &DropRun) -> String {
+    match (run.close_cancelled_x, run.close_not_measured) {
         (Some(true), _) => "yes: X rested before it, no cancel of ours was sent, and the read \
              after it no longer listed X, with X's account flat after it and X's trades since \
              its send read whole, no row since then on the account (decision 0132 item 4)"
@@ -1203,8 +1478,12 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
             "not measured: {}",
             why.map_or("the session did not reach its close", CloseUnmeasured::says)
         ),
-    };
-    let cancels = match &run.cancels {
+    }
+}
+
+/// What a stop's cancels did, as the report says it.
+fn cancels_said(cancels: Option<&Cancels>) -> String {
+    match cancels {
         None => "none: no stop that cancels in a drop session came (0151 item 2)".to_owned(),
         Some(c) => format!(
             "Kill, then {} cancel{} by venue id; {}; {} press{} of Ctrl-C while they ran, each \
@@ -1219,7 +1498,56 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
             c.presses,
             if c.presses == 1 { "" } else { "es" }
         ),
-    };
+    }
+}
+
+/// An order's request, as the report says it: whether it was handed to the session, shown
+/// resting, echoed byte for byte, its outcome and its time to its ACK.
+fn placed_said(x: &XRun) -> String {
+    format!(
+        "handed to the session {}; shown resting by an order event {}; an ACK echoing its \
+         client id byte for byte {}; its request's outcome {}; from its send to its ACK {}",
+        yn(x.submitted),
+        yn(x.acked),
+        yn(x.exact_echo),
+        x.outcome.as_deref().unwrap_or("none reported"),
+        x.ack_after.map_or("not measured".to_owned(), ms),
+    )
+}
+
+/// The frames' client ids as QFEX gave them back, as the report says them.
+fn echoes_said(echoes: &[String]) -> String {
+    match echoes.is_empty() {
+        true => "none heard".to_owned(),
+        false => echoes.join("; "),
+    }
+}
+
+/// The comparisons' table.
+fn compared_markdown(s: &mut String, compared: &[crate::compare::Compared]) {
+    let _ = writeln!(
+        s,
+        "The comparisons of the streams with the reads (0151 item 4: a read at once, then each \
+         --read-interval-ms after the last began, at most 10 within --agree-wait-ms):\n\n\
+         | after | reads | first agreeing read after the step | ended |\n\
+         | --- | --- | --- | --- |"
+    );
+    for c in compared {
+        let first = c.first_agreed.map_or("none".to_owned(), ms);
+        let _ = writeln!(
+            s,
+            "| {} | {} | {first} | {} |",
+            c.step,
+            c.reads.len(),
+            ended(c.ended)
+        );
+    }
+    let _ = writeln!(s);
+}
+
+/// The report's section on drop session one.
+fn one_markdown(s: &mut String, run: &DropRun) {
+    let arm = run.arm.as_deref().unwrap_or("none reported");
     let after = match &run.after {
         None => "not read".to_owned(),
         Some(a) => format!(
@@ -1242,18 +1570,16 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
     };
     let _ = writeln!(
         s,
-        "## Drop session one (FBC-23ch, decision 0132 item 4)\n\n\
-         On {} (named by the run's configuration). Until an ACK echoes our client id, a \
-         session places at most one post-only GTC far from the touch (decision 0132 item 7): \
-         X, at the instrument's minimum size, --away-bps behind the touch (a fence met; no price \
-         or size is shown).\n\n\
+        "### Drop session one (FBC-23ch)\n\n\
+         Until an ACK echoes our client id, a session places at most one post-only GTC far from \
+         the touch (decision 0132 item 7): X, at the instrument's minimum size, --away-bps \
+         behind the touch (a fence met; no price or size is shown).\n\n\
          - Stream authenticated: {}; what answered the arm: {arm}; resync applied: {}; market \
            Started under its market lease: {}\n\
-         - X: handed to the session {}; shown resting by an order event {}; an ACK echoing its \
-           client id byte for byte {}; its request's outcome {}; from its send to its ACK {}\n\
-         - The stop's cancels: {cancels}\n\
+         - X: {}\n\
+         - The stop's cancels: {}\n\
          - Ended by: {}\n\
-         - Whether the graceful close cancelled X: {close}\n\
+         - Whether the graceful close cancelled X: {}\n\
          - X and its trades after the session: {after}\n\
          - X resting when the run ended: {}\n\
          - Our client id as QFEX gave it back, frame by frame (decision 0148 item 2; never the \
@@ -1261,22 +1587,18 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
          - add_order sent as encoded, with no take_profit, stop_loss or reduce_only (FBC-blcw): \
            {}\n\
          - Error: {}\n",
-        run.account,
         yn(run.authenticated),
         yn(run.resynced),
         yn(run.started),
-        yn(run.x.submitted),
-        yn(run.x.acked),
-        yn(run.x.exact_echo),
-        run.x.outcome.as_deref().unwrap_or("none reported"),
-        run.x
-            .ack_after
-            .map_or("not measured".to_owned(), |d| format!(
-                "{} ms",
-                d.as_millis()
-            )),
+        placed_said(&run.x),
+        cancels_said(run.cancels.as_ref()),
         run.ended_by.unwrap_or("it did not open"),
+        close_said(run),
         match (run.x_resting, run.x.submitted, run.x_read) {
+            (true, _, _) if run.two.is_some() => {
+                "no: X rested after drop session one, and drop session two's drop followed, \
+                 whose reads show it (below)"
+            }
             (true, _, _) => HAND_CANCEL,
             (false, false, _) => "no: X was not placed",
             (false, true, true) => "no",
@@ -1285,67 +1607,195 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
                  site before the next run"
             }
         },
-        match run.echoes.is_empty() {
-            true => "none heard".to_owned(),
-            false => run.echoes.join("; "),
-        },
+        echoes_said(&run.echoes),
         run.as_encoded.map_or("none sent", yn),
         run.error.as_deref().unwrap_or("none"),
     );
-    let _ = writeln!(
-        s,
-        "The comparisons of the streams with the reads (0151 item 4: a read at once, then each \
-         --read-interval-ms after the last began, at most 10 within --agree-wait-ms):\n\n\
-         | after | reads | first agreeing read after the step | ended |\n\
-         | --- | --- | --- | --- |"
-    );
-    for c in &run.compared {
-        let first = c
-            .first_agreed
-            .map_or("none".to_owned(), |d| format!("{} ms", d.as_millis()));
-        let _ = writeln!(
-            s,
-            "| {} | {} | {first} | {} |",
-            c.step,
-            c.reads.len(),
-            ended(c.ended)
-        );
-    }
-    let _ = writeln!(s);
+    compared_markdown(s, &run.compared);
 }
 
-/// The evidence's entry for drop session one.
-pub fn drop_to_json(run: &DropRun) -> Value {
+/// The report's section on drop session two (FBC-77r8).
+fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
+    let before_two = match run.x_before_two {
+        Some(true) => "yes: X open on the account as drop session two armed",
+        Some(false) => "no: X no longer open on the account",
+        None => "not read",
+    };
+    let before_drop = match two.before_drop {
+        Some([x, y]) => format!("X listed {}; Y listed {}", yn(x), yn(y)),
+        None => "not made".to_owned(),
+    };
+    let after_drop = match &two.after_drop {
+        None => "not made: the session ended short of its drop".to_owned(),
+        Some(a) => format!(
+            "{} reads; {}{}",
+            a.reads.len(),
+            a.absent_after
+                .map_or("none listed neither X nor Y".to_owned(), |d| {
+                    format!(
+                        "the first listing neither X nor Y ended {} after they began",
+                        ms(d)
+                    )
+                }),
+            match a.refused {
+                Some(_) => "; cut short by a provider rate refusal (decision 0148 item 8)",
+                None => "",
+            }
+        ),
+    };
+    // Read with no reads after the drop: after drop session two failed with no stop.
+    let traded_when = match (&two.after_drop, &two.after) {
+        (None, Some(_)) => "the session",
+        _ => "the drop",
+    };
+    let after = match &two.after {
+        None => "not read".to_owned(),
+        Some(a) => format!(
+            "{} trade rows since X's send, {} naming X, {} naming Y{}",
+            a.trades,
+            a.naming.first().copied().unwrap_or(0),
+            a.naming.get(1).copied().unwrap_or(0),
+            a.error
+                .as_ref()
+                .map_or(String::new(), |e| format!("; not read whole: {e}"))
+        ),
+    };
+    let resting = match (two.resting, two.read) {
+        (true, _) => HAND_CANCEL_ORDERS,
+        (false, true) => "no",
+        (false, false) => {
+            "not known: the account was not read after the session; read it on QFEX's site \
+             before the next run"
+        }
+    };
+    let _ = writeln!(
+        s,
+        "### Drop session two (FBC-77r8)\n\n\
+         After every named account read clean but for X, which may rest alone on this account as \
+         one open order on its symbol (decision 0132 item 7, 0144 item 4): the same registry, \
+         seeded nothing (decision 0148 item 3); Y, a post-only GTC at the instrument's minimum \
+         size --away-bps behind the touch, once the arm was accepted; the read before the drop, \
+         on a socket that never arms; then the abrupt drop, with no WebSocket close. From the \
+         first session's arm to the last read, no cancel of X or Y, no reconnect and no later \
+         arm (decision 0132 item 4).\n\n\
+         - X listed by the read before drop session two: {before_two}\n\
+         - Stream authenticated: {}; what answered the arm: {}; resync applied: {}\n\
+         - A CANCELLED of X reported in the arm's window: {}\n\
+         - Y: {}\n\
+         - The read before the drop: {before_drop}\n\
+         - A CANCELLED of X before the drop: {}; Y open as the connection dropped: {}\n\
+         - The stop's cancels: {}\n\
+         - Ended by: {}\n\
+         - The reads after the drop: {after_drop}\n\
+         - X's and Y's trades after {traded_when}: {after}\n\
+         - An order resting on the account when the run ended: {resting}\n\
+         - Our client id as QFEX gave it back, frame by frame: {}\n\
+         - add_order sent as encoded (FBC-blcw): {}\n\
+         - Error: {}\n",
+        yn(two.authenticated),
+        two.arm.as_deref().unwrap_or("none reported"),
+        yn(two.resynced),
+        yn(two.x_cancel_reported),
+        placed_said(&two.y),
+        yn(two.x_cancelled_before_drop),
+        yn(two.y_open_at_drop),
+        cancels_said(two.cancels.as_ref()),
+        two.ended_by.unwrap_or("it did not open"),
+        echoes_said(&two.echoes),
+        two.as_encoded.map_or("none sent", yn),
+        two.error.as_deref().unwrap_or("none"),
+    );
+    if !two.compared.is_empty() {
+        compared_markdown(s, &two.compared);
+    }
+}
+
+/// A comparison, as the evidence keeps it.
+fn compared_json(c: &crate::compare::Compared) -> Value {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    let compared: Vec<Value> = (run.compared.iter())
-        .map(|c| {
-            let reads: Vec<Value> = (c.reads.iter())
-                .map(|(at, took)| json!({"began_ms": ms(*at), "took": format!("{took:?}")}))
-                .collect();
-            json!({"after": c.step, "reads": reads,
-                "first_agreed_ms": c.first_agreed.map(ms), "ended": ended(c.ended),
-                "stop": c.stop.map(Stop::name)})
-        })
+    let reads: Vec<Value> = (c.reads.iter())
+        .map(|(at, took)| json!({"began_ms": ms(*at), "took": format!("{took:?}")}))
         .collect();
-    let cancels = run
-        .cancels
-        .as_ref()
-        .map(|c| json!({"sent": c.sent, "held": c.held, "ended": c.ended, "presses": c.presses}));
+    json!({"after": c.step, "reads": reads,
+        "first_agreed_ms": c.first_agreed.map(ms), "ended": ended(c.ended),
+        "stop": c.stop.map(Stop::name)})
+}
+
+/// A stop's cancels, as the evidence keeps them.
+fn cancels_json(c: Option<&Cancels>) -> Value {
+    json!(
+        c.map(|c| json!({"sent": c.sent, "held": c.held, "ended": c.ended,
+        "presses": c.presses}))
+    )
+}
+
+/// An order's request, as the evidence keeps it.
+fn placed_json(x: &XRun) -> Value {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    json!({"submitted": x.submitted, "acked": x.acked, "exact_echo": x.exact_echo,
+        "outcome": x.outcome, "ack_after_ms": x.ack_after.map(ms)})
+}
+
+/// The evidence's entry for one named account's drop test: drop session one's items under
+/// `session_one`, drop session two's under `session_two`, and the verdict.
+pub fn drop_to_json(run: &DropRun) -> Value {
+    let compared: Vec<Value> = run.compared.iter().map(compared_json).collect();
     let after = run.after.as_ref().map(|a| {
         json!({"trades": a.trades, "trades_naming_x": a.trades_naming_x,
             "trades_read": a.trades_read, "terminal_status": a.terminal_status,
-            "error": a.error})
+            "trade_fields": a.fields, "error": a.error})
     });
-    json!({"account": run.account, "authenticated": run.authenticated, "arm": run.arm,
-        "resynced": run.resynced, "started": run.started,
-        "x": {"submitted": run.x.submitted, "acked": run.x.acked,
-            "exact_echo": run.x.exact_echo, "outcome": run.x.outcome,
-            "ack_after_ms": run.x.ack_after.map(ms)},
-        "cancels": cancels, "compared": compared, "ended_by": run.ended_by,
+    let one = json!({"account": run.account, "authenticated": run.authenticated,
+        "arm": run.arm, "resynced": run.resynced, "started": run.started,
+        "x": placed_json(&run.x),
+        "cancels": cancels_json(run.cancels.as_ref()), "compared": compared,
+        "ended_by": run.ended_by,
         "close_cancelled_x": run.close_cancelled_x,
         "close_not_measured": run.close_not_measured.map(CloseUnmeasured::says),
         "x_resting": run.x_resting,
         "x_read_after": run.x_read,
-        "hand_cancel": run.x_resting.then_some(HAND_CANCEL), "after": after,
-        "echoes": run.echoes, "add_order_as_encoded": run.as_encoded, "error": run.error})
+        "hand_cancel": (run.x_resting && run.two.is_none()).then_some(HAND_CANCEL),
+        "after": after,
+        "echoes": run.echoes, "add_order_as_encoded": run.as_encoded, "error": run.error});
+    let two = run.two.as_ref().map(two_to_json);
+    let verdict = run.verdict.as_ref().map(verdict_to_json);
+    json!({"account": run.account, "session_one": one, "x_before_two": run.x_before_two,
+        "session_two": two, "verdict": verdict, "others_clean": run.others_clean,
+        "stop": run.stop})
+}
+
+/// Drop session two's entry.
+fn two_to_json(two: &TwoRun) -> Value {
+    let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    let compared: Vec<Value> = two.compared.iter().map(compared_json).collect();
+    let after_drop = two.after_drop.as_ref().map(|a| {
+        let reads: Vec<Value> = (a.reads.iter())
+            .map(|(at, shown)| json!({"began_ms": ms(*at), "shown": format!("{shown:?}")}))
+            .collect();
+        json!({"reads": reads, "absent_after_ms": a.absent_after.map(ms),
+            "refused": a.refused.map(|on| Stop::RateRefused { on }.name())})
+    });
+    let after = two.after.as_ref().map(|a| {
+        json!({"trades": a.trades, "naming": a.naming, "terminal_status": a.terminal,
+            "trade_fields": a.fields, "trades_whole": a.trades_whole,
+            "historic_whole": a.historic_whole, "error": a.error})
+    });
+    json!({"authenticated": two.authenticated, "arm": two.arm, "resynced": two.resynced,
+        "x_cancel_reported": two.x_cancel_reported,
+        "x_cancelled_before_drop": two.x_cancelled_before_drop,
+        "y_open_at_drop": two.y_open_at_drop, "y": placed_json(&two.y),
+        "before_drop": two.before_drop.map(|[x, y]| json!({"x_listed": x, "y_listed": y})),
+        "cancels": cancels_json(two.cancels.as_ref()), "compared": compared,
+        "ended_by": two.ended_by, "after_drop": after_drop, "after": after,
+        "resting": two.resting, "read_after": two.read,
+        "hand_cancel": two.resting.then_some(HAND_CANCEL_ORDERS),
+        "echoes": two.echoes, "add_order_as_encoded": two.as_encoded, "error": two.error})
+}
+
+/// The verdict's entry: names and flags alone.
+fn verdict_to_json(v: &crate::verdict::DropVerdict) -> Value {
+    let failures: Vec<String> = v.failures.iter().map(|f| f.says()).collect();
+    json!({"passed": v.passed, "failures": failures, "reach_over_x": v.reach.says(),
+        "arm_cancels_open_orders": v.arm.says(), "terminal_status": v.terminal,
+        "stop": v.stop().map(Stop::name)})
 }

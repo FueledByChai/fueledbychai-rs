@@ -4,7 +4,7 @@
 //! nothing and sends no command but each session's arm, its resync's reads and the probe's own
 //! reads. With `--hold-secs` it first holds one trade connection that never arms (decision 0146),
 //! and a run may hold without arming at all. With `--place-stages` it runs the place stages'
-//! preflight and drop session one, which places X (below).
+//! preflight and each named account's drop test, which places X and Y (below).
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
 //!   (`src/auth_qfex.rs`), and the configuration of each account it reads, under the adapter's
@@ -104,9 +104,10 @@
 //!   `--hold-secs` asks, alone (the owner's Ctrl-C from the hold's first read to its last stops
 //!   it before its preflight, with no stop marker, [`Run::hold`]),
 //!   then runs [`crate::market`]'s preflight (the spec from this run's
-//!   `GET /refdata`, the count bound, the MDS touch and the caps), then drop session one
-//!   ([`Run::drop_one`], below). [`place_config`] is the configuration a place stage's sessions
-//!   take, the only one with `qfex.exec.production_places` (decision 0148 item 4).
+//!   `GET /refdata`, the count bound, the MDS touch and the caps), then each named account's
+//!   drop test ([`Run::drop_tests`], below). [`place_config`] is the configuration a place
+//!   stage's sessions take, the only one with `qfex.exec.production_places` (decision 0148 item
+//!   4).
 //!   Before anything connects it opens its lease directory ([`places::RunLeases::open`], FBC-23ch:
 //!   the production tag, the stop markers held to `--reconciled`, the namespace lease and the
 //!   run's mint; 0151 items 1 and 6). With `--reconciled` it reads every named account after the
@@ -117,30 +118,48 @@
 //!   the run cleared it.
 //! - **The journal's tee** ([`crate::tee`], FBC-23ch): the run's journal sink is wrapped by a
 //!   [`Tee`], which hands every record on unchanged and reads the sessions' frames as the journal
-//!   keeps them, for the stops drop session one waits on.
-//! - **Drop session one** ([`Run::drop_one`], FBC-23ch; decisions 0132 items 4 and 7, 0148 and
-//!   0151) on the first named account: every named account read clean (unless the reads that
-//!   cleared a stop marker just did); the drop registry built, its `CancelOnlyTrip` given to the
-//!   journal before any market arms (decision 0139), seeded flat (0148 item 3); one unchanged
-//!   `ExecSession` on [`place_config`] with the discovered spec table, the run's `--namespace`,
-//!   its one `RpcIds`, the run's next session number, an `AccountWideCodAuthority` for its own
-//!   account (decisions 0121 and 0122) and one connection attempt, its handler a
+//!   keeps them, for the stops the drop sessions wait on.
+//! - **The drop test** ([`Run::drop_tests`], FBC-23ch and FBC-77r8; decisions 0132 items 4 and 7,
+//!   0148 and 0151) on each named account in turn, each starting only once the one before ended
+//!   with no stop. **Drop session one**: every named account read clean (unless the reads that
+//!   cleared a stop marker just did); the account's drop registry built, its `CancelOnlyTrip` given
+//!   to the journal before any market arms (decision 0139), seeded flat (0148 item 3); one
+//!   unchanged `ExecSession` on [`place_config`] with the discovered spec table, the run's
+//!   `--namespace`, its one `RpcIds`, the run's next session number, an `AccountWideCodAuthority`
+//!   for its own account (decisions 0121 and 0122) and one connection attempt, its handler a
 //!   [`places::PlaceHandler`] over the registry's `Link`; once it is authenticated, its arm
-//!   accepted and its resync applied, Start under the market lease, then X, a post-only GTC at
-//!   the instrument's minimum size `--away-bps` behind the MDS touch, kept current meanwhile,
-//!   minted under the run's namespace lease and authorized by fbc-oms, the one place before an
-//!   ACK echoes our client id (decision 0132 item 7), spent from the registry's list first
-//!   ([`places::Allowance`]); X's ACK or its deadline; the streams compared with never-arming
-//!   reads ([`crate::compare`]); a graceful close; the read of every named account after it, and
-//!   X and its trades read (FBC-be57). The first stop the tee, the handler, a comparison, the
-//!   span bound or the owner's Ctrl-C raises ends the steps: only Ctrl-C and a fill of ours then
-//!   cancel, by venue id (0151 item 2, [`Run::stop_cancels`]), and every session ends by a
-//!   graceful close, cancels held included (0151 item 11), unless its connection ended first.
-//!   The reads after it wait out a provider rate refusal's hold on the shared budget
-//!   ([`Run::admitted`]), as does the close. The run then ends with its stop, its marker
-//!   written; with none, X still resting is reported for the owner's hand cancel and marked
-//!   ([`Stop::LeftResting`]), and the run ends naming FBC-77r8, which builds drop session two
-//!   ([`NOT_BUILT`]).
+//!   accepted and its resync applied, Start under the market lease, then X, a post-only GTC at the
+//!   instrument's minimum size `--away-bps` behind the MDS touch, kept current meanwhile, minted
+//!   under the run's namespace lease and authorized by fbc-oms, the one place before an ACK echoes
+//!   our client id (decision 0132 item 7), spent from the registry's list first
+//!   ([`places::Allowance`]); X's ACK or its deadline; the streams compared with never-arming reads
+//!   ([`crate::compare`]); a graceful close; the read of every named account after it, and X and
+//!   its trades read (FBC-be57). The first stop the tee, the handler, a comparison, the span bound
+//!   or the owner's Ctrl-C raises ends the steps: only Ctrl-C and a fill of ours then cancel, by
+//!   venue id (0151 item 2, [`Run::stop_cancels`]), and every session ends by a graceful close,
+//!   cancels held included (0151 item 11), unless its connection ended first. The reads after it
+//!   wait out a provider rate refusal's hold on the shared budget ([`Run::admitted`]), as does the
+//!   close. A stop ends the run, its marker written, X still resting reported for the owner's hand
+//!   cancel. **Drop session two** (FBC-77r8): the read before it of every named account
+//!   ([`Run::read_before_two`]), which admits X alone, one open order on its symbol (decision 0132
+//!   item 7, 0144 item 4); then a session on the same `Link` and registry, seeded nothing (0148
+//!   item 3) and not Started again, its market armed from drop session one: its arm accepted; Y, as
+//!   X was placed; Y's ACK or its deadline; the read before the drop, one never-arming read beside
+//!   the session, a `CANCELLED` of X heard by its end being the arm's, reported, and a stop or a
+//!   press met as its socket closes taken before the drop; then the abrupt drop, its run dropped
+//!   unpolled, its connection with it, with no WebSocket close. From the first arm to the last read
+//!   nothing cancels X or Y but Ctrl-C or a fill of ours, nothing reconnects, and no later arm is
+//!   sent (decision 0132 item 4). **After the drop** ([`Run::judge_drop`]): reads of the account at
+//!   the comparisons' cadence until X and Y are absent or `--agree-wait-ms` ends, then the trades
+//!   since X's send and `GET /user/historic-orders`, and the verdict ([`crate::verdict`]), judged
+//!   per account in memory and never carried to another account or run (decision 0148 item 2); then
+//!   the read of every named account. A stop in drop session two ends it as one in drop session one
+//!   does, before any drop, and a failure there that is no stop gains the stop the reads after it
+//!   show ([`read_stop`]); a failed verdict, an arm-time cancel QFEX did not report, a fill of X or
+//!   Y the reads show (the run stopping not flat, the position the owner's, 0151 item 9) or an
+//!   order still resting after it is a stop, marked, so nothing more is placed on that account or
+//!   any other. With no stop the run ends after the last account's drop test, naming FBC-su9i,
+//!   which builds stage two ([`NOT_BUILT`]).
 //! - **The files** ([`crate::report`] for the report and the evidence, [`crate::capture`] for the
 //!   journal and the scrubbed fixture slice), which scripts/privacy-check.sh must pass. A record
 //!   the journal dropped, marked in it or only counted by its sink, one its writer never wrote, and
@@ -189,6 +208,7 @@ use futures_util::{FutureExt, StreamExt};
 
 use crate::auth_qfex::{self, Armed, Lookup, SUB_ID_VAR};
 use crate::capture::{self, AccountRead, AllowedOrder, Evidence, SessionRun};
+use crate::compare::Reader as _;
 use crate::evidence;
 use crate::hold::{self as held_frames, Control, End, Heard, HoldRun, ReadAfter};
 use crate::interrupt::Presses;
@@ -196,10 +216,12 @@ use crate::ledger::{self, Opened, PlaceBounds, PlaceLists, PlaceRegistry, Regist
 use crate::link::{Link, LinkHandler};
 use crate::market::{self, Discovered, PlaceCaps, Preflight};
 use crate::places::{
-    self, Allowance, Cancels, DropRun, PlaceHandler, RunLeases, Stop, Watched, XAfter,
+    self, Allowance, Cancels, DropRun, PlaceHandler, RunLeases, Stop, Traded, TwoRun, Watched,
 };
 use crate::probe_args::{self as args, Hold, Options, Places, RESYNC_TIMEOUT};
-use crate::refusals::{self, AFTER_DROP_ONE, AFTER_HOLD, HOLD, ReadSocket, Refusals};
+use crate::refusals::{
+    self, AFTER_DROP_ONE, AFTER_DROP_TWO, AFTER_HOLD, HOLD, ReadSocket, Refusals,
+};
 use crate::tee::{Tap, Tee};
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -363,11 +385,11 @@ pub const LOOPBACK_ONLY: &str = "--place-stages: refused, nothing sent: until FB
      every stop decisions 0132 item 7 and 0148 item 8 require, the place stages run only against \
      a loopback test stub, every origin (trade, REST and MDS) a loopback address";
 
-/// Why a place-stage run ends after drop session one's reads, when no stop came first
-/// (FBC-23ch): drop session two is not built yet.
-pub const NOT_BUILT: &str = "drop session two of the drop test (decision 0132 item 4) and the \
-     place stages after it are not built yet (FBC-77r8 builds session two): the run ends after \
-     drop session one's reads, its outcome not ok";
+/// Why a place-stage run ends after every named account's drop test, when no stop came first
+/// (FBC-77r8): stage two is not built yet.
+pub const NOT_BUILT: &str = "stage two of the place stages (decision 0132 item 7: the crossing \
+     post-only and the taker IOC) and the stages after it are not built yet (FBC-su9i builds \
+     stage two): the run ends after every named account's drop test, its outcome not ok";
 
 /// Why a place-stage run that holds stops when the owner's Ctrl-C comes before the hold's
 /// connection opens, during the reads before it or its connect: it is the hold's interrupt, so
@@ -563,10 +585,12 @@ async fn run_with(
             opts.arms
         )),
         Some(_) => run.line(format_args!(
-            "PROBE place stages on QFEX {} ({}), against {target}: the preflight, then drop \
-             session one on the first named account (FBC-23ch): X, one post-only GTC at the \
-             minimum size behind the touch, then a graceful close and the reads; the run ends \
-             there, not ok, until FBC-77r8 builds drop session two{held}",
+            "PROBE place stages on QFEX {} ({}), against {target}: the preflight, then each \
+             named account's drop test in turn (FBC-23ch and FBC-77r8): drop session one places \
+             X, one post-only GTC at the minimum size behind the touch, and closes gracefully; \
+             drop session two places Y and drops abruptly; the reads after the drop judge the \
+             account's verdict; the run ends after the last account's, not ok, until FBC-su9i \
+             builds stage two{held}",
             environment(env),
             env.mode(),
         )),
@@ -747,6 +771,15 @@ fn checked_fixtures(
     checked.map_err(|e| format!("{e}; the fixtures directory was removed"))
 }
 
+/// What a never-arming read socket of an account is made of ([`Run::socket_parts`]): its
+/// configuration, which the guard admitted, its reader, and the context of each signed frame or
+/// request.
+struct SocketParts {
+    cfg: VenueConfig,
+    reader: ReadAuth,
+    ctx: Box<dyn FnMut() -> EncodeCtx>,
+}
+
 /// One run's shared state.
 struct Run<'a> {
     opts: &'a Options,
@@ -847,7 +880,7 @@ impl Run<'_> {
     }
 
     /// The hold, when the run asks for one, then each session, each after the checks of every
-    /// account the configuration names.
+    /// account the configuration names; a place-stage run's preflight and drop tests.
     async fn stage(&mut self) -> Result<(), String> {
         self.line(format_args!(
             "ACCOUNTS {} named by the run's configuration, not listed by QFEX (decision 0144): {}",
@@ -870,7 +903,7 @@ impl Run<'_> {
                 None => return Err(self.halt(Stop::Interrupted, "during the preflight")),
             };
             let read = self.reconcile().await?;
-            return self.drop_one(places, market, read).await;
+            return self.drop_tests(places, market, read).await;
         }
         let arms = self.opts.arms.clone();
         for (n, armed) in arms.into_iter().enumerate() {
@@ -1087,7 +1120,8 @@ impl Run<'_> {
     /// Reads every account the configuration names as [`Run::check_accounts`] does, but admits
     /// `allowed`, when given, on its account alone: a page listing it and a REST count of it are
     /// clean there ([`AccountRead::refusal`]). Decision 0132 item 7's one exception, X before the
-    /// drop test's second session (FBC-77r8); every read in this slice admits none.
+    /// drop test's second session (FBC-77r8, [`Run::read_before_two`]); every other read admits
+    /// none.
     async fn check_accounts_allowing(
         &mut self,
         before: &'static str,
@@ -1188,7 +1222,7 @@ impl Run<'_> {
 
     /// One account's positions, and its open orders on a trade socket of its own, counting
     /// those that are `admits.0` when it is on `admits.1`, the account read
-    /// ([`AllowedOrder::count`]); `met` is the provider rate refusals that socket met, once it
+    /// ([`AccountRead::of`]); `met` is the provider rate refusals that socket met, once it
     /// opened.
     async fn read_account(
         &mut self,
@@ -1226,17 +1260,7 @@ impl Run<'_> {
         let closed = self.close_read(ws).await;
         let page = page?;
         closed?;
-        Ok(AccountRead {
-            rows: positions.rows().len(),
-            flat: positions.is_flat(),
-            rest_open_orders: positions.rows().iter().map(|row| row.open_orders).sum(),
-            page_orders: page.orders().len(),
-            page_twaps: page.twaps(),
-            page_full: page.is_full(),
-            page_allowed: AllowedOrder::count(admits.0, admits.1, page.orders()),
-            page_lists_it: AllowedOrder::listed(admits.0, admits.1, page.orders()),
-            ..AccountRead::default()
-        })
+        Ok(AccountRead::of(&positions, &page, admits.0, admits.1))
     }
 
     /// The socket's authentication, its success, then one `get_user_orders` page from offset 0;
@@ -1953,8 +1977,42 @@ impl From<Stop> for Halt {
     }
 }
 
+/// Which session of a drop test (decision 0132 item 4).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Which {
+    One,
+    Two,
+}
+
+impl Which {
+    /// Its name: what its session and the reads before it are reported under.
+    fn name(self) -> &'static str {
+        match self {
+            Which::One => places::DROP_ONE,
+            Which::Two => places::DROP_TWO,
+        }
+    }
+
+    /// What the reads after it are reported under.
+    fn after(self) -> &'static str {
+        match self {
+            Which::One => AFTER_DROP_ONE,
+            Which::Two => AFTER_DROP_TWO,
+        }
+    }
+
+    /// The order it places: X, or Y.
+    fn order(self) -> &'static str {
+        match self {
+            Which::One => "X",
+            Which::Two => "Y",
+        }
+    }
+}
+
 /// One drop session's handles: its `Link`, what its handler saw, its orders, its account key,
-/// its market and its registry's span bound.
+/// its market and its registry's span bound, the account it runs on, which session it is, and
+/// where its frames begin among those the tee heard and the `add_order`s it saw sent.
 struct DropCtx {
     link: Rc<RefCell<Link>>,
     wake: Rc<tokio::sync::Notify>,
@@ -1965,14 +2023,18 @@ struct DropCtx {
     /// The registry's lot caps, fixed at the preflight's touch ([`market::caps_admit`]).
     caps: PlaceCaps,
     span_end: tokio::time::Instant,
+    on: Armed,
+    which: Which,
+    heard_from: usize,
+    sent_from: usize,
 }
 
-/// X as drop session one placed it: its client id and when it was sent.
+/// X or Y as its drop session placed it: its client id and when it was sent.
 #[derive(Copy, Clone)]
 struct Placed {
     cid: fbc_core::ClientOrderId,
     at: tokio::time::Instant,
-    /// Its send on the wall clock, in whole seconds: the trades read after it start there.
+    /// Its send on the wall clock, in whole seconds: the trades read after X start there.
     wall_secs: u64,
 }
 
@@ -1984,8 +2046,11 @@ pub const AFTER_PATIENCE: Duration = Duration::from_secs(60);
 /// `paradex_testnet_acceptance` waits for one.
 pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
-/// What ends a drop session that ran its course: a graceful close (decision 0132 item 4).
+/// What ends drop session one when it ran its course: a graceful close (decision 0132 item 4).
 pub const GRACEFUL: &str = "a graceful close";
+/// What ends drop session two when it ran its course: its connection dropped abruptly, with no
+/// WebSocket close (decision 0132 item 4), by dropping the session's run.
+pub const DROPPED: &str = "the abrupt drop";
 /// What ends one whose connection ended first: the server's close, the codec's end or a
 /// transport error ([`Stop::ConnectionEnded`]).
 pub const CONNECTION_ENDED: &str = "the connection's end";
@@ -2023,29 +2088,94 @@ pub fn ended_first(
     }
 }
 
+/// Whether the reads of `reads` were clean on every named account but `on`: `None` when `named`
+/// names no other account (FBC-77r8: whether the other named accounts stayed clean through a
+/// drop test).
+pub fn others_clean(reads: &[AccountRead], named: &[Armed], on: Armed) -> Option<bool> {
+    let others: Vec<&str> = (named.iter().filter(|a| **a != on))
+        .map(|a| name(*a))
+        .collect();
+    if others.is_empty() {
+        return None;
+    }
+    let theirs = reads.iter().filter(|r| others.contains(&r.label.as_str()));
+    Some(theirs.into_iter().all(|r| r.refusal().is_none()))
+}
+
 impl Run<'_> {
-    /// Drop session one (FBC-23ch) on the first named account, after the preflight gave
-    /// `market` and, unless `read` (the reads that cleared a stop marker), every named account
-    /// read clean, a provider rate refusal those reads met a stop, marked ([`Run::unless_refused`];
-    /// decision 0148 item 8, 0151 item 6): the drop registry built and its trip given to the
-    /// journal before any market arms (decision 0139), seeded flat (0148 item 3), then the session
-    /// ([`Run::drop_session`]),
-    /// the after-session read of every named account, and X and its trades read (FBC-be57). The
-    /// run then ends: with the stop that came, or, when none did, after those reads with X still
-    /// resting reported for the owner's hand cancel ([`Stop::LeftResting`], marked) or a position
-    /// not flat or a trade naming X, a fill seen with no session open ([`Stop::NotFlat`], 0151
-    /// item 9), and otherwise [`NOT_BUILT`].
-    ///
-    /// It runs on the first named account alone: until FBC-77r8 builds drop session two, X is
-    /// left resting there for the owner's hand cancel, so a session on another account would
-    /// start with an order of ours open, which the clean reads before it refuse.
-    async fn drop_one(
+    /// Each named account's drop test in turn ([`Run::drop_test`]; decision 0132 item 4, 0148
+    /// items 1 and 2), each starting only once the one before ended with no stop, so no order
+    /// of ours rests on another account while a session runs (decision 0132 items 4 and 7). The
+    /// first account's reads before drop session one are skipped when `read` (the reads that
+    /// cleared a stop marker just made them). The first stop ends the run, so a drop test that
+    /// failed places nothing more on its account or any other; with none, the run ends after the
+    /// last account's, [`NOT_BUILT`], naming FBC-su9i, which builds stage two.
+    async fn drop_tests(
         &mut self,
         places: &Places,
         mut market: Market,
         read: bool,
     ) -> Result<(), String> {
-        let on = self.named[0];
+        for (n, on) in self.named.clone().into_iter().enumerate() {
+            self.drop_test(places, &mut market, on, read && n == 0)
+                .await?;
+        }
+        Err(NOT_BUILT.to_owned())
+    }
+
+    /// The drop test on `on` (FBC-23ch, FBC-77r8; decision 0132 item 4), as [`Run::drop_sessions`]
+    /// runs it, then, once it was built, what it says of the other named accounts' reads during
+    /// it and the run's stop, if one came.
+    async fn drop_test(
+        &mut self,
+        places: &Places,
+        market: &mut Market,
+        on: Armed,
+        read: bool,
+    ) -> Result<(), String> {
+        let (reads, made) = (self.ev.reads.len(), self.ev.drops.len());
+        let tested = self.drop_sessions(places, market, on, read).await;
+        if self.ev.drops.len() > made {
+            let others = others_clean(&self.ev.reads[reads..], &self.named, on);
+            let stop = self.stop.map(Stop::name);
+            let run = self.drop_run();
+            run.others_clean = others;
+            run.stop = stop;
+        }
+        tested
+    }
+
+    /// The drop test's sessions on `on`, after the preflight gave `market` and, unless `read`
+    /// (the reads that cleared a stop marker), every named account read clean: the drop registry
+    /// built and its trip given to the journal before any market arms (decision 0139), seeded
+    /// flat (0148 item 3), then drop session one ([`Run::drop_session`]), the after-session read
+    /// of every named account, and X and its trades read (FBC-be57). Then, with no stop, the read
+    /// before drop session two ([`Run::read_before_two`]), which admits X alone, and drop session
+    /// two on the same `Link` and registry with no second seed, ended by the abrupt drop; the
+    /// reads after it ([`Run::after_drop`]), X's and Y's trades and historic-orders rows, the
+    /// verdict ([`crate::verdict::DropVerdict`]), and the read of every named account after it.
+    /// From the first arm to the last read nothing cancels X or Y but Ctrl-C or a fill of ours,
+    /// nothing reconnects, and no later arm is sent (decision 0132 item 4, 0151 item 2).
+    ///
+    /// Each way it ends the run is a stop, marked, the first that applies. After drop session
+    /// one: the session's stop; a provider rate refusal in the reads after it, then one reading
+    /// X; the owner's Ctrl-C during them; a position not flat or a trade naming X (0151 item 9);
+    /// a trade naming another order or none ([`Stop::DropFailed`], decision 0132 item 4); X's
+    /// trades or historic orders not read whole ([`Stop::LeftResting`]); then a failure of
+    /// the session that raised no stop, with [`Stop::LeftResting`] marked when an order of ours
+    /// rests; then a stop of the read before drop session two. After drop session two: the
+    /// session's stop; a failure that raised no stop, with the stop the reads after it show
+    /// ([`read_stop`]: a provider rate refusal, Ctrl-C, a position not flat or a trade naming X
+    /// or Y, an order of ours still resting), so an order still resting is marked; the verdict's
+    /// stop (0151 items 9 and 13); then the reads' stop. With none it ends `Ok`, the next
+    /// account's drop test next.
+    async fn drop_sessions(
+        &mut self,
+        places: &Places,
+        market: &mut Market,
+        on: Armed,
+        read: bool,
+    ) -> Result<(), String> {
         let label = name(on);
         if !read {
             let mark = self.read_mark();
@@ -2065,6 +2195,9 @@ impl Run<'_> {
             }
         }
         let (cfg, creds) = place_config(&self.base, self.lookup, on)?;
+        // Drop session two's configuration, read before anything is placed, so no failure to
+        // read it can come between the sessions while X rests.
+        let two_config = place_config(&self.base, self.lookup, on)?;
         let acct = account_key(on);
         let order = (self.caps.exec.as_ref()).map(|e| e.order.clone());
         let order = order.ok_or("the probe's caps declare no order entry")?;
@@ -2090,7 +2223,8 @@ impl Run<'_> {
         let ladder = ladder.map_err(|e| format!("the ladder: {}", places::variant_name(&e)))?;
         let (link, mut placed) = built.into_link(order, ladder);
         let link = Rc::new(RefCell::new(link));
-        // The flat seed, after clean reads of every named account (decision 0148 item 3).
+        // The flat seed, after clean reads of every named account (decision 0148 item 3): once,
+        // for both of the drop test's sessions.
         let seeded = link
             .borrow_mut()
             .reg()
@@ -2109,17 +2243,17 @@ impl Run<'_> {
         if places.test.x_spent {
             let _ = allowance.take(Step::Drop, ledger::X);
         }
-        self.ev.drop_one = Some(DropRun {
+        self.ev.drops.push(DropRun {
             account: label,
             ..DropRun::default()
         });
-        let ctx = (cfg, creds, Rc::clone(&link), placed.deadline());
+        let span_end = placed.deadline();
+        let ctx = (cfg, creds, Rc::clone(&link), span_end);
         let ran = self
-            .drop_session(places, &mut market, on, ctx, &mut allowance)
+            .drop_session(places, market, on, ctx, &mut allowance, None)
             .await;
         placed.session_ended(&link.borrow(), places::DROP_ONE, self.mono());
         self.ev.place_registries.push(placed);
-        drop(market);
         let (stop, x) = match ran {
             Ok(ran) => ran,
             Err(why) => {
@@ -2128,24 +2262,24 @@ impl Run<'_> {
             }
         };
         let said = stop.map(|stop| self.halt(stop, "in drop session one"));
+        let vid_of = |cid| (link.borrow().registry().get(cid)).and_then(|r| r.vid().cloned());
         let x_allowed = x.map(|x| AllowedOrder {
             account: on,
             cid: x.cid,
-            venue: link
-                .borrow()
-                .registry()
-                .get(x.cid)
-                .and_then(|r| r.vid().cloned()),
+            venue: vid_of(x.cid),
         });
         // The reads after the session wait out a hold the shared budget is under (decision
         // 0126), for at most AFTER_PATIENCE.
         self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
-        let after = self.read_after(x_allowed.as_ref()).await;
-        let (mut x_refused, mut x_pressed) = (None, false);
+        let after = self.read_after(Which::One, on, x_allowed.as_ref()).await;
+        let (mut x_refused, mut x_pressed, mut x_unread) = (None, false, false);
         if let (Some(x), Some(allowed)) = (x, &x_allowed) {
-            let (read, refused, pressed) = self.read_x(on, x.wall_secs, allowed).await;
-            self.drop_run().after = Some(read);
-            (x_refused, x_pressed) = (refused, pressed);
+            let read = self
+                .read_orders(Which::One, on, x.wall_secs, &[allowed])
+                .await;
+            self.drop_run().after = Some(read.0.x_after());
+            x_unread = !(read.0.trades_whole && read.0.historic_whole);
+            (x_refused, x_pressed) = (read.1, read.2);
         }
         self.patient = None;
         // Whether the close cancelled X, measured on a read of X's own account alone (another
@@ -2161,46 +2295,346 @@ impl Run<'_> {
         (run.close_cancelled_x, run.close_not_measured) = (verdict.ok(), verdict.err());
         run.x_resting = after.x_listed;
         run.x_read = after.x_read;
-        if after.x_listed {
-            self.line(format_args!("RESTING {}", places::HAND_CANCEL));
-        }
         // The run's end, the first that applies: the session's stop; a provider rate refusal in
         // the reads after it, then one reading X; the owner's Ctrl-C during those reads; a
-        // position not flat, or a trade naming X; then X or another order of ours still resting,
-        // for the owner's hand cancel, marked; then a failure of the session that was no stop,
-        // kept in the evidence as the session's error whichever stop came after it; and
-        // otherwise drop session two not built. A stop after the session is raised, and marked,
-        // whether or not the session failed (0151 item 6).
+        // position not flat, or a trade naming X; a trade naming another order or none, which
+        // fails the drop test already; X's trades or historic orders not read whole, X left
+        // unjudged; then a failure of the session that was no stop, kept in the evidence as
+        // the session's error whichever stop came after it, with any order of ours still resting
+        // marked for the owner's hand cancel; then a stop of the read before drop session two. A
+        // stop after the session is raised, and marked, whether or not the session failed (0151
+        // item 6). X still resting then is the owner's to cancel by hand (decision 0132 item 7).
+        let ended = 'ended: {
+            if let Some(said) = said {
+                break 'ended Err(said);
+            }
+            if let Some(stop) = after.refused {
+                break 'ended Err(self.halt(stop, "in the reads after drop session one"));
+            }
+            if let Some(stop) = x_refused {
+                break 'ended Err(self.halt(stop, "reading X after drop session one"));
+            }
+            if after.pressed || x_pressed {
+                let when = "during the reads after drop session one";
+                break 'ended Err(self.halt(Stop::Interrupted, when));
+            }
+            // A trade naming X, seen with no session open, is a fill of ours: not flat, the
+            // position the owner's, whatever the position read before it showed (0151 item 9),
+            // so drop session two is not run.
+            let x_traded = (self.drop_run().after.as_ref()).is_some_and(|a| a.trades_naming_x > 0);
+            if after.not_flat || x_traded {
+                break 'ended Err(self.halt(Stop::NotFlat, "after drop session one"));
+            }
+            // A row since X's send naming another order or none, on an account still flat:
+            // something else traded on the account, which 0132 item 4 rules out from the first
+            // arm to the read after the drop, so the drop test has failed already and Y is not
+            // placed. The session is over, so nothing is cancelled (0151 item 2).
+            let other =
+                (self.drop_run().after.as_ref()).is_some_and(|a| a.trades > a.trades_naming_x);
+            if other {
+                let when = "after drop session one, a get_user_trades row since X's send naming \
+                            another order or none (decision 0132 item 4)";
+                break 'ended Err(self.halt(Stop::DropFailed, when));
+            }
+            // A read of X's trades or historic orders that failed with no refusal leaves X
+            // unjudged, as an account that could not be read does before drop session two: Y is
+            // not placed beside an X whose fills were never read.
+            if x_unread {
+                let when = "reading X after drop session one";
+                break 'ended Err(self.halt(Stop::LeftResting, when));
+            }
+            // A failure of the session that raised no stop, after every stop the reads showed:
+            // an order of ours still resting is marked for the owner's hand cancel.
+            if let Some(why) = self.drop_run().error.clone() {
+                if after.resting {
+                    self.halt(Stop::LeftResting, "after drop session one");
+                }
+                break 'ended Err(why);
+            }
+            // X, placed and ended with no stop: the read before drop session two admits it
+            // alone, whether it still rests or a graceful close cancelled it (decision 0132
+            // items 4 and 7).
+            let x = x_allowed
+                .as_ref()
+                .expect("X, placed when drop session one ran");
+            self.read_before_two(x).await
+        };
+        if let Err(why) = ended {
+            if after.x_listed {
+                self.line(format_args!("RESTING {}", places::HAND_CANCEL));
+            }
+            return Err(why);
+        }
+        let (x, x_allowed) = x
+            .zip(x_allowed)
+            .expect("X, placed when drop session one ran");
+        let mine = format!("{label} (drop)");
+        let mut reads = self.ev.reads.iter().rev();
+        let before_two = reads.find(|r| r.before == places::DROP_TWO && r.label == mine);
+        let x_before_two = before_two.is_some_and(|r| r.page_allowed > 0);
+        let run = self.drop_run();
+        run.x_before_two = Some(x_before_two);
+        run.two = Some(TwoRun::default());
+        // Drop session two, on the same registry and Link, seeded nothing.
+        let (cfg, creds) = two_config;
+        let ctx = (cfg, creds, Rc::clone(&link), span_end);
+        let ran = self
+            .drop_session(places, market, on, ctx, &mut allowance, Some(x))
+            .await;
+        let now = self.mono();
+        let ended = self.ev.place_registries.last_mut();
+        ended
+            .expect("the drop registry")
+            .session_ended(&link.borrow(), places::DROP_TWO, now);
+        let (stop, y) = match ran {
+            Ok(ran) => ran,
+            Err(why) => {
+                self.two_run().error = Some(why.clone());
+                (None, None)
+            }
+        };
+        let said = stop.map(|stop| self.halt(stop, "in drop session two"));
+        self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
+        let (mut verdict, mut pressed) = (None, false);
+        let allowed = |p: Placed| AllowedOrder {
+            account: on,
+            cid: p.cid,
+            venue: vid_of(p.cid),
+        };
+        let x_allowed = AllowedOrder {
+            venue: vid_of(x.cid),
+            ..x_allowed
+        };
+        if self.two_run().ended_by == Some(DROPPED) {
+            let y = y.expect("Y, placed when drop session two reached its drop");
+            let y_allowed = allowed(y);
+            let symbol = market.found.spec.venue_symbol.as_wire().to_owned();
+            let (judged, held) = self
+                .judge_drop(on, &symbol, x, (&x_allowed, &y_allowed))
+                .await;
+            verdict = Some(judged);
+            pressed = held;
+        }
+        let mut after = self.read_after(Which::Two, on, None).await;
+        // A failure that raised no stop: X's trades, and Y's once it was submitted, read after
+        // the account reads, as after drop session one, so a fill of either seen with no session
+        // open stops the run not flat whatever the position read before it showed (0151 item 9).
+        // A provider rate refusal or a press of Ctrl-C meanwhile is the reads' too. A read not
+        // whole adds no stop: the failure is still the run's end, with the reads' stop after it.
+        if said.is_none() && self.two_run().error.is_some() {
+            let y_allowed = y.map(allowed);
+            let orders: Vec<&AllowedOrder> = std::iter::once(&x_allowed)
+                .chain(y_allowed.as_ref())
+                .collect();
+            let (traded, refused, held) =
+                self.read_orders(Which::Two, on, x.wall_secs, &orders).await;
+            after.not_flat |= traded.naming.iter().any(|&n| n > 0);
+            after.refused = after.refused.or(refused);
+            pressed |= held;
+            self.two_run().after = Some(traded);
+        }
+        self.patient = None;
+        let two = self.two_run();
+        two.resting = after.resting;
+        two.read = after.x_read;
+        if after.resting {
+            self.line(format_args!("RESTING {}", places::HAND_CANCEL_ORDERS));
+        }
+        // The run's end, the first that applies: the session's stop; a failure that was no stop,
+        // with the reads' stop after it when they show one (a provider rate refusal, Ctrl-C, a
+        // position not flat or a trade naming X or Y, an order still resting), so an order still
+        // resting is marked for the hand cancel the report asks for (0151 items 6 and 9); the
+        // verdict's stop (decision 0132 item 7, 0151 items 9 and 13); then the reads' stop.
+        let read_stop = after_stop(&after, pressed);
         if let Some(said) = said {
             return Err(said);
         }
-        if let Some(stop) = after.refused {
-            return Err(self.halt(stop, "in the reads after drop session one"));
+        if let Some(why) = self.two_run().error.clone() {
+            return Err(match read_stop {
+                Some((stop, when)) => format!("{why}; {}", self.halt(stop, when)),
+                None => why,
+            });
         }
-        if let Some(stop) = x_refused {
-            return Err(self.halt(stop, "reading X after drop session one"));
+        let judged = verdict.as_ref().and_then(crate::verdict::DropVerdict::stop);
+        self.drop_run().verdict = verdict;
+        if let Some(stop) = judged {
+            return Err(self.halt(stop, "after the drop"));
         }
-        if after.pressed || x_pressed {
-            let when = "during the reads after drop session one";
-            return Err(self.halt(Stop::Interrupted, when));
-        }
-        // A trade naming X, seen with no session open, is a fill of ours: not flat, the
-        // position the owner's, whatever the position read before it showed (0151 item 9).
-        let x_traded = (self.drop_run().after.as_ref()).is_some_and(|a| a.trades_naming_x > 0);
-        let failed = self.drop_run().error.clone();
-        match (after.not_flat || x_traded, after.resting) {
-            (true, _) => Err(self.halt(Stop::NotFlat, "after drop session one")),
-            (false, true) => {
-                self.halt(Stop::LeftResting, "after drop session one");
-                Err(failed.unwrap_or_else(|| NOT_BUILT.to_owned()))
-            }
-            (false, false) => Err(failed.unwrap_or_else(|| NOT_BUILT.to_owned())),
+        match read_stop {
+            Some((stop, when)) => Err(self.halt(stop, when)),
+            None => Ok(()),
         }
     }
 
-    /// The run's drop session one, as the evidence holds it.
+    /// The account's drop test, as the evidence holds it: the last begun.
     fn drop_run(&mut self) -> &mut DropRun {
-        self.ev.drop_one.get_or_insert_with(DropRun::default)
+        self.ev.drops.last_mut().expect("a drop test begun")
+    }
+
+    /// Its drop session two, as the evidence holds it.
+    fn two_run(&mut self) -> &mut TwoRun {
+        self.drop_run().two.get_or_insert_with(TwoRun::default)
+    }
+
+    /// What `d`'s order (X in drop session one, Y in two) became, as the evidence holds it.
+    fn placed_run(&mut self, which: Which) -> &mut places::XRun {
+        match which {
+            Which::One => &mut self.drop_run().x,
+            Which::Two => &mut self.two_run().y,
+        }
+    }
+
+    /// The drop test's verdict on `on` once drop session two dropped (decision 0132 item 4, 0151
+    /// items 5 and 13): the reads after the drop until X and Y are absent ([`Run::after_drop`]),
+    /// then every `get_user_trades` page since X's send and every `GET /user/historic-orders`
+    /// page ([`Run::read_orders`]), judged with what drop session two and the read before it
+    /// showed. Whether the owner pressed Ctrl-C meanwhile is the second given: the presses are
+    /// taken, none ending the reads.
+    async fn judge_drop(
+        &mut self,
+        on: Armed,
+        symbol: &str,
+        x: Placed,
+        (x_allowed, y_allowed): (&AllowedOrder, &AllowedOrder),
+    ) -> (crate::verdict::DropVerdict, bool) {
+        let order = |o: &AllowedOrder| crate::verdict::DropOrder::new(o.cid, o.venue.clone());
+        let orders = order(x_allowed).and_then(|x| order(y_allowed).map(|y| (x, y)));
+        let (after_drop, pressed) = match &orders {
+            Ok((x, y)) => self.after_drop(on, symbol, (x, y)).await,
+            Err(_) => (crate::verdict::AfterDrop::default(), false),
+        };
+        let both = [x_allowed, y_allowed];
+        let read = self.read_orders(Which::Two, on, x.wall_secs, &both);
+        let (traded, refused, read_pressed) = read.await;
+        let refused = after_drop
+            .refused
+            .map(|on| Stop::RateRefused { on })
+            .or(refused);
+        let refused = refused.and_then(|stop| match stop {
+            Stop::RateRefused { on } => Some(on),
+            _ => None,
+        });
+        let run = self.drop_run();
+        let two = run.two.clone().unwrap_or_default();
+        let naming = [0, 1].map(|n| traded.naming.get(n).copied().unwrap_or(0));
+        let terminal = [0, 1].map(|n| traded.terminal.get(n).cloned().flatten());
+        let facts = crate::verdict::Facts {
+            x_before_two: run.x_before_two.unwrap_or(false),
+            arm_reported_x: two.x_cancel_reported,
+            x_cancelled_before_drop: two.x_cancelled_before_drop,
+            x_before_drop: two.before_drop.map(|[x, _]| x),
+            y_before_drop: two.before_drop.map(|[_, y]| y),
+            y_rested: two.y.acked,
+            y_open_at_drop: two.y_open_at_drop,
+            after: after_drop.last,
+            traded: (traded.trades_whole && refused.is_none()).then_some(naming),
+            // The rows naming neither X nor Y, on the pages read: another order's, or none's.
+            other_trades: traded.trades.saturating_sub(naming.iter().sum()),
+            historic: (traded.historic_whole && refused.is_none()).then_some(terminal),
+            refused,
+        };
+        let verdict = crate::verdict::DropVerdict::judge(&facts);
+        let two = self.two_run();
+        two.after_drop = Some(after_drop);
+        two.after = Some(traded);
+        self.line(format_args!(
+            "VERDICT drop test on {}: {}",
+            name(on),
+            match verdict.passed {
+                true => "passed",
+                false => "failed",
+            }
+        ));
+        (verdict, pressed || read_pressed)
+    }
+
+    /// The reads after the drop on `on` ([`crate::verdict::until_absent`]): never-arming reads
+    /// of `get_user_orders` and REST positions on `symbol`, every frame and request charged to
+    /// the shared limiter first, at the comparisons' cadence, until one lists neither `orders`
+    /// nor the wait ends (0151 item 4), its socket's refusals reported under
+    /// [`AFTER_DROP_TWO`]. The owner's presses meanwhile are taken, none ending them: whether
+    /// one was is the second given.
+    async fn after_drop(
+        &mut self,
+        on: Armed,
+        symbol: &str,
+        orders: (&crate::verdict::DropOrder, &crate::verdict::DropOrder),
+    ) -> (crate::verdict::AfterDrop, bool) {
+        let mut presses = std::mem::take(&mut self.presses);
+        let mut pressed = false;
+        let made = match self.socket_parts(on) {
+            Err(_) => None,
+            Ok(mut parts) => {
+                let places = self.places.expect("a place-stage run");
+                let cadence = crate::compare::Cadence::of(places);
+                let ctx = &mut *parts.ctx;
+                let mut socket =
+                    crate::compare::Socket::new(self.io(symbol), &parts.cfg, &parts.reader, ctx);
+                let after = {
+                    let reads = crate::verdict::until_absent(&mut socket, orders, cadence);
+                    tokio::pin!(reads);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            after = &mut reads => break after,
+                            () = presses.pressed() => pressed = true,
+                        }
+                    }
+                };
+                Some((after, socket.close().await))
+            }
+        };
+        pressed |= presses.try_pressed();
+        self.presses = presses;
+        let Some((after, heard)) = made else {
+            return (crate::verdict::AfterDrop::default(), pressed);
+        };
+        self.ev.read_sockets.push(ReadSocket {
+            before: AFTER_DROP_TWO,
+            label: format!("{} (the reads after the drop)", name(on)),
+            refusals: heard,
+        });
+        self.line(format_args!(
+            "READ after the drop: {}: {} reads, {}",
+            name(on),
+            after.reads.len(),
+            match after.absent_after {
+                Some(_) => "the last listing neither X nor Y",
+                None => "none listing neither X nor Y",
+            }
+        ));
+        (after, pressed)
+    }
+
+    /// What a never-arming read socket of `on`'s is made of: `on`'s configuration, which the
+    /// guard admitted, its reader and the context of each signed frame or request.
+    fn socket_parts(&self, on: Armed) -> Result<SocketParts, String> {
+        let (cfg, _) = configured(&self.base, self.lookup, on)?;
+        let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
+        let reader = auth_qfex::reader(self.lookup, selection)?;
+        let mut nonces = self.nonces.clone();
+        let origin = self.origin;
+        let ctx = Box::new(move || EncodeCtx {
+            wall: wall_ns(),
+            mono: ledger::mono_since(origin),
+            nonces: nonces.reserve(ReadAuth::NONCES),
+        });
+        Ok(SocketParts { cfg, reader, ctx })
+    }
+
+    /// What a never-arming read socket reads with: the run's connector, shared limiter, caps,
+    /// namespace, page size and waits, and the traded `symbol` as QFEX writes it.
+    fn io<'s>(&'s self, symbol: &'s str) -> crate::compare::Io<'s> {
+        crate::compare::Io {
+            connector: &self.connector,
+            limiter: &self.limiter,
+            caps: &self.caps,
+            ns: self.ns(),
+            page_size: self.opts.page_size,
+            connect_wait: self.opts.connect_wait,
+            read_wait: self.opts.read_wait,
+            symbol,
+        }
     }
 
     /// A place stage's session configuration on `cfg` (decision 0148 item 4; [`place_config`]):
@@ -2240,19 +2674,23 @@ impl Run<'_> {
         }
     }
 
-    /// Drop session one on `on` (decision 0132 item 4): an unchanged `ExecSession` whose handler
-    /// is a [`PlaceHandler`] over the drop registry's `link`, its steps ([`Run::drop_steps`]) run
-    /// beside it and the MDS touch driven on. Whatever ends the steps, a stop that cancels in a
-    /// drop session (the owner's Ctrl-C, or any stop once a fill of ours came: 0151 item 2) is
-    /// followed by its cancels ([`Run::stop_cancels`]) and a comparison after them; every other
-    /// stop sends no cancel. Then the session ends by a graceful close (0151 item 11: no drop
-    /// test passed yet), unless its connection ended first, after waiting for the shared
-    /// budget's room when a provider refusal holds it; a Ctrl-C while it waits, with no cancels
-    /// run yet, is taken as one made during the steps, and so is a stop the tee or the handler
-    /// raised meanwhile, a fill of ours among them: its cancels run once there is room, or, with
-    /// none within the patience, are held as 0151 item 11 says.
-    /// Gives the run's stop, if any came, and X, once it was submitted; an error is a failure
-    /// before the session opened.
+    /// A drop session on `on` (decision 0132 item 4): drop session one, or, given X (`x`, which
+    /// session one placed), drop session two. An unchanged `ExecSession` whose handler is a
+    /// [`PlaceHandler`] over the drop registry's `link`, its steps ([`Run::drop_steps`] or
+    /// [`Run::two_steps`]) run beside it and the MDS touch driven on. Whatever ends the steps, a
+    /// stop that cancels in a drop session (the owner's Ctrl-C, or any stop once a fill of ours
+    /// came: 0151 item 2) is followed by its cancels ([`Run::stop_cancels`]) and a comparison
+    /// after them; every other stop sends no cancel. Then the session ends by a graceful close
+    /// (0151 item 11: no drop test passed yet), unless its connection ended first, after waiting
+    /// for the shared budget's room when a provider refusal holds it; a Ctrl-C while it waits,
+    /// with no cancels run yet, is taken as one made during the steps, and so is a stop the tee
+    /// or the handler raised meanwhile, a fill of ours among them: its cancels run once there is
+    /// room, or, with none within the patience, are held as 0151 item 11 says. But drop session
+    /// two that ran its course, Y placed and the read before the drop made, ends by the abrupt
+    /// drop: its run is dropped, unpolled, and its connection with it, with no WebSocket close,
+    /// no wait for room and no cancel (decision 0132 item 4). Gives the run's stop, if any came,
+    /// and the order it placed (X, or Y), once it was submitted; an error is a failure before the
+    /// session opened.
     async fn drop_session(
         &mut self,
         places: &Places,
@@ -2265,13 +2703,19 @@ impl Run<'_> {
             tokio::time::Instant,
         ),
         allowance: &mut Allowance,
+        x: Option<Placed>,
     ) -> Result<(Option<Stop>, Option<Placed>), String> {
+        let which = match x {
+            None => Which::One,
+            Some(_) => Which::Two,
+        };
         let acct = account_key(on);
         let label = name(on);
         let before = self.rejected();
         let sockets = self.ev.read_sockets.len();
         let wake = Rc::new(tokio::sync::Notify::new());
-        let watched = Rc::new(RefCell::new(Watched::default()));
+        // A later session of the registry's watches only what follows it.
+        let watched = Rc::new(RefCell::new(Watched::after(&link.borrow())));
         let control = Rc::new(RefCell::new(None));
         let handler = PlaceHandler {
             inner: LinkHandler {
@@ -2288,10 +2732,20 @@ impl Run<'_> {
         session.set_journal(self.journal.clone());
         let orders = session.orders();
         link.borrow_mut().attach(orders.clone(), acct);
-        self.line(format_args!(
-            "SESSION {label} (drop session one): it arms, places X, compares, and closes \
-             gracefully"
-        ));
+        match which {
+            Which::One => self.line(format_args!(
+                "SESSION {label} (drop session one): it arms, places X, compares, and closes \
+                 gracefully"
+            )),
+            Which::Two => self.line(format_args!(
+                "SESSION {label} (drop session two): it arms, places Y, reads before the drop, \
+                 and drops abruptly"
+            )),
+        }
+        let (heard_from, sent_from) = {
+            let kept = self.tee.kept();
+            (kept.heard.len(), kept.sent().len())
+        };
         let d = DropCtx {
             link,
             wake,
@@ -2301,9 +2755,13 @@ impl Run<'_> {
             inst: market.found.inst,
             caps: market.caps,
             span_end,
+            on,
+            which,
+            heard_from,
+            sent_from,
         };
         let mut presses = std::mem::take(&mut self.presses);
-        let mut x = None;
+        let mut placed = None;
         let (mut stop, mut error) = (None, None);
         let view = market.touch.view();
         let found = market.found.clone();
@@ -2317,7 +2775,25 @@ impl Run<'_> {
             tokio::pin!(running);
             let drive = market.touch.drive();
             tokio::pin!(drive);
-            let steps = self.drop_steps(places, &found, &view, &d, allowance, &mut presses, &mut x);
+            let steps: Pin<Box<dyn Future<Output = Result<(), Halt>> + '_>> = match x {
+                None => Box::pin(self.drop_steps(
+                    places,
+                    &found,
+                    &view,
+                    &d,
+                    allowance,
+                    &mut presses,
+                    &mut placed,
+                )),
+                Some(x) => Box::pin(self.two_steps(
+                    places,
+                    (&found, &view),
+                    &d,
+                    allowance,
+                    &mut presses,
+                    (x, &mut placed),
+                )),
+            };
             let stepped = tokio::select! {
                 biased;
                 ended = &mut running => Err(ended),
@@ -2336,6 +2812,9 @@ impl Run<'_> {
                     (stop, error) = ended_first(self.stop_now(&d), ended);
                 }
             }
+            // The abrupt drop's case, decided once the steps ended: drop session two that ran
+            // its course waits for no room and sends no cancel (decision 0132 item 4).
+            let drop_it = which == Which::Two && stop.is_none() && error.is_none() && !over;
             // The stop's cancels, then the wait for room to close; a press of Ctrl-C taken while
             // the close waits, before any cancels ran, is a stop that cancels too (0151 item 2),
             // and so is a stop the tee or the handler raised meanwhile once a fill of ours came,
@@ -2358,8 +2837,10 @@ impl Run<'_> {
                         ..Cancels::default()
                     });
                     let compare = !cancels.held && cancels.ended && !over;
-                    let ours: Vec<fbc_core::ClientOrderId> = x.iter().map(|p| p.cid).collect();
-                    self.drop_run().cancels = Some(cancels);
+                    // X, and Y in drop session two: every order of the drop test placed so far.
+                    let ours = (x.iter().chain(placed.iter())).map(|p| p.cid);
+                    let ours: Vec<fbc_core::ClientOrderId> = ours.collect();
+                    self.stop_cancelled(which, cancels);
                     if compare {
                         let step = "the stop's cancels";
                         let compare = self.compare_step(&d, (&found, &ours), on, step, None);
@@ -2370,7 +2851,7 @@ impl Run<'_> {
                         };
                         over |= compared.is_none();
                         if let Some(compared) = compared {
-                            self.compared(compared);
+                            self.compared(which, compared);
                         }
                     }
                 }
@@ -2378,7 +2859,7 @@ impl Run<'_> {
                 // close frame included, which the runtime would then drop unsent, the connection
                 // with it: the close waits out the hold, the session read on meanwhile, so it is
                 // graceful (0151 item 11). A hold that outlasts the patience leaves no room.
-                if !over && !roomless && self.rejected() > before {
+                if !over && !drop_it && !roomless && self.rejected() > before {
                     let room = self.room_for_close();
                     tokio::pin!(room);
                     let room = loop {
@@ -2413,9 +2894,14 @@ impl Run<'_> {
             }
             if over {
                 ended_by = CONNECTION_ENDED;
+            } else if drop_it {
+                // The abrupt drop (decision 0132 item 4): its end planned, the session's run is
+                // dropped here unpolled, its connection with it, with no WebSocket close.
+                d.watched.borrow_mut().closing = true;
+                ended_by = DROPPED;
             } else {
                 // What a graceful close could cancel: X as the registry holds it now.
-                rested_at_close = x.as_ref().is_some_and(|p| {
+                rested_at_close = placed.as_ref().is_some_and(|p| {
                     let state = d.link.borrow().registry().get(p.cid).map(|r| r.state());
                     matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled))
                 });
@@ -2441,25 +2927,41 @@ impl Run<'_> {
         let arm = w.arm.as_ref().map(places::outcome_name);
         let (echoes, as_encoded) = {
             let kept = self.tee.kept();
-            (places::echoes(&kept), places::as_encoded(&kept))
+            let echoes = places::echoes(&kept, d.heard_from);
+            (echoes, places::as_encoded(&kept, d.sent_from))
         };
-        let run = self.drop_run();
-        run.echoes = echoes;
-        run.as_encoded = as_encoded;
-        run.x.rested_at_close = rested_at_close;
-        run.authenticated = w.authenticated;
-        run.arm.clone_from(&arm);
-        run.resynced = w.resynced;
-        run.ended_by = Some(ended_by);
+        let (authenticated, resynced) = (w.authenticated, w.resynced);
         drop(w);
+        match which {
+            Which::One => {
+                let run = self.drop_run();
+                run.echoes = echoes;
+                run.as_encoded = as_encoded;
+                run.x.rested_at_close = rested_at_close;
+                run.authenticated = authenticated;
+                run.arm.clone_from(&arm);
+                run.resynced = resynced;
+                run.ended_by = Some(ended_by);
+            }
+            Which::Two => {
+                let two = self.two_run();
+                two.echoes = echoes;
+                two.as_encoded = as_encoded;
+                two.authenticated = authenticated;
+                two.arm.clone_from(&arm);
+                two.resynced = resynced;
+                two.ended_by = Some(ended_by);
+            }
+        }
         self.line(format_args!(
-            "SESSION {label} (drop session one): arm outcome {}, ended by {ended_by}",
+            "SESSION {label} ({}): arm outcome {}, ended by {ended_by}",
+            which.name(),
             arm.as_deref().unwrap_or("none")
         ));
         self.ev.sessions.push(SessionRun {
             account: label,
-            name: places::DROP_ONE,
-            authenticated: d.watched.borrow().authenticated,
+            name: which.name(),
+            authenticated,
             arm,
             ended_by,
             attempts: counters.attempts,
@@ -2475,10 +2977,21 @@ impl Run<'_> {
         });
         match (stop, error) {
             (None, Some(why)) => {
-                self.drop_run().error = Some(why);
-                Ok((None, x))
+                match which {
+                    Which::One => self.drop_run().error = Some(why),
+                    Which::Two => self.two_run().error = Some(why),
+                }
+                Ok((None, placed))
             }
-            (stop, _) => Ok((stop, x)),
+            (stop, _) => Ok((stop, placed)),
+        }
+    }
+
+    /// Records `cancels`, a stop's cancels in drop session `which`.
+    fn stop_cancelled(&mut self, which: Which, cancels: Cancels) {
+        match which {
+            Which::One => self.drop_run().cancels = Some(cancels),
+            Which::Two => self.two_run().cancels = Some(cancels),
         }
     }
 
@@ -2571,26 +3084,10 @@ impl Run<'_> {
         }
     }
 
-    /// Drop session one's steps (decision 0132 item 4): authentication, an `Accepted` arm and
-    /// the resync, the place gate open; Start under the market lease; X, a post-only GTC at the
-    /// instrument's minimum size `--away-bps` behind the touch, the one place before an ACK
-    /// echoes our client id (decision 0132 item 7), spent from the drop registry's list first
-    /// and sent only while both USD caps admit the registry's lot caps and X at that touch
-    /// ([`market::caps_admit`], [`Stop::BeyondCaps`]; decision 0113);
-    /// X's ACK or its deadline; then the streams compared with the reads. Each step ends at the
-    /// first stop ([`Run::waiting`]).
-    #[allow(clippy::too_many_arguments)]
-    async fn drop_steps(
-        &mut self,
-        places: &Places,
-        found: &Discovered,
-        touch: &market::TouchView,
-        d: &DropCtx,
-        allowance: &mut Allowance,
-        presses: &mut Presses,
-        x: &mut Option<Placed>,
-    ) -> Result<(), Halt> {
-        let on = self.named[0];
+    /// Waits for the session's stream authenticated, its arm accepted and its resync applied,
+    /// the place gate open: an arm that came back otherwise is a failure that is no stop, its
+    /// order not placed (decision 0132 item 4).
+    async fn armed(&self, d: &DropCtx, presses: &mut Presses) -> Result<(), Halt> {
         let orders = d.orders.clone();
         let arm = self
             .waiting(d, presses, |_, w| {
@@ -2606,10 +3103,29 @@ impl Run<'_> {
             .await?;
         arm.map_err(|name| {
             Halt::Error(format!(
-                "drop session one's arm came back {name}, not Accepted: X is not placed (decision \
-                 0132 item 4)"
+                "{}'s arm came back {name}, not Accepted: {} is not placed (decision 0132 item 4)",
+                d.which.name(),
+                d.which.order()
             ))
-        })?;
+        })
+    }
+
+    /// Drop session one's steps (decision 0132 item 4): authentication, an `Accepted` arm and
+    /// the resync, the place gate open ([`Run::armed`]); Start under the market lease; X
+    /// ([`Run::place_resting`]); then the streams compared with the reads. Each step ends at the
+    /// first stop ([`Run::waiting`]).
+    #[allow(clippy::too_many_arguments)]
+    async fn drop_steps(
+        &mut self,
+        places: &Places,
+        found: &Discovered,
+        touch: &market::TouchView,
+        d: &DropCtx,
+        allowance: &mut Allowance,
+        presses: &mut Presses,
+        x: &mut Option<Placed>,
+    ) -> Result<(), Halt> {
+        self.armed(d, presses).await?;
         let dir = self.leases.as_ref().map(|l| l.dir.clone());
         let dir = dir.ok_or_else(|| Halt::Error("no lease directory".to_owned()))?;
         places::start(d.link.borrow_mut().reg(), &dir, d.inst).map_err(Halt::Error)?;
@@ -2617,18 +3133,152 @@ impl Run<'_> {
         self.line(format_args!(
             "START {}: the market armed under its market lease, with no account lease (QFEX's \
              nonce scope is none)",
-            name(on)
+            name(d.on)
         ));
-        // X, spent from the drop registry's list before it is built.
-        allowance.take(Step::Drop, ledger::X)?;
+        let placed = self
+            .place_resting(places, (found, touch), d, allowance, presses, x)
+            .await?;
+        let ours = [placed.cid];
+        let compared = self.compare_step(d, (found, &ours), d.on, "X's place", Some(placed.at));
+        let compared = self.unless_stopped(d, presses, compared).await?;
+        let stop = compared.0.stop;
+        self.compared(Which::One, compared);
+        match stop {
+            Some(stop) => Err(Halt::Stop(stop)),
+            None => Ok(()),
+        }
+    }
+
+    /// Drop session two's steps (decision 0132 item 4): authentication, an `Accepted` arm and
+    /// the resync ([`Run::armed`]); no Start, since the market stays armed from drop session one
+    /// on the same registry; Y ([`Run::place_resting`]); then the read before the drop, one
+    /// never-arming read of `get_user_orders` and REST positions beside the session, which lists
+    /// X, `x`, and Y or not. Each step ends at the first stop ([`Run::waiting`]), and a provider
+    /// rate refusal in the read is one (decision 0148 item 8); a stop raised, or a press made,
+    /// as the read's socket closed is taken before the drop, so Ctrl-C then cancels. Then, as
+    /// the session drops (nothing is awaited between the steps' end and the drop), what its
+    /// frames and its registry showed of X and Y ([`Run::at_drop`]).
+    async fn two_steps(
+        &mut self,
+        places: &Places,
+        (found, touch): (&Discovered, &market::TouchView),
+        d: &DropCtx,
+        allowance: &mut Allowance,
+        presses: &mut Presses,
+        (x, y): (Placed, &mut Option<Placed>),
+    ) -> Result<(), Halt> {
+        self.armed(d, presses).await?;
+        let placed = self
+            .place_resting(places, (found, touch), d, allowance, presses, y)
+            .await?;
+        let vid = |cid| (d.link.borrow().registry().get(cid)).and_then(|r| r.vid().cloned());
+        let order = |cid| crate::verdict::DropOrder::new(cid, vid(cid)).map_err(Halt::Error);
+        let (x, y) = (order(x.cid)?, order(placed.cid)?);
+        let parts = self.socket_parts(d.on).map_err(Halt::Error)?;
+        let symbol = found.spec.venue_symbol.as_wire();
+        let SocketParts {
+            cfg,
+            reader,
+            mut ctx,
+        } = parts;
+        let mut socket = crate::compare::Socket::new(self.io(symbol), &cfg, &reader, &mut *ctx);
+        let read = self.unless_stopped(d, presses, socket.read()).await?;
+        // The arm's window ends with the read before the drop: a CANCELLED of X heard by then
+        // is the arm's, reported (decision 0132 item 4: no report settles nothing until that
+        // read).
+        let reported = self
+            .tee
+            .kept()
+            .cancelled_of_from(d.heard_from, x.cid_text());
+        let heard = socket.close().await;
+        self.two_run().x_cancel_reported = reported;
+        self.ev.read_sockets.push(ReadSocket {
+            before: places::DROP_TWO,
+            label: format!("{} (the read before the drop)", name(d.on)),
+            refusals: heard,
+        });
+        let before_drop = match read {
+            crate::compare::Attempt::Read(read) => {
+                let listing = crate::verdict::Listing::of(&read, &x, &y);
+                Some([listing.x, listing.y])
+            }
+            crate::compare::Attempt::Refused(on) => {
+                self.line(format_args!(
+                    "READ before the drop: {}: refused by a provider rate refusal",
+                    name(d.on)
+                ));
+                return Err(Halt::Stop(Stop::RateRefused { on }));
+            }
+            _ => None,
+        };
+        self.two_run().before_drop = before_drop;
+        self.line(format_args!(
+            "READ before the drop: {}: {}",
+            name(d.on),
+            match before_drop {
+                Some([x, y]) => format!("X listed {x}, Y listed {y}"),
+                None => "not made".to_owned(),
+            }
+        ));
+        self.not_stopped(d, presses)?;
+        self.at_drop(d, (&x, &y));
+        Ok(())
+    }
+
+    /// What drop session two showed of X and Y, `x` and `y`, as it drops: whether a `CANCELLED`
+    /// of X was heard in the session, so the drop did not end it (decision 0132 item 4), and
+    /// whether Y was still open in the registry, with no `CANCELLED` of it heard, so the drop had
+    /// Y of its own to cancel (0151 item 13).
+    fn at_drop(
+        &mut self,
+        d: &DropCtx,
+        (x, y): (&crate::verdict::DropOrder, &crate::verdict::DropOrder),
+    ) {
+        let (x_cancelled, y_cancelled) = {
+            let kept = self.tee.kept();
+            let of =
+                |o: &crate::verdict::DropOrder| kept.cancelled_of_from(d.heard_from, o.cid_text());
+            (of(x), of(y))
+        };
+        let state = d.link.borrow().registry().get(y.cid).map(|r| r.state());
+        let open = matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled));
+        let two = self.two_run();
+        two.x_cancelled_before_drop = x_cancelled;
+        two.y_open_at_drop = open && !y_cancelled;
+    }
+
+    /// Places `d`'s order, X in drop session one or Y in two: a post-only GTC at the
+    /// instrument's minimum size `--away-bps` behind the touch, spent from the drop registry's
+    /// list first ([`Allowance`]), its client id minted under the run's namespace lease, as an
+    /// fbc-oms authorization; the one place before an ACK echoes our client id in its session
+    /// (decision 0132 item 7). Before it is built into a command, both USD caps are asked again
+    /// at the touch it is priced at ([`market::caps_admit`]); an order either would not admit
+    /// is not sent, and never resized, the run's stop [`Stop::BeyondCaps`] (decision 0113).
+    /// Then its ACK, or its deadline. Gives it, as placed, once handed to the session (`placed`
+    /// holds it from then); a stop or a press first places nothing.
+    async fn place_resting(
+        &mut self,
+        places: &Places,
+        (found, touch): (&Discovered, &market::TouchView),
+        d: &DropCtx,
+        allowance: &mut Allowance,
+        presses: &mut Presses,
+        placed: &mut Option<Placed>,
+    ) -> Result<Placed, Halt> {
+        let what = match d.which {
+            Which::One => ledger::X,
+            Which::Two => ledger::Y,
+        };
+        let order = d.which.order();
+        allowance.take(Step::Drop, what)?;
         let leases = self.leases.as_mut().expect("a place-stage run's leases");
         let cid = leases.mint.mint(1).await.map_err(Halt::Error)?[0];
         let quote = touch.now(places.touch_max_age).map_err(Halt::Error)?;
         let px = market::rest_price(&found.spec, places.side, quote, places.away_bps);
         let px = px.map_err(Halt::Error)?;
-        // A test's X not priced: a failure of the session that is no stop.
+        // A test's X not priced: a failure of drop session one that is no stop.
         #[cfg(test)]
-        if places.test.x_unpriced {
+        if places.test.x_unpriced && d.which == Which::One {
             return Err(Halt::Error("a test's X could not be priced".to_owned()));
         }
         let new = fbc_core::NewOrder {
@@ -2643,12 +3293,12 @@ impl Run<'_> {
             reduce_only: false,
             reducing: false,
         };
-        // A stop raised, or a press made, while the id was minted and the touch read, before X
-        // is built: nothing more is placed (decision 0132 item 7, 0151 item 2).
+        // A stop raised, or a press made, while the id was minted and the touch read, before the
+        // order is built: nothing more is placed (decision 0132 item 7, 0151 item 2).
         self.not_stopped(d, presses)?;
-        // The caps asked again at the touch X is priced at: fbc-oms holds them in lots fixed at
-        // the preflight's touch, which a touch risen since leaves above what the USD caps admit
-        // (decision 0113). X is then not sent, and never resized.
+        // The caps asked again at the touch the order (X, or Y) is priced at: fbc-oms holds them
+        // in lots fixed at the preflight's touch, which a touch risen since leaves above what the
+        // USD caps admit (decision 0113). It is then not sent, and never resized.
         if !market::caps_admit(places, found, quote, d.caps, found.min_size) {
             return Err(Halt::Stop(Stop::BeyondCaps));
         }
@@ -2657,25 +3307,27 @@ impl Run<'_> {
             let cmd = link
                 .reg()
                 .place(new)
-                .map_err(|e| format!("X was refused: {}", places::variant_name(&e)));
+                .map_err(|e| format!("{order} was refused: {}", places::variant_name(&e)));
             let auth = cmd.and_then(|cmd| {
                 let auth = link.reg().authorize(d.acct, cmd);
-                auth.map_err(|e| format!("X was not authorized: {}", places::variant_name(&e)))
+                auth.map_err(|e| {
+                    format!("{order} was not authorized: {}", places::variant_name(&e))
+                })
             });
             auth.and_then(|auth| link.submit(&d.orders, auth))
         };
         let rpc = submitted.map_err(Halt::Error)?;
-        let placed = Placed {
+        let now = Placed {
             cid,
             at: tokio::time::Instant::now(),
             wall_secs: u64::try_from(wall_secs()).unwrap_or(0),
         };
-        *x = Some(placed);
-        self.drop_run().x.submitted = true;
+        *placed = Some(now);
+        self.placed_run(d.which).submitted = true;
         self.line(format_args!(
-            "PLACE X on {}: one post-only GTC at the instrument's minimum size, --away-bps \
+            "PLACE {order} on {}: one post-only GTC at the instrument's minimum size, --away-bps \
              behind the touch (no price, size or id is shown)",
-            name(on)
+            name(d.on)
         ));
         // Its ACK, or its deadline.
         let acked = self
@@ -2690,8 +3342,8 @@ impl Run<'_> {
                 }
             })
             .await?;
-        let exact = self.tee.kept().exact_ack();
-        // X is ours whatever client id its later frames carry (decision 0132 item 7).
+        let exact = self.tee.kept().exact_ack_from(d.heard_from);
+        // It is ours whatever client id its later frames carry (decision 0132 item 7).
         let vid = d
             .link
             .borrow()
@@ -2708,27 +3360,18 @@ impl Run<'_> {
             let state = link.registry().get(cid).map(|r| r.state());
             matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled))
         };
-        let acked_x = acked.0 && (open || self.tee.kept().acked_ours());
-        let run = self.drop_run();
-        run.x.acked = acked_x;
-        run.x.outcome = acked.1.as_ref().map(places::outcome_name);
-        run.x.exact_echo = exact;
-        run.x.ack_after = acked_x.then(|| placed.at.elapsed());
-        let ours = [cid];
-        let compared = self.compare_step(d, (found, &ours), on, "X's place", Some(placed.at));
-        let compared = self.unless_stopped(d, presses, compared).await?;
-        let stop = compared.0.stop;
-        self.compared(compared);
-        match stop {
-            Some(stop) => Err(Halt::Stop(stop)),
-            None => Ok(()),
-        }
+        let acked_ours = self.tee.kept().acked_ours_from(d.heard_from);
+        let run = self.placed_run(d.which);
+        run.acked = acked.0 && (open || acked_ours);
+        run.outcome = acked.1.as_ref().map(places::outcome_name);
+        run.exact_echo = exact;
+        run.ack_after = run.acked.then(|| now.at.elapsed());
+        Ok(now)
     }
-
     /// The streams of `d`'s session, its orders `ours` on `found`'s market, compared with
     /// never-arming reads of `on` after the step named `step`, made at `since` (now when `None`),
     /// at the run's cadence (0151 item 4, [`crate::compare`]): its socket's refusals reported
-    /// under drop session one.
+    /// under `d`'s session.
     async fn compare_step(
         &self,
         d: &DropCtx,
@@ -2776,7 +3419,7 @@ impl Run<'_> {
         // refusal met meanwhile is counted once, as the session's.
         let heard = socket.close().await;
         let socket = ReadSocket {
-            before: places::DROP_ONE,
+            before: d.which.name(),
             label: format!("{label} (the comparison after {step})"),
             refusals: heard,
         };
@@ -2792,10 +3435,17 @@ impl Run<'_> {
         (compared, Some(socket))
     }
 
-    /// Records `compared`, a comparison of drop session one, and its read socket's refusals.
-    fn compared(&mut self, (compared, socket): (crate::compare::Compared, Option<ReadSocket>)) {
+    /// Records `compared`, a comparison of drop session `which`, and its read socket's refusals.
+    fn compared(
+        &mut self,
+        which: Which,
+        (compared, socket): (crate::compare::Compared, Option<ReadSocket>),
+    ) {
         self.ev.read_sockets.extend(socket);
-        self.drop_run().compared.push(compared);
+        match which {
+            Which::One => self.drop_run().compared.push(compared),
+            Which::Two => self.two_run().compared.push(compared),
+        }
     }
 
     /// A stop's cancels in a drop session (0151 items 2 and 11; as `paradex_testnet_acceptance`
@@ -2924,21 +3574,26 @@ impl Run<'_> {
         c
     }
 
-    /// The after-session read of every named account (decision 0132 item 7), each whatever
-    /// another showed, X admitted on its account so the read says whether it rests. The owner's
-    /// presses meanwhile are taken, none ending the reads: the run stops after them. A provider
-    /// rate refusal they meet, a `GET /user/positions` answered 429 or 418, any rise in the
-    /// shared limiter's `rejected.user` count, or one their read sockets' frames show, in clear
-    /// or kept whole ([`Refusals::shown`]), is a stop too, once they all ran.
-    async fn read_after(&mut self, x: Option<&AllowedOrder>) -> AfterReads {
+    /// The read of every named account after drop session `which` on `on` (decision 0132 item
+    /// 7), each whatever another showed, X admitted on its account when given, so the read says
+    /// whether it rests. The owner's presses meanwhile are taken, none ending the reads: the run
+    /// stops after them. A provider rate refusal they meet, a `GET /user/positions` answered 429
+    /// or 418, any rise in the shared limiter's `rejected.user` count, or one their read
+    /// sockets' frames show, in clear or kept whole ([`Refusals::shown`]), is a stop too, once
+    /// they all ran.
+    async fn read_after(
+        &mut self,
+        which: Which,
+        on: Armed,
+        x: Option<&AllowedOrder>,
+    ) -> AfterReads {
         let mut after = AfterReads::default();
         let mark = self.read_mark();
         let mut presses = std::mem::take(&mut self.presses);
-        let on = self.named[0];
         let mut pressed = false;
         for account in self.named.clone() {
             let read = {
-                let read = self.read_one(AFTER_DROP_ONE, on, " (drop)", account, x);
+                let read = self.read_one(which.after(), on, " (drop)", account, x);
                 tokio::pin!(read);
                 loop {
                     tokio::select! {
@@ -2951,8 +3606,10 @@ impl Run<'_> {
             match read {
                 Ok(read) => {
                     // X's account is read when its page listed X or was the last: a full page
-                    // not listing X leaves X unread, not absent.
-                    after.x_read |= account == on && (read.page_lists_it || !read.page_full);
+                    // not listing X leaves X unread, not absent. With no X to find, after drop
+                    // session two, the account is read when its read ended.
+                    let found = x.is_none() || read.page_lists_it || !read.page_full;
+                    after.x_read |= account == on && found;
                     after.x_flat |= account == on && read.flat;
                     after.not_flat |= !read.flat;
                     after.resting |= read.page_orders > 0 || read.rest_open_orders > 0;
@@ -3014,27 +3671,81 @@ impl Run<'_> {
         Err(self.halt(stop, when))
     }
 
-    /// X and its trades read after drop session one (FBC-be57) on a socket of `on`'s that never
-    /// arms: every `get_user_trades` page from X's send, `since` in whole seconds, and every
-    /// `GET /user/historic-orders` page, each charged to the shared limiter first; the trades
-    /// naming X counted and X's `terminal_status` kept as a status name. A full page the same as
-    /// the one before it, row for row, as a venue ignoring the offset answers, fails the read
-    /// rather than paging on. A provider rate refusal is a stop. The owner's presses meanwhile,
-    /// and one made before they end, are taken, none ending them: whether one was is the last
-    /// given.
-    async fn read_x(
+    /// The read before drop session two (FBC-77r8; decision 0132 item 7, 0144 item 4): every
+    /// named account read as before a session ([`Run::check_accounts_allowing`]) under
+    /// [`places::DROP_TWO`], admitting `x`, X resting from drop session one, alone on its account
+    /// ([`AccountRead::refusal`]: X listed, and REST counting one open order on its symbol and
+    /// none on another). The reads wait out a hold the shared budget is under, as the reads after
+    /// a session do, and the owner's presses meanwhile are taken, none ending them. X rests
+    /// whatever they show, so each way they end the run is a stop, marked: a provider rate
+    /// refusal they met ([`Stop::RateRefused`]; one their sockets' frames show, kept whole
+    /// included, [`Refusals::shown`]), then the owner's Ctrl-C ([`Stop::Interrupted`]),
+    /// then a read that is not clean, an open order but X, a TWAP or a position the streams never
+    /// showed ([`Stop::ReadDisagrees`]), then an account that could not be read, X left resting
+    /// unjudged ([`Stop::LeftResting`]).
+    async fn read_before_two(&mut self, x: &AllowedOrder) -> Result<(), String> {
+        let (mark, made) = (self.read_mark(), self.ev.reads.len());
+        let mut presses = std::mem::take(&mut self.presses);
+        self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
+        let mut pressed = false;
+        let read = {
+            let some = Some(x);
+            let read = self.check_accounts_allowing(places::DROP_TWO, x.account, " (drop)", some);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
+                    read = &mut read => break read,
+                    () = presses.pressed() => pressed = true,
+                }
+            }
+        };
+        pressed |= presses.try_pressed();
+        self.patient = None;
+        self.presses = presses;
+        // A refusal their read sockets' frames show, in clear or kept whole, is one too, though
+        // the adapter reads no hold from a frame kept whole ([`Refusals::shown`]).
+        let refused = self.refused_since(mark);
+        let unclean = (self.ev.reads[made..].last()).is_some_and(|r| r.refusal().is_some());
+        let stop = match (refused, pressed, &read) {
+            (Some(stop), ..) => stop,
+            (None, true, _) => Stop::Interrupted,
+            (None, false, Ok(())) => return Ok(()),
+            (None, false, Err(_)) if unclean => Stop::ReadDisagrees,
+            (None, false, Err(_)) => Stop::LeftResting,
+        };
+        let why = read.err().map_or(String::new(), |why| format!("{why}; "));
+        let said = self.halt(stop, "in the read before drop session two");
+        Err(format!("{why}{said}"))
+    }
+
+    /// The drop test's orders and their trades read after drop session `which` (FBC-be57,
+    /// FBC-77r8) on a socket of `on`'s that never arms: every `get_user_trades` page from X's
+    /// send, `since` in whole seconds, and every `GET /user/historic-orders` page, each charged to
+    /// the shared limiter first; the trades naming each of `orders` (X, then Y after the drop)
+    /// counted, each one's `terminal_status` kept as a status name, and the member names the
+    /// rows carry. A full page the same as the one before it, row for row, as a venue ignoring
+    /// the offset answers, fails the read rather than paging on. A provider rate refusal is a
+    /// stop. The owner's presses meanwhile, and one made before they end, are taken, none ending
+    /// them: whether one was is the last given.
+    async fn read_orders(
         &mut self,
+        which: Which,
         on: Armed,
         since: u64,
-        x: &AllowedOrder,
-    ) -> (XAfter, Option<Stop>, bool) {
-        let mut after = XAfter::default();
+        orders: &[&AllowedOrder],
+    ) -> (Traded, Option<Stop>, bool) {
+        let mut after = Traded {
+            naming: vec![0; orders.len()],
+            terminal: vec![None; orders.len()],
+            ..Traded::default()
+        };
         let before = self.rejected();
         let mut heard = Refusals::default();
         let mut presses = std::mem::take(&mut self.presses);
         let mut pressed = false;
         let read = {
-            let read = self.reading_x(on, since, x, &mut after, &mut heard);
+            let read = self.reading_orders(on, since, orders, &mut after, &mut heard);
             tokio::pin!(read);
             loop {
                 tokio::select! {
@@ -3047,9 +3758,13 @@ impl Run<'_> {
         pressed |= presses.try_pressed();
         self.presses = presses;
         heard.limiter = self.rejected().saturating_sub(before);
+        let what = match which {
+            Which::One => "X and its trades",
+            Which::Two => "X, Y and their trades",
+        };
         self.ev.read_sockets.push(ReadSocket {
-            before: AFTER_DROP_ONE,
-            label: format!("{} (X and its trades)", name(on)),
+            before: which.after(),
+            label: format!("{} ({what})", name(on)),
             refusals: heard,
         });
         let refused = match read {
@@ -3066,24 +3781,24 @@ impl Run<'_> {
         (after, refused, pressed)
     }
 
-    /// [`Run::read_x`]'s reads, into `after`, each frame counted in `heard`.
-    async fn reading_x(
+    /// [`Run::read_orders`]'s reads, into `after`, each frame counted in `heard`.
+    async fn reading_orders(
         &mut self,
         on: Armed,
         since: u64,
-        x: &AllowedOrder,
-        after: &mut XAfter,
+        orders: &[&AllowedOrder],
+        after: &mut Traded,
         heard: &mut Refusals,
     ) -> Result<(), (String, Option<Stop>)> {
         let plain = |e: String| (e, None);
         let (cfg, _) = configured(&self.base, self.lookup, on).map_err(plain)?;
         let selection = account_selection(&cfg).map_err(|e| plain(e.to_string()))?;
         let reader = auth_qfex::reader(self.lookup, selection).map_err(plain)?;
-        let cid = fbc_core::encode_cid(&fbc_venue_qfex::exec::CLIENT_ID_FORMAT, x.cid);
-        let cid = cid
-            .map_err(|e| plain(format!("X's client id: {}", places::variant_name(&e))))?
-            .to_string();
-        let vid = x.venue.as_ref().map(|v| v.as_str().to_owned());
+        let mut drop_orders = Vec::new();
+        for order in orders {
+            let made = crate::verdict::DropOrder::new(order.cid, order.venue.clone());
+            drop_orders.push(made.map_err(|e| plain(format!("a client id: {e}")))?);
+        }
         let url = account_reads::trade_url(&cfg, &reader).map_err(|e| plain(e.to_string()))?;
         let opened = auth_qfex::open(&self.connector, &url, self.opts.connect_wait).await;
         let mut opened = opened.map_err(plain)?;
@@ -3116,14 +3831,19 @@ impl Run<'_> {
             let page = account_reads::decode_trades_page(&reader, reply.raw());
             let page =
                 page.map_err(|e| plain(format!("get_user_trades: {}", places::variant_name(&e))))?;
-            let naming = |row: &account_reads::TradeRow| {
-                row.client_order_id.as_deref() == Some(cid.as_str())
-                    || (vid.is_some() && row.order_id == vid)
-            };
             after.trades += page.rows().len();
-            after.trades_naming_x += page.rows().iter().filter(|r| naming(r)).count();
+            for (n, order) in drop_orders.iter().enumerate() {
+                after.naming[n] += page.rows().iter().filter(|r| order.named_by(r)).count();
+            }
+            for row in page.rows() {
+                for member in &row.members {
+                    let member = places::member_name(member);
+                    if !after.fields.contains(&member) {
+                        after.fields.push(member);
+                    }
+                }
+            }
             if page.rows().len() < usize::from(ask.limit()) {
-                after.trades_read = true;
                 break;
             }
             // A full page the same as the one before it, row for row: a venue ignoring the
@@ -3137,6 +3857,7 @@ impl Run<'_> {
             before = Some(page.rows().to_vec());
             offset += u32::from(ask.limit());
         }
+        after.trades_whole = true;
         let _ = self.close_read(opened).await;
         let mut offset = 0;
         let mut before: Option<Vec<account_reads::HistoricOrder>> = None;
@@ -3163,9 +3884,10 @@ impl Run<'_> {
             };
             let page = account_reads::decode_historic(&resp);
             let page = page.map_err(|e| plain(format!("GET /user/historic-orders: {e}")))?;
-            let named = page.rows().iter().find(|r| r.client_order_id == cid);
-            if let Some(row) = named {
-                after.terminal_status = Some(status_name(&row.terminal_status));
+            for (n, order) in drop_orders.iter().enumerate() {
+                if let Some(status) = order.terminal_in(page.rows()) {
+                    after.terminal[n] = Some(status);
+                }
             }
             if page.rows().len() < usize::from(ask.limit()) {
                 break;
@@ -3181,13 +3903,15 @@ impl Run<'_> {
             before = Some(page.rows().to_vec());
             offset += u32::from(ask.limit());
         }
+        after.historic_whole = true;
         Ok(())
     }
 
-    /// Counts `frame`, off X's read socket, as a read socket's ([`Refusals::hear`]), holding the
-    /// shared budget for a `RateLimited` err, which is a stop; so is every other refusal its
-    /// count shows, one in a frame the journal keeps whole included ([`Refusals::shown`]), from
-    /// which the adapter reads no hold (decision 0134 items 2 and 6, 0135 item 2).
+    /// Counts `frame`, off the read socket of X and its trades, as a read socket's
+    /// ([`Refusals::hear`]), holding the shared budget for a `RateLimited` err, which is a stop;
+    /// so is every other refusal its count shows, one in a frame the journal keeps whole
+    /// included ([`Refusals::shown`]), from which the adapter reads no hold (decision 0134 items
+    /// 2 and 6, 0135 item 2).
     fn heard_x(
         &self,
         heard: &mut Refusals,
@@ -3207,7 +3931,7 @@ impl Run<'_> {
                 let now = tokio::time::Instant::now();
                 (self.limiter).provider_rejected(now, NO_CONN, hold.charge, hold.retry_after);
                 Err((
-                    "a RateLimited err on X's read socket".to_owned(),
+                    "a RateLimited err on the read socket of X and its trades".to_owned(),
                     Some(Stop::RateRefused { on }),
                 ))
             }
@@ -3234,11 +3958,12 @@ struct ReadMark {
 struct AfterReads {
     /// Whether an account held an open order (on the page, or counted by REST).
     resting: bool,
-    /// Whether an account held a position that is not flat.
+    /// Whether an account held a position that is not flat, or, after drop session two failed
+    /// with no stop, a trade named X or Y.
     not_flat: bool,
     /// Whether X was listed on its account's page.
     x_listed: bool,
-    /// Whether X's account, the first named, was read, on a page that listed X or was its last.
+    /// Whether the drop test's account was read, on a page that listed X or was its last.
     x_read: bool,
     /// Whether X's account was read and its position was flat.
     x_flat: bool,
@@ -3246,6 +3971,36 @@ struct AfterReads {
     pressed: bool,
     /// The provider rate refusal they met, if any: a stop ([`Run::read_after`]).
     refused: Option<Stop>,
+}
+
+/// The stop the reads after drop session two make, given `after` and whether the owner pressed
+/// Ctrl-C during the reads after the drop, or during X's and Y's trades read after a failure
+/// (`pressed`): [`read_stop`]'s.
+fn after_stop(after: &AfterReads, pressed: bool) -> Option<(Stop, &'static str)> {
+    let pressed = pressed || after.pressed;
+    read_stop(after.refused, pressed, after.not_flat, after.resting)
+}
+
+/// The stop the reads after drop session two make, and when it was met, the first that applies:
+/// the provider rate refusal they met, `refused`; the owner's Ctrl-C during them, `pressed`; a
+/// position not flat; an order of ours still resting, for the owner's hand cancel (decision
+/// 0132 item 7). Each is marked (0151 item 6). None when they show none of them.
+pub fn read_stop(
+    refused: Option<Stop>,
+    pressed: bool,
+    not_flat: bool,
+    resting: bool,
+) -> Option<(Stop, &'static str)> {
+    const AFTER: &str = "after drop session two";
+    if let Some(stop) = refused {
+        return Some((stop, "in the reads after drop session two"));
+    }
+    match (pressed, not_flat, resting) {
+        (true, ..) => Some((Stop::Interrupted, "during the reads after drop session two")),
+        (false, true, _) => Some((Stop::NotFlat, AFTER)),
+        (false, false, true) => Some((Stop::LeftResting, AFTER)),
+        (false, false, false) => None,
+    }
 }
 
 /// A comparison that made no read, since its socket could not be set up: `why` is not shown.
@@ -3285,15 +4040,5 @@ fn streams_of(
     Streams {
         orders,
         position: rust_decimal::Decimal::from(reg.inventory(inst).0) * step,
-    }
-}
-
-/// `status` as the report keeps it: a status name (capitals, digits and underscores, at most
-/// 32), or `(not a status name)`.
-fn status_name(status: &str) -> String {
-    let named = |c: char| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_';
-    match (1..=32).contains(&status.len()) && status.chars().all(named) {
-        true => status.to_owned(),
-        false => "(not a status name)".to_owned(),
     }
 }

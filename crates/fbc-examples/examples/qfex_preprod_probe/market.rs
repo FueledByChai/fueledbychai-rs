@@ -32,8 +32,8 @@
 //!   grid on its safe side as `InstrumentSpec::quantize` snaps, flooring a buy and ceiling a
 //!   sell, so a resting order is never nearer the touch, and a flatten never further through it,
 //!   than asked, however many ticks the price spans. The resting price is taken for the caps
-//!   and for X (FBC-23ch, from the touch [`Touch::drive`] keeps current, [`TouchView`]); later
-//!   slices price the others.
+//!   and for X and Y (FBC-23ch and FBC-77r8, from the touch [`Touch::drive`] keeps current while
+//!   a session runs, [`TouchView`]); later slices price the others.
 //! - **The caps** ([`place_caps`]): each of `--resting-cap-usd` and `--inventory-cap-usd` in lots
 //!   with `testnet::cap_lots`, at `testnet::inventory_price` of the resting price and the touch,
 //!   the highest price any order of the stages takes, and refused below three of the
@@ -704,10 +704,9 @@ const FENCES: &str = "--production; --sole-trader (decision 0148 item 7); --rest
      comparison; and every origin a loopback test stub's, until FBC-4plj";
 
 /// What the place stages do after the preflight, and do not do yet, as the report says it.
-const NOT_BUILT: &str = "After the preflight, drop session one of decision 0132 item 4's drop \
-     test runs on the first named account alone (FBC-23ch), and the run ends after its reads: \
-     drop session two and the stages after it are not built yet (FBC-77r8 and the slices after \
-     it)";
+const NOT_BUILT: &str = "After the preflight, decision 0132 item 4's drop test runs on each \
+     named account in turn (FBC-23ch and FBC-77r8), and the run ends after the last account's: \
+     stage two and the stages after it are not built yet (FBC-su9i and the slices after it)";
 
 /// The report's section on the place stages' preflight.
 pub fn markdown(s: &mut String, pre: &Preflight) {

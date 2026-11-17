@@ -1,9 +1,9 @@
-//! The QFEX model the place stages' tests run against (FBC-c6kw, FBC-23ch; story BT-702):
-//! QFEX's REST reads, its trade sockets, sessions and reads alike, and its MDS touch, each
-//! answered as QFEX's pages show them, on the conformance stub's serving scripts (decision
+//! The QFEX model the place stages' tests run against (FBC-c6kw, FBC-23ch, FBC-77r8; story
+//! BT-702): QFEX's REST reads, its trade sockets, sessions and reads alike, and its MDS touch,
+//! each answered as QFEX's pages show them, on the conformance stub's serving scripts (decision
 //! 0150), since the place stages' connections, several at once, send what no timeline can know.
 //! fbc-conformance stays venue-free: the model is this test's own. Later slices extend it with
-//! crossings, IOCs and paging (FBC-77r8 and after).
+//! crossings, IOCs and paging (FBC-su9i and after).
 //!
 //! - **State** ([`QfexModel`], behind `Arc<Mutex<..>>`): the instruments `/refdata` lists (or,
 //!   with [`QfexModel::refdata`], the status and body it answers in their place), each
@@ -27,7 +27,12 @@
 //!   offset. Any other frame is refused, failing that answer as the serving script reports it.
 //!   An armed connection's account has every open order cancelled once the connection closed
 //!   gracefully, with [`QfexModel::cod_on_close`], or dropped, with [`QfexModel::cod_on_drop`]
-//!   (account-wide, decision 0121), seen at the model's next answer.
+//!   (account-wide, decision 0121), seen at the model's next answer; with [`QfexModel::cod_reach`]
+//!   at [`Reach::Own`], only the orders placed on that connection (FBC-77r8). Those three are
+//!   the cod knob. The arm itself cancels every open order of its account with
+//!   [`QfexModel::arm_cancels_open`], each reported by a `CANCELLED` `order_response` before
+//!   the arm's ack, reported late with the next place's answer, or not reported at all
+//!   ([`ArmCancels`], FBC-77r8; QFEX's note says enabling cancels, decision 0132 item 2).
 //! - **Positions** follow the model's own orders and fills: an account they touched is answered
 //!   its position on [`SYMBOL`] and its open orders, every other one its body in
 //!   [`QfexModel::positions`].
@@ -38,22 +43,33 @@
 //!   [`QfexModel::close_on_place`], [`QfexModel::arm_err`],
 //!   [`QfexModel::rest_lag`], [`QfexModel::rest_fails`], [`QfexModel::cancel_delay`],
 //!   [`QfexModel::foreign_order`], [`QfexModel::position_on_place`] and
-//!   [`QfexModel::position_after_close`], [`QfexModel::cancel_place`],
+//!   [`QfexModel::position_after_close`], [`QfexModel::foreign_after_close`] (FBC-77r8),
+//!   [`QfexModel::cancel_place`],
 //!   [`QfexModel::venue_cancel`],
 //!   [`QfexModel::close_on_cancel`], [`QfexModel::stray_after`],
-//!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`] and
-//!   [`QfexModel::fill_on_trades`]; as the first graceful close of an armed connection is
-//!   settled, [`QfexModel::fill_after_close`], [`QfexModel::part_fill_after_close`] and
-//!   [`QfexModel::trade_after_close`]; at the first trade-socket authentication,
-//!   [`QfexModel::touch_moves`]; on every read socket, [`QfexModel::auth_fails`],
-//!   [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`], [`QfexModel::trades_err`] and
-//!   [`QfexModel::hold_trades`], on every `GET /user/historic-orders`
-//!   [`QfexModel::historic_fails`], and
-//!   on every read socket's pages [`QfexModel::newest_first`], after the first `add_order`
-//!   [`QfexModel::page_delay`] and, once an armed connection ended,
-//!   [`QfexModel::blank_cid_after_session`]. With [`QfexModel::stray_order`] or
+//!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`],
+//!   [`QfexModel::fill_on_trades`] and [`QfexModel::fill_on_trades_page`]; as the first graceful
+//!   close of an armed connection is settled, [`QfexModel::fill_after_close`],
+//!   [`QfexModel::part_fill_after_close`], [`QfexModel::trade_after_close`] and
+//!   [`QfexModel::netting_after_close`]; at the first
+//!   trade-socket authentication, [`QfexModel::touch_moves`]; on every read socket,
+//!   [`QfexModel::auth_fails`], [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`],
+//!   [`QfexModel::trades_err`] and [`QfexModel::hold_trades`], and on every read socket's pages
+//!   [`QfexModel::newest_first`], after the first `add_order` [`QfexModel::page_delay`] and,
+//!   once an armed connection ended, [`QfexModel::blank_cid_after_session`] and, on its
+//!   positions, [`QfexModel::stop_order_after_close`]; on one authentication,
+//!   [`QfexModel::silent_auth`] (FBC-77r8). With [`QfexModel::stray_order`] or
 //!   [`QfexModel::cid_absent_update`], a read socket's page waits from the first `add_order`
-//!   until the end of the connection it came on is seen ([`QfexModel::knob_frames_unread`]).
+//!   until the end of the connection it came on is seen ([`QfexModel::knob_frames_unread`]),
+//!   and with [`OnAck::MakerFill`] from its fill until its connection's client writes again or
+//!   that connection's end is seen.
+//!   FBC-77r8's on a later place, arm or drop:
+//!   [`QfexModel::ack_delay_on`], [`QfexModel::fill_at_arm`], [`QfexModel::arm_err_on`],
+//!   [`QfexModel::on_ack`] ([`OnAck`]), [`QfexModel::crossed_on_place`],
+//!   [`QfexModel::fill_on_drop`], [`QfexModel::trade_on_drop`],
+//!   [`QfexModel::historic_omits_last`],
+//!   [`QfexModel::historic_fails`] and
+//!   [`QfexModel::touch_moves_at_arm`].
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -99,6 +115,8 @@ pub struct Conn {
     pub armed: bool,
     /// Whether its end was seen, and its cancel-on-disconnect applied as the knobs say.
     pub settled: bool,
+    /// Whether that end was a drop, with no close of the client's.
+    pub dropped: bool,
 }
 
 /// Where an order the model rests stands.
@@ -145,6 +163,49 @@ pub enum StrayTrade {
     Unnamed,
 }
 
+/// What the cancel-on-disconnect arm does to its account's open orders
+/// ([`QfexModel::arm_cancels_open`]; decision 0132 items 2 and 4).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum ArmCancels {
+    /// It cancels none.
+    #[default]
+    No,
+    /// It cancels every one, each reported by an `order_response` `CANCELLED` naming its client
+    /// id, sent before the arm's ack.
+    Reported,
+    /// It cancels every one, and no frame says so.
+    Silent,
+    /// It cancels every one, each reported by an `order_response` `CANCELLED` naming its client
+    /// id that comes late: with the next `add_order`'s answer, before its `ACK`, so after the
+    /// session's resync ended.
+    Late,
+}
+
+/// What the model does to one order after its `ACK` ([`QfexModel::on_ack`]), on a connection
+/// still open.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum OnAck {
+    /// QFEX cancels it itself, its `order_response` `CANCELLED` naming its client id.
+    VenueCancel,
+    /// It fills whole as a maker, its `fill_response` and `FILLED` `order_response` naming its
+    /// client id.
+    MakerFill,
+}
+
+/// Which open orders an armed connection's end cancels ([`QfexModel::cod_reach`]).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum Reach {
+    /// Every open order of its account, placed on any connection (decision 0121's account-wide
+    /// cancel-on-disconnect).
+    #[default]
+    Account,
+    /// Only the orders placed on that connection: the drop's reach over an earlier connection's
+    /// orders fails (decision 0132 item 4).
+    Own,
+    /// Only the orders placed on earlier connections: the order placed on it outlives it.
+    Earlier,
+}
+
 /// A provider rate refusal the model answers in place of one request ([`QfexModel::rate_limit`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Limited {
@@ -164,6 +225,9 @@ pub enum Limited {
     ReadSocketAfterSession,
     /// The first `GET /user/positions` once an armed connection ended, answered HTTP 429.
     RestAfterSession,
+    /// The first `GET /user/positions` once an armed connection dropped, with no close,
+    /// answered HTTP 429: the first read's after the drop (FBC-77r8).
+    RestAfterDrop,
     /// The `n`th trade-socket authentication after the first `add_order`, from 0, answered a
     /// `RateLimited` err that echoes nothing. A session's authentication is counted too, since
     /// a connection shows itself a session only by subscribing after it: aimed at a read socket
@@ -329,6 +393,9 @@ pub struct QfexModel {
     pub views: Option<(ConnectionsView, ConnectionsView)>,
     /// The trade stub's push handle, once it is up: the knobs that answer later or close.
     pub pusher: Option<Pusher>,
+    /// The MDS stub's push handle, once it is up ([`QfexModel::crossed_on_place`],
+    /// [`QfexModel::touch_moves`], [`QfexModel::touch_moves_at_arm`]).
+    pub mds_pusher: Option<Pusher>,
     /// Each trade connection seen, by its number.
     pub conns: HashMap<usize, Conn>,
     /// Every order rested and every fill made, in order.
@@ -337,12 +404,29 @@ pub struct QfexModel {
     /// Whether a session's connection subscribed while another session's was open.
     pub overlapped: bool,
     /// Graceful close and drop: whether an armed connection's end cancels its account's open
-    /// orders (decision 0121's account-wide cancel-on-disconnect).
+    /// orders (decision 0121's account-wide cancel-on-disconnect), and which of them it reaches.
     pub cod_on_close: bool,
     pub cod_on_drop: bool,
+    pub cod_reach: Reach,
+    /// Whether the arm cancels its account's open orders, and whether a frame reports it.
+    pub arm_cancels_open: ArmCancels,
     /// The first `add_order`'s answer and its knobs' frames are pushed this long after it, past
     /// the request's deadline if need be, instead of answering it at once.
     pub ack_delay: Option<Duration>,
+    /// Which `add_order` of the run, from 0, [`QfexModel::ack_delay`] delays (the first by
+    /// default): its answer alone, pushed later.
+    pub ack_delay_on: usize,
+    /// The `n`th arm of the run, from 0, fills every open order of its account whole, as a
+    /// maker, its `fill_response` and `FILLED` `order_response` pushed after the arm's ack.
+    pub fill_at_arm: Option<usize>,
+    /// An armed connection's drop fills the open orders placed on it whole, as a maker, before
+    /// its cancel-on-disconnect; no frame says so, since nothing is open to hear it.
+    pub fill_on_drop: bool,
+    /// `GET /user/historic-orders` leaves out the run's last-placed order, ended or not.
+    pub historic_omits_last: bool,
+    /// The run's first `GET /user/historic-orders` answered HTTP 500, as a read that fails with
+    /// no provider rate refusal.
+    pub historic_fails: bool,
     pub rate_limit: Option<Limited>,
     /// After the first `ACK`: an `order_response` naming an order no run placed, with
     /// [`STRAY_CID`] (decision 0151 item 13's stray order). With it, as with
@@ -364,6 +448,16 @@ pub struct QfexModel {
     /// Whether the cancel-on-disconnect arm is answered an err echoing it, which rejects it,
     /// instead of its ack.
     pub arm_err: bool,
+    /// The `n`th arm of the run, from 0, answered such an err alone (FBC-77r8).
+    pub arm_err_on: Option<usize>,
+    /// The `n`th `add_order` of the run, from 0: what the model does to its order right after
+    /// its `ACK`, in the same answer (FBC-77r8). With [`OnAck::MakerFill`], the read sockets'
+    /// pages wait from then until that connection's client writes again or its end is seen
+    /// ([`QfexModel::knob_frames_unread`]).
+    pub on_ack: Option<(usize, OnAck)>,
+    /// As the `n`th `add_order` of the run, from 0, arrives, the MDS pushes a crossed touch on
+    /// every MDS connection open, so no later order is priced from it (FBC-77r8).
+    pub crossed_on_place: Option<usize>,
     /// After each change to an account's orders or position, its next `rest_lag` read-socket
     /// pages and REST positions each answer what it was before the change.
     pub rest_lag: usize,
@@ -376,6 +470,9 @@ pub struct QfexModel {
     pub position_after_close: bool,
     /// From the first `add_order` on, its account's positions show that position too.
     pub position_on_place: bool,
+    /// Once an armed connection ended, its account also holds an open order no run placed, under
+    /// [`STRAY_CID`], which its pages list and no frame names, as another trader's would.
+    pub foreign_after_close: bool,
     /// With the first `add_order`, its account also holds an open order it did not place, under
     /// [`STRAY_CID`], which its pages list and no frame names, as another trader's would.
     pub foreign_order: bool,
@@ -385,6 +482,10 @@ pub struct QfexModel {
     pub hold_on_place: Option<(fbc_runtime::RateLimiter, Duration)>,
     /// Whether every authentication is answered a failure.
     pub auth_fails: bool,
+    /// The `n`th trade-socket authentication after the first `add_order`, from 0, a session's
+    /// included (as [`Limited::ReadAuth`] counts), left unanswered, so its read waits on it for
+    /// `--read-wait-ms`, as a test pressing Ctrl-C during that read needs.
+    pub silent_auth: Option<usize>,
     /// Whether every `get_user_orders` page is answered from offset 0, whatever its offset, as
     /// a venue that ignored it would.
     pub stuck_pages: bool,
@@ -413,6 +514,11 @@ pub struct QfexModel {
     /// As the first `get_user_trades` page is asked, the run's first order fills whole as a
     /// maker, no frame telling any socket: a fill after the reads that showed its account flat.
     pub fill_on_trades: bool,
+    /// As the `n`th `get_user_trades` page of the run is asked, from 0, the run's first order
+    /// fills whole as a maker, no frame telling any socket: [`QfexModel::fill_on_trades`] on a
+    /// later read (FBC-77r8: `n` 1, the read of X's and Y's trades after a drop session two that
+    /// failed, the first being X's after drop session one).
+    pub fill_on_trades_page: Option<usize>,
     /// With the first trade-socket authentication, the touch becomes this one, pushed on every
     /// MDS connection: a touch that moved after the preflight read it.
     pub touch_moves: Option<Touch>,
@@ -428,6 +534,14 @@ pub struct QfexModel {
     /// Whether a read socket's `get_user_trades` pages are each answered as if asked from offset
     /// 0, whatever offset they name, as a venue ignoring it would.
     pub stuck_trades: bool,
+    /// Once an armed connection of an account the model placed nothing on ended, that account's
+    /// `GET /user/positions` counts one open order on [`SYMBOL`] that no page lists, as a stop
+    /// order would (FBC-77r8: an order resting after a drop session one that failed).
+    pub stop_order_after_close: bool,
+    /// At the `n`th arm of the run, from 0, the touch becomes this one, pushed on every MDS
+    /// connection before the arm is answered: a touch that moved before a later session's place
+    /// (FBC-77r8: Y's, at drop session two's arm, `n` 1).
+    pub touch_moves_at_arm: Option<(usize, Touch)>,
     /// Once an armed connection closed gracefully, as the model settles that close and before
     /// any answer after it, that connection's account's first open order fills whole as a
     /// maker, no frame telling any socket: a fill after the close and before the read after it.
@@ -443,17 +557,28 @@ pub struct QfexModel {
     /// first order, which moves its position: a trade after X's send naming another order, or
     /// none, as [`StrayTrade`] says.
     pub trade_after_close: Option<StrayTrade>,
-    /// Whether every `GET /user/historic-orders` is answered HTTP 500.
-    pub historic_fails: bool,
+    /// Once an armed connection closed gracefully, as the model settles that close, two trades
+    /// on its account of an order the model never had, as [`QfexModel::trade_on_drop`]'s, so its
+    /// position does not move: rows since X's send naming another order, or none, on an account
+    /// still flat after drop session one (FBC-77r8).
+    pub netting_after_close: Option<StrayTrade>,
+    /// As an armed connection's drop is settled, two trades on its account of an order the model
+    /// never had, one each way at the size of the account's first order, so its position does
+    /// not move: rows since X's send naming another order, or none, as [`StrayTrade`] says, on
+    /// an account still flat (FBC-77r8).
+    pub trade_on_drop: Option<StrayTrade>,
     /// The trades whose `get_user_trades` rows carry neither `order_id` nor `client_order_id`
     /// ([`StrayTrade::Unnamed`]), by trade id.
     pub unnamed: Vec<String>,
-    /// The MDS stub's push handle, once it is up ([`QfexModel::touch_moves`]).
-    pub mds_pusher: Option<Pusher>,
     /// The answers [`QfexModel::hold_trades`] held: each connection and frame.
     pub(super) held: Vec<(usize, Frame)>,
+    /// The connection each order was placed on, by its id ([`Reach::Own`]).
+    pub(super) placed_on: HashMap<String, usize>,
     /// The connection the first `add_order` came on.
-    pub(super) placed_on: Option<usize>,
+    pub(super) first_placed_on: Option<usize>,
+    /// The connection [`OnAck::MakerFill`]'s fill came on, and how many data frames its client
+    /// had sent by then, as the stub's record shows.
+    pub(super) fill_after_ack_on: Option<(usize, usize)>,
     /// The read sockets' pages [`QfexModel::knob_frames_unread`] held: each connection and
     /// frame.
     pub(super) held_pages: Vec<(usize, Frame)>,
@@ -462,12 +587,18 @@ pub struct QfexModel {
     pub(super) moved: Vec<Option<String>>,
     pub(super) places: usize,
     pub(super) cancels: usize,
+    /// The arms answered so far ([`QfexModel::fill_at_arm`]).
+    pub(super) arms: usize,
+    /// The `CANCELLED` frames [`ArmCancels::Late`] holds for the next `add_order`'s answer.
+    pub(super) late_cancels: Vec<Frame>,
     /// Read-socket pages and REST positions answered since the first `add_order`.
     pub(super) pages_after: usize,
     pub(super) rest_after: usize,
     /// Trade-socket authentications answered since the first `add_order`, a session's included
     /// ([`Limited::ReadAuth`]).
     pub(super) auths_after: usize,
+    /// The `get_user_trades` pages asked so far ([`QfexModel::fill_on_trades_page`]).
+    pub(super) trades_asked: usize,
     pub(super) next_id: u64,
 }
 
@@ -492,13 +623,21 @@ impl Default for QfexModel {
             printed: Printed::default(),
             views: None,
             pusher: None,
+            mds_pusher: None,
             conns: HashMap::new(),
             orders: Vec::new(),
             fills: Vec::new(),
             overlapped: false,
             cod_on_close: false,
             cod_on_drop: true,
+            cod_reach: Reach::Account,
+            arm_cancels_open: ArmCancels::No,
             ack_delay: None,
+            ack_delay_on: 0,
+            fill_at_arm: None,
+            fill_on_drop: false,
+            historic_omits_last: false,
+            historic_fails: false,
             rate_limit: None,
             stray_order: false,
             cid_absent_update: false,
@@ -507,14 +646,19 @@ impl Default for QfexModel {
             server_close: false,
             close_on_place: false,
             arm_err: false,
+            arm_err_on: None,
+            on_ack: None,
+            crossed_on_place: None,
             rest_lag: 0,
             rest_fails: Vec::new(),
             cancel_delay: None,
             position_after_close: false,
             position_on_place: false,
+            foreign_after_close: false,
             foreign_order: false,
             hold_on_place: None,
             auth_fails: false,
+            silent_auth: None,
             stuck_pages: false,
             cancel_place: false,
             venue_cancel: false,
@@ -524,28 +668,36 @@ impl Default for QfexModel {
             part_fill_after: None,
             close_after: None,
             fill_on_trades: false,
+            fill_on_trades_page: None,
             touch_moves: None,
             blank_cid_after_session: false,
             newest_first: false,
             page_delay: None,
             stuck_trades: false,
+            stop_order_after_close: false,
+            touch_moves_at_arm: None,
             fill_after_close: false,
             part_fill_after_close: false,
             trades_err: false,
             trade_after_close: None,
-            historic_fails: false,
+            netting_after_close: None,
+            trade_on_drop: None,
             unnamed: Vec::new(),
-            mds_pusher: None,
             held: Vec::new(),
-            placed_on: None,
+            placed_on: HashMap::new(),
+            first_placed_on: None,
+            fill_after_ack_on: None,
             held_pages: Vec::new(),
             lagging: HashMap::new(),
             moved: Vec::new(),
             places: 0,
             cancels: 0,
+            arms: 0,
+            late_cancels: Vec::new(),
             pages_after: 0,
             rest_after: 0,
             auths_after: 0,
+            trades_asked: 0,
             next_id: 0,
         }
     }
@@ -597,20 +749,29 @@ impl QfexModel {
                     self.rate_limit = None;
                     return status(429, r#"{"error":"Too Many Requests"}"#);
                 }
+                if self.rate_limit == Some(Limited::RestAfterDrop) && self.dropped() {
+                    self.rate_limit = None;
+                    return status(429, r#"{"error":"Too Many Requests"}"#);
+                }
                 if after && self.rest_fails.contains(&n) {
                     return status(500, r#"{"error":"synthetic failure"}"#);
                 }
                 ok(&self.positions_of(account))
             }
             "/user/subaccounts" => listing_refused(),
-            _ if self.historic_fails => status(500, r#"{"error":"synthetic failure"}"#),
+            _ if std::mem::take(&mut self.historic_fails) => {
+                status(500, r#"{"error":"synthetic failure"}"#)
+            }
             _ => ok(&self.historic(account)),
         }
     }
 
     /// `account`'s ended orders, as `GET /user/historic-orders` lists them.
     fn historic(&self, account: Option<String>) -> String {
+        let last = (self.orders.last()).filter(|_| self.historic_omits_last);
+        let shown = |o: &&Order| last.is_none_or(|last| last.id != o.id);
         let ended = (self.orders.iter()).filter(|o| o.account == account && o.state != State::Open);
+        let ended = ended.filter(shown);
         let data: Vec<Value> = ended
             .map(|o| {
                 let terminal = match o.state {
@@ -641,6 +802,14 @@ impl QfexModel {
         }
         if let Some(stale) = self.stale_of(&account, |s| &mut s.rest) {
             return stale.positions;
+        }
+        let ended = (self.conns.values()).any(|c| c.armed && c.settled && c.account == account);
+        let placed = self.orders.iter().any(|o| o.account == account);
+        if self.stop_order_after_close && ended && !placed {
+            return serde_json::json!({"balance": {}, "positions": [
+                {"symbol": SYMBOL, "position": 0, "open_orders": 1}
+            ]})
+            .to_string();
         }
         self.current(&account)
     }
@@ -722,6 +891,9 @@ impl QfexModel {
                 self.conns.entry(conn).or_default().account = account;
                 let n = self.auths_after;
                 self.auths_after += usize::from(self.places > 0);
+                if self.places > 0 && self.silent_auth == Some(n) {
+                    return Ok(Vec::new());
+                }
                 if self.places > 0 && self.rate_limit == Some(Limited::ReadAuth(n)) {
                     let err = r#"{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after 3 seconds"}"#;
                     return Ok(vec![Frame::text(err)]);
@@ -742,14 +914,39 @@ impl QfexModel {
                 self.subscribed(conn);
                 confirmation(frame)
             }
-            "cancel_on_disconnect" if self.arm_err => Ok(vec![Frame::text(format!(
-                r#"{{"type":"Err","error_code":"InvalidRequest","message":"synthetic","incoming_message":{text}}}"#
-            ))]),
+            "cancel_on_disconnect" if self.arm_err || self.arm_err_on == Some(self.arms) => {
+                self.arms += 1;
+                Ok(vec![Frame::text(format!(
+                    concat!(
+                        r#"{{"type":"Err","error_code":"InvalidRequest","message":"synthetic","#,
+                        r#""incoming_message":{text}}}"#,
+                    ),
+                    text = text
+                ))])
+            }
             "cancel_on_disconnect" => {
                 self.conns.entry(conn).or_default().armed = true;
-                Ok(vec![Frame::text(format!(
+                let mut frames = self.arm_cancels(conn);
+                frames.push(Frame::text(format!(
                     r#"{{"ack":{{"incoming_message":{text}}}}}"#
-                ))])
+                )));
+                let n = self.arms;
+                self.arms += 1;
+                if let Some((at, touch)) = self.touch_moves_at_arm.take() {
+                    match at == n {
+                        true => self.move_touch(touch),
+                        false => self.touch_moves_at_arm = Some((at, touch)),
+                    }
+                }
+                if self.fill_at_arm == Some(n) {
+                    let open = self.open_of(&self.account_of(conn));
+                    for order in open {
+                        let filled = self.fill(&order.id);
+                        frames.push(fill_response(&filled, true));
+                        frames.push(order_response(&filled.order, "FILLED", true));
+                    }
+                }
+                Ok(frames)
             }
             "add_order" => Ok(self.add_order(conn, &v, text)),
             "cancel_order" => Ok(self.cancel_order(conn, &v, text)),
@@ -782,7 +979,10 @@ impl QfexModel {
                 Ok(Vec::new())
             }
             "get_user_trades" => {
-                if std::mem::take(&mut self.fill_on_trades) {
+                let asked = self.trades_asked;
+                self.trades_asked += 1;
+                let later = self.fill_on_trades_page == Some(asked);
+                if std::mem::take(&mut self.fill_on_trades) || later {
                     let id = self.orders.first().map(|o| o.id.clone());
                     self.fill(&id.expect("an order to fill"));
                 }
@@ -807,9 +1007,33 @@ impl QfexModel {
     /// session ends its connection only after drop session one's steps end, so a comparison
     /// held this way ends by the stop the knob's frame raises or by the end of its wait, never
     /// by agreeing before the session read that frame.
+    ///
+    /// So, too, with [`OnAck::MakerFill`] (FBC-77r8), from its fill until the placing
+    /// connection's client writes again or its end is seen: the read before drop session two's
+    /// drop shows nothing of a fill of Y, and the stop the fill's frames raise is what sends the
+    /// next frame, the cancels (0151 item 2), so a read held this way cannot end before the
+    /// session heard the fill. The drop comes only after that read, so its end never releases
+    /// the hold first.
     pub(super) fn knob_frames_unread(&self) -> bool {
         let knob = self.stray_order || self.cid_absent_update;
-        knob && self.placed_on.is_some_and(|n| !self.conn_ended(n))
+        let stray = knob && self.first_placed_on.is_some_and(|n| !self.conn_ended(n));
+        let fill = (self.fill_after_ack_on).is_some_and(|(n, sent)| !self.conn_wrote(n, sent));
+        stray || fill
+    }
+
+    /// Whether trade connection `n`'s client wrote a data frame past its `sent`th, as the
+    /// stub's record shows, or the end of `n` was seen ([`QfexModel::conn_ended`]).
+    fn conn_wrote(&self, n: usize, sent: usize) -> bool {
+        let records = self.views.as_ref().map(|(trade, _)| trade.connections());
+        let record = records.and_then(|r| r.get(n).cloned());
+        self.conn_ended(n) || record.is_some_and(|r| r.received.len() > sent)
+    }
+
+    /// How many data frames trade connection `n`'s client has sent, as the stub's record shows.
+    fn sent_on(&self, n: usize) -> usize {
+        let records = self.views.as_ref().map(|(trade, _)| trade.connections());
+        let record = records.and_then(|r| r.get(n).cloned());
+        record.map_or(0, |r| r.received.len())
     }
 
     /// Whether the end of trade connection `n` was seen: its client's close frame read, or the
@@ -833,6 +1057,13 @@ impl QfexModel {
         }
     }
 
+    /// Whether an armed connection's drop was seen: its end, with no close of the client's.
+    fn dropped(&self) -> bool {
+        self.conns
+            .values()
+            .any(|c| c.armed && c.settled && c.dropped)
+    }
+
     /// `conn`'s account.
     fn account_of(&self, conn: usize) -> Option<String> {
         self.conns.get(&conn).and_then(|c| c.account.clone())
@@ -850,60 +1081,140 @@ impl QfexModel {
         self.conns.entry(conn).or_default().session = true;
     }
 
-    /// Applies cancel-on-disconnect to each armed connection whose end the stub has seen since:
-    /// a graceful close (the client's close frame read) cancels every open order of its account
-    /// with [`QfexModel::cod_on_close`], and a drop with [`QfexModel::cod_on_drop`].
+    /// The arm on `conn`, as [`QfexModel::arm_cancels_open`] says: every open order of its
+    /// account cancelled, logged, and, when reported, each one's `CANCELLED` `order_response`,
+    /// which the arm's ack follows.
+    fn arm_cancels(&mut self, conn: usize) -> Vec<Frame> {
+        let account = self.account_of(conn);
+        let open = self.open_of(&account);
+        if self.arm_cancels_open == ArmCancels::No || open.is_empty() {
+            return Vec::new();
+        }
+        self.before_change(&account);
+        let how = self.arm_cancels_open;
+        let mut frames = Vec::new();
+        for order in &mut self.orders {
+            if order.account == account && order.state == State::Open {
+                order.state = State::Cancelled;
+                let report =
+                    (how != ArmCancels::Silent).then(|| order_response(order, "CANCELLED", true));
+                frames.extend(report);
+            }
+        }
+        let how = match how {
+            ArmCancels::Reported => "reported",
+            ArmCancels::Late => {
+                self.late_cancels.append(&mut frames);
+                "reported late"
+            }
+            _ => "silently",
+        };
+        self.event(format!("arm {conn} cancels {} {how}", open.len()), None);
+        frames
+    }
+
+    /// Applies cancel-on-disconnect to each armed connection whose end the stub has seen since
+    /// ([`QfexModel::ended`]), in the order the connections opened.
     fn settle(&mut self) {
         let Some((trade, _)) = &self.views else {
             return;
         };
         let records = trade.connections();
         let mut ended = Vec::new();
-        for (n, conn) in &mut self.conns {
+        for (n, conn) in &self.conns {
             let Some(record) = records.get(*n) else {
                 continue;
             };
             if conn.armed && !conn.settled && (record.client_closed || !record.open) {
-                conn.settled = true;
-                ended.push((*n, conn.account.clone(), record.client_closed));
+                ended.push((*n, record.client_closed));
             }
         }
-        ended.sort_by_key(|(n, ..)| *n);
-        for (n, account, graceful) in ended {
-            let (how, cancels) = match graceful {
-                true => ("close", self.cod_on_close),
-                false => ("drop", self.cod_on_drop),
-            };
-            let fills = self.fill_after_close || self.part_fill_after_close;
-            if graceful && fills {
-                let whole = !std::mem::take(&mut self.part_fill_after_close);
-                self.fill_after_close = false;
-                let open = (self.orders.iter())
-                    .find(|o| o.account == account && o.state == State::Open)
-                    .map(|o| (o.id.clone(), o.quantity - o.filled));
-                if let Some((id, left)) = open {
-                    match whole {
-                        true => self.fill(&id),
-                        false => self.fill_part(&id, left / Decimal::TWO),
-                    };
-                }
-            }
-            if let Some(stray) = self.trade_after_close.take_if(|_| graceful) {
-                self.stray_trade(account.clone(), stray);
-            }
-            if cancels {
-                self.before_change(&account);
-                let open = self.orders.iter_mut();
-                let open = open.filter(|o| o.account == account && o.state == State::Open);
-                open.for_each(|o| o.state = State::Cancelled);
-            }
-            if self.position_after_close && !self.moved.contains(&account) {
-                self.moved.push(account.clone());
-            }
-            let did = if cancels { "cancels" } else { "keeps" };
-            self.event(format!("cod {n} {how} {did}"), None);
+        ended.sort_by_key(|(n, _)| *n);
+        for (n, graceful) in ended {
+            self.ended(n, graceful);
         }
         self.release_pages();
+    }
+
+    /// Trade connection `n`'s end, gracefully (the client's close frame read) or by a drop: once
+    /// armed, a graceful close cancels its account's open orders with
+    /// [`QfexModel::cod_on_close`], and a drop with [`QfexModel::cod_on_drop`], every one or only
+    /// those placed on it, as [`QfexModel::cod_reach`] says; logged as `cod <n> <close|drop>
+    /// <cancels|keeps>`. A connection that never armed, or whose end was seen, changes nothing.
+    pub(super) fn ended(&mut self, n: usize, graceful: bool) {
+        let Some(conn) = self.conns.get_mut(&n).filter(|c| c.armed && !c.settled) else {
+            return;
+        };
+        conn.settled = true;
+        conn.dropped = !graceful;
+        let account = conn.account.clone();
+        if self.fill_on_drop && !graceful {
+            let own = (self.orders.iter())
+                .filter(|o| o.state == State::Open && self.placed_on.get(&o.id) == Some(&n));
+            let own: Vec<String> = own.map(|o| o.id.clone()).collect();
+            for id in own {
+                self.fill(&id);
+            }
+        }
+        let (how, cancels) = match graceful {
+            true => ("close", self.cod_on_close),
+            false => ("drop", self.cod_on_drop),
+        };
+        let fills = self.fill_after_close || self.part_fill_after_close;
+        if graceful && fills {
+            let whole = !std::mem::take(&mut self.part_fill_after_close);
+            self.fill_after_close = false;
+            let open = (self.orders.iter())
+                .find(|o| o.account == account && o.state == State::Open)
+                .map(|o| (o.id.clone(), o.quantity - o.filled));
+            if let Some((id, left)) = open {
+                match whole {
+                    true => self.fill(&id),
+                    false => self.fill_part(&id, left / Decimal::TWO),
+                };
+            }
+        }
+        if let Some(stray) = self.trade_after_close.take_if(|_| graceful) {
+            self.stray_trade(account.clone(), stray);
+        }
+        if let Some(stray) = self.netting_after_close.take_if(|_| graceful) {
+            self.netting_trades(account.clone(), stray);
+        }
+        if let Some(stray) = self.trade_on_drop.take_if(|_| !graceful) {
+            self.netting_trades(account.clone(), stray);
+        }
+        if cancels {
+            self.before_change(&account);
+            let reach = self.cod_reach;
+            let placed_on = &self.placed_on;
+            let reached = |o: &Order| match reach {
+                Reach::Account => true,
+                Reach::Own => placed_on.get(&o.id) == Some(&n),
+                Reach::Earlier => placed_on.get(&o.id) != Some(&n),
+            };
+            let open = self.orders.iter_mut();
+            let open = open.filter(|o| o.account == account && o.state == State::Open);
+            open.filter(|o| reached(o))
+                .for_each(|o| o.state = State::Cancelled);
+        }
+        if self.position_after_close && !self.moved.contains(&account) {
+            self.moved.push(account.clone());
+        }
+        if self.foreign_after_close {
+            let first = self.orders.iter().find(|o| o.account == account).cloned();
+            let foreign = first.map(|first| Order {
+                id: "44444444-4444-4444-8444-444444444444".to_owned(),
+                cid: STRAY_CID.to_owned(),
+                filled: Decimal::ZERO,
+                state: State::Open,
+                ..first
+            });
+            let new = |f: &Order| self.orders.iter().all(|o| o.id != f.id);
+            let foreign = foreign.filter(new);
+            self.orders.extend(foreign);
+        }
+        let did = if cancels { "cancels" } else { "keeps" };
+        self.event(format!("cod {n} {how} {did}"), None);
     }
 
     /// Rests the order `v`, whose frame is `text`, on `conn`'s account and answers it, with the
@@ -912,7 +1223,10 @@ impl QfexModel {
         self.places += 1;
         let first = self.places == 1;
         if first {
-            self.placed_on = Some(conn);
+            self.first_placed_on = Some(conn);
+        }
+        if self.crossed_on_place == Some(self.places - 1) {
+            self.push_crossed();
         }
         if let Some((limiter, held)) = self.hold_on_place.as_ref().filter(|_| first) {
             let now = tokio::time::Instant::now();
@@ -935,8 +1249,10 @@ impl QfexModel {
         let params = &v["params"];
         let text_of = |key: &str| params[key].as_str().unwrap_or_default().to_owned();
         let quantity = Decimal::from_str(&params["quantity"].to_string()).unwrap_or_default();
+        let id = self.mint_id();
+        self.placed_on.insert(id.clone(), conn);
         let order = Order {
-            id: self.mint_id(),
+            id,
             account: account.clone(),
             cid: text_of("client_order_id"),
             side: text_of("side"),
@@ -956,7 +1272,23 @@ impl QfexModel {
             return vec![order_response(&ended, "CANCELLED", true)];
         }
         self.orders.push(order.clone());
-        let mut frames = vec![order_response(&order, "ACK", true)];
+        let mut frames = std::mem::take(&mut self.late_cancels);
+        frames.push(order_response(&order, "ACK", true));
+        match self.on_ack {
+            Some((n, OnAck::VenueCancel)) if n + 1 == self.places => {
+                let at = self.orders.len() - 1;
+                self.before_change(&account);
+                self.orders[at].state = State::Cancelled;
+                frames.push(order_response(&self.orders[at], "CANCELLED", true));
+            }
+            Some((n, OnAck::MakerFill)) if n + 1 == self.places => {
+                self.fill_after_ack_on = Some((conn, self.sent_on(conn)));
+                let filled = self.fill(&order.id);
+                frames.push(fill_response(&filled, true));
+                frames.push(order_response(&filled.order, "FILLED", true));
+            }
+            _ => {}
+        }
         if let Some(after) = self.stray_after.filter(|_| first) {
             let stray = Order {
                 id: "77777777-7777-4777-8777-777777777777".to_owned(),
@@ -1002,7 +1334,8 @@ impl QfexModel {
         // A late answer, and a close, go through the pusher alone, so the close follows every
         // frame of the answer.
         let close = first && self.server_close;
-        match (self.ack_delay.filter(|_| first), close) {
+        let delayed = self.places == self.ack_delay_on + 1;
+        match (self.ack_delay.filter(|_| delayed), close) {
             (None, false) => frames,
             (after, _) => {
                 self.later(conn, frames, after.unwrap_or_default(), close);
@@ -1120,6 +1453,60 @@ impl QfexModel {
                 let _ = pusher.push(conn, frame.clone()).await;
             }
         });
+    }
+
+    /// Pushes a crossed touch of [`SYMBOL`] on every MDS connection open, logged as `mds
+    /// crossed`.
+    fn push_crossed(&mut self) {
+        let crossed = Touch {
+            bid: Some(("100.20", "1.00")),
+            ask: Some(("100.10", "2.00")),
+            age_secs: 0,
+        };
+        let frame = Frame::text(crossed.frame(SYMBOL));
+        let mds = self.views.as_ref().map(|(_, mds)| mds.connections());
+        let open: Vec<usize> = (mds.unwrap_or_default().iter().enumerate())
+            .filter(|(_, c)| c.open)
+            .map(|(n, _)| n)
+            .collect();
+        let pusher = self.mds_pusher.clone().expect("the MDS stub is up");
+        self.event("mds crossed".to_owned(), None);
+        tokio::spawn(async move {
+            for n in open {
+                let _ = pusher.push(n, frame.clone()).await;
+            }
+        });
+    }
+
+    /// Two trades on `account` of an order the model never had, one each way at the size of the
+    /// account's first order, so its position does not move ([`QfexModel::trade_on_drop`],
+    /// [`QfexModel::netting_after_close`]).
+    fn netting_trades(&mut self, account: Option<String>, stray: StrayTrade) {
+        self.stray_trade(account.clone(), stray);
+        self.stray_trade(account, stray);
+        let last = self.fills.last_mut().expect("the second stray trade");
+        last.order.side = match last.order.side.as_str() {
+            "SELL" => "BUY".to_owned(),
+            _ => "SELL".to_owned(),
+        };
+    }
+
+    /// Half of the last order placed fills as a maker now, the rest left open, its
+    /// `fill_response` and its `FILLED` `order_response` pushed on the connection it was placed
+    /// on: [`QfexModel::part_fill_after`]'s fill, on a later order and at a moment a test
+    /// chooses by a line the probe prints, so no timer orders it (FBC-77r8).
+    pub fn part_fill_last(&mut self) {
+        let order = self.orders.last().cloned().expect("an order placed");
+        let conn = *self
+            .placed_on
+            .get(&order.id)
+            .expect("the connection it was placed on");
+        let filled = self.fill_part(&order.id, order.quantity / Decimal::TWO);
+        let frames = vec![
+            fill_response(&filled, true),
+            order_response(&filled.order, "FILLED", true),
+        ];
+        self.later(conn, frames, Duration::ZERO, false);
     }
 
     /// Pushes `frames` on `conn` after `after`, then, with `close`, closes it.

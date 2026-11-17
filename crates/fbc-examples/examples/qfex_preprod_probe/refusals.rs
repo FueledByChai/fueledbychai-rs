@@ -76,11 +76,15 @@ pub const AFTER_HOLD: &str = "after the hold";
 /// before.
 pub const AFTER_DROP_ONE: &str = "after drop session one";
 
+/// What the reads of every named account after the place stages' drop session two (FBC-77r8),
+/// and the reads after its drop, of X, Y and their trades, are reported under.
+pub const AFTER_DROP_TWO: &str = "after drop session two";
+
 /// When a read was made, as the report and the evidence say it: `after the hold`, `after drop
-/// session one`, or before the session or the hold `before` names.
+/// session one` or `two`, or before the session or the hold `before` names.
 pub fn read_when(before: &str) -> String {
     match before {
-        AFTER_HOLD | AFTER_DROP_ONE => before.to_owned(),
+        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO => before.to_owned(),
         _ => format!("before {before}"),
     }
 }
@@ -232,9 +236,10 @@ pub fn met(ev: &Evidence, sessions: &[SessionRun]) -> u64 {
 /// (`SessionRun::label`), the count, and whether it ran (a probe stopped by a read before it
 /// starts none). The hold is one of them, under [`HOLD`], with the read sockets before it and its
 /// own connection, and the read sockets after it are another, under [`AFTER_HOLD`]; so are the
-/// read sockets after the place stages' drop session one, under [`AFTER_DROP_ONE`], which ran
-/// when that session did. A place stage's session counts the read sockets of its comparisons
-/// with those before it, since they are reported under its name.
+/// read sockets after the place stages' drop session one and two, under [`AFTER_DROP_ONE`] and
+/// [`AFTER_DROP_TWO`], which ran when that session did. A place stage's session counts the read
+/// sockets of its comparisons with those before it, since they are reported under its name, and
+/// its name is every named account's: those sessions are counted together.
 pub fn by_session(
     reads: &[ReadSocket],
     sessions: &[SessionRun],
@@ -254,15 +259,21 @@ pub fn by_session(
         let (own, went) = match *name {
             HOLD => (hold.map(|hold| hold.refusals.met()), hold.is_some()),
             AFTER_HOLD => (None, hold.is_some()),
-            AFTER_DROP_ONE => {
-                let ran = sessions
-                    .iter()
-                    .any(|run| run.label() == crate::places::DROP_ONE);
+            AFTER_DROP_ONE | AFTER_DROP_TWO => {
+                let session = match *name {
+                    AFTER_DROP_ONE => crate::places::DROP_ONE,
+                    _ => crate::places::DROP_TWO,
+                };
+                let ran = sessions.iter().any(|run| run.label() == session);
                 (None, ran)
             }
+            // A place stage's sessions are named alike on each named account: each one's own.
             _ => {
-                let run = sessions.iter().find(|run| run.label() == *name);
-                (run.map(|run| run.refusals.met()), run.is_some())
+                let runs = sessions.iter().filter(|run| run.label() == *name);
+                let own = runs
+                    .map(|run| run.refusals.met())
+                    .reduce(u64::saturating_add);
+                (own, own.is_some())
             }
         };
         *met = read.saturating_add(own.unwrap_or(0));
