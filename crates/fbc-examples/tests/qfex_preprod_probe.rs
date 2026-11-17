@@ -34,6 +34,11 @@
 //!   session's journal, and none for a session whose pages were all short;
 //! - builds the place stages' registries as `place_registries.rs` proves (FBC-oxjs, decision
 //!   0148 items 3 and 7);
+//! - runs the place stages' preflight (FBC-c6kw, decision 0148, in [`place_stages`], against the
+//!   QFEX model in [`model`]): every place-stage flag refused naming it and never its value, the
+//!   CAPS line first, the hold before the preflight, the spec from this run's `GET /refdata`, the
+//!   MDS touch and the caps at it, each on the guarded origins, and nothing authenticated for a
+//!   place stage, only ever on loopback origins;
 //! - scrubs a place stage's frames (FBC-t45e, decision 0148 item 10, in [`place_scrub`]): every
 //!   `id` and `*_id` member blanked at its length, every number and decimal-shaped string zeroed,
 //!   each fee kept as its sign and every `symbol`, an echo's too, one placeholder, so a slice of
@@ -66,6 +71,12 @@ mod ledger;
 #[allow(dead_code)]
 #[path = "../src/link.rs"]
 mod link;
+#[path = "../examples/qfex_preprod_probe/market.rs"]
+mod market;
+// The QFEX model the place stages' tests run against (FBC-c6kw), on the conformance stub's
+// serving scripts (decision 0150), declared by path as `place_registries` is.
+#[path = "qfex_preprod_probe/model.rs"]
+mod model;
 #[path = "../examples/qfex_preprod_probe/pages.rs"]
 mod pages;
 // The place stages' registries' proof (FBC-oxjs), declared by path so it is part of this test
@@ -73,6 +84,9 @@ mod pages;
 // builds no target of its own for it.
 #[path = "qfex_preprod_probe/place_registries.rs"]
 mod place_registries;
+// The place stages' preflight's proof (FBC-c6kw), declared by path as `place_registries` is.
+#[path = "qfex_preprod_probe/place_stages.rs"]
+mod place_stages;
 #[path = "../examples/qfex_preprod_probe/probe_args.rs"]
 mod probe_args;
 #[path = "../examples/qfex_preprod_probe/refusals.rs"]
@@ -84,6 +98,9 @@ mod stage;
 // The place stages' capture scrub and the arm window (FBC-t45e).
 #[path = "qfex_preprod_probe/place_scrub.rs"]
 mod place_scrub;
+#[allow(dead_code)]
+#[path = "../src/testnet.rs"]
+mod testnet;
 
 use std::cell::RefCell;
 use std::collections::HashMap;

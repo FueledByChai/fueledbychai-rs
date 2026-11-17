@@ -92,6 +92,19 @@
 //! - **The resync's full pages** ([`crate::pages`]): each full `get_user_orders` page a session's
 //!   resync read, with its page size and offset (decision 0132 item 5, FBC-4h1p), from the
 //!   session's journal, since its codec's own count cannot be reached from outside the session.
+//! - **The place stages' preflight** ([`run_places_until`], FBC-c6kw, the first slice of
+//!   FBC-9sk2; decision 0148): a run with `--place-stages` prints a `CAPS` line with the
+//!   environment and both caps first, before any request, the hold's included (decisions 0113
+//!   items 1 and 2 and 0148 item 7); it is refused, nothing sent, unless every origin is a
+//!   loopback test stub's (until FBC-4plj lands every stop decisions 0132 item 7 and 0148 item 8
+//!   require), and unless `--registry-span` is above the drop test's floor for the accounts the
+//!   configuration names (`probe_args::check_place_span`, FBC-fqv5 item 3). It holds first when
+//!   `--hold-secs` asks, alone (the owner's Ctrl-C on the hold stops it before its preflight),
+//!   then runs [`crate::market`]'s preflight (the spec from this run's
+//!   `GET /refdata`, the count bound, the MDS touch and the caps), and then stops, its outcome
+//!   not ok: the place stages after the preflight are not built yet, so nothing authenticated
+//!   connects for a place stage. [`place_config`] is the configuration a place stage's sessions
+//!   will take, the only one with `qfex.exec.production_places` (decision 0148 item 4).
 //! - **The files** ([`crate::report`] for the report and the evidence, [`crate::capture`] for the
 //!   journal and the scrubbed fixture slice), which scripts/privacy-check.sh must pass. A record
 //!   the journal dropped, marked in it or only counted by its sink, one its writer never wrote, and
@@ -130,7 +143,8 @@ use fbc_venue_qfex::account_reads::{
 use fbc_venue_qfex::auth::{ACCOUNT_KEY, AccountSelection, ReadAuth, TRADE_URL, account_selection};
 use fbc_venue_qfex::exec::{AUTH_DEADLINE, CHANNELS};
 use fbc_venue_qfex::probe::{
-    self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_RESYNC_TIMEOUT, KEY_RPC_TIMEOUT, Origins,
+    self, Environment, KEY_EXEC_MODE, KEY_PAGE_SIZE, KEY_PRODUCTION_PLACES, KEY_RESYNC_TIMEOUT,
+    KEY_RPC_TIMEOUT, Origins, PROBE_PLACE_STAGES,
 };
 use fbc_venue_qfex::sign::QfexNonces;
 use fbc_venue_qfex::{KEY_MDS_URL, KEY_REST_URL};
@@ -141,7 +155,8 @@ use crate::capture::{self, AccountRead, Evidence, SessionRun};
 use crate::evidence;
 use crate::hold::{self as held_frames, Control, End, Heard, HoldRun, ReadAfter};
 use crate::ledger::{self, Opened, RegistryLedger};
-use crate::probe_args::{Hold, Options, RESYNC_TIMEOUT};
+use crate::market::{self, Preflight};
+use crate::probe_args::{self as args, Hold, Options, Places, RESYNC_TIMEOUT};
 use crate::refusals::{self, AFTER_HOLD, HOLD, ReadSocket, Refusals};
 
 /// Where the lines go: standard output when run, a buffer under test.
@@ -263,14 +278,78 @@ pub async fn run_until(
     out: Out,
     interrupt: Interrupt,
 ) -> Result<Outcome, String> {
-    // The accounts a session arms on, then the one the hold authenticates as.
+    run_with(opts, None, lookup, out, interrupt).await
+}
+
+/// Runs a place-stage run as [`run_places_until`] does, with no interrupt: the integration
+/// test's entry.
+#[allow(dead_code)]
+pub async fn run_places(
+    opts: &Options,
+    places: &Places,
+    lookup: Lookup<'_>,
+    out: Out,
+) -> Result<Outcome, String> {
+    run_places_until(opts, places, lookup, out, Box::pin(std::future::pending())).await
+}
+
+/// Runs a place-stage run (`--place-stages`, FBC-c6kw): the `CAPS` line, the guard, the
+/// loopback-only gate and the span bound's floor, the hold when `opts.hold` asks for one, then
+/// the place stages' preflight ([`crate::market`]), then the files. It places nothing: it stops
+/// after the preflight, its outcome not ok, since the place stages after it are not built yet.
+pub async fn run_places_until(
+    opts: &Options,
+    places: &Places,
+    lookup: Lookup<'_>,
+    out: Out,
+    interrupt: Interrupt,
+) -> Result<Outcome, String> {
+    run_with(opts, Some(places), lookup, out, interrupt).await
+}
+
+/// The refusal of a place-stage run on an origin that is not loopback (FBC-c6kw), until FBC-4plj
+/// lifts it.
+pub const LOOPBACK_ONLY: &str = "--place-stages: refused, nothing sent: until FBC-4plj lands \
+     every stop decisions 0132 item 7 and 0148 item 8 require, the place stages run only against \
+     a loopback test stub, every origin (trade, REST and MDS) a loopback address";
+
+/// Why a place-stage run stops after its preflight (FBC-c6kw).
+pub const NOT_BUILT: &str = "the place stages after the preflight are not built yet (FBC-23ch \
+     and the slices after it): nothing authenticated connected for a place stage, and nothing \
+     was placed";
+
+/// [`run_until`] or, with `places`, [`run_places_until`].
+async fn run_with(
+    opts: &Options,
+    places: Option<&Places>,
+    lookup: Lookup<'_>,
+    out: Out,
+    interrupt: Interrupt,
+) -> Result<Outcome, String> {
+    // The caps, first, before anything else, and so before any request (decisions 0113 items 1
+    // and 2, 0148 item 7): on standard output alone, never in the report or the evidence
+    // (FBC-fqv5 item 10).
+    if let Some(places) = places {
+        let _ = writeln!(
+            out.borrow_mut(),
+            "CAPS on QFEX {}: --resting-cap-usd {} USD, --inventory-cap-usd {} USD: the \
+             operator's own (decision 0113), printed before any request and written to neither \
+             the report nor the evidence",
+            environment(opts.environment()),
+            places.resting_cap_usd,
+            places.inventory_cap_usd
+        );
+    }
+    let named = named(lookup);
+    // The accounts a session arms on, then the one the hold authenticates as, then, for the
+    // place stages, every account the configuration names, each of which they run on in turn.
     let mut used = opts.arms.clone();
     used.extend(opts.hold.map(|hold| hold.account));
+    used.extend(places.iter().flat_map(|_| named.iter().copied()));
     let first = *(used.first()).ok_or("--arm or --hold-secs is required: nothing to run")?;
     auth_qfex::check(lookup, &used)?;
     // Every account a session arms on or the hold authenticates as is among them: `check`
     // refuses the subaccount when no variable names it.
-    let named = named(lookup);
     assert!(used.iter().all(|a| named.contains(a)), "a named account");
     let base = base_config(opts);
     // What the guard admitted of the configuration of each account the run reads, every one a
@@ -303,6 +382,13 @@ pub async fn run_until(
                     loopback, not this machine's; connect to a stub directly"
                 .to_owned(),
         );
+    }
+    if let Some(places) = places {
+        // The guard admits one side for all three origins, so loopback here is every one.
+        if origins != Origins::Loopback {
+            return Err(LOOPBACK_ONLY.to_owned());
+        }
+        args::check_place_span(opts, places, named.len())?;
     }
     let dir = &opts.evidence_dir;
     fs::create_dir_all(dir).map_err(|e| format!("--evidence-dir: {e}"))?;
@@ -364,9 +450,11 @@ pub async fn run_until(
             accounts: named.iter().map(|a| name(*a)).collect(),
             arms: opts.arms.iter().map(|a| name(*a)).collect(),
             hold_asked: opts.hold.is_some(),
+            places_asked: places.is_some(),
             ..Evidence::default()
         },
         named,
+        places,
     };
     let held = opts.hold.map_or(String::new(), |hold| {
         format!(
@@ -375,12 +463,21 @@ pub async fn run_until(
             hold.duration.as_secs()
         )
     });
-    run.line(format_args!(
-        "PROBE stage one on QFEX {} ({}), against {target}: arms on {:?}{held}",
-        environment(env),
-        env.mode(),
-        opts.arms
-    ));
+    match places {
+        None => run.line(format_args!(
+            "PROBE stage one on QFEX {} ({}), against {target}: arms on {:?}{held}",
+            environment(env),
+            env.mode(),
+            opts.arms
+        )),
+        Some(_) => run.line(format_args!(
+            "PROBE place stages on QFEX {} ({}), against {target}: the preflight alone \
+             (FBC-c6kw), placing nothing and connecting nothing authenticated for a place \
+             stage{held}",
+            environment(env),
+            env.mode(),
+        )),
+    }
     if let Err(why) = run.stage().await {
         run.line(format_args!("STOPPED {why}"));
         run.ev.stopped = Some(why);
@@ -420,7 +517,7 @@ pub async fn run_until(
 /// (`preprod_probe`, or `production_probe` with `--production`), its settings and the origins.
 /// Each session's account and public key are added from the environment, and its account key
 /// from the program's numbering ([`configured`]).
-fn base_config(opts: &Options) -> VenueConfig {
+pub fn base_config(opts: &Options) -> VenueConfig {
     let mut cfg = VenueConfig::new();
     cfg.insert(KEY_EXEC_MODE, opts.environment().mode());
     cfg.insert(TRADE_URL, &opts.trade_url);
@@ -433,10 +530,27 @@ fn base_config(opts: &Options) -> VenueConfig {
     cfg
 }
 
+/// The configuration of a place stage's session on `armed` (decision 0148 item 4): `armed`'s
+/// session configuration ([`configured`]) with `qfex.exec.production_places` set to
+/// `probe_place_stages`, under which the production probe codec encodes a post-only GTC or a
+/// limit IOC at the instrument's minimum size and refuses every other place. Only a place
+/// stage's sessions take it: [`base_config`] never holds the key, so no stage-one session and no
+/// read has it.
+#[allow(dead_code)] // the place stages' driver opens its sessions on it (FBC-23ch)
+pub fn place_config(
+    base: &VenueConfig,
+    lookup: Lookup<'_>,
+    armed: Armed,
+) -> Result<(VenueConfig, fbc_core::Secrets), String> {
+    let (mut cfg, creds) = configured(base, lookup, armed)?;
+    cfg.insert(KEY_PRODUCTION_PLACES, PROBE_PLACE_STAGES);
+    Ok((cfg, creds))
+}
+
 /// The configuration of the session arming on `armed`, and its credentials: `base` with the
 /// account and public key the environment gives it (`auth_qfex::session`) and the account key
 /// the program numbers it by (decision 0122 item 1).
-fn configured(
+pub fn configured(
     base: &VenueConfig,
     lookup: Lookup<'_>,
     armed: Armed,
@@ -511,6 +625,8 @@ struct Run<'a> {
     ev: Evidence,
     /// The accounts the run's configuration names, read before every session ([`named`]).
     named: Vec<Armed>,
+    /// What a place-stage run asks for (`--place-stages`): `None` for stage one.
+    places: Option<&'a Places>,
 }
 
 impl Run<'_> {
@@ -529,6 +645,14 @@ impl Run<'_> {
         if let Some(hold) = self.opts.hold {
             self.hold(hold).await?;
         }
+        if let Some(places) = self.places {
+            // After the hold, so the MDS touch is not open while it holds (decision 0146).
+            let mut pre = Preflight::default();
+            let passed = self.preflight(places, &mut pre).await;
+            self.ev.preflight = Some(pre);
+            passed?;
+            return Err(NOT_BUILT.to_owned());
+        }
         let arms = self.opts.arms.clone();
         for (n, armed) in arms.into_iter().enumerate() {
             let (cfg, creds) = configured(&self.base, self.lookup, armed)?;
@@ -546,6 +670,44 @@ impl Run<'_> {
             self.ev.registries.push(registry.run().clone());
             self.ev.sessions.push(ran?);
         }
+        Ok(())
+    }
+
+    /// The place stages' preflight ([`crate::market`]), each step it passes recorded in `pre`:
+    /// the spec from this run's `GET /refdata` on the configuration the guard admitted, the count
+    /// bound against each place registry's ceiling, the MDS touch, and the caps at it. No account
+    /// connects, and nothing authenticated opens.
+    async fn preflight(&mut self, places: &Places, pre: &mut Preflight) -> Result<(), String> {
+        let (cfg, _) = configured(&self.base, self.lookup, self.named[0])?;
+        let cfg = market::market_config(&cfg, self.opts.read_wait);
+        self.line(format_args!(
+            "PREFLIGHT the instrument's spec from GET /refdata on the guarded REST origin"
+        ));
+        let found = market::discover_spec(&cfg, &places.symbol, &self.connector, &self.limiter);
+        let found = found.await?;
+        pre.passed.push(market::DISCOVERED);
+        let parsed =
+            (self.opts.ledger.as_ref()).ok_or("--place-stages without the ledger's bounds")?;
+        market::count_bound(parsed, &found, places)?;
+        pre.passed.push(market::COUNTED);
+        self.line(format_args!(
+            "PREFLIGHT the touch from the guarded MDS origin"
+        ));
+        let opened = market::Touch::open(
+            &cfg,
+            &found,
+            &self.connector,
+            &self.clock,
+            self.opts.connect_wait,
+        );
+        let within = self.opts.connect_wait + self.opts.read_wait;
+        let quote = opened?.first(within, places.touch_max_age).await?;
+        pre.passed.push(market::TOUCHED);
+        market::place_caps(places, &found, quote)?;
+        pre.passed.push(market::CAPPED);
+        self.line(format_args!(
+            "PREFLIGHT passed: the spec, the count bound, the touch and the caps"
+        ));
         Ok(())
     }
 
@@ -820,15 +982,19 @@ impl Run<'_> {
             run.pings_before_auth()
         ));
         let mut why = run.stops();
-        if why.is_none() && !self.opts.arms.is_empty() {
+        if why.is_none() && (!self.opts.arms.is_empty() || self.places.is_some()) {
+            // What the interrupt stops: a place-stage run's preflight (FBC-c6kw), or the sessions.
+            let next = match self.places {
+                Some(_) => "no preflight starts",
+                None => "no session starts",
+            };
             why = match (&run.ended_by, run.interrupted_closing) {
-                (End::Interrupted, _) => {
-                    Some("the owner's interrupt (Ctrl-C) ended the hold: no session starts".into())
-                }
-                (_, true) => Some(
-                    "the owner's interrupt (Ctrl-C) came as the hold closed: no session starts"
-                        .into(),
-                ),
+                (End::Interrupted, _) => Some(format!(
+                    "the owner's interrupt (Ctrl-C) ended the hold: {next}"
+                )),
+                (_, true) => Some(format!(
+                    "the owner's interrupt (Ctrl-C) came as the hold closed: {next}"
+                )),
                 _ => None,
             };
         }

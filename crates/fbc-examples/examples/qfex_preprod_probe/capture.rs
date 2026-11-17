@@ -67,6 +67,7 @@ use serde_json::{Map, Value};
 use crate::evidence::privacy_hits;
 use crate::hold::HoldRun;
 use crate::ledger::RegistryRun;
+use crate::market::Preflight;
 use crate::pages::Pages;
 use crate::refusals::{ReadSocket, Refusals};
 pub use crate::report::outputs;
@@ -317,6 +318,11 @@ pub struct Evidence {
     pub hold_asked: bool,
     /// What the hold's connection heard, once the hold started.
     pub hold: Option<HoldRun>,
+    /// Whether the run asked for the place stages (`--place-stages`, FBC-c6kw).
+    pub places_asked: bool,
+    /// What the place stages' preflight passed, once it started ([`crate::market`]): never a
+    /// value.
+    pub preflight: Option<Preflight>,
     pub reads: Vec<AccountRead>,
     pub sessions: Vec<SessionRun>,
     /// Each registry's fill ledger: its bounds, and its horizon and replay counts at each of its

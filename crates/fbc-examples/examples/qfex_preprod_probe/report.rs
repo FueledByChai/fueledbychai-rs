@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::capture::{Evidence, SessionRun, has_gap, list, partial_accounts, shown};
 use crate::evidence::privacy_hits;
-use crate::{hold, ledger, refusals};
+use crate::{hold, ledger, market, refusals};
 
 /// Where the accounts read came from, as `evidence.json` says it (decision 0144 item 3).
 const ACCOUNTS_NOTE: &str = "named by the run's configuration, not listed by QFEX: the probe \
@@ -46,17 +46,24 @@ pub fn markdown(ev: &Evidence) -> String {
         true => " The liveness hold: FBC-39ks and decision 0146.",
         false => "",
     };
+    let title = match ev.places_asked {
+        true => format!(
+            "# QFEX {} place stages: the preflight\n\n\
+             FBC-c6kw, the first slice of FBC-9sk2, decision 0148.",
+            ev.environment
+        ),
+        false => format!(
+            "# QFEX {} stage one: {}\n\n\
+             FBC-l931, decision 0132 items 1, 3 and 7, and decision 0143.",
+            ev.environment,
+            ev.about()
+        ),
+    };
     let _ = writeln!(
         s,
-        "# QFEX {} stage one: {}\n\n\
-         FBC-l931, decision 0132 items 1, 3 and 7, and decision 0143.{hold} Environment: QFEX \
-         {}, under the probe mode `{}`. Started {} against {}. Result: {result}.\n",
-        ev.environment,
-        ev.about(),
-        ev.environment,
-        ev.mode,
-        ev.started,
-        ev.target
+        "{title}{hold} Environment: QFEX {}, under the probe mode `{}`. Started {} against {}. \
+         Result: {result}.\n",
+        ev.environment, ev.mode, ev.started, ev.target
     );
     let sessions = shown(ev);
     if let Some(line) = refusals::headline(ev, &sessions) {
@@ -135,9 +142,24 @@ pub fn markdown(ev: &Evidence) -> String {
         }
         None => {}
     }
+    if let Some(pre) = &ev.preflight {
+        market::markdown(&mut s, pre);
+    }
+    let asked_none = ev.arms.is_empty() && (ev.hold_asked || ev.places_asked);
     let _ = writeln!(s, "## The sessions\n");
-    if ev.arms.is_empty() && ev.hold_asked {
-        let _ = writeln!(s, "None: the run asked for no session (no --arm).\n");
+    match (asked_none, ev.places_asked) {
+        // The place stages would open sessions; this slice stops before them (FBC-c6kw).
+        (true, true) => {
+            let _ = writeln!(
+                s,
+                "None: no session opened: the place stages after the preflight are not built \
+                 yet (FBC-23ch).\n"
+            );
+        }
+        (true, false) => {
+            let _ = writeln!(s, "None: the run asked for no session (no --arm).\n");
+        }
+        (false, _) => {}
     }
     for run in &sessions {
         let arm = run.arm.as_deref().unwrap_or("none reported");
@@ -185,7 +207,7 @@ pub fn markdown(ev: &Evidence) -> String {
         let _ = writeln!(s);
     }
     refusals::markdown(&mut s, ev, &sessions);
-    if !(ev.arms.is_empty() && ev.hold_asked) {
+    if !asked_none {
         ledger::markdown(&mut s, &ev.registries);
     }
     let _ = writeln!(
@@ -206,6 +228,17 @@ pub fn markdown(ev: &Evidence) -> String {
         list(&ev.strings),
     );
     s
+}
+
+/// What the run asked for: the accounts it arms on and whether it holds, and, for a place-stage
+/// run alone (FBC-c6kw), `"place_stages": true`, so a run that stops before its preflight still
+/// says it was one. A stage-one run's entry is as it was.
+fn asked(ev: &Evidence) -> Value {
+    let mut asked = json!({"arms": ev.arms, "hold": ev.hold_asked});
+    if ev.places_asked {
+        asked["place_stages"] = Value::Bool(true);
+    }
+    asked
 }
 
 /// The evidence, machine-readable.
@@ -247,8 +280,9 @@ pub fn to_json(ev: &Evidence) -> Value {
         "stopped": ev.stopped,
         "accounts": {"source": "configuration", "named": ev.accounts,
             "count": ev.accounts.len(), "others_checked": false, "note": ACCOUNTS_NOTE},
-        "asked": {"arms": ev.arms, "hold": ev.hold_asked},
+        "asked": asked(ev),
         "hold": ev.hold.as_ref().map(|held| hold::to_json(held, ev.environment)),
+        "place_stages": ev.preflight.as_ref().map(market::to_json),
         "reads": reads,
         "sessions": sessions,
         "provider_rate_refusals": refusals::to_json(ev, &shown),
