@@ -17,19 +17,24 @@
 //! program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
-//! With `--place-stages` (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions 0148 and
-//! 0151) it runs the place stages on production (`--production`) and, until FBC-4plj, only against
-//! a loopback test stub: a `CAPS` line first, its lease directory opened ([`places`]: tagged
-//! production, a stop marker held to `--reconciled`, the namespace lease taken; 0151 items 1 and
-//! 6), the hold first when `--hold-secs` asks, then the traded instrument's spec from this run's
-//! `GET /refdata`, the ledger's count bound against each place registry's ceiling, the MDS touch
-//! and the caps at it ([`market`]), with `--reconciled` the reads that clear the marker, then each
-//! named account's drop test in turn (`stage.rs`): drop session one places X, one post-only GTC at
-//! the minimum size behind the touch, compared with never-arming reads ([`compare`]), the journal's
-//! frames read on their way by the tee ([`tee`]), then closes gracefully; after the reads, the read
-//! before drop session two admitting X alone, drop session two places Y and its connection drops
-//! abruptly; the reads after the drop give the account's verdict ([`verdict`]). The run ends after
-//! the last account's, its outcome not ok, until FBC-su9i builds stage two; every stop of the place
+//! With `--place-stages` (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; decisions
+//! 0148 and 0151) it runs the place stages on production (`--production`) and, until FBC-4plj, only
+//! against a loopback test stub: a `CAPS` line first, its lease directory opened ([`places`]:
+//! tagged production, a stop marker held to `--reconciled`, the namespace lease taken; 0151 items 1
+//! and 6), the hold first when `--hold-secs` asks, then the traded instrument's spec from this
+//! run's `GET /refdata`, the ledger's count bound against each place registry's ceiling, the MDS
+//! touch and the caps at it ([`market`]), with `--reconciled` the reads that clear the marker, then
+//! each named account's drop test in turn (`stage.rs`): drop session one places X, one post-only
+//! GTC at the minimum size behind the touch, compared with never-arming reads ([`compare`]), the
+//! journal's frames read on their way by the tee ([`tee`]), then closes gracefully; after the
+//! reads, the read before drop session two admitting X alone, drop session two places Y and its
+//! connection drops abruptly; the reads after the drop give the account's verdict ([`verdict`]).
+//! Then stage two ([`stage_two`]): with the run's exact-echo gate open (an ACK in this run echoed
+//! one of our client ids byte for byte), each named account in turn places one crossing post-only,
+//! a post-only GTC at the minimum size at the far touch, only while no other order of ours rests on
+//! any named account, and cancels every order of ours by venue id before its session stops; with
+//! the gate shut the run ends NoEcho, not a fault. The run ends after the last account's crossing
+//! post-only, its outcome not ok, until FBC-ou9g builds the taker IOC; every stop of the place
 //! stages (Ctrl-C among them) ends it sooner, an order still resting reported for the owner's hand
 //! cancel, and writes the report and the stop marker. Ctrl-C from the hold's first read to its last
 //! is the hold's: it stops the run before its preflight, with its report and no stop marker.
@@ -77,6 +82,9 @@ mod probe_args;
 mod refusals;
 mod report;
 mod stage;
+// Stage two (FBC-su9i): the exact-echo gate, no_other_order(), each crossing session's record
+// and the report's items, which stage two's crossing session reads and writes.
+mod stage_two;
 // The journal's tee (FBC-23ch), whose stops the drop sessions wait on.
 mod tee;
 // The drop test's verdict (FBC-77r8): what the reads after drop session two's drop show of X

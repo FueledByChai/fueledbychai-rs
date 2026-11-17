@@ -100,6 +100,45 @@
 //! reads none of, and a resync with a fill unsettled across it) are proven on the handler and the
 //! report's own path: each raised by `PlaceHandler` from the events that carry it, its marker
 //! written and the report naming it.
+//!
+//! FBC-su9i's done line (decisions 0005, 0132 item 7, 0148 items 2, 6 and 8, 0151 items 5, 9 and
+//! 11): stage two's crossing post-only, against the model's trade sockets, and its judgments at
+//! function level (with the helpers and the rest in `crossing.rs`):
+//!
+//! - the exact-echo gate open on an exact ACK echo in this run and shut for upper-cased,
+//!   escaped, absent, null and empty client ids, an echo's exactness recorded but never opening it
+//!   (`an_exact_echo_opens_the_gate`, `an_upper_cased_or_escaped_echo_does_not_open_the_gate`);
+//!   with it shut, by an upper-cased or escaped echo, every account's drop test runs and the run
+//!   ends NoEcho, no marker, while an ACK whose client id is absent, null or empty names no order
+//!   of ours and stops the run a stray's in drop session one, before the gate is judged (0151
+//!   item 13, which wins over the ticket's NoEcho for these three)
+//!   (`an_absent_echo_ends_the_run_after_every_accounts_drop_test`); the gate per run, a second
+//!   run on the same lease directory judging its own
+//!   (`an_open_gate_is_not_carried_into_a_second_run`);
+//! - the crossing post-only refused CANCELLED, by an unmapped status and by an err echo, each
+//!   recorded and reported, the last two leaving its place Unknown, counted resting, a stop
+//!   (`the_crossing_post_only_is_refused_and_recorded`); an Unknown place never resent and
+//!   reported (`an_unknown_place_is_never_resent_and_is_reported`); a fill a stop, a refused arm
+//!   or a touch it cannot be priced from placing none;
+//! - no crossing order beside another order of ours, on the account's registries or reads or on
+//!   another named account's, judged at function level on hand-built registries and reads
+//!   (`a_crossing_order_waits_for_no_other_order_of_ours`,
+//!   `a_crossing_order_waits_for_no_order_of_ours_on_any_named_account`,
+//!   `an_unknown_crossing_post_only_blocks_the_taker_ioc`); in a run, the one path a model's
+//!   answer cannot reach, an order of ours held in the first account's cross registry, through a
+//!   test's hook (`a_crossing_order_is_kept_back_in_a_run_while_another_order_of_ours_rests`),
+//!   and an Unknown crossing post-only's stop keeping every later crossing order back
+//!   (`an_unknown_place_is_never_resent_and_is_reported`,
+//!   `the_crossing_post_only_is_refused_and_recorded`);
+//!   the run's glue from the drop tests' reads to X and Y counted ended is not reached by a run
+//!   whose drop test did not pass, since only such an account crosses;
+//! - the session machinery: cancels by venue id before each crossing session stops, at Ctrl-C
+//!   too, its span bound met exactly one `--rpc-timeout-ms` early on a paused clock and not a
+//!   millisecond before, an order left resting a stop whether the registry counts it or only a
+//!   read shows it, a named account not read after a crossing session a stop, and held cancels
+//!   ending it by the abrupt drop after a passed drop test;
+//! - the report's characters exercised, whether add_order was accepted as encoded, an upper-cased
+//!   echo read "not byte for byte", and the places-production/ slice passing the privacy check.
 
 use super::*;
 
@@ -528,16 +567,25 @@ fn place_stage_flags_are_refused_naming_the_flag() {
     }
     let usage = usage.split_whitespace().collect::<Vec<_>>().join(" ");
     for said in [
-        "With --place-stages (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions \
-         0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's drop \
-         test on each named account in turn",
+        "With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of FBC-9sk2; \
+         decisions 0148 and 0151) it runs the place stages' preflight, then decision 0132 item \
+         4's drop test on each named account in turn, then stage two's crossing post-only",
         "only against a loopback test stub, every origin (trade, REST and MDS) a loopback address",
         "It prints a CAPS line with the environment and both caps first, before any request",
         "Drop session two: every named account read again, X alone admitted, as one open order \
          on its symbol",
         "then the abrupt drop of its connection, with no WebSocket close",
-        "With no stop the run ends after the last account's drop test, its outcome not ok, until \
-         FBC-su9i builds stage two.",
+        "With no stop, stage two follows.",
+        "With no stop the run ends after the last account's crossing post-only, its outcome not \
+         ok, until FBC-ou9g builds the taker IOC.",
+        "A crossing session also cancels every order of ours by venue id before it stops",
+        "a place never answered, or refused by a status the adapter does not map or by an err \
+         echo, ending Unknown, never resent and counted resting (decision 0005)",
+        "an ACK whose client id is absent, null or empty names no order of ours, so it stops the \
+         run in drop session one, StrayOrder, before the gate is judged",
+        "a press during the preflight, the reads, a drop session, a crossing session or a \
+         session's stop's cancels stops the run, Interrupted",
+        "in a drop session or a crossing session it cancels by venue id first.",
         "between the drop test's sessions it stops the run once the reads under way end, X still \
          resting reported for your hand cancel",
         "In a drop session only Ctrl-C and a fill of ours cancel (0151 item 2)",
@@ -961,7 +1009,8 @@ async fn a_hold_runs_before_the_preflight_with_nothing_else_open() {
     let (report, _) = outputs_of(&dir);
     assert!(
         report.starts_with(
-            "# QFEX production place stages: the preflight and each named account's drop test\n"
+            "# QFEX production place stages: the preflight, each named account's drop test and \
+             stage two's crossing post-only\n"
         ),
         "{report}"
     );
@@ -1241,8 +1290,8 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
     );
     assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
     // Past the preflight, each named account's drop test ran, two sessions each (FBC-23ch and
-    // FBC-77r8), and no stage-one registry was built.
-    assert_eq!(ev.sessions.len(), 4);
+    // FBC-77r8), then each one's crossing session (FBC-su9i), and no stage-one registry was built.
+    assert_eq!(ev.sessions.len(), 6);
     assert!(ev.registries.is_empty());
     assert_eq!(
         (ev.environment, ev.target),
@@ -1262,6 +1311,10 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
     for line in [
         "PROBE place stages on QFEX production (production_probe), against a loopback test stub: \
          the preflight, then each named account's drop test in turn (FBC-23ch and FBC-77r8)",
+        "then stage two (FBC-su9i): with the run's exact-echo gate open, each named account in \
+         turn places its crossing post-only",
+        "and with it shut the run ends NoEcho; the run ends after the last account's crossing \
+         post-only, not ok, until FBC-ou9g builds the taker IOC",
         "PREFLIGHT the instrument's spec from GET /refdata on the guarded REST origin",
         "PREFLIGHT the touch from the guarded MDS origin",
         "PREFLIGHT passed: the spec, the count bound, the touch and the caps",
@@ -1278,7 +1331,7 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         report.contains(&format!("Passed, in order: {DISCOVERED}; {COUNTED}")),
         "{report}"
     );
-    assert!(report.contains("stage two and the stages after it are not built yet"));
+    assert!(report.contains("stage two's taker IOC and the stages after it are not built yet"));
     let json = super::json(&json);
     assert_eq!(json["place_stages"]["passed"].as_array().unwrap().len(), 4);
     assert_eq!(
@@ -3235,9 +3288,10 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     assert!(closed < trades && trades < historic, "{what:?}");
     assert!(historic < last("GET /user/historic-orders"), "{what:?}");
     // Two sessions on each named account, none of which reconnected, one add_order each and no
-    // cancel: X and Y alone (FBC-77r8).
-    assert_eq!(d.count("subscribe"), 12);
-    assert_eq!((d.count("add_order"), d.count("cancel_order")), (4, 0));
+    // cancel: X and Y alone (FBC-77r8); then each one's crossing session, its crossing post-only
+    // refused CANCELLED, so nothing to cancel (FBC-su9i).
+    assert_eq!(d.count("subscribe"), 18);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (6, 0));
     // The lines, in order.
     let lines = [
         "READ before drop session one: primary (drop)",
@@ -3258,12 +3312,13 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
         assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
     }
     // X rested after the close, but the run went on to drop session two: no hand cancel, no
-    // stop and no marker, the run ending after every account's drop test, naming FBC-su9i.
+    // stop and no marker, the run ending after every account's crossing post-only, naming
+    // FBC-ou9g (FBC-su9i).
     assert!(!d.printed.contains("RESTING"), "{}", d.printed);
     assert!(d.marker().is_none() && d.ev.stop.is_none());
     let stopped = d.ev.stopped.clone().unwrap();
     assert_eq!(stopped, stage::NOT_BUILT);
-    assert!(stopped.contains("FBC-su9i"), "{stopped}");
+    assert!(stopped.contains("FBC-ou9g"), "{stopped}");
     // What the session did, as the evidence keeps it.
     let run = d.drop_run();
     assert!(run.authenticated && run.resynced && run.started);
@@ -3278,7 +3333,7 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     assert_eq!((after.trades, after.trades_naming_x), (0, 0));
     assert_eq!(after.terminal_status, None);
     assert_eq!(run.as_encoded, Some(true));
-    assert_eq!(d.ev.sessions.len(), 4);
+    assert_eq!(d.ev.sessions.len(), 6);
     let session = &d.ev.sessions[0];
     assert_eq!(
         (session.label(), session.account),
@@ -3298,13 +3353,15 @@ async fn every_place_is_the_minimum_size() {
     let model = d.venue.model.lock().unwrap();
     // X and Y on each named account (FBC-77r8), each at the instrument's minimum size (one lot of
     // 0.01), a post-only GTC on --side, --away-bps (50) behind the bid of 100.00, snapped onto
-    // the cent grid.
-    assert_eq!(model.orders.len(), 4);
-    for x in &model.orders {
+    // the cent grid; then each one's crossing post-only (FBC-su9i), at the minimum size too, at
+    // the far touch, the ask of 100.10.
+    assert_eq!(model.orders.len(), 6);
+    for (n, x) in model.orders.iter().enumerate() {
         assert_eq!(x.quantity, Decimal::new(1, 2));
         assert_eq!((x.kind.as_str(), x.tif.as_str()), ("ALO", "GTC"));
         assert_eq!(x.side, "BUY");
-        assert_eq!(x.price, super::json("99.5"));
+        let price = if n < 4 { "99.5" } else { "100.1" };
+        assert_eq!(x.price, super::json(price));
     }
     // The registry's list held it, and the codec's place-stage key admits it only at the
     // minimum (decision 0148 item 4).
@@ -3368,9 +3425,13 @@ async fn each_session_arms_under_an_authority_for_its_own_account() {
         model.conns.iter().filter(|(_, c)| c.armed).collect();
     armed.sort_by_key(|(n, _)| **n);
     // Each drop test's two sessions armed on its own account, as their authentication named it:
-    // the primary account's, then the subaccount's (FBC-77r8).
+    // the primary account's, then the subaccount's (FBC-77r8); then each crossing session, on
+    // its own account too (FBC-su9i).
     let accounts: Vec<Option<&str>> = armed.iter().map(|(_, c)| c.account.as_deref()).collect();
-    assert_eq!(accounts, [None, None, Some(SUB), Some(SUB)]);
+    assert_eq!(
+        accounts,
+        [None, None, Some(SUB), Some(SUB), None, Some(SUB)]
+    );
     assert!(armed.iter().all(|(_, c)| c.session));
     let arms =
         d.ev.drops
@@ -3403,13 +3464,17 @@ async fn a_registrys_trip_reaches_the_journal_before_any_market_arms() {
     assert!(d.printed.contains(
         "its CancelOnlyTrip given to the journal before any market arms (decision 0139)"
     ));
-    // One drop registry per named account (FBC-77r8).
+    // One drop registry per named account (FBC-77r8), then one cross registry each (FBC-su9i),
+    // whose trip is given before its market arms too.
     let registries = &d.ev.place_registries;
-    assert_eq!(registries.len(), 2);
+    let steps: Vec<ledger::Step> = registries.iter().map(|r| r.step).collect();
+    use ledger::Step::{Cross, Drop};
+    assert_eq!(steps, [Drop, Drop, Cross, Cross]);
     for registry in registries {
-        assert_eq!(registry.step, ledger::Step::Drop);
         assert_eq!(registry.declaration, ledger::PLACES_DECLARATION);
     }
+    let start = "START the cross registry on primary";
+    assert!(d.at("REGISTRY cross on primary") < d.at(start));
 }
 
 #[tokio::test]
@@ -3439,7 +3504,10 @@ async fn the_seed_follows_clean_reads_of_every_named_account() {
     let sub = d.at("READ before drop session one: subaccount (drop)");
     assert!(d.at("VERDICT drop test on primary") < sub);
     assert!(sub < d.at("REGISTRY drop on subaccount"));
-    assert_eq!(d.printed.matches("seeded flat").count(), 2);
+    // And each one's cross registry once, after clean reads of every named account (FBC-su9i).
+    assert_eq!(d.printed.matches("seeded flat").count(), 4);
+    let cross = d.at("READ before the crossing session: subaccount");
+    assert!(cross < d.at("REGISTRY cross on primary"));
     // An account that does not read clean stops the run before any registry is built, so
     // nothing is seeded and no session opens.
     let not_flat = QfexModel {
@@ -3471,10 +3539,11 @@ async fn no_two_sessions_are_ever_open() {
     // and the reads' sockets never arm or subscribe.
     let model = d.venue.model.lock().unwrap();
     assert!(!model.overlapped);
-    // Two sessions on each named account (FBC-77r8), one after the other.
+    // Two sessions on each named account (FBC-77r8), then one crossing session each (FBC-su9i),
+    // one after the other.
     let sessions = model.conns.values().filter(|c| c.session).count();
-    assert_eq!(sessions, 4);
-    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 4);
+    assert_eq!(sessions, 6);
+    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 6);
 }
 
 #[tokio::test]
@@ -3505,13 +3574,15 @@ async fn before_the_echo_each_session_places_at_most_one_order() {
         ..QfexModel::default()
     };
     let d = dropped(model, "drop-one-place").await;
-    assert_eq!(d.places_by_session(), [1, 1, 1, 1]);
+    // Y's ACK echoed exactly, so each crossing session placed its one crossing post-only too
+    // (FBC-su9i).
+    assert_eq!(d.places_by_session(), [1; 6]);
     let run = d.drop_run();
     assert!(!run.x.acked && !run.x.exact_echo, "{run:?}");
     assert_eq!(run.x.outcome.as_deref(), Some("Unknown"));
     // And with the echo: still one a session, X or Y (FBC-77r8).
     let d = dropped(QfexModel::default(), "drop-one-place-echoed").await;
-    assert_eq!(d.places_by_session(), [1, 1, 1, 1]);
+    assert_eq!(d.places_by_session(), [1; 6]);
     assert!(d.drop_run().x.exact_echo);
 }
 
@@ -3526,9 +3597,10 @@ async fn the_probe_authorizes_no_place_beyond_a_registrys_list() {
     let refused = allowance.take(Step::Drop, X).unwrap_err();
     assert_eq!(refused, places::Stop::BeyondList);
     assert!(refused.marks() && !refused.cancels_in_drop(false));
-    // A run spends its list: X and Y alone reached QFEX, once each on each named account.
+    // A run spends its list: X and Y alone reached QFEX from the drop registries, once each on
+    // each named account, and one crossing post-only from each cross registry (FBC-su9i).
     let d = dropped(QfexModel::default(), "drop-list").await;
-    assert_eq!(d.count("add_order"), 4);
+    assert_eq!(d.count("add_order"), 6);
     assert_eq!(d.ev.place_registries[0].step, Step::Drop);
     // Its list holds X and Y once: a third resting place is beyond it.
     assert_eq!(allowance.take(Step::Drop, ledger::Y), Ok(()));
@@ -4507,16 +4579,17 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
     let orders = model.orders.clone();
     drop(model);
     // Every synthetic value the run met: the credentials and the subaccount's id, X's and Y's
-    // venue ids and client ids on both accounts, the user id QFEX's frames name, their price and
-    // size, both caps, the symbol and the namespace.
+    // venue ids and client ids on both accounts, and the crossing post-only's (FBC-su9i), the
+    // user id QFEX's frames name, their prices and size, both caps, the symbol and the
+    // namespace.
     let mut values: Vec<String> = [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB, model::USER_ID]
         .map(str::to_owned)
         .to_vec();
-    assert_eq!(orders.len(), 4);
+    assert_eq!(orders.len(), 6);
     for order in &orders {
         values.extend([order.id.clone(), order.cid.clone()]);
     }
-    values.extend(["99.5".to_owned(), "0.01".to_owned()]);
+    values.extend(["99.5", "100.1", "0.01"].map(str::to_owned));
     values.extend(["424242", "373737", SYMBOL, "61437"].map(str::to_owned));
     // The report, the evidence and the drop-production/ slice the owner commits.
     let evidence = d.dir.join("evidence");
@@ -4556,11 +4629,12 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
     }
     assert!(d.printed.lines().next().unwrap().contains("424242.17"));
     // The journal, which stays local (decision 0006), keeps each add_order as written.
-    assert_eq!(written(&d, "add_order"), [true; 4]);
-    // Each output passes scripts/privacy-check.sh, the slice by the run itself.
+    assert_eq!(written(&d, "add_order"), [true; 6]);
+    // Each output passes scripts/privacy-check.sh, each slice by the run itself.
     assert_report_and_evidence_pass_the_privacy_check(&evidence);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
     evidence::privacy_check(&script, &slice).unwrap();
+    evidence::privacy_check(&script, &evidence.join(stage::PLACES_SLICE)).unwrap();
     let (report, _) = d.outputs();
     for account in ["primary", "subaccount"] {
         let heading =
@@ -6522,8 +6596,9 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
             .position(|e| e == w)
             .unwrap_or_else(|| panic!("{w}: {what:?}"))
     };
+    // The drop test's two sessions, then the crossing session (FBC-su9i).
     let conns = d.session_conns();
-    assert_eq!(conns.len(), 2, "{what:?}");
+    assert_eq!(conns.len(), 3, "{what:?}");
     let (one, two) = (&conns[0], &conns[1]);
     let on = |conn: &str, kind: &str| at(&format!("trade {conn} {kind}"));
     // Session one: its arm, X, its graceful close.
@@ -6553,14 +6628,17 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
     let historic = (trades..what.len())
         .find(|i| what[*i].starts_with("GET /user/historic-orders"))
         .unwrap();
-    let last = what.len() - 1;
+    // The last read of the drop test, before the crossing session's (FBC-su9i).
+    let last = at(&format!("trade {} auth", conns[2])) - 1;
     assert!(
         dropped < after_drop && after_drop < trades && historic < last,
         "{what:?}"
     );
-    // From the first arm to the last read: no cancel, two arms alone, and no reconnect: one
-    // connection attempt a session, and no session connection after the second.
-    let span = &what[first_arm..];
+    // From the first arm to the last read before the crossing session: no cancel, two arms
+    // alone, and no reconnect: one connection attempt a session, and no session connection
+    // after the second but the crossing session's (FBC-su9i), its own registry's.
+    let crossing = at(&format!("trade {} auth", conns[2]));
+    let span = &what[first_arm..crossing];
     assert!(
         span.iter().all(|w| !w.ends_with(" cancel_order")),
         "{what:?}"
@@ -6570,13 +6648,13 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
         .filter(|w| w.ends_with(" cancel_on_disconnect"))
         .count();
     assert_eq!(arms, 2, "{what:?}");
-    assert_eq!(d.count("subscribe"), 6);
+    assert_eq!(d.count("subscribe"), 9);
     let attempts: Vec<(u64, u64)> = (d.ev.sessions.iter())
         .map(|s| (s.attempts, s.failed_attempts))
         .collect();
-    assert_eq!(attempts, [(1, 0), (1, 0)]);
+    assert_eq!(attempts, [(1, 0), (1, 0), (1, 0)]);
     let ended: Vec<&str> = d.ev.sessions.iter().map(|s| s.ended_by).collect();
-    assert_eq!(ended, [stage::GRACEFUL, stage::DROPPED]);
+    assert_eq!(ended, [stage::GRACEFUL, stage::DROPPED, stage::GRACEFUL]);
     // The abrupt drop sent no WebSocket close; every other socket was closed.
     let n: usize = two.parse().unwrap();
     assert!(!d.venue.trade.connections()[n].client_closed);
@@ -6610,13 +6688,15 @@ async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
     )
     .await;
     // One drop registry for the account, built, tripped and seeded once, whose ledger is read at
-    // the end of each of its two sessions (decision 0148 item 3).
-    assert_eq!(d.ev.place_registries.len(), 1);
+    // the end of each of its two sessions (decision 0148 item 3); the cross registry after it is
+    // the account's next (FBC-su9i).
+    assert_eq!(d.ev.place_registries.len(), 2);
+    assert_eq!(d.ev.place_registries[1].step, ledger::Step::Cross);
     let ends = &d.ev.place_registries[0].registry_run().ends;
     let sessions: Vec<&str> = ends.iter().map(|e| e.session).collect();
     assert_eq!(sessions, [places::DROP_ONE, places::DROP_TWO]);
     assert_eq!(d.printed.matches("REGISTRY drop on primary").count(), 1);
-    assert_eq!(d.printed.matches("seeded flat").count(), 1);
+    assert_eq!(d.printed.matches("seeded flat").count(), 2);
     // Started once, by drop session one: drop session two's market stays armed.
     assert_eq!(d.printed.matches("START primary").count(), 1);
     assert!(d.at("REGISTRY drop on primary") < d.at("SESSION primary (drop session one)"));
@@ -6625,7 +6705,11 @@ async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
         .collect();
     assert_eq!(
         names,
-        [("primary", places::DROP_ONE), ("primary", places::DROP_TWO)]
+        [
+            ("primary", places::DROP_ONE),
+            ("primary", places::DROP_TWO),
+            ("primary", places::CROSS)
+        ]
     );
     // Y went out through the same Link and registry: the market Started in session one placed
     // it, and drop session two's resync seeded nothing.
@@ -7409,7 +7493,8 @@ async fn the_report_gives_each_accounts_drop_items_and_the_slice_passes_the_priv
     }
     // Every session's capture is whole, drop session two's, which journals no Closed control,
     // included; its frames are in the drop-production/ slice, which passes the privacy check.
-    assert_eq!(d.ev.sessions.len(), 4);
+    // The crossing sessions' frames are in the places-production/ slice (FBC-su9i).
+    assert_eq!(d.ev.sessions.len(), 6);
     assert!(
         d.ev.sessions
             .iter()
@@ -9174,4 +9259,2129 @@ async fn the_other_accounts_cleanness_is_not_known_when_a_read_of_one_failed() {
                 named account made was clean, but one could not be made";
     assert!(report.contains(said), "{report}");
     assert_eq!(json["drop_tests"][0]["others_clean"], "not known");
+}
+
+// ----- Stage two's parts (FBC-su9i; decisions 0005, 0148 items 2 and 6, 0151 item 5) -----
+
+#[test]
+fn an_exact_echo_opens_the_gate() {
+    let cids: Vec<String> = crossing::minted(2)
+        .into_iter()
+        .map(crossing::text_of)
+        .collect();
+    let mut model = QfexModel::default();
+    crossing::session(&mut model, 0);
+    let (mut tee, tap) = crossing::teed();
+    // Before any ACK the run's gate is shut.
+    let gate = stage_two::EchoGate::of(&tap.kept());
+    assert!(!gate.open, "{gate:?}");
+    // The model's ACK echoes our client id byte for byte, as the run's tee reads the frame: open.
+    let frame = crossing::add_order(&cids[0], "BUY", "99.50");
+    crossing::exchange(&mut model, &mut tee, &frame);
+    let gate = stage_two::EchoGate::of(&tap.kept());
+    assert!(gate.open, "{gate:?}");
+    assert_eq!(gate.echoes.acks.exact, 1);
+    assert!(gate.says().starts_with("open: an ACK in this run echoed"));
+    assert_eq!(tap.stop(), None);
+    // Per run, in memory: the next run's tee, a new one, is shut whatever this one heard.
+    let (_, next) = crossing::teed();
+    assert!(!stage_two::EchoGate::of(&next.kept()).open);
+    // An exact ACK of a client id the run never sent opens nothing: it is not ours.
+    let (mut tee, tap) = crossing::teed();
+    crossing::sent(&mut tee, &crossing::add_order(&cids[0], "BUY", "99.50"));
+    let foreign = model.trade(
+        0,
+        &Frame::text(crossing::add_order(&cids[1], "BUY", "99.50")),
+    );
+    crossing::heard(&mut tee, &foreign.unwrap());
+    assert!(!stage_two::EchoGate::of(&tap.kept()).open);
+    assert_eq!(tap.stop(), Some(places::Stop::StrayOrder));
+}
+
+#[test]
+fn an_upper_cased_or_escaped_echo_does_not_open_the_gate() {
+    let cid = crossing::text_of(crossing::minted(1)[0]);
+    let frame = crossing::add_order(&cid, "BUY", "99.50");
+    for echo in [
+        model::Echo::Upper,
+        model::Echo::Escaped,
+        model::Echo::Absent,
+        model::Echo::Null,
+        model::Echo::Empty,
+    ] {
+        let mut model = QfexModel {
+            ack_echo: echo,
+            ..QfexModel::default()
+        };
+        crossing::session(&mut model, 0);
+        let (mut tee, tap) = crossing::teed();
+        crossing::exchange(&mut model, &mut tee, &frame);
+        let gate = stage_two::EchoGate::of(&tap.kept());
+        assert!(!gate.open, "{echo:?}");
+        let acks = gate.echoes.acks;
+        let counted = match echo {
+            model::Echo::Upper | model::Echo::Escaped => acks.differs,
+            model::Echo::Absent | model::Echo::Null => acks.absent,
+            _ => acks.empty,
+        };
+        // Its exactness is recorded. An ACK of an order not yet known ours with no client id
+        // names no order of ours, so it is a stray's (0151 item 13), a stop; it is still counted
+        // among the ACKs by how it came, since nothing in it ties it to an order.
+        assert_eq!((acks.total(), counted), (1, 1), "{echo:?}");
+        match echo {
+            model::Echo::Upper | model::Echo::Escaped => {
+                assert!(acks.says().starts_with("1 not byte for byte"), "{echo:?}");
+                assert_eq!(tap.stop(), None, "{echo:?}");
+            }
+            model::Echo::Absent | model::Echo::Null => {
+                assert_eq!(acks.says(), "1 absent or null", "{echo:?}");
+                assert_eq!(tap.stop(), Some(places::Stop::StrayOrder), "{echo:?}");
+            }
+            _ => {
+                assert_eq!(acks.says(), "1 empty", "{echo:?}");
+                assert_eq!(tap.stop(), Some(places::Stop::StrayOrder), "{echo:?}");
+            }
+        }
+    }
+    // An ack or err echo of the add_order naming our client id exactly is recorded as exact, and
+    // never opens the gate.
+    let (mut tee, tap) = crossing::teed();
+    crossing::sent(&mut tee, &frame);
+    crossing::heard_echo(&mut tee, "ack", &frame, &cid);
+    crossing::heard_echo(&mut tee, "err", &frame, &cid);
+    let gate = stage_two::EchoGate::of(&tap.kept());
+    assert!(!gate.open);
+    assert_eq!(
+        (gate.echoes.ack_echoes.exact, gate.echoes.err_echoes.exact),
+        (1, 1)
+    );
+}
+
+/// The registries and reads of a run whose drop tests passed on both named accounts, X and Y
+/// shown ended on all three of 0151 item 5's reads, and nothing else placed.
+struct Ran {
+    drops: [fbc_oms::Registry; 2],
+    /// Each account's X and Y.
+    xy: [[fbc_core::ClientOrderId; 2]; 2],
+    ended: [Vec<fbc_core::ClientOrderId>; 2],
+    cross: [fbc_oms::Registry; 2],
+    reads: [capture::AccountRead; 2],
+}
+
+impl Ran {
+    fn new() -> Ran {
+        let cids = crossing::minted(4);
+        let xy = [[cids[0], cids[1]], [cids[2], cids[3]]];
+        // X and Y rest in the drop registry as its streams left them: nothing settles them.
+        let drops = xy.map(|[x, y]| {
+            let mut reg = fbc_oms::Registry::new();
+            crossing::holding(&mut reg, x, crossing::As::Open);
+            crossing::holding(&mut reg, y, crossing::As::Open);
+            reg
+        });
+        Ran {
+            drops,
+            xy,
+            ended: [xy[0].to_vec(), xy[1].to_vec()],
+            cross: [fbc_oms::Registry::new(), fbc_oms::Registry::new()],
+            reads: [crossing::clean(), crossing::clean()],
+        }
+    }
+
+    /// Whether a crossing order may be placed now.
+    fn judge(&self) -> Result<(), stage_two::Blocked> {
+        let mut built = Vec::new();
+        for (n, account) in ["primary", "subaccount"].into_iter().enumerate() {
+            built.push(stage_two::Built {
+                account,
+                step: ledger::Step::Drop,
+                registry: &self.drops[n],
+                ended: &self.ended[n],
+            });
+            built.push(stage_two::Built {
+                account,
+                step: ledger::Step::Cross,
+                registry: &self.cross[n],
+                ended: &[],
+            });
+        }
+        let reads = [
+            ("primary", Some(&self.reads[0])),
+            ("subaccount", Some(&self.reads[1])),
+        ];
+        stage_two::no_other_order(crossing::INST, &built, &reads)
+    }
+}
+
+/// The refusal of a registry of `account` at `step`.
+fn blocked(account: &'static str, step: ledger::Step) -> Result<(), stage_two::Blocked> {
+    Err(stage_two::Blocked::Registry { account, step })
+}
+
+#[test]
+fn a_crossing_order_waits_for_no_other_order_of_ours() {
+    // X and Y shown ended after the drop, and nothing else of ours: a crossing order may go.
+    assert_eq!(Ran::new().judge(), Ok(()));
+    // X or Y not shown ended on every read after the drop stays counted resting (0151 item 5).
+    let none = places::TwoRun::default();
+    assert_eq!(stage_two::ended_after_drop(&none), [false, false]);
+    let mut ran = Ran::new();
+    ran.ended[0] = vec![ran.xy[0][0]];
+    assert_eq!(ran.judge(), blocked("primary", ledger::Step::Drop));
+    // Another order of the account's, open or in flight on the cross registry, before its
+    // crossing post-only.
+    for stands in [crossing::As::Open, crossing::As::Sent] {
+        let mut ran = Ran::new();
+        let other = crossing::minted(1)[0];
+        crossing::holding(&mut ran.cross[0], other, stands);
+        assert_eq!(
+            ran.judge(),
+            blocked("primary", ledger::Step::Cross),
+            "{stands:?}"
+        );
+    }
+    // One that ended counts for nothing.
+    let mut ran = Ran::new();
+    crossing::holding(
+        &mut ran.cross[0],
+        crossing::minted(1)[0],
+        crossing::As::Refused,
+    );
+    assert_eq!(ran.judge(), Ok(()));
+    // The account's never-arming read listing an order, a TWAP, or REST counting one.
+    type Change = fn(&mut capture::AccountRead);
+    let listed: [Change; 3] = [
+        |r| r.page_orders = 1,
+        |r| r.page_twaps = 1,
+        |r| r.rest_open_orders = 1,
+    ];
+    for list in listed {
+        let mut ran = Ran::new();
+        list(&mut ran.reads[0]);
+        let refused = stage_two::Blocked::Listed { account: "primary" };
+        assert_eq!(ran.judge(), Err(refused.clone()));
+        assert!(
+            refused
+                .says()
+                .starts_with("primary's never-arming read lists")
+        );
+    }
+}
+
+#[test]
+fn a_crossing_order_waits_for_no_order_of_ours_on_any_named_account() {
+    // The subaccount's X not shown ended, its cross registry holding an order, its read listing
+    // one, or no read of it at all: each keeps the primary account's crossing order back.
+    let mut ran = Ran::new();
+    ran.ended[1].clear();
+    assert_eq!(ran.judge(), blocked("subaccount", ledger::Step::Drop));
+    let mut ran = Ran::new();
+    crossing::holding(
+        &mut ran.cross[1],
+        crossing::minted(1)[0],
+        crossing::As::Open,
+    );
+    assert_eq!(ran.judge(), blocked("subaccount", ledger::Step::Cross));
+    let mut ran = Ran::new();
+    ran.reads[1].page_orders = 1;
+    let listed = stage_two::Blocked::Listed {
+        account: "subaccount",
+    };
+    assert_eq!(ran.judge(), Err(listed));
+    let ran = Ran::new();
+    let built: Vec<stage_two::Built<'_>> = Vec::new();
+    let reads = [("primary", Some(&ran.reads[0])), ("subaccount", None)];
+    let unread = stage_two::no_other_order(crossing::INST, &built, &reads);
+    let want = stage_two::Blocked::Unread {
+        account: "subaccount",
+    };
+    assert_eq!(unread, Err(want));
+    // An order of ours on another market is not on this one.
+    let mut ran = Ran::new();
+    let elsewhere = fbc_core::NewOrder {
+        inst: fbc_core::InstrumentId::new(2),
+        ..crossing::order(crossing::minted(1)[0], 1)
+    };
+    ran.cross[1].insert(elsewhere).unwrap();
+    assert_eq!(ran.judge(), Ok(()));
+}
+
+#[test]
+fn an_unknown_crossing_post_only_blocks_the_taker_ioc() {
+    // The crossing post-only, left Unknown at its deadline: never resent (decision 0005), it
+    // stays counted resting on the cross registry, so no_other_order() refuses the taker IOC.
+    let mut ran = Ran::new();
+    let crossing_post_only = crossing::minted(1)[0];
+    crossing::holding(&mut ran.cross[0], crossing_post_only, crossing::As::Unknown);
+    let state = ran.cross[0].get(crossing_post_only).map(|r| r.state());
+    assert_eq!(state, Some(fbc_oms::OrdState::Unknown));
+    let refused = ran.judge();
+    assert_eq!(refused, blocked("primary", ledger::Step::Cross));
+    let said = refused.unwrap_err().says();
+    assert!(said.contains("Unknown order is never resent"), "{said}");
+    // On the subaccount's, it keeps the primary account's taker IOC back too.
+    let mut ran = Ran::new();
+    crossing::holding(&mut ran.cross[1], crossing_post_only, crossing::As::Unknown);
+    assert_eq!(ran.judge(), blocked("subaccount", ledger::Step::Cross));
+}
+
+// ----- FBC-su9i: stage two's crossing post-only, run against the model -----
+
+impl Dropped {
+    /// Stage two, as the evidence holds it.
+    fn stage_two(&self) -> &stage_two::StageTwo {
+        self.ev.stage_two.as_ref().expect("stage two's record")
+    }
+
+    /// The `n`th crossing session, in run order.
+    fn cross(&self, n: usize) -> &stage_two::CrossRun {
+        &self.stage_two().crosses[n]
+    }
+
+    /// The trade connections of the crossing sessions, in order: the sessions after the drop
+    /// tests' two each.
+    fn cross_conns(&self) -> Vec<String> {
+        let drops = 2 * self.ev.drops.len();
+        self.session_conns().into_iter().skip(drops).collect()
+    }
+
+    /// Whether the run's journal holds a `kind` frame it wrote naming `id`.
+    fn wrote_naming(&self, kind: &str, id: &str) -> bool {
+        let journal = self.dir.join("evidence").join("journal");
+        let reader = fbc_journal::JournalReader::open(&journal, 0).unwrap();
+        reader.entries().any(|e| match e.unwrap().record {
+            fbc_journal::Record::Outbound { frame, .. } => {
+                let text = String::from_utf8_lossy(frame.bytes()).into_owned();
+                text.contains(&format!(r#""type":"{kind}""#)) && text.contains(id)
+            }
+            _ => false,
+        })
+    }
+
+    /// The model's crossing post-only orders, the orders after X and Y on each named account.
+    fn crossing_orders(&self) -> Vec<model::Order> {
+        let model = self.venue.model.lock().unwrap();
+        let drops = 2 * self.ev.drops.len();
+        model.orders.iter().skip(drops).cloned().collect()
+    }
+}
+
+/// The model's default, but every post-only priced through the touch rests as any other.
+fn resting_cross() -> QfexModel {
+    QfexModel {
+        alo_cross: None,
+        ..QfexModel::default()
+    }
+}
+
+/// Asserts that `d` stopped in or after a crossing session with `stop`, by name and with what it
+/// is, its report and evidence naming it and passing the privacy check, its marker written, and
+/// every named account read after the crossing session.
+fn assert_cross_stopped(d: &Dropped, stop: places::Stop) {
+    let name = stop.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    assert!(
+        d.printed.contains(&format!(
+            "MARKER written ({name}): the next place-stage run"
+        )),
+        "{}",
+        d.printed
+    );
+    let after: Vec<&str> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_CROSS)
+        .map(|r| r.label.as_str())
+        .collect();
+    assert_eq!(
+        after[..2],
+        ["primary (cross)", "subaccount"],
+        "{}",
+        d.printed
+    );
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+    assert!(
+        report.contains("| after the crossing session | primary (cross) |"),
+        "{report}"
+    );
+    assert_eq!(json["stop"], name);
+    assert_eq!(json["stage_two"]["crossings"][0]["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    assert_no_secret(&d.dir.join("evidence"));
+    d.venue.assert_served();
+}
+
+/// The report's section on the crossing post-only on `account`.
+fn cross_section(report: &str, account: &str) -> String {
+    let heading = format!("### The crossing post-only on {account} (FBC-su9i)");
+    let section = report
+        .split(&heading)
+        .nth(1)
+        .unwrap_or_else(|| panic!("{report}"));
+    section.split("\n## ").next().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn an_absent_echo_ends_the_run_after_every_accounts_drop_test() {
+    // "Absent" is the exact echo's absence: no ACK of the run echoes our client id byte for
+    // byte, each writing it upper-cased, or with its first character a JSON escape. The gate
+    // stays shut: every named account's drop test still runs, and passes, and the run then ends
+    // NoEcho, which is no fault and writes no stop marker, placing no crossing order (decision
+    // 0148 item 2). An ACK whose client id member is absent, null or empty never gets that far.
+    for (echo, what) in [
+        (model::Echo::Upper, "cross-no-echo-upper"),
+        (model::Echo::Escaped, "cross-no-echo-escaped"),
+    ] {
+        let model = QfexModel {
+            ack_echo: echo,
+            ..QfexModel::default()
+        };
+        let d = dropped(model, what).await;
+        assert_eq!(d.ev.drops.len(), 2, "{echo:?}: {}", d.printed);
+        for run in &d.ev.drops {
+            let passed = run.verdict.as_ref().is_some_and(|v| v.passed);
+            assert!(passed, "{echo:?}: {run:?}");
+            assert!(!run.x.exact_echo, "{echo:?}");
+        }
+        assert_eq!(d.ev.stop, Some("NoEcho"), "{echo:?}");
+        assert!(d.marker().is_none(), "{echo:?}");
+        assert!(!d.printed.contains("MARKER written"), "{}", d.printed);
+        let stopped = d.ev.stopped.clone().unwrap();
+        assert!(
+            stopped.starts_with("NoEcho once every named account's drop test ran: no ACK"),
+            "{stopped}"
+        );
+        assert!(d.at("VERDICT drop test on subaccount") < d.at("GATE shut: no ACK"));
+        assert!(d.printed.contains(&format!("STOPPED {stopped}")));
+        // No crossing session and no crossing order: X and Y alone, on four sessions.
+        assert_eq!(d.ev.sessions.len(), 4);
+        assert_eq!(d.count("add_order"), 4);
+        assert!(!d.printed.contains("REGISTRY cross"), "{}", d.printed);
+        let two = d.stage_two();
+        assert_eq!(two.gate, Some(false));
+        assert!(two.crosses.is_empty());
+        assert_eq!((two.echoes.acks.exact, two.echoes.acks.differs), (0, 4));
+        let (report, json) = d.outputs();
+        assert!(
+            report.contains(&format!(
+                "- The exact-echo gate: {}",
+                stage_two::EchoGate::shut_said()
+            )),
+            "{report}"
+        );
+        assert!(report.contains("**The place stages' stop:** NoEcho."));
+        assert_eq!(json["stage_two"]["exact_echo_gate"], false);
+        assert_eq!(json["stop"], "NoEcho");
+        assert!(!d.dir.join("evidence").join(stage::PLACES_SLICE).exists());
+        assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+        d.venue.assert_served();
+    }
+    // An ACK naming no client id at all, absent, null or empty, is an order_response naming no
+    // order of ours, since nothing yet ties X to us: a stray's, a stop (0151 item 13, which wins
+    // over the ticket's NoEcho for these three) in drop session one, marked, so the run never
+    // reaches the gate, which is not judged, and places no crossing order.
+    for (echo, what) in [
+        (model::Echo::Absent, "cross-absent-echo"),
+        (model::Echo::Null, "cross-null-echo"),
+        (model::Echo::Empty, "cross-empty-echo"),
+    ] {
+        let model = QfexModel {
+            ack_echo: echo,
+            ..QfexModel::default()
+        };
+        let d = dropped(model, what).await;
+        assert_stopped(&d, places::Stop::StrayOrder);
+        assert_eq!(d.ev.drops.len(), 1, "{echo:?}");
+        assert_eq!(d.stage_two().gate, None, "{echo:?}");
+        let acks = d.stage_two().echoes.acks;
+        let counted = match echo {
+            model::Echo::Empty => acks.empty,
+            _ => acks.absent,
+        };
+        assert_eq!((acks.total(), counted), (1, 1), "{echo:?}");
+        let (report, _) = d.outputs();
+        assert!(
+            report.contains("- The exact-echo gate: not judged: the run stopped before"),
+            "{report}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_crossing_post_only_is_refused_and_recorded() {
+    use model::AloCross;
+    use stage_two::Crossed;
+    // CANCELLED, which ends it: recorded on each named account, the run going on to the next and
+    // ending after the last, naming FBC-ou9g. An unmapped status or an err echo, which the
+    // adapter reads as no end: recorded, its place ending Unknown at its deadline, never resent
+    // and counted resting (decision 0005), so an order of ours left resting, a stop, and no
+    // crossing order on the next account (decision 0148 item 6).
+    let cases = [
+        (
+            AloCross::Cancelled,
+            Crossed::Cancelled { exact: true },
+            None,
+        ),
+        (
+            AloCross::Unmapped,
+            Crossed::Unmapped {
+                status: model::UNMAPPED.to_owned(),
+                exact: true,
+            },
+            Some(places::Stop::LeftResting),
+        ),
+        (
+            AloCross::Err,
+            Crossed::ErrEcho(tee::EchoCid::Exact),
+            Some(places::Stop::LeftResting),
+        ),
+    ];
+    for (how, want, stop) in cases {
+        let model = QfexModel {
+            alo_cross: Some(how),
+            ..QfexModel::default()
+        };
+        let d = dropped(model, "cross-refused").await;
+        let run = d.cross(0);
+        assert_eq!(run.crossed.as_ref(), Some(&want), "{how:?}: {}", d.printed);
+        assert!(
+            run.started && run.placed.submitted && !run.placed.acked,
+            "{run:?}"
+        );
+        assert!(run.blocked.is_none(), "{run:?}");
+        // One crossing post-only on its session, a post-only GTC at the far touch, never resent.
+        let conns = d.cross_conns();
+        let placed = |conn: &String| {
+            let place = format!("trade {conn} add_order");
+            d.what().iter().filter(|w| **w == place).count()
+        };
+        assert_eq!(placed(&conns[0]), 1, "{how:?}");
+        // QFEX's err echo makes no order; each other answer names the one it ended.
+        if how != AloCross::Err {
+            let crossing = &d.crossing_orders()[0];
+            assert_eq!(
+                (crossing.kind.as_str(), crossing.tif.as_str()),
+                ("ALO", "GTC")
+            );
+            assert_eq!(crossing.price, super::json("100.1"));
+        }
+        assert!(
+            d.printed
+                .contains(&format!("CROSSED on primary: {}", want.says()))
+        );
+        assert!(
+            d.printed
+                .contains("ANSWERED the crossing post-only on primary: it does not rest"),
+            "{how:?}: {}",
+            d.printed
+        );
+        let (report, json) = d.outputs();
+        let section = cross_section(&report, "primary");
+        assert!(
+            section.contains(&format!("- How QFEX refused it: {}", want.says())),
+            "{section}"
+        );
+        assert_eq!(json["stage_two"]["crossings"][0]["refused"], want.says());
+        match stop {
+            None => {
+                assert_eq!((d.ev.stop, d.marker()), (None, None), "{how:?}");
+                assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+                assert_eq!(d.stage_two().crosses.len(), 2);
+                assert_eq!(d.cross(1).crossed.as_ref(), Some(&want));
+                assert_eq!(placed(&conns[1]), 1);
+                assert!(section.contains(&format!("- What followed: {}", stage_two::NEXT_CROSS)));
+                let last = cross_section(&report, "subaccount");
+                assert!(
+                    last.contains(&format!("- What followed: {}", stage_two::LAST_CROSS)),
+                    "{last}"
+                );
+            }
+            Some(stop) => {
+                assert_cross_stopped(&d, stop);
+                assert!(run.counted_resting && !run.resting, "{run:?}");
+                assert_eq!(run.placed.outcome.as_deref(), Some("Unknown"));
+                assert_eq!(d.stage_two().crosses.len(), 1, "{how:?}");
+                assert_eq!(d.cross_conns().len(), 1);
+                assert!(
+                    d.ev.stopped
+                        .as_deref()
+                        .unwrap()
+                        .starts_with("LeftResting after the crossing session"),
+                    "{:?}",
+                    d.ev.stopped
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_place_is_never_resent_and_is_reported() {
+    // The crossing post-only's ACK never comes (QFEX rests it, and answers only an hour later):
+    // its place ends Unknown at its deadline, recorded and reported; the probe runs no Unknown
+    // ladder, so it is never resent (decision 0005); it stays counted resting, an order of ours
+    // left resting after the session, a stop, so no taker IOC and no crossing order on the next
+    // account (decision 0148 item 6).
+    let model = QfexModel {
+        ack_delay: Some(Duration::from_secs(3600)),
+        ack_delay_on: 4,
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-unknown").await;
+    assert_cross_stopped(&d, places::Stop::LeftResting);
+    let run = d.cross(0);
+    assert_eq!(
+        run.crossed,
+        Some(stage_two::Crossed::Unknown),
+        "{}",
+        d.printed
+    );
+    assert_eq!(run.placed.outcome.as_deref(), Some("Unknown"));
+    assert!(!run.placed.acked && !run.placed.exact_echo);
+    assert!(run.counted_resting, "{run:?}");
+    // One add_order on the crossing session and none after it: never resent.
+    let conns = d.cross_conns();
+    assert_eq!(conns.len(), 1);
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1]);
+    assert_eq!(d.count("add_order"), 5);
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    let said = stage_two::Crossed::Unknown.says();
+    assert!(
+        section.contains(&format!("- How QFEX refused it: {said}")),
+        "{section}"
+    );
+    assert!(said.contains("never resent and stays counted resting (decision 0005)"));
+    assert!(
+        section.contains("Unknown and never resent (decision 0005)")
+            || section.contains(stage_two::HAND_CANCEL_CROSS),
+        "{section}"
+    );
+    assert_eq!(json["stage_two"]["crossings"][0]["counted_resting"], true);
+}
+
+/// A run of `model` pressed once the model has seen `places` add_orders, as [`pressed_drop`]
+/// presses.
+async fn pressed_at_place(model: QfexModel, what: &str, places: usize) -> Dropped {
+    pressed_at_place_with(model, what, places, |argv| argv).await
+}
+
+/// [`pressed_at_place`] on the run's command line as `argv` changes it.
+async fn pressed_at_place_with(
+    model: QfexModel,
+    what: &str,
+    places: usize,
+    argv: impl Fn(Argv) -> Argv,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, parsed_places) = parsed(&argv(drop_argv(&dir, &venue))).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let (mut press, presses) = interrupt::Presses::channel();
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let drive = async {
+        let placed = |log: &[model::Event]| {
+            log.iter()
+                .filter(|e| e.what.ends_with(" add_order"))
+                .count()
+                >= places
+        };
+        until("the moment to press", || placed(&venue.log())).await;
+        press();
+    };
+    let ran = stage::run_places_until(&opts, &parsed_places, &lookup, out, hold, presses);
+    let (ran, ()) = tokio::join!(ran, drive);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+#[tokio::test]
+async fn each_session_cancels_by_venue_id_before_it_stops() {
+    // Each crossing post-only rests (the model's answer here): once it met its deadline the
+    // session ran its course, and before it stops it cancels every order of ours by venue id, an
+    // fbc-oms authorization through its Link, sees it end, compares, and closes gracefully
+    // (decision 0132 item 7, 0148 item 8).
+    let d = dropped(resting_cross(), "cross-cancels").await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    let orders = d.crossing_orders();
+    assert_eq!(orders.len(), 2);
+    assert!(orders.iter().all(|o| o.state == model::State::Cancelled));
+    let what = d.what();
+    for (n, conn) in d.cross_conns().iter().enumerate() {
+        let run = d.cross(n);
+        assert_eq!(run.crossed, Some(stage_two::Crossed::Rested));
+        assert!(run.placed.acked && run.placed.exact_echo && run.placed.ack_after.is_some());
+        let cancels = run.cancels.as_ref().unwrap();
+        assert_eq!(
+            (cancels.sent, cancels.held, cancels.blocked, cancels.ended),
+            (1, false, false, true)
+        );
+        assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+        assert!(!run.resting && !run.counted_resting && run.read, "{run:?}");
+        // Its cancel names its order by venue id, and comes before its close.
+        assert!(d.wrote_naming("cancel_order", &orders[n].id), "{n}");
+        let at = |w: &str| what.iter().position(|e| e.starts_with(w)).unwrap();
+        let cancel = at(&format!("trade {conn} cancel_order"));
+        assert!(cancel < at(&format!("cod {conn} close")), "{what:?}");
+        let steps: Vec<&str> = run.compared.iter().map(|c| c.step).collect();
+        assert_eq!(steps, ["the crossing post-only", "the stop's cancels"]);
+    }
+    assert!(d.printed.contains(
+        "STOP cancels: Kill, then 1 cancels by venue id (decision 0132 item 7, 0148 item 8), \
+         every order they named seen to end; the market disarmed"
+    ));
+    let (report, _) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains(
+            "- The Stop's cancels: Kill, then 1 cancel by venue id; every order they named was \
+             seen to end"
+        ),
+        "{section}"
+    );
+    assert!(section.contains("- How QFEX refused it: rested: QFEX acknowledged it (ACK)"));
+}
+
+#[tokio::test]
+async fn stop_on_ctrl_c_cancels_by_venue_id() {
+    // The owner's Ctrl-C as the primary account's crossing post-only goes out (the fifth place
+    // of the run): the crossing session stops, cancelling it by venue id first (decision 0148
+    // item 8), and the run stops, marked, no crossing order on the subaccount.
+    let d = pressed_at_place(resting_cross(), "cross-ctrl-c", 5).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    let orders = d.crossing_orders();
+    assert_eq!(orders.len(), 1);
+    assert_eq!(orders[0].state, model::State::Cancelled);
+    assert!(d.wrote_naming("cancel_order", &orders[0].id));
+    assert_eq!(d.count("cancel_order"), 1);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().unwrap();
+    assert!(cancels.ended && !cancels.held, "{cancels:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("Interrupted in the crossing session"),
+        "{:?}",
+        d.ev.stopped
+    );
+}
+
+/// Where the probe's lines go in [`the_span_bound_begins_cancels_one_rpc_timeout_early`]: the
+/// model's [`Printed`], and the instant on the paused clock the cross registry was built.
+struct TimedAt {
+    printed: Printed,
+    built: Rc<std::cell::Cell<Option<tokio::time::Instant>>>,
+}
+
+impl std::io::Write for TimedAt {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.printed.write(buf)?;
+        let built = self.printed.text().contains("REGISTRY cross on primary");
+        if built && self.built.get().is_none() {
+            self.built.set(Some(tokio::time::Instant::now()));
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Lets every task run until `done`, as `until` does, but for the reads after each drop: there
+/// the clock, which stands still but for the test's own advance, moves on one
+/// `--read-interval-ms` (1 s here) each time the model answers a page, so a read after the drop
+/// that came before the model saw the drop is read again, as it would be live, instead of
+/// waiting for ever. The reads after the drop run with no session open, so nothing else waits on
+/// the clock then but their own waits, each longer than one interval. Panics after two minutes of
+/// wall-clock time, so a regression fails instead of hanging, even under the full check's load.
+async fn until_stepping_after_drops(venue: &Venue, printed: &Printed, done: impl Fn() -> bool) {
+    let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = expired.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(120));
+        flag.store(true, Ordering::SeqCst);
+    });
+    // The pages the model had answered when the reads after a drop began, then at each step.
+    let mut stepped: Option<usize> = None;
+    while !done() {
+        assert!(
+            !expired.load(Ordering::SeqCst),
+            "the crossing post-only's answer: not within 120 s: {}",
+            printed.text()
+        );
+        let text = printed.text();
+        let ended = format!("({}): arm outcome", places::DROP_TWO);
+        let reading = text.matches(&ended).count() > text.matches("READ after the drop:").count();
+        let page = |e: &model::Event| e.what.ends_with(" get_user_orders");
+        let pages = venue.log().iter().filter(|e| page(e)).count();
+        match (reading, stepped) {
+            (false, _) => stepped = None,
+            (true, None) => stepped = Some(pages),
+            (true, Some(before)) if pages > before => {
+                stepped = Some(pages);
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            (true, Some(_)) => {}
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A run on the primary account alone, every crossing post-only resting, whose clock stands
+/// still but for the test's own advance: once the crossing post-only is placed and has its ACK,
+/// the clock is moved to `short` before the cross registry's span bound (600 s from its building,
+/// the instant the registry's line is printed).
+async fn span_run(what: &str, short: Duration) -> Dropped {
+    let frozen = freeze();
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(resting_cross()).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = primary_only();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let built = Rc::new(std::cell::Cell::new(None));
+    let out: stage::Out = Rc::new(RefCell::new(TimedAt {
+        printed: printed.clone(),
+        built: Rc::clone(&built),
+    }));
+    // Whether the run ended, so a run that ended before the crossing post-only's ACK fails at
+    // once on what ended it, not when the wait below runs out.
+    let ended = std::cell::Cell::new(false);
+    let drive = async {
+        // Its ACK, read by the session before any clock moves: the model answers it at once.
+        let acked = || {
+            printed
+                .text()
+                .contains("ANSWERED the crossing post-only on primary")
+        };
+        until_stepping_after_drops(&venue, &printed, || ended.get() || acked()).await;
+        if ended.get() {
+            return;
+        }
+        let bound = built.get().unwrap() + Duration::from_secs(600);
+        tokio::time::advance((bound - short) - tokio::time::Instant::now()).await;
+    };
+    let ran = async {
+        let ran = stage::run_places(&opts, &places, &lookup, out).await;
+        ended.set(true);
+        ran
+    };
+    let (ran, ()) = tokio::join!(ran, drive);
+    drop(frozen);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_span_bound_begins_cancels_one_rpc_timeout_early() {
+    // The clock stands still but for the test's own advance. The crossing post-only rests and
+    // waits for its deadline; the test then moves the clock to exactly one --rpc-timeout-ms (600
+    // ms) before the cross registry's span bound: the span bound, met one --rpc-timeout-ms early,
+    // stops the session there, and its Stop's cancels begin 600 ms before the bound itself
+    // (decision 0148 item 8). Met any later, the session would have run its course first (its
+    // deadline is due by then), so no SpanBound; met any earlier, the next test's run would stop.
+    let d = span_run("cross-span", Duration::from_millis(600)).await;
+    assert_eq!(d.ev.stop, Some("SpanBound"), "{}", d.printed);
+    assert!(d.marker().unwrap().starts_with("stop: SpanBound\n"));
+    let run = d.cross(0);
+    assert_eq!(
+        run.cancels_lead,
+        Some(Duration::from_millis(600)),
+        "{run:?}"
+    );
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!((cancels.sent, cancels.ended), (1, true), "{cancels:?}");
+    let orders = d.crossing_orders();
+    assert_eq!(orders[0].state, model::State::Cancelled);
+    assert!(d.wrote_naming("cancel_order", &orders[0].id));
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("SpanBound in the crossing session"),
+        "{:?}",
+        d.ev.stopped
+    );
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains("the span bound stopped it, its cancels begun 600 ms before the bound"),
+        "{report}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_span_bound_is_not_met_a_millisecond_before_one_rpc_timeout_early() {
+    // As the test before, but the clock moved to 601 ms before the span bound: the crossing
+    // post-only's deadline is due, the span bound's early instant is not, so the session runs its
+    // course, cancels by venue id as it stops, and the run ends after it with no stop.
+    let d = span_run("cross-span-short", Duration::from_millis(601)).await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    let run = d.cross(0);
+    assert_eq!(run.cancels_lead, None, "{run:?}");
+    assert_eq!(run.crossed, Some(stage_two::Crossed::Rested));
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!((cancels.sent, cancels.ended), (1, true), "{cancels:?}");
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+}
+
+#[tokio::test]
+async fn stop_on_an_order_left_resting() {
+    // The crossing post-only rests, and QFEX answers the Stop's cancel of it NO_SUCH_ORDER while
+    // it still rests: the read of every named account after the session lists it, an order of
+    // ours left resting, which stops the probe, reported for the owner's hand cancel (decision
+    // 0132 item 7).
+    let model = QfexModel {
+        cancel_misses: true,
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-left-resting").await;
+    assert_cross_stopped(&d, places::Stop::LeftResting);
+    let run = d.cross(0);
+    assert!(run.resting && run.read, "{run:?}");
+    let cancels = run.cancels.as_ref().unwrap();
+    assert!(
+        cancels.held && !cancels.blocked && !cancels.ended,
+        "{cancels:?}"
+    );
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.crossing_orders()[0].state, model::State::Open);
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS))
+    );
+    let (report, json) = d.outputs();
+    assert!(report.contains(stage_two::HAND_CANCEL_CROSS), "{report}");
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains("answered other than accepted"),
+        "{section}"
+    );
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["hand_cancel"],
+        stage_two::HAND_CANCEL_CROSS
+    );
+    assert_eq!(d.stage_two().crosses.len(), 1);
+}
+
+#[tokio::test]
+async fn stop_on_an_order_left_resting_that_only_a_read_shows() {
+    // The crossing post-only rests, and QFEX answers the Stop's cancel of it CANCELLED while it
+    // still rests: the cross registry holds it ended, so only the reads show it resting. The
+    // comparison after the Stop's cancels sees a read listing an order the streams ended, so the
+    // session's stop is ReadDisagrees (decision 0148 item 8), marked; the read of every named
+    // account after the session still shows it resting, reported for the owner's hand cancel
+    // (decision 0132 item 7).
+    let model = QfexModel {
+        cancel_lies: true,
+        ..resting_cross()
+    };
+    let d = dropped_with(model, "cross-read-resting", short_agree).await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let run = d.cross(0);
+    let compared = run.compared.last().unwrap();
+    assert_eq!(compared.ended, compare::Ended::Disagreed, "{compared:?}");
+    assert!(run.resting && !run.counted_resting && run.read, "{run:?}");
+    let cancels = run.cancels.as_ref().unwrap();
+    assert!(
+        cancels.ended && !cancels.held && !cancels.blocked,
+        "{cancels:?}"
+    );
+    assert_eq!(d.crossing_orders()[0].state, model::State::Open);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("ReadDisagrees in the crossing session"),
+        "{:?}",
+        d.ev.stopped
+    );
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS))
+    );
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(section.contains(stage_two::HAND_CANCEL_CROSS), "{section}");
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["hand_cancel"],
+        stage_two::HAND_CANCEL_CROSS
+    );
+    assert_eq!(json["stage_two"]["crossings"][0]["counted_resting"], false);
+    assert_eq!(d.stage_two().crosses.len(), 1);
+}
+
+#[tokio::test]
+async fn a_named_account_not_read_after_a_crossing_session_stops_the_run_marked() {
+    // Each crossing post-only is refused CANCELLED, so the cross registry counts nothing
+    // resting; but once the subaccount's, the last, arrived, the primary account's
+    // authentications go unanswered, so the read of it after that session fails. Nobody looked
+    // at it after an order was placed: an order of ours may rest there unjudged, so the run
+    // stops LeftResting, marked, and the next run must reconcile (decision 0132 item 7, 0151
+    // item 6), as before every session an account that cannot be read stops the probe.
+    let model = QfexModel {
+        alo_cross: Some(model::AloCross::Cancelled),
+        silent_after_cross: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "cross-unread", |argv| {
+        set(argv, "--read-wait-ms", "3000")
+    })
+    .await;
+    let name = places::Stop::LeftResting.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    assert!(d.printed.contains(&format!("MARKER written ({name})")));
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with(
+            "LeftResting after the crossing session, a named account not read after it"
+        ),
+        "{stopped}"
+    );
+    assert_eq!(d.stage_two().crosses.len(), 2);
+    let first = d.cross(0);
+    assert_eq!(first.stop, None, "{first:?}");
+    let last = d.cross(1);
+    assert_eq!(last.account, "subaccount");
+    assert_eq!(
+        last.crossed,
+        Some(stage_two::Crossed::Cancelled { exact: true })
+    );
+    assert!(
+        last.read && !last.resting && !last.counted_resting,
+        "{last:?}"
+    );
+    assert_eq!(last.stop, Some(name));
+    assert!(!d.ev.errors.is_empty(), "{}", d.printed);
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+    assert_eq!(json["stage_two"]["crossings"][1]["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    assert_no_secret(&d.dir.join("evidence"));
+}
+
+#[tokio::test]
+async fn an_open_gate_is_not_carried_into_a_second_run() {
+    // A run whose gate opened, ending after its crossings with no stop and no marker, then a
+    // second on the same lease directory whose every ACK writes our client id upper-cased: its
+    // own gate, judged on its own frames alone, stays shut, so it ends NoEcho.
+    let (dir, _removed) = temp_dir("gate-not-carried");
+    let leases = leases_of(&dir);
+    let venue = Venue::start(QfexModel::default()).await;
+    let first = dir.join("first");
+    let argv = set(
+        drop_argv(&first, &venue),
+        "--lease-dir",
+        leases.to_str().unwrap(),
+    );
+    let (ran, printed) = place_run(&venue, &argv, &primary_only()).await;
+    let ev = stopped(ran, &printed);
+    assert_eq!(ev.stage_two.as_ref().unwrap().gate, Some(true), "{printed}");
+    assert_eq!(
+        (ev.stop, ev.stopped.as_deref()),
+        (None, Some(stage::NOT_BUILT))
+    );
+    assert!(!leases.join(places::MARKER).exists());
+    let venue = Venue::start(QfexModel {
+        ack_echo: model::Echo::Upper,
+        ..QfexModel::default()
+    })
+    .await;
+    let second = dir.join("second");
+    let argv = set(
+        drop_argv(&second, &venue),
+        "--lease-dir",
+        leases.to_str().unwrap(),
+    );
+    let argv = set(argv, "--namespace", "8");
+    let (ran, printed) = place_run(&venue, &argv, &primary_only()).await;
+    let ev = stopped(ran, &printed);
+    assert_eq!(
+        ev.stage_two.as_ref().unwrap().gate,
+        Some(false),
+        "{printed}"
+    );
+    assert_eq!(ev.stop, Some("NoEcho"), "{printed}");
+    assert!(printed.contains("GATE shut: no ACK"), "{printed}");
+    assert!(!printed.contains("REGISTRY cross"), "{printed}");
+    assert!(!leases.join(places::MARKER).exists());
+}
+
+#[tokio::test]
+async fn held_stop_cancels_end_by_a_drop_after_a_passed_drop_test() {
+    // The crossing post-only rests, and QFEX answers the Stop's cancel of it with a RateLimited
+    // err: the cancels are held by a provider rate refusal, and since this account's drop test
+    // passed in this run, which showed the drop cancels, the session ends by the abrupt drop,
+    // with no WebSocket close, and the drop cancels the order (0151 item 11). The rate refusal
+    // stops the run, after the read of every named account.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-held").await;
+    assert_cross_stopped(
+        &d,
+        places::Stop::RateRefused {
+            on: places::RefusedOn::Session,
+        },
+    );
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().unwrap();
+    assert!(
+        cancels.held && cancels.blocked && !cancels.ended,
+        "{cancels:?}"
+    );
+    assert_eq!(run.ended_by, Some(stage::DROPPED));
+    let conn: usize = d.cross_conns()[0].parse().unwrap();
+    assert!(!d.venue.trade.connections()[conn].client_closed);
+    assert!(d.what().contains(&format!("cod {conn} drop cancels")));
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+    assert!(!run.resting && run.read, "{run:?}");
+    let section = cross_section(&d.outputs().0, "primary");
+    assert!(
+        section.contains("refused locally or met by a provider rate refusal"),
+        "{section}"
+    );
+    assert!(section.contains("- Ended by: the abrupt drop"), "{section}");
+}
+
+#[tokio::test]
+async fn the_reads_after_a_held_drop_read_again_until_its_cancel_shows() {
+    // As held_stop_cancels_end_by_a_drop_after_a_passed_drop_test, but QFEX's first read of the
+    // account after the drop still shows the crossing post-only open, as a read made before QFEX
+    // learns of the drop would. The reads after the crossing session read every named account
+    // again at the comparisons' cadence (0151 items 4 and 11), and the next one shows it gone:
+    // nothing of ours is left resting, and the run reports no hand cancel.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        // The third drop of the run: each named account's drop session two, then this one.
+        drop_lag: Some((2, 1)),
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-held-lag").await;
+    assert_cross_stopped(
+        &d,
+        places::Stop::RateRefused {
+            on: places::RefusedOn::Session,
+        },
+    );
+    let run = d.cross(0);
+    assert_eq!(run.ended_by, Some(stage::DROPPED));
+    let conn: usize = d.cross_conns()[0].parse().unwrap();
+    assert!(d.what().contains(&format!("cod {conn} drop cancels")));
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+    assert!(!run.resting && run.read, "{run:?}");
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    let line = "READ after the crossing session's drop: primary: ";
+    let said = d.printed.lines().find(|l| l.starts_with(line));
+    let said = said.unwrap_or_else(|| panic!("{}", d.printed));
+    assert!(!said.contains(": 1 of at most 5 rounds"), "{said}");
+    assert!(
+        said.ends_with("the last judged listing no order of ours"),
+        "{said}"
+    );
+}
+
+#[tokio::test]
+async fn the_reads_after_a_held_drop_end_at_the_wait_with_an_order_still_listed() {
+    // QFEX's reads show the crossing post-only open after the drop for longer than the wait:
+    // the reads after the crossing session read every named account again at the comparisons'
+    // cadence, at most --agree-wait-ms / --read-interval-ms times (5 here), and none due at the
+    // end of the wait, then report the order resting for the owner's hand cancel.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        drop_lag: Some((2, 100)),
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-held-lag-long").await;
+    assert_cross_stopped(
+        &d,
+        places::Stop::RateRefused {
+            on: places::RefusedOn::Session,
+        },
+    );
+    let run = d.cross(0);
+    assert_eq!(run.ended_by, Some(stage::DROPPED));
+    assert!(run.resting && run.read, "{run:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS)),
+        "{}",
+        d.printed
+    );
+    assert!(
+        d.printed.contains(
+            "READ after the crossing session's drop: primary: 5 of at most 5 rounds of reads of \
+             every named account, the last judged listing an order of ours"
+        ),
+        "{}",
+        d.printed
+    );
+    let after: Vec<&str> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_CROSS)
+        .map(|r| r.label.as_str())
+        .collect();
+    assert_eq!(after.len(), 10, "{after:?}");
+}
+
+#[tokio::test]
+async fn the_report_lists_the_characters_exercised() {
+    let d = dropped(QfexModel::default(), "cross-characters").await;
+    // The characters the run's client ids exercised, by class of QFEX's client-id format (a
+    // lowercase UUID), those an ACK echoed byte for byte, those sent but not shown so, and the
+    // rest named as not measured: never an id.
+    let chars = d.stage_two().characters.clone().unwrap();
+    let names: Vec<&str> = chars.classes.iter().map(|c| c.name).collect();
+    assert_eq!(
+        names,
+        ["decimal digits", "lowercase letters a to f", "the hyphen"]
+    );
+    assert!(chars.classes[2].echoed.contains(&'-'));
+    assert_eq!(chars.outside, 0);
+    let (report, json) = d.outputs();
+    let line = format!(
+        "- The characters our client ids exercised, by class of QFEX's client-id format \
+         (decision 0132's Consequences; the rest not measured): {}",
+        chars.says()
+    );
+    assert!(report.contains(&line), "{report}");
+    assert!(
+        chars
+            .says()
+            .starts_with("decimal digits: echoed byte for byte by an ACK ")
+    );
+    assert_eq!(json["stage_two"]["characters"], chars.says());
+    let orders = d.venue.model.lock().unwrap().orders.clone();
+    assert!(orders.iter().all(|o| !report.contains(&o.cid)));
+    // The crossing sessions' frames are in the places-production/ slice, apart from the drop
+    // test's, each passing the privacy check.
+    let evidence = d.dir.join("evidence");
+    let places = evidence.join(stage::PLACES_SLICE);
+    let readme = fs::read_to_string(places.join("README.md")).unwrap();
+    assert!(
+        readme.starts_with("# QFEX trade-socket frames: stage two's crossing post-only"),
+        "{readme}"
+    );
+    assert!(
+        readme.contains("the crossing session on primary then the crossing session on subaccount")
+    );
+    let listed = |dir: &Path| -> Vec<String> {
+        let names = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name());
+        names.map(|n| n.to_string_lossy().into_owned()).collect()
+    };
+    let crossing = listed(&places);
+    assert!(
+        crossing
+            .iter()
+            .any(|f| f.starts_with("primary-the-crossing-session-"))
+    );
+    assert!(
+        crossing
+            .iter()
+            .any(|f| f.starts_with("subaccount-the-crossing-session-"))
+    );
+    assert!(
+        crossing.iter().all(|f| !f.contains("drop-session")),
+        "{crossing:?}"
+    );
+    let drop_slice = listed(&evidence.join(stage::DROP_SLICE));
+    assert!(
+        drop_slice.iter().all(|f| !f.contains("crossing")),
+        "{drop_slice:?}"
+    );
+    let drop_readme = fs::read_to_string(evidence.join(stage::DROP_SLICE).join("README.md"));
+    assert!(!drop_readme.unwrap().contains("the crossing session"));
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &places).unwrap();
+    assert_report_and_evidence_pass_the_privacy_check(&evidence);
+}
+
+#[tokio::test]
+async fn the_report_says_whether_add_order_was_accepted_as_encoded() {
+    let d = dropped(QfexModel::default(), "cross-as-encoded").await;
+    // Every add_order went out as the codec encodes it, with none of take_profit, stop_loss and
+    // reduce_only, and QFEX acknowledged one: accepted as encoded (FBC-blcw).
+    let two = d.stage_two();
+    assert_eq!(two.as_encoded, Some(stage_two::AsEncoded::Accepted));
+    assert!(d.cross(0).as_encoded == Some(true));
+    let (report, json) = d.outputs();
+    let line = format!(
+        "- Whether QFEX accepted add_order as encoded, without take_profit, stop_loss or \
+         reduce_only (FBC-blcw): {}",
+        stage_two::AsEncoded::Accepted.says()
+    );
+    assert!(report.contains(&line), "{report}");
+    assert!(
+        stage_two::AsEncoded::Accepted
+            .says()
+            .starts_with("yes: QFEX acknowledged")
+    );
+    assert_eq!(
+        json["stage_two"]["add_order_as_encoded"],
+        stage_two::AsEncoded::Accepted.says()
+    );
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains("- add_order sent as encoded (FBC-blcw): yes"),
+        "{section}"
+    );
+    // Which statuses were rejects and which ends: the crossing post-only's CANCELLED before any
+    // ACK, a reject; the drop's ends of X and Y read only after the drop, so none heard.
+    assert_eq!(two.statuses.rejects, ["CANCELLED"]);
+    assert!(
+        report.contains(&format!(
+            "- Which statuses are rejects and which ends: {}",
+            two.statuses.says()
+        )),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn an_upper_cased_echo_reads_not_byte_for_byte() {
+    let model = QfexModel {
+        ack_echo: model::Echo::Upper,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-upper").await;
+    // Every ACK of the run writes our client id upper-cased: ours to fbc-core, but not byte for
+    // byte, which the report says, kind by kind and frame by frame, and the gate stays shut.
+    let (report, json) = d.outputs();
+    assert!(
+        report
+            .contains("  - ACK: 4 not byte for byte: ours, in another case or with a JSON escape"),
+        "{report}"
+    );
+    assert_eq!(
+        json["stage_two"]["echoes"]["ACK"],
+        "4 not byte for byte: ours, in another case or with a JSON escape"
+    );
+    assert!(
+        report.contains("order_response ACK: ours, not byte for byte"),
+        "{report}"
+    );
+    assert_eq!(d.stage_two().gate, Some(false));
+}
+
+#[tokio::test]
+async fn a_crossing_post_only_that_fills_stops_the_run_not_flat() {
+    // QFEX fills the crossing post-only as a taker: a fill of ours other than the taker IOC's
+    // and the flatten IOCs', a stop (0151 item 9), the session cancelling by venue id first.
+    // FBC-ou9g adds the flatten; until then the run stops not flat, the position the owner's.
+    let model = QfexModel {
+        alo_cross: Some(model::AloCross::Fills),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-fills").await;
+    assert_cross_stopped(&d, places::Stop::UnexpectedFill);
+    let run = d.cross(0);
+    assert_eq!(run.crossed, Some(stage_two::Crossed::Filled));
+    assert!(run.cancels.is_some(), "{run:?}");
+    let (report, _) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(section.contains(stage_two::CROSS_FILLED), "{section}");
+    let not_flat = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_CROSS)
+        .any(|r| !r.flat);
+    assert!(not_flat, "{:?}", d.ev.reads);
+}
+
+#[tokio::test]
+async fn an_arm_not_accepted_in_the_crossing_session_places_no_crossing_order() {
+    // QFEX rejects the crossing session's arm (the run's fifth): the session's runtime ends the
+    // connection whose arm failed, so no crossing order is placed, the end is unplanned, a stop,
+    // and the run stops with its reads after it, its report and its marker.
+    let model = QfexModel {
+        arm_err_on: Some(4),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-arm-err").await;
+    assert_cross_stopped(&d, places::Stop::ConnectionEnded);
+    assert_eq!(d.count("add_order"), 4, "{:?}", d.what());
+    let run = d.cross(0);
+    assert_eq!(run.arm.as_deref(), Some("Rejected"));
+    assert!(
+        !run.started && !run.placed.submitted && run.crossed.is_none(),
+        "{run:?}"
+    );
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED));
+    let (report, _) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains("- How QFEX refused it: not measured: it was not placed"),
+        "{section}"
+    );
+    assert!(
+        section.contains("- The Stop's cancels: none: the session's connection ended first"),
+        "{section}"
+    );
+}
+
+#[tokio::test]
+async fn a_crossing_post_only_with_no_touch_to_price_it_is_not_placed() {
+    // As the subaccount's Y goes out the MDS touch turns crossed, so the crossing post-only, the
+    // next place, has no touch to be priced from: it is not placed, a failure that is no stop,
+    // recorded as the crossing session's error; the session still cancels by venue id (nothing of
+    // ours rests) and closes, the reads after it are made, and the run ends on that failure, with
+    // no marker.
+    let model = QfexModel {
+        crossed_on_place: Some(3),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-no-touch").await;
+    assert_eq!(d.count("add_order"), 4, "{:?}", d.what());
+    let run = d.cross(0);
+    assert!(
+        run.started && !run.placed.submitted && run.crossed.is_none(),
+        "{run:?}"
+    );
+    let error = run.error.clone().unwrap();
+    assert_eq!(error, market::CROSSED, "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(error.as_str()));
+    assert_eq!((d.ev.stop, d.marker()), (None, None));
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!((cancels.sent, cancels.ended), (0, true));
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(run.read && !run.resting, "{run:?}");
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(section.contains(&format!("- Error: {error}")), "{section}");
+    assert_eq!(json["stage_two"]["crossings"][0]["error"], error);
+}
+
+#[tokio::test]
+async fn a_touch_that_moves_past_the_caps_before_the_crossing_post_only_sends_none() {
+    // FBC-23ch's review fix of PR #272 (thread 4605918689), carried to the crossing post-only:
+    // both caps admit exactly three minimum sizes at the preflight's touch near 100, where X and
+    // Y are placed on both accounts; at the primary account's crossing session's arm, the run's
+    // fifth, the touch moves near 400, where they admit none, while the cross registry's lot
+    // caps, fixed at the preflight, still admit three. The crossing post-only is not sent and
+    // never resized, and the run stops, marked; the session cancels by venue id, nothing of
+    // ours resting, and ends by a graceful close (decision 0113).
+    let moved = model::Touch {
+        bid: Some(("400.00", "1.00")),
+        ask: Some(("400.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        touch_moves_at_arm: Some((4, moved)),
+        ..QfexModel::default()
+    };
+    let caps = |argv| {
+        let argv = set(argv, "--resting-cap-usd", THREE_MIN_USD);
+        set(argv, "--inventory-cap-usd", THREE_MIN_USD)
+    };
+    let d = dropped_with(model, "cross-caps-moved", caps).await;
+    assert_eq!(d.count("add_order"), 4, "{:?}", d.what());
+    assert_cross_stopped(&d, places::Stop::BeyondCaps);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("BeyondCaps in the crossing session"),
+        "{said}"
+    );
+    let run = d.cross(0);
+    assert!(
+        run.started && !run.placed.submitted && run.crossed.is_none(),
+        "{run:?}"
+    );
+    assert!(
+        !d.printed.contains("PLACE the crossing post-only"),
+        "{}",
+        d.printed
+    );
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!((cancels.sent, cancels.ended), (0, true), "{cancels:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.count("cancel_order"), 0);
+    assert!(d.crossing_orders().is_empty());
+}
+
+#[tokio::test]
+async fn a_crossing_order_is_kept_back_in_a_run_while_another_order_of_ours_rests() {
+    // An order of ours, never sent, held in the primary account's cross registry before a
+    // crossing session's check (a test's hook: the reads before each session, and the stop an
+    // order left resting after one is, keep the model from ever reaching it): on the account's
+    // own registry before its crossing post-only, and on the primary account's registry before
+    // the subaccount's. Either keeps the crossing order back, a stop, LeftResting, with no
+    // crossing order (decision 0148 item 6).
+    for (n, account, places_before) in [(0, "primary", 4), (1, "subaccount", 5)] {
+        let (dir, removed) = temp_dir("cross-blocked");
+        let venue = Venue::start(QfexModel::default()).await;
+        let (mut opts, mut places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+        places.test.other_order = Some(n);
+        opts.rate_user = user();
+        let env = environment();
+        let printed = venue.printed();
+        let lookup = |var: &str| env.get(var).cloned();
+        let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+        let ran = stage::run_places(&opts, &places, &lookup, out).await;
+        let printed = printed.text();
+        let ev = stopped(ran, &printed);
+        let d = Dropped {
+            dir,
+            _removed: removed,
+            venue,
+            ev,
+            printed,
+        };
+        assert_eq!(d.ev.stop, Some("LeftResting"), "{}", d.printed);
+        assert_eq!(d.count("add_order"), places_before, "{:?}", d.what());
+        let run = d.cross(n);
+        let blocked = run.blocked.clone().unwrap();
+        assert!(
+            blocked.starts_with("the cross registry on primary holds an order of ours"),
+            "{blocked}"
+        );
+        assert!(run.started && !run.placed.submitted, "{run:?}");
+        assert!(d.printed.contains(&format!(
+            "BLOCKED the crossing post-only on {account}: {blocked} (decision 0148 item 6)"
+        )));
+        let section = cross_section(&d.outputs().0, account);
+        assert!(
+            section.contains(&format!(
+                "- No other order of ours (decision 0148 item 6): kept back: {blocked}"
+            )),
+            "{section}"
+        );
+        assert!(
+            d.ev.stopped
+                .as_deref()
+                .unwrap()
+                .starts_with("LeftResting in the crossing session"),
+            "{:?}",
+            d.ev.stopped
+        );
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_reads_before_the_crossing_session_stops_the_run() {
+    // The owner presses Ctrl-C as the reads before the crossing session begin: they stop there,
+    // no cross registry is built, and the run stops, marked (decision 0148 item 8).
+    let (dir, removed) = temp_dir("cross-reads-press");
+    let venue = Venue::start(QfexModel::default()).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let (press, presses) = interrupt::Presses::channel();
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at: "GATE open",
+        press: Some(Box::new(press)),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    assert_eq!(ev.stop, Some("Interrupted"), "{printed}");
+    assert!(
+        ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("Interrupted during the reads before the crossing session"),
+        "{:?}",
+        ev.stopped
+    );
+    assert!(!printed.contains("REGISTRY cross"), "{printed}");
+    let two = ev.stage_two.as_ref().unwrap();
+    assert!(two.crosses.is_empty() && two.gate == Some(true));
+    assert!(fs::read_to_string(leases_of(&dir).join(places::MARKER)).is_ok());
+    drop(removed);
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_the_reads_before_the_crossing_session_stops_the_run_marked() {
+    // FBC-23ch's second review fix to the reads before a session (0151 items 4 and 6), carried to
+    // the reads before the crossing session: as the gate opens, the model refuses the next
+    // get_user_orders page on a read socket with a RateLimited err, or the next GET
+    // /user/positions with HTTP 429. That provider rate refusal is the run's stop, marked, so the
+    // next run needs --reconciled; no cross registry is built and nothing crosses the touch.
+    let cases = [
+        (true, places::RefusedOn::ReadSocket),
+        (false, places::RefusedOn::Rest),
+    ];
+    for (socket, on) in cases {
+        let (dir, removed) = temp_dir("cross-reads-refused");
+        let venue = Venue::start(QfexModel::default()).await;
+        let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+        opts.rate_user = user();
+        let env = environment();
+        let printed = venue.printed();
+        let lookup = |var: &str| env.get(var).cloned();
+        let shared = Arc::clone(&venue.model);
+        let refuse = move || {
+            let mut m = shared.lock().unwrap();
+            m.rate_limit = Some(match socket {
+                true => model::Limited::ReadSocket(m.pages_after),
+                false => model::Limited::Rest(m.rest_after),
+            });
+        };
+        let out: stage::Out = Rc::new(RefCell::new(PressAt {
+            printed: printed.clone(),
+            at: "GATE open",
+            press: Some(Box::new(refuse)),
+        }));
+        let hold: stage::Interrupt = Box::pin(std::future::pending());
+        let none = interrupt::Presses::none();
+        let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, none).await;
+        let printed = printed.text();
+        let ev = stopped(ran, &printed);
+        let stop = places::Stop::RateRefused { on };
+        let name = stop.name();
+        assert_eq!(ev.stop, Some(name), "{printed}");
+        let said = ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(&format!("{name} in the reads before the crossing session")),
+            "{said}"
+        );
+        let marker = fs::read_to_string(leases_of(&dir).join(places::MARKER)).unwrap_or_default();
+        assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+        // The read failure the refusal made is kept among the errors.
+        let failed = match socket {
+            true => "get_user_orders: QFEX refused the page read: RateLimited",
+            false => "GET /user/positions: HTTP 429, a provider rate refusal",
+        };
+        assert!(
+            ev.errors.iter().any(|e| e.ends_with(failed)),
+            "{:?}",
+            ev.errors
+        );
+        assert!(!printed.contains("REGISTRY cross"), "{printed}");
+        let two = ev.stage_two.as_ref().unwrap();
+        assert!(two.crosses.is_empty() && two.gate == Some(true));
+        assert_eq!(venue.model.lock().unwrap().crossings, 0);
+        venue.assert_served();
+        drop(removed);
+    }
+}
+
+#[tokio::test]
+async fn a_stop_the_comparison_after_the_crossing_sessions_cancels_raises_ends_the_run_marked() {
+    // The primary account's crossing session runs its course, its crossing post-only cancelled
+    // by QFEX, so no stop comes from its steps; under Policy::Stage its Stop still cancels every
+    // order of ours by venue id and compares the streams with the reads after them. As those
+    // cancels end, the model refuses the next get_user_orders page on a read socket with a
+    // RateLimited err, or the next GET /user/positions with HTTP 429, or shows a position on the
+    // primary account that no fill made. That comparison's stop, a provider rate refusal or
+    // ReadDisagrees, is the session's: the run stops, marked, and the subaccount's crossing
+    // post-only is never placed.
+    let cases = [
+        Some(places::RefusedOn::ReadSocket),
+        Some(places::RefusedOn::Rest),
+        None,
+    ];
+    for refused in cases {
+        let (dir, removed) = temp_dir("cross-cancels-compared");
+        let venue = Venue::start(QfexModel::default()).await;
+        let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+        opts.rate_user = user();
+        let env = environment();
+        let printed = venue.printed();
+        let lookup = |var: &str| env.get(var).cloned();
+        let shared = Arc::clone(&venue.model);
+        let then = move || {
+            let mut m = shared.lock().unwrap();
+            match refused {
+                Some(places::RefusedOn::ReadSocket) => {
+                    m.rate_limit = Some(model::Limited::ReadSocket(m.pages_after));
+                }
+                Some(places::RefusedOn::Rest) => {
+                    m.rate_limit = Some(model::Limited::Rest(m.rest_after));
+                }
+                Some(on) => unreachable!("no case refuses on {on:?}"),
+                // The primary account, keyed by no subaccount id.
+                None => m.moved.push(None),
+            }
+        };
+        let out: stage::Out = Rc::new(RefCell::new(PressAt {
+            printed: printed.clone(),
+            at: "cancels by venue id (decision 0132 item 7, 0148 item 8)",
+            press: Some(Box::new(then)),
+        }));
+        let hold: stage::Interrupt = Box::pin(std::future::pending());
+        let none = interrupt::Presses::none();
+        let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, none).await;
+        let printed = printed.text();
+        let ev = stopped(ran, &printed);
+        let stop = match refused {
+            Some(on) => places::Stop::RateRefused { on },
+            None => places::Stop::ReadDisagrees,
+        };
+        let name = stop.name();
+        assert_eq!(ev.stop, Some(name), "{printed}");
+        let said = ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(&format!("{name} in the crossing session")),
+            "{said}"
+        );
+        let marker = fs::read_to_string(leases_of(&dir).join(places::MARKER)).unwrap_or_default();
+        assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+        let two = ev.stage_two.as_ref().unwrap();
+        assert_eq!(two.crosses.len(), 1, "{printed}");
+        let cross = &two.crosses[0];
+        assert!(cross.cancels.is_some(), "{cross:?}");
+        assert_eq!(cross.compared.last().unwrap().stop, Some(stop), "{cross:?}");
+        assert_eq!(cross.stop, Some(name));
+        assert_eq!(venue.model.lock().unwrap().crossings, 1);
+        venue.assert_served();
+        drop(removed);
+    }
+}
+
+#[tokio::test]
+async fn a_rate_refusal_met_while_the_stops_cancels_wait_holds_them_at_the_waits_end() {
+    // The owner's Ctrl-C while the crossing post-only's ACK is on its way (QFEX answers it 1.5 s
+    // later): its cancel waits for that ACK, goes out by venue id once it lands, and QFEX answers
+    // it with a RateLimited err, which wakes no wait of the cancels. The wait, --rpc-timeout-ms
+    // (4 s here), ends before the cancel's own deadline, and the refusal met by then holds the
+    // cancels: refused for rate, so, the drop test passed, the session ends by the abrupt drop
+    // (0151 item 11), and the drop cancels the order.
+    let model = QfexModel {
+        ack_delay: Some(Duration::from_millis(1500)),
+        ack_delay_on: 4,
+        rate_limit: Some(model::Limited::Cancel),
+        ..resting_cross()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "4000");
+    let d = pressed_at_place_with(model, "cross-held-late", 5, rpc).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!(cancels.sent, 1, "{cancels:?}");
+    assert!(
+        cancels.held && cancels.blocked && !cancels.ended,
+        "{cancels:?}"
+    );
+    assert_eq!(run.ended_by, Some(stage::DROPPED));
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+    assert!(d.wrote_naming("cancel_order", &d.crossing_orders()[0].id));
+}
+
+#[tokio::test]
+async fn a_press_while_the_crossing_sessions_close_waits_for_room_is_taken_by_the_reads_after_it() {
+    // The crossing post-only rests, and as QFEX reads the Stop's cancel of it, the run's first,
+    // the shared budget is held for 3 s, as a provider rate refusal echoing nothing would. The
+    // cancel is answered and its order seen to end, so the cancels are not held, but the
+    // comparison after them reads nothing within its one second, and the graceful close waits
+    // for room (0151 item 11). The owner presses Ctrl-C as that comparison ends, so the close is
+    // still waiting. The cancels have already run, so the wait does not take the press: the
+    // session ends by its graceful close once there is room, and the reads after it take the
+    // press, which stops the run, marked, after every named account was read.
+    let rate_user = user();
+    let model = QfexModel {
+        hold_on_cancel: Some((shared_limiter(rate_user), Duration::from_secs(3))),
+        ..resting_cross()
+    };
+    let wait = |argv| set(argv, "--agree-wait-ms", "1000");
+    let at = "COMPARE after the stop's cancels";
+    let d = pressed_at_as(model, "cross-press-at-close", rate_user, wait, at).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("Interrupted during the reads after the crossing session"),
+        "{said}"
+    );
+    assert_eq!(d.stage_two().crosses.len(), 1);
+    let run = d.cross(0);
+    assert_eq!(run.crossed, Some(stage_two::Crossed::Rested));
+    // One round of cancels, before the wait: none ran again for the press.
+    let cancels = run.cancels.as_ref().unwrap();
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.blocked, cancels.ended),
+        (1, false, false, true)
+    );
+    assert_eq!(cancels.presses, 0, "{cancels:?}");
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    let steps: Vec<_> = run.compared.iter().map(|c| (c.step, c.ended)).collect();
+    assert_eq!(steps[1], ("the stop's cancels", compare::Ended::Unread));
+    // The close waited for room, so its frame was sent and the venue saw the client close it,
+    // after the cancel.
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    let conn = &d.cross_conns()[0];
+    let n: usize = conn.parse().unwrap();
+    assert!(d.venue.trade.connections()[n].client_closed);
+    let what = d.what();
+    let at = |w: &str| what.iter().position(|e| e.starts_with(w)).unwrap();
+    let cancel = at(&format!("trade {conn} cancel_order"));
+    assert!(cancel < at(&format!("cod {conn} close")), "{what:?}");
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+    assert!(!run.resting && !run.counted_resting && run.read, "{run:?}");
+}
+
+// ----- FBC-77r8's review of PR #273, carried into stage two (FBC-su9i) ---------------------------
+
+/// The line `d` printed when the reads after a crossing session listed an order or a TWAP not
+/// ours.
+fn others_after_cross(d: &Dropped) -> bool {
+    let line = format!(
+        "READ after the crossing session: {}",
+        stage_two::OTHERS_CROSS
+    );
+    d.printed.contains(&line)
+}
+
+#[tokio::test]
+async fn an_order_not_ours_the_reads_after_a_crossing_session_list_stops_read_disagrees() {
+    // The crossing post-only is refused CANCELLED, so nothing of ours rests; but once its
+    // connection ended, the primary account holds an order no run placed, as another trader's
+    // would, which only the reads after the session see. It is what the streams did not show, so
+    // the run stops ReadDisagrees (decision 0148 item 8), marked, not LeftResting with a hand
+    // cancel of an order of ours (FBC-77r8's review).
+    let model = QfexModel {
+        after_cross_end: vec![model::AfterHistoric::Foreign],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-after-foreign").await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with(
+            "ReadDisagrees after the crossing session, a read listing an order or a TWAP not ours"
+        ),
+        "{stopped}"
+    );
+    let run = d.cross(0);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert!(!run.resting && !run.counted_resting && run.read, "{run:?}");
+    assert!(others_after_cross(&d), "{}", d.printed);
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(section.contains(stage_two::OTHERS_CROSS), "{section}");
+    // The session reached the check for another order of ours, which found none.
+    assert!(
+        section.contains("- No other order of ours (decision 0148 item 6): none: it may be placed"),
+        "{section}"
+    );
+    assert_eq!(json["stage_two"]["crossings"][0]["others_after"], true);
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["other_order_checked"],
+        true
+    );
+    assert!(json["stage_two"]["crossings"][0]["hand_cancel"].is_null());
+    assert_eq!(d.stage_two().crosses.len(), 1);
+}
+
+#[tokio::test]
+async fn a_twap_the_reads_after_a_crossing_session_list_stops_read_disagrees() {
+    // As above, but what the primary account's pages list once the crossing session's
+    // connection ended is a TWAP: no order rests, and still the streams did not show it, so the
+    // run stops ReadDisagrees, marked, rather than going on to the next account's crossing.
+    let model = QfexModel {
+        after_cross_end: vec![model::AfterHistoric::Twap],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-after-twap").await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let run = d.cross(0);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert!(!run.resting && run.read, "{run:?}");
+    assert!(others_after_cross(&d), "{}", d.printed);
+    assert_eq!(d.stage_two().crosses.len(), 1);
+}
+
+#[tokio::test]
+async fn a_position_the_reads_after_a_crossing_session_show_outranks_an_order_not_ours() {
+    // Once the crossing session's connection ended, the primary account shows both a position
+    // no order of ours made and an order not ours: a position not flat comes before an order the
+    // streams did not show, as after drop session two, so the run stops NotFlat, the order not
+    // ours still recorded (FBC-77r8's review).
+    let model = QfexModel {
+        after_cross_end: vec![
+            model::AfterHistoric::Position,
+            model::AfterHistoric::Foreign,
+        ],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-after-position").await;
+    assert_cross_stopped(&d, places::Stop::NotFlat);
+    let run = d.cross(0);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert!(others_after_cross(&d), "{}", d.printed);
+}
+
+#[tokio::test]
+async fn an_order_not_ours_a_read_after_a_crossing_drop_lists_is_not_erased_by_a_later_one() {
+    // The crossing post-only rests, and beside it the primary account holds an order no run
+    // placed, which the comparison after it shows: ReadDisagrees, the session's stop. QFEX
+    // answers the Stop's cancel RateLimited, so the session ends by the abrupt drop (0151 item
+    // 11), whose cancel-on-disconnect cancels both. The first read after the drop still shows
+    // both open, as one made before QFEX learns of the drop would; the next shows neither. The
+    // first read's order not ours is not erased by the second: the reads end there, reporting it
+    // (FBC-77r8's review).
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        // The third drop of the run: each named account's drop session two, then this one.
+        drop_lag: Some((2, 1)),
+        // The run's fifth place: X and Y on each named account, then the crossing post-only.
+        foreign_order_on: Some(4),
+        ..resting_cross()
+    };
+    let d = dropped_with(model, "cross-drop-foreign", short_agree).await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let run = d.cross(0);
+    assert_eq!(run.ended_by, Some(stage::DROPPED), "{run:?}");
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert!(others_after_cross(&d), "{}", d.printed);
+    assert!(
+        d.printed.contains(
+            "READ after the crossing session's drop: primary: 1 of at most 2 rounds of reads of \
+             every named account, the last judged listing an order or a TWAP not ours"
+        ),
+        "{}",
+        d.printed
+    );
+}
+
+// ----- FBC-su9i's review of its restack onto FBC-77r8's review fixes -----------------------------
+
+#[tokio::test]
+async fn an_order_not_ours_beside_an_order_of_ours_left_resting_stops_read_disagrees() {
+    // The crossing post-only rests, and QFEX answers the Stop's cancel of it NO_SUCH_ORDER while
+    // it still rests; once its connection ended, the primary account also holds an order no run
+    // placed, which only the reads after the session see. An order not ours is what the streams
+    // did not show, which comes before an order of ours left resting: the run stops
+    // ReadDisagrees, marked, not LeftResting, and the order of ours is still reported for the
+    // owner's hand cancel (decision 0148 item 8, 0132 item 7).
+    let model = QfexModel {
+        cancel_misses: true,
+        after_cross_end: vec![model::AfterHistoric::Foreign],
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-ours-and-foreign").await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with(&format!("ReadDisagrees {}", stage::CROSS_OTHERS)),
+        "{stopped}"
+    );
+    let run = d.cross(0);
+    assert!(run.resting && run.read, "{run:?}");
+    assert_eq!(run.others, Some(true), "{run:?}");
+    assert_eq!(d.crossing_orders()[0].state, model::State::Open);
+    assert!(others_after_cross(&d), "{}", d.printed);
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS)),
+        "{}",
+        d.printed
+    );
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(section.contains(stage_two::HAND_CANCEL_CROSS), "{section}");
+    assert!(section.contains(stage_two::OTHERS_CROSS), "{section}");
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["hand_cancel"],
+        stage_two::HAND_CANCEL_CROSS
+    );
+    assert_eq!(json["stage_two"]["crossings"][0]["others_after"], true);
+    assert_eq!(d.stage_two().crosses.len(), 1);
+}
+
+#[tokio::test]
+async fn a_later_round_after_a_crossing_drop_that_cannot_read_an_account_erases_nothing() {
+    // As the_reads_after_a_held_drop_end_at_the_wait_with_an_order_still_listed, but once QFEX
+    // learns of the drop, the primary account's GET /user/positions answers one read, then fails
+    // every one after it. The round that cannot read the account is not judged and ends the
+    // reads: the round before it, which listed the crossing post-only, stands, so the order of
+    // ours is still reported for the owner's hand cancel and the account still read after the
+    // session (FBC-su9i's review).
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        // The third drop of the run: each named account's drop session two, then this one.
+        drop_lag: Some((2, 100)),
+        rest_fails_after_drop: Some((2, 1)),
+        ..resting_cross()
+    };
+    let d = dropped(model, "cross-held-lag-unread").await;
+    assert_cross_stopped(
+        &d,
+        places::Stop::RateRefused {
+            on: places::RefusedOn::Session,
+        },
+    );
+    let run = d.cross(0);
+    assert_eq!(run.ended_by, Some(stage::DROPPED), "{run:?}");
+    assert!(run.resting && run.read, "{run:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS)),
+        "{}",
+        d.printed
+    );
+    let line = "READ after the crossing session's drop: primary: ";
+    let said = d.printed.lines().find(|l| l.starts_with(line));
+    let said = said.unwrap_or_else(|| panic!("{}", d.printed));
+    assert!(!said.contains(": 1 of at most"), "{said}");
+    assert!(
+        said.ends_with("the last judged listing an order of ours"),
+        "{said}"
+    );
+    assert!(
+        (d.ev.errors.iter()).any(|e| e.starts_with("primary (cross) could not be read")),
+        "{:?}",
+        d.ev.errors
+    );
+    let json = d.outputs().1;
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["hand_cancel"],
+        stage_two::HAND_CANCEL_CROSS
+    );
+    assert_eq!(json["stage_two"]["crossings"][0]["read_after"], true);
+}
+
+#[tokio::test]
+async fn the_reads_after_a_crossing_drop_end_at_a_round_showing_a_position() {
+    // The crossing post-only rests, and as it arrives the primary account shows a position no
+    // order of ours made, which the comparison after it sees: ReadDisagrees, the session's stop.
+    // QFEX answers the Stop's cancel RateLimited, so the session ends by the abrupt drop, and the
+    // reads after it show the crossing post-only still open beside the position. A position not
+    // flat ends those reads at once, so no later round can erase it, and the report says the
+    // position is the owner's beside the session's stop (0151 item 9; FBC-su9i's review).
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        drop_lag: Some((2, 100)),
+        // The run's fifth place: X and Y on each named account, then the crossing post-only.
+        position_on_place_on: Some(4),
+        ..resting_cross()
+    };
+    let d = dropped_with(model, "cross-drop-position", short_agree).await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let run = d.cross(0);
+    assert_eq!(run.ended_by, Some(stage::DROPPED), "{run:?}");
+    assert_eq!(run.not_flat_after, Some(true), "{run:?}");
+    assert!(run.resting, "{run:?}");
+    assert!(
+        d.printed.contains(
+            "READ after the crossing session's drop: primary: 1 of at most 2 rounds of reads of \
+             every named account, the last judged listing an order of ours"
+        ),
+        "{}",
+        d.printed
+    );
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "- A position not flat in the reads after the session: {}",
+            stage_two::CROSS_POSITION_BESIDE
+        )),
+        "{section}"
+    );
+    assert_eq!(json["stage_two"]["crossings"][0]["not_flat_after"], true);
+}
+
+#[tokio::test]
+async fn a_position_the_reads_after_a_crossing_session_show_beside_its_stop_is_the_owners() {
+    // The crossing post-only is refused CANCELLED, but as it arrives the primary account shows a
+    // position no order of ours made, as a hand trade's or a maker fill no frame told would: the
+    // comparison after the crossing post-only sees it, so the session's stop is ReadDisagrees.
+    // The reads after the session show it too: the report and the evidence say the position is
+    // the owner's, though the run stopped first on the session's stop (0151 item 9; FBC-su9i's
+    // review).
+    let model = QfexModel {
+        position_on_place_on: Some(4),
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "cross-position-beside", short_agree).await;
+    assert_cross_stopped(&d, places::Stop::ReadDisagrees);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with("ReadDisagrees in the crossing session"),
+        "{stopped}"
+    );
+    let run = d.cross(0);
+    assert_eq!(run.not_flat_after, Some(true), "{run:?}");
+    assert!(!run.resting && run.read, "{run:?}");
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "- A position not flat in the reads after the session: {}",
+            stage_two::CROSS_POSITION_BESIDE
+        )),
+        "{section}"
+    );
+    let crossing = &json["stage_two"]["crossings"][0];
+    assert_eq!(crossing["not_flat_after"], true);
+    assert_eq!(
+        crossing["owners_position"],
+        stage_two::CROSS_POSITION_BESIDE
+    );
+}
+
+#[tokio::test]
+async fn an_open_order_rest_alone_counts_after_a_crossing_session_stops_left_resting() {
+    // The crossing post-only is refused CANCELLED, but as it arrives the primary account's GET
+    // /user/positions counts one open order that no page lists, as a stop order would. The
+    // comparisons read no such count; the reads after the session do, and an open order REST
+    // alone counts is not told from ours: an order of ours left resting, a stop, marked, for the
+    // owner's hand cancel (decision 0132 item 7; FBC-su9i's review).
+    let model = QfexModel {
+        stop_order_on: Some(4),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "cross-rest-counted").await;
+    assert_cross_stopped(&d, places::Stop::LeftResting);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with("LeftResting after the crossing session")
+            && !stopped.contains("not read"),
+        "{stopped}"
+    );
+    let run = d.cross(0);
+    assert_eq!(
+        run.crossed,
+        Some(stage_two::Crossed::Cancelled { exact: true })
+    );
+    assert!(run.resting && !run.counted_resting && run.read, "{run:?}");
+    assert_eq!(run.others, Some(false), "{run:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", stage_two::HAND_CANCEL_CROSS)),
+        "{}",
+        d.printed
+    );
+    let json = d.outputs().1;
+    assert_eq!(
+        json["stage_two"]["crossings"][0]["hand_cancel"],
+        stage_two::HAND_CANCEL_CROSS
+    );
+    assert_eq!(d.stage_two().crosses.len(), 1);
 }

@@ -62,6 +62,7 @@
 //! ([`crate::refusals`]).
 
 use std::cell::{Ref, RefCell};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::rc::Rc;
 
@@ -198,10 +199,17 @@ impl Cid {
 pub enum EchoCid {
     /// The bytes at the echo's client-id span are exactly one the run sent.
     Exact,
-    /// They are none the run sent, or the echo names the member more than once.
+    /// Ours, but not byte for byte: its value, as JSON decodes it, is one the run sent in either
+    /// case, but its bytes are not exactly that one's (another case, a JSON escape, or the member
+    /// named more than once).
     Differs,
+    /// A client id that is none of ours, in either case.
+    Foreign,
     /// The echo names no client id, null, or an empty one.
     Absent,
+    /// An `err` with no `incoming_message`: it echoes no request, so neither the request it
+    /// refused nor its client id is known (FBC-su9i).
+    Unechoed,
 }
 
 /// A fee's sign, never its amount.
@@ -247,6 +255,10 @@ pub enum Heard {
         /// `ack` or `err`.
         envelope: &'static str,
         cid: EchoCid,
+        /// Whether it is an `err` whose `error_code` is `RateLimited`: a provider rate refusal
+        /// (decision 0148 item 8), which refuses the request and says nothing of the order, so
+        /// the report counts it as no refusal of the order (FBC-su9i).
+        rate_limited: bool,
     },
 }
 
@@ -271,9 +283,30 @@ impl Kept {
 
     /// Whether QFEX sent an `order_response` whose status is `ACK` and whose client id is
     /// exactly one we sent, byte for byte (decision 0148 item 2's gate, which FBC-su9i opens).
-    #[cfg_attr(not(test), allow(dead_code))] // FBC-su9i's per-run gate reads it
     pub fn exact_ack(&self) -> bool {
         self.exact_ack_from(0)
+    }
+
+    /// Which `add_order` the run sent carried `cid`, exactly as written, when one did: what a
+    /// [`Cid::sent`] names it by.
+    pub fn index_of(&self, cid: &str) -> Option<usize> {
+        self.sent.iter().position(|s| s.cid == cid)
+    }
+
+    /// The characters of every client id the run sent, then those of the ids an `ACK` echoed
+    /// byte for byte: characters alone, in memory, for the report's character classes
+    /// (`stage_two::Characters`), never an id.
+    pub fn characters(&self) -> (BTreeSet<char>, BTreeSet<char>) {
+        let sent = self.sent.iter().flat_map(|s| s.cid.chars()).collect();
+        let acked = self.heard.iter().filter_map(|h| match h {
+            Heard::Order {
+                status,
+                cid: Cid::Exact(n),
+                ..
+            } if status == "ACK" => self.sent.get(*n),
+            _ => None,
+        });
+        (sent, acked.flat_map(|s| s.cid.chars()).collect())
     }
 
     /// [`Kept::exact_ack`] among the frames heard from the `from`th on: one session's.
@@ -499,33 +532,63 @@ impl Tap {
         body: &Map<String, Value>,
     ) {
         let code = body.get("error_code").and_then(Value::as_str);
-        if envelope == "err" && code == Some("RateLimited") {
+        let rate_limited = envelope == "err" && code == Some("RateLimited");
+        if rate_limited {
             self.raise(Stop::RateRefused {
                 on: RefusedOn::Session,
             });
         }
-        let echoed = body.get("incoming_message").and_then(Value::as_object);
+        let echoed = body.get("incoming_message");
+        // An err that echoes no message at all may be the refusal of any request in flight, an
+        // add_order's included: kept, so the report can say one came (a rate refusal is counted
+        // as one already).
+        if echoed.is_none() && envelope == "err" && !rate_limited {
+            let heard = Heard::Echo {
+                at,
+                envelope,
+                cid: EchoCid::Unechoed,
+                rate_limited,
+            };
+            self.kept.borrow_mut().heard.push(heard);
+            return;
+        }
+        let echoed = echoed.and_then(Value::as_object);
         let Some(echoed) = echoed.filter(|m| m.get("type") == Some(&json_str("add_order"))) else {
             return;
         };
         let named = echoed.get("params").and_then(|p| p.get("client_order_id"));
         let cid = match named {
             Some(Value::String(s)) if !s.is_empty() => {
-                match string_members(kept.as_bytes(), b"client_order_id").as_slice() {
-                    [one] => {
-                        let bytes = raw.get(one.clone()).unwrap_or_default();
-                        let kept = self.kept.borrow();
-                        match kept.sent.iter().any(|s| s.cid.as_bytes() == bytes) {
-                            true => EchoCid::Exact,
-                            false => EchoCid::Differs,
-                        }
-                    }
-                    _ => EchoCid::Differs,
+                // The member's bytes as they arrived: the kept text has the span the codec
+                // names blanked, at the same length.
+                let members = string_members(kept.as_bytes(), b"client_order_id");
+                let arrived: Vec<&[u8]> =
+                    members.iter().filter_map(|m| raw.get(m.clone())).collect();
+                let kept = self.kept.borrow();
+                let sent = |b: &[u8]| kept.sent.iter().any(|t| t.cid.as_bytes() == b);
+                let ours = |text: &str| kept.sent.iter().any(|t| t.cid.eq_ignore_ascii_case(text));
+                let decoded = |b: &&[u8]| {
+                    let quoted = [&b"\""[..], b, &b"\""[..]].concat();
+                    serde_json::from_slice::<String>(&quoted).ok()
+                };
+                let named_ours = match arrived.is_empty() {
+                    true => ours(s),
+                    false => arrived.iter().filter_map(decoded).any(|d| ours(&d)),
+                };
+                match (arrived.as_slice(), named_ours) {
+                    ([one], _) if sent(one) => EchoCid::Exact,
+                    (_, true) => EchoCid::Differs,
+                    (_, false) => EchoCid::Foreign,
                 }
             }
             _ => EchoCid::Absent,
         };
-        let heard = Heard::Echo { at, envelope, cid };
+        let heard = Heard::Echo {
+            at,
+            envelope,
+            cid,
+            rate_limited,
+        };
         self.kept.borrow_mut().heard.push(heard);
     }
 
@@ -1263,7 +1326,9 @@ mod tests {
             ("ack", CID.to_owned(), EchoCid::Exact),
             ("err", CID.to_owned(), EchoCid::Exact),
             ("ack", CID.to_uppercase(), EchoCid::Differs),
-            ("ack", "someone-else".to_owned(), EchoCid::Differs),
+            ("err", CID.to_uppercase(), EchoCid::Differs),
+            ("ack", "someone-else".to_owned(), EchoCid::Foreign),
+            ("err", "someone-else".to_owned(), EchoCid::Foreign),
         ] {
             let (mut tee, tap) = teed();
             outbound(&mut tee, &add_order(CID), Vec::new());
@@ -1297,6 +1362,59 @@ mod tests {
             })
             .collect();
         assert_eq!(cids, [EchoCid::Absent, EchoCid::Absent]);
+        // Our client id named twice in one echo is ours, but its span cannot be read exactly.
+        let (mut tee, tap) = teed();
+        outbound(&mut tee, &add_order(CID), Vec::new());
+        let twice = format!(
+            concat!(
+                r#"{{"ack":{{"incoming_message":{{"type":"add_order","params":{{"#,
+                r#""client_order_id":"{c}","client_order_id":"{c}"}}}}}}}}"#,
+            ),
+            c = CID
+        );
+        inbound(&mut tee, &twice, &[]);
+        assert!(matches!(
+            tap.kept().heard[0],
+            Heard::Echo {
+                cid: EchoCid::Differs,
+                ..
+            }
+        ));
+        // An err with no incoming_message is kept, echoing nothing, and raises nothing; an ack
+        // with none, and a RateLimited err with none, which is a rate refusal, are not.
+        let (mut tee, tap) = teed();
+        inbound(
+            &mut tee,
+            r#"{"type":"Err","error_code":"InvalidOrder"}"#,
+            &[],
+        );
+        inbound(&mut tee, r#"{"err":{"error_code":"ServerError"}}"#, &[]);
+        inbound(&mut tee, r#"{"ack":{}}"#, &[]);
+        assert_eq!(tap.stop(), None);
+        inbound(
+            &mut tee,
+            r#"{"type":"Err","error_code":"RateLimited"}"#,
+            &[],
+        );
+        assert!(matches!(tap.stop(), Some(Stop::RateRefused { .. })));
+        let heard: Vec<(EchoCid, &str, bool)> = (tap.kept().heard.iter())
+            .filter_map(|h| match h {
+                Heard::Echo {
+                    cid,
+                    envelope,
+                    rate_limited,
+                    ..
+                } => Some((*cid, *envelope, *rate_limited)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            heard,
+            [
+                (EchoCid::Unechoed, "err", false),
+                (EchoCid::Unechoed, "err", false)
+            ]
+        );
     }
 
     #[test]

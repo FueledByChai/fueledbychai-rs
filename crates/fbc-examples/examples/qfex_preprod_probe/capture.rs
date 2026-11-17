@@ -496,6 +496,9 @@ pub struct Evidence {
     /// FBC-77r8): what its two sessions did, what its reads showed and its verdict, names, flags,
     /// counts and times alone.
     pub drops: Vec<crate::places::DropRun>,
+    /// Stage two (FBC-su9i), once a drop session ran: the run's exact-echo gate, what its frames
+    /// show of our client ids and QFEX's statuses, and each named account's crossing session.
+    pub stage_two: Option<crate::stage_two::StageTwo>,
     /// Each place-stage registry built: its step, its declaration, its bounds as fences, and its
     /// ledger at each of its sessions' ends (decision 0132 item 5).
     pub place_registries: Vec<crate::ledger::PlaceRun>,
@@ -1268,9 +1271,12 @@ fn gap_note(ev: &Evidence) -> String {
 }
 
 /// The README of a place-stage run's fixture directory (`drop-production/`, 0151 item 7): what
-/// its frames are and how they were scrubbed (decision 0148 item 10), never a value.
+/// its frames are and how they were scrubbed (decision 0148 item 10), never a value. Only the
+/// drop test's sessions are named: stage two's crossing sessions' frames go in
+/// `places-production/` ([`readme_crossing`]).
 fn readme_places(ev: &Evidence) -> String {
     let sessions: Vec<String> = (ev.sessions.iter())
+        .filter(|run| !is_crossing(run))
         .map(|run| format!("{} on {}", run.label(), run.account))
         .collect();
     let sessions = match sessions.is_empty() {
@@ -1308,6 +1314,66 @@ fn readme_places(ev: &Evidence) -> String {
         ev.environment,
         ev.mode,
         ev.target,
+        list(&ev.strings),
+        gap_note(ev),
+    )
+}
+
+/// Whether `run` is one of stage two's crossing sessions (FBC-su9i), whose frames go in the
+/// `places-production/` slice (0151 item 7).
+pub fn is_crossing(run: &SessionRun) -> bool {
+    run.name == crate::places::CROSS
+}
+
+/// Fixture files, each named, with its text.
+pub type Files = Vec<(String, String)>;
+
+/// The files of `files`, as [`slice_places`] named them, of stage two's crossing sessions of
+/// `ev`, then the others: each file's name begins with its session's [`SessionRun::slug`].
+pub fn split_crossing(ev: &Evidence, files: Files) -> (Files, Files) {
+    let crossing: Vec<String> = (ev.sessions.iter().filter(|run| is_crossing(run)))
+        .map(|run| format!("{}-", run.slug()))
+        .collect();
+    files
+        .into_iter()
+        .partition(|(file, _)| crossing.iter().any(|slug| file.starts_with(slug.as_str())))
+}
+
+/// The README of a place-stage run's `places-production/` fixture directory (0151 item 7):
+/// stage two's crossing sessions' frames, scrubbed as the drop test's are.
+fn readme_crossing(ev: &Evidence) -> String {
+    let sessions: Vec<String> = (ev.sessions.iter().filter(|run| is_crossing(run)))
+        .map(|run| format!("{} on {}", run.label(), run.account))
+        .collect();
+    format!(
+        "# QFEX trade-socket frames: stage two's crossing post-only\n\n\
+         Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
+         `qfex_preprod_probe` (crates/fbc-examples, FBC-su9i, a slice of FBC-9sk2; decisions \
+         0132 item 7, 0148 and 0151): each named account's crossing session ({}), one post-only \
+         GTC at the instrument's minimum size at the far touch, through it, placed only once \
+         that account's drop test passed and an ACK in the run echoed one of our client ids \
+         byte for byte (decision 0148 item 2), to show how QFEX refuses a crossing post-only \
+         and whether that refusal echoes our client id. Each session cancels every order of \
+         ours by venue id before it stops. These are recorded frames, not synthetic ones: this \
+         directory carries no SYNTHETIC marker.\n\n\
+         Each file is one frame QFEX sent on a session's trade socket, in the order received, \
+         named `<account>-the-crossing-session-<n>-<when>.json` against the session's arm: \
+         `before-arm`, `in-window` or `after-window`, or `partial` for a partial capture.\n\n\
+         Method: as the drop test's slice (`drop-production/`): the journal read back with \
+         every span the codec named blanked to `2`s, then scrubbed member by member as decision \
+         0148 item 10 asks and 0151 item 7 reads it: each `symbol` becomes `{SYMBOL}`; a \
+         top-level ack or err echo is otherwise as the codec's spans left it; in any other \
+         frame every number and every decimal string is zeroed, each `fee` kept as its sign \
+         alone, and every `id` and `*_id` member blanked to `2`s at its length. No frame we \
+         wrote is kept. Every file passed the privacy check's patterns before it was written, \
+         and scripts/privacy-check.sh then scanned the directory; the owner reads every file \
+         before committing this directory as `fixtures/qfex/exec-recorded/places-production/`, \
+         starting from the members the run found keeping a string value: {}.\n{}",
+        ev.started.get(..10).unwrap_or(""),
+        ev.environment,
+        ev.mode,
+        ev.target,
+        sessions.join(" then "),
         list(&ev.strings),
         gap_note(ev),
     )
@@ -1418,8 +1484,32 @@ pub fn write_fixtures_scrubbed(
     ev: &mut Evidence,
     scrub: Scrub,
 ) -> Result<(), String> {
+    ev.strings.clear();
+    write_fixtures_with(dir, files, ev, scrub, readme)
+}
+
+/// [`write_fixtures_scrubbed`] of stage two's crossing sessions' files into
+/// `places-production/` (0151 item 7), with that directory's README, the strings it keeps added
+/// to those the run's other slice kept.
+pub fn write_crossing_fixtures(
+    dir: &Path,
+    files: Vec<(String, String)>,
+    ev: &mut Evidence,
+) -> Result<(), String> {
+    write_fixtures_with(dir, files, ev, Scrub::Places, readme_crossing)
+}
+
+/// Writes `files` and the README `readme` gives into `dir`, as [`write_fixtures_scrubbed`]
+/// says, the strings they keep added to `ev`'s.
+fn write_fixtures_with(
+    dir: &Path,
+    files: Vec<(String, String)>,
+    ev: &mut Evidence,
+    scrub: Scrub,
+    readme: fn(&Evidence) -> String,
+) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("the fixtures directory: {e}"))?;
-    let mut strings = BTreeSet::new();
+    let mut strings: BTreeSet<String> = ev.strings.drain(..).collect();
     for (file, text) in files {
         if write_checked(dir, file, &text, ev)? {
             strings.extend(scrub.kept(&text));
