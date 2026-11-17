@@ -3,8 +3,9 @@
 //! before it is written ([`outputs`]). The report answers what decision 0132 items 1, 3 and 7 ask
 //! of stage one, for each session and account read; a run that holds a connection first (decision
 //! 0146) reports the hold too ([`crate::hold`]). A place-stage run's (FBC-9sk2) reports its
-//! preflight, its stop marker, drop session one (what answered its arm, whether its graceful
-//! close cancelled X, its comparisons, any stop by name: [`crate::places`]) and its registries
+//! preflight, its stop marker, each named account's drop test (what answered each arm, whether
+//! enabling cancels open orders, whether a graceful close cancelled X, the drop test's verdict,
+//! the comparisons, any stop by name: [`crate::places`]) and its registries
 //! ([`crate::ledger::place_markdown`]), every cap, distance and attempt count as a fence met, never
 //! a value (0151 item 10).
 
@@ -52,8 +53,9 @@ pub fn markdown(ev: &Evidence) -> String {
     };
     let title = match ev.places_asked {
         true => format!(
-            "# QFEX {} place stages: the preflight and drop session one\n\n\
-             FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0132 item 4, 0148 and 0151.",
+            "# QFEX {} place stages: the preflight and each named account's drop test\n\n\
+             FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions 0132 item 4, 0148 \
+             and 0151.",
             ev.environment
         ),
         false => format!(
@@ -159,8 +161,8 @@ pub fn markdown(ev: &Evidence) -> String {
     if let Some(marker) = &ev.marker {
         places::markdown(&mut s, marker);
     }
-    if let Some(run) = &ev.drop_one {
-        places::drop_markdown(&mut s, run);
+    for (n, run) in ev.drops.iter().enumerate() {
+        places::drop_markdown(&mut s, run, n + 1 == ev.accounts.len());
     }
     let asked_none = ev.arms.is_empty() && ev.hold_asked && !ev.places_asked;
     let _ = writeln!(s, "## The sessions\n");
@@ -257,12 +259,15 @@ const STAGE_ONE_NOT_MEASURED: &str = "Not measured by stage one (FBC-9sk2's stag
      0144).";
 
 /// What a place-stage run does not measure yet, as its report says it.
-const PLACES_NOT_MEASURED: &str = "Not measured until FBC-77r8 builds drop session two: whether \
-     enabling cancel-on-disconnect cancels open orders, whether the abrupt drop cancels X and Y, \
-     and the drop test's verdict; nor anything of stages two and three. Not checked by the probe: \
-     whether the user has a subaccount the configuration does not name, and `--sole-trader`'s \
-     declaration that nothing else trades on the named accounts (the owner confirms both before \
-     the run, which the probe does not record: decisions 0144 and 0148 item 7).";
+const PLACES_NOT_MEASURED: &str = "Not measured until FBC-su9i and the slices after it build \
+     stages two and three: anything of the crossing post-only, the taker IOC, the flatten and the \
+     pages. Not measured by the drop test (decision 0132 item 4): an order placed through \
+     another live connection after the arm, and whether an arm or a drop cancels another \
+     account's orders, since no order of ours rests on another account while a session runs. Not \
+     checked by the probe: whether the user has a subaccount the configuration does not name, \
+     and `--sole-trader`'s declaration that nothing else trades on the named accounts (the owner \
+     confirms both before the run, which the probe does not record: decisions 0144 and 0148 item \
+     7).";
 
 /// A session's heading: its account, and its name when it has one of its own.
 fn heading(run: &SessionRun) -> String {
@@ -343,7 +348,7 @@ pub fn to_json(ev: &Evidence) -> Value {
         "provider_rate_refusals": refusals::to_json(ev, &shown),
         "registries": ledger::to_json(&ev.registries),
         "place_registries": ledger::place_to_json(&ev.place_registries),
-        "drop_session_one": ev.drop_one.as_ref().map(places::drop_to_json),
+        "drop_tests": ev.drops.iter().map(places::drop_to_json).collect::<Vec<Value>>(),
         "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})
 }

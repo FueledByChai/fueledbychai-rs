@@ -4,7 +4,8 @@
 //! by path in `tests/qfex_preprod_probe.rs`, so this proof is part of the test binary decision
 //! 0148's Consequences name (0151 item 12) and Cargo builds no target of its own for it. No
 //! request reaches a venue, and every symbol, cap, price, key and id is made up. Past the
-//! preflight, drop session one places X on the model alone (FBC-23ch, below).
+//! preflight, each named account's drop test places X and Y on the model alone (FBC-23ch and
+//! FBC-77r8, below).
 //!
 //! - every place-stage flag is refused naming it and never its value, `--place-stages` without
 //!   `--production` naming the reason, a flag given twice, more than 10 reads per comparison,
@@ -62,6 +63,38 @@
 //!   report and its stop marker, which keeps the stops of a marker it replaces, and the marker
 //!   held to `--reconciled` by the next run, which names every stop in it, cleared only after
 //!   clean reads of every named account, the declaration reported unchecked (0151 item 6).
+//!
+//! FBC-77r8's done line (decisions 0132 items 4 and 7, 0144 item 4, 0148 and 0151): each named
+//! account's whole drop test in turn, against the model's trade sockets:
+//!
+//! - the read before drop session two admitting X alone, one open order on its symbol
+//!   (`the_read_before_session_two_admits_x_alone`), and any other open order, a provider rate
+//!   refusal, an account it cannot read or the owner's Ctrl-C stopping the run there, X resting
+//!   and marked (`any_other_open_order_before_session_two_stops_the_run` and the three after it);
+//! - the drop test's steps in order on the model's log, with no cancel, no reconnect and no
+//!   later arm from the first arm to the last read
+//!   (`the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect`), and its two sessions on
+//!   one registry seeded once (`the_drop_tests_sessions_share_one_registry_and_seed_once`);
+//! - each verdict: the drop cancelling X and Y and the test passing, on both accounts; a
+//!   graceful close that cancelled X, Y still judged; the arm cancelling X, reported, and
+//!   silently, a stop after the drop; X absent before the drop, the reach over it not measured;
+//!   Y still open after the wait, a trade row naming Y, historic-orders not showing Y ended and
+//!   a provider rate refusal after the drop, each failing it;
+//! - a session's capture ended at its end when its abrupt drop journals no Closed control
+//!   (`an_abrupt_drop_with_no_closed_control_ends_the_capture_at_the_sessions_end`), and every
+//!   session's capture whole in a run;
+//! - a fill of X in drop session two stopping with cancels, not flat, and a fill of Y seen
+//!   after the drop stopping not flat, the position the owner's (0151 item 9); Ctrl-C between
+//!   the sessions reporting X resting, and after the drop, each a stop with no cancel; the span
+//!   bound in drop session two cancelling nothing and failing the test;
+//! - a failed drop test placing nothing more on its account or any other, and a passed verdict
+//!   not carried into a second run;
+//! - the report's drop items for both accounts, and the report, the evidence and the
+//!   drop-production/ slice passing scripts/privacy-check.sh.
+//!
+//! The verdict at function level, the read before drop session two's judgment and the QFEX
+//! model's arm, cancel-on-disconnect and later knobs are proven in `verdict.rs`'s own tests and
+//! in `drop_two.rs`.
 //!
 //! The stops a drop session one cannot meet on QFEX's answers (a replayed fill, which its resync
 //! reads none of, and a resync with a fill unsettled across it) are proven on the handler and the
@@ -128,10 +161,13 @@ pub(super) fn argv_on(dir: &Path, trade: &str, rest: &str, mds: &str) -> Argv {
     ]
 }
 
-/// [`argv_on`] the model's origins.
+/// [`argv_on`] the model's origins, a touch priced from for up to a minute: the model sends its
+/// touch once, as the MDS connection subscribes, and every named account's drop test prices from
+/// it (FBC-77r8).
 pub(super) fn argv(dir: &Path, venue: &Venue) -> Argv {
     let (trade, rest) = (venue.trade.ws_url(""), venue.trade.http_url(""));
-    argv_on(dir, &trade, &rest, &venue.mds.ws_url(""))
+    let argv = argv_on(dir, &trade, &rest, &venue.mds.ws_url(""));
+    set(argv, "--touch-max-age-ms", "60000")
 }
 
 /// [`argv_on`] origins nothing listens on, for the parse alone.
@@ -492,13 +528,18 @@ fn place_stage_flags_are_refused_naming_the_flag() {
     }
     let usage = usage.split_whitespace().collect::<Vec<_>>().join(" ");
     for said in [
-        "With --place-stages (FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0148 and \
-         0151) it runs the place stages' preflight, then drop session one of decision 0132 item \
-         4's drop test",
+        "With --place-stages (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions \
+         0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's drop \
+         test on each named account in turn",
         "only against a loopback test stub, every origin (trade, REST and MDS) a loopback address",
         "It prints a CAPS line with the environment and both caps first, before any request",
-        "The run then ends, its outcome not ok, until FBC-77r8 builds drop session two: X still \
-         resting is reported for your hand cancel on QFEX's site and the stop marker written",
+        "Drop session two: every named account read again, X alone admitted, as one open order \
+         on its symbol",
+        "then the abrupt drop of its connection, with no WebSocket close",
+        "With no stop the run ends after the last account's drop test, its outcome not ok, until \
+         FBC-su9i builds stage two.",
+        "between the drop test's sessions it stops the run once the reads under way end, X still \
+         resting reported for your hand cancel",
         "In a drop session only Ctrl-C and a fill of ours cancel (0151 item 2)",
         "$HOME/.fueledbychai/qfex_probe_production",
     ] {
@@ -901,8 +942,17 @@ async fn a_hold_runs_before_the_preflight_with_nothing_else_open() {
     assert!(refdata < first_mds, "{what:?}");
     let between = &what[refdata..first_mds];
     assert!(between.iter().all(|w| !w.starts_with("trade ")), "{what:?}");
-    // Every trade socket, the hold's included, was closed by the probe.
-    assert!(venue.trade.connections().iter().all(|c| c.client_closed));
+    // Every trade socket, the hold's included, was closed by the probe, but each drop session
+    // two's, dropped abruptly with no close (decision 0132 item 4, FBC-77r8).
+    let ended = || venue.trade.connections().iter().all(|c| !c.open);
+    until("every trade socket's end", ended).await;
+    let unclosed = venue
+        .trade
+        .connections()
+        .iter()
+        .filter(|c| !c.client_closed)
+        .count();
+    assert_eq!(unclosed, 2);
     let reads: Vec<&str> = ev.reads.iter().map(|r| r.before).collect();
     assert_eq!(
         reads[..4],
@@ -910,7 +960,9 @@ async fn a_hold_runs_before_the_preflight_with_nothing_else_open() {
     );
     let (report, _) = outputs_of(&dir);
     assert!(
-        report.starts_with("# QFEX production place stages: the preflight and drop session one\n"),
+        report.starts_with(
+            "# QFEX production place stages: the preflight and each named account's drop test\n"
+        ),
         "{report}"
     );
     assert!(report.contains("## The liveness hold (FBC-39ks, decision 0146)"));
@@ -1188,9 +1240,9 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         [DISCOVERED, COUNTED, TOUCHED, CAPPED]
     );
     assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
-    // Past the preflight, drop session one ran on the primary account (FBC-23ch), and no
-    // stage-one registry was built.
-    assert_eq!(ev.sessions.len(), 1);
+    // Past the preflight, each named account's drop test ran, two sessions each (FBC-23ch and
+    // FBC-77r8), and no stage-one registry was built.
+    assert_eq!(ev.sessions.len(), 4);
     assert!(ev.registries.is_empty());
     assert_eq!(
         (ev.environment, ev.target),
@@ -1209,7 +1261,7 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
     assert_eq!(super::json(sent), super::json(subscribe));
     for line in [
         "PROBE place stages on QFEX production (production_probe), against a loopback test stub: \
-         the preflight, then drop session one on the first named account (FBC-23ch)",
+         the preflight, then each named account's drop test in turn (FBC-23ch and FBC-77r8)",
         "PREFLIGHT the instrument's spec from GET /refdata on the guarded REST origin",
         "PREFLIGHT the touch from the guarded MDS origin",
         "PREFLIGHT passed: the spec, the count bound, the touch and the caps",
@@ -1226,7 +1278,7 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         report.contains(&format!("Passed, in order: {DISCOVERED}; {COUNTED}")),
         "{report}"
     );
-    assert!(report.contains("drop session two and the stages after it are not built yet"));
+    assert!(report.contains("stage two and the stages after it are not built yet"));
     let json = super::json(&json);
     assert_eq!(json["place_stages"]["passed"].as_array().unwrap().len(), 4);
     assert_eq!(
@@ -2484,9 +2536,10 @@ async fn a_stopped_run_needs_the_reconciled_flag_and_clean_reads_to_clear_its_ma
     assert!(marker.cleared && marker.written.is_none());
     let reads: Vec<&str> = ev.reads.iter().map(|r| r.before).collect();
     assert_eq!(reads[..2], [places::DROP_ONE, places::DROP_ONE]);
-    // The reads that cleared the marker are drop session one's: it reads none of its own.
+    // The reads that cleared the marker are drop session one's: it reads none of its own, the
+    // reads after it next.
     let after = refusals::AFTER_DROP_ONE;
-    assert!(reads[2..].iter().all(|r| *r == after), "{reads:?}");
+    assert!(reads[2..4].iter().all(|r| *r == after), "{reads:?}");
     let (report, json) = outputs_of(&second);
     assert!(report.contains(
         "The owner declared `--reconciled both`: the owner's own declaration of what was done \
@@ -2494,8 +2547,8 @@ async fn a_stopped_run_needs_the_reconciled_flag_and_clean_reads_to_clear_its_ma
          every named account read clean."
     ));
     assert!(report.contains(
-        "drop session one of decision 0132 item 4's drop test runs on the first named account \
-         alone (FBC-23ch)"
+        "decision 0132 item 4's drop test runs on each named account in turn (FBC-23ch and \
+         FBC-77r8)"
     ));
     let json = super::json(&json);
     assert_eq!(json["stop_marker"]["reconciled"], "both");
@@ -3029,7 +3082,7 @@ impl Dropped {
 
     /// The run's drop session one.
     fn drop_run(&self) -> &places::DropRun {
-        self.ev.drop_one.as_ref().expect("drop session one ran")
+        self.ev.drops.first().expect("drop session one ran")
     }
 
     /// The stop marker the run left in its lease directory.
@@ -3060,7 +3113,7 @@ async fn dropped_with(model: QfexModel, what: &str, argv: impl Fn(Argv) -> Argv)
     let asked = argv(drop_argv(&dir, &venue));
     let (ran, printed) = place_run(&venue, &asked, &environment()).await;
     let ev = stopped(ran, &printed);
-    assert!(ev.drop_one.is_some(), "{printed}");
+    assert!(!ev.drops.is_empty(), "{printed}");
     Dropped {
         dir,
         _removed: removed,
@@ -3103,11 +3156,13 @@ fn assert_stopped(d: &Dropped, stop: places::Stop) {
     d.venue.assert_served();
 }
 
-/// Asserts every named account was read after drop session one, primary then subaccount.
+/// Asserts every named account was read after the first named account's drop session one,
+/// primary then subaccount.
 fn assert_after_reads(d: &Dropped) {
     let after: Vec<&str> = (d.ev.reads.iter())
         .filter(|r| r.before == refusals::AFTER_DROP_ONE)
         .map(|r| r.label.as_str())
+        .take(2)
         .collect();
     assert_eq!(after, ["primary (drop)", "subaccount"], "{}", d.printed);
 }
@@ -3126,7 +3181,10 @@ fn assert_no_cancel_and_x_resting(d: &Dropped) {
     );
     let (report, json) = d.outputs();
     assert!(report.contains(places::HAND_CANCEL), "{report}");
-    assert_eq!(json["drop_session_one"]["hand_cancel"], places::HAND_CANCEL);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["hand_cancel"],
+        places::HAND_CANCEL
+    );
 }
 
 #[tokio::test]
@@ -3168,12 +3226,18 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
             .iter()
             .position(|w| w.ends_with("get_user_trades"))
             .unwrap();
-    let historic = last("GET /user/historic-orders");
+    let historic = what[closed..]
+        .iter()
+        .position(|w| w.starts_with("GET /user/historic-orders"))
+        .map(|i| closed + i)
+        .unwrap();
     assert!(place < compared && compared < closed, "{what:?}");
     assert!(closed < trades && trades < historic, "{what:?}");
-    // One session, which never reconnected, one add_order and no cancel: X alone.
-    assert_eq!(d.count("subscribe"), 3);
-    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    assert!(historic < last("GET /user/historic-orders"), "{what:?}");
+    // Two sessions on each named account, none of which reconnected, one add_order each and no
+    // cancel: X and Y alone (FBC-77r8).
+    assert_eq!(d.count("subscribe"), 12);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (4, 0));
     // The lines, in order.
     let lines = [
         "READ before drop session one: primary (drop)",
@@ -3186,16 +3250,20 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
         "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close",
         "READ after drop session one: primary (drop)",
         "READ after drop session one: subaccount",
-        "RESTING X still rests",
-        "STOPPED drop session two",
-        "MARKER written (LeftResting)",
+        "READ before drop session two: primary (drop)",
+        "SESSION primary (drop session two)",
+        "STOPPED stage two",
     ];
     for pair in lines.windows(2) {
         assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
     }
+    // X rested after the close, but the run went on to drop session two: no hand cancel, no
+    // stop and no marker, the run ending after every account's drop test, naming FBC-su9i.
+    assert!(!d.printed.contains("RESTING"), "{}", d.printed);
+    assert!(d.marker().is_none() && d.ev.stop.is_none());
     let stopped = d.ev.stopped.clone().unwrap();
     assert_eq!(stopped, stage::NOT_BUILT);
-    assert!(stopped.contains("FBC-77r8"), "{stopped}");
+    assert!(stopped.contains("FBC-su9i"), "{stopped}");
     // What the session did, as the evidence keeps it.
     let run = d.drop_run();
     assert!(run.authenticated && run.resynced && run.started);
@@ -3210,7 +3278,7 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     assert_eq!((after.trades, after.trades_naming_x), (0, 0));
     assert_eq!(after.terminal_status, None);
     assert_eq!(run.as_encoded, Some(true));
-    assert_eq!(d.ev.sessions.len(), 1);
+    assert_eq!(d.ev.sessions.len(), 4);
     let session = &d.ev.sessions[0];
     assert_eq!(
         (session.label(), session.account),
@@ -3228,14 +3296,16 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
 async fn every_place_is_the_minimum_size() {
     let d = dropped(QfexModel::default(), "drop-min-size").await;
     let model = d.venue.model.lock().unwrap();
-    // X alone, at the instrument's minimum size (one lot of 0.01), a post-only GTC on --side,
-    // --away-bps (50) behind the bid of 100.00, snapped onto the cent grid.
-    assert_eq!(model.orders.len(), 1);
-    let x = &model.orders[0];
-    assert_eq!(x.quantity, Decimal::new(1, 2));
-    assert_eq!((x.kind.as_str(), x.tif.as_str()), ("ALO", "GTC"));
-    assert_eq!(x.side, "BUY");
-    assert_eq!(x.price, super::json("99.5"));
+    // X and Y on each named account (FBC-77r8), each at the instrument's minimum size (one lot of
+    // 0.01), a post-only GTC on --side, --away-bps (50) behind the bid of 100.00, snapped onto
+    // the cent grid.
+    assert_eq!(model.orders.len(), 4);
+    for x in &model.orders {
+        assert_eq!(x.quantity, Decimal::new(1, 2));
+        assert_eq!((x.kind.as_str(), x.tif.as_str()), ("ALO", "GTC"));
+        assert_eq!(x.side, "BUY");
+        assert_eq!(x.price, super::json("99.5"));
+    }
     // The registry's list held it, and the codec's place-stage key admits it only at the
     // minimum (decision 0148 item 4).
     let found = spec_of(Listed::trading());
@@ -3294,11 +3364,22 @@ async fn each_session_arms_under_an_authority_for_its_own_account() {
     // arm accepted is one armed under the authority for its own account.
     assert_eq!(d.drop_run().arm.as_deref(), Some("Accepted"));
     let model = d.venue.model.lock().unwrap();
-    let armed: Vec<&model::Conn> = model.conns.values().filter(|c| c.armed).collect();
-    assert_eq!(armed.len(), 1);
-    // Its account is the primary one, the first named, as its authentication named it.
-    assert_eq!(armed[0].account, None);
-    assert!(armed[0].session);
+    let mut armed: Vec<(&usize, &model::Conn)> =
+        model.conns.iter().filter(|(_, c)| c.armed).collect();
+    armed.sort_by_key(|(n, _)| **n);
+    // Each drop test's two sessions armed on its own account, as their authentication named it:
+    // the primary account's, then the subaccount's (FBC-77r8).
+    let accounts: Vec<Option<&str>> = armed.iter().map(|(_, c)| c.account.as_deref()).collect();
+    assert_eq!(accounts, [None, None, Some(SUB), Some(SUB)]);
+    assert!(armed.iter().all(|(_, c)| c.session));
+    let arms =
+        d.ev.drops
+            .iter()
+            .flat_map(|r| [r.arm.clone(), r.two.clone().unwrap().arm]);
+    assert!(
+        arms.into_iter()
+            .all(|arm| arm.as_deref() == Some("Accepted"))
+    );
     drop(model);
     // Its configuration's account key is the primary account's, as the place config sets it.
     let env = environment();
@@ -3322,10 +3403,13 @@ async fn a_registrys_trip_reaches_the_journal_before_any_market_arms() {
     assert!(d.printed.contains(
         "its CancelOnlyTrip given to the journal before any market arms (decision 0139)"
     ));
+    // One drop registry per named account (FBC-77r8).
     let registries = &d.ev.place_registries;
-    assert_eq!(registries.len(), 1);
-    assert_eq!(registries[0].step, ledger::Step::Drop);
-    assert_eq!(registries[0].declaration, ledger::PLACES_DECLARATION);
+    assert_eq!(registries.len(), 2);
+    for registry in registries {
+        assert_eq!(registry.step, ledger::Step::Drop);
+        assert_eq!(registry.declaration, ledger::PLACES_DECLARATION);
+    }
 }
 
 #[tokio::test]
@@ -3341,7 +3425,21 @@ async fn the_seed_follows_clean_reads_of_every_named_account() {
         .filter(|r| r.before == places::DROP_ONE)
         .map(|r| r.label.as_str())
         .collect();
-    assert_eq!(before, ["primary (drop)", "subaccount"]);
+    assert_eq!(
+        before,
+        [
+            "primary (drop)",
+            "subaccount",
+            "primary",
+            "subaccount (drop)"
+        ]
+    );
+    // Each named account's registry is seeded once, after clean reads of every named account
+    // that follow the drop test before it (FBC-77r8).
+    let sub = d.at("READ before drop session one: subaccount (drop)");
+    assert!(d.at("VERDICT drop test on primary") < sub);
+    assert!(sub < d.at("REGISTRY drop on subaccount"));
+    assert_eq!(d.printed.matches("seeded flat").count(), 2);
     // An account that does not read clean stops the run before any registry is built, so
     // nothing is seeded and no session opens.
     let not_flat = QfexModel {
@@ -3360,7 +3458,7 @@ async fn the_seed_follows_clean_reads_of_every_named_account() {
             .unwrap()
             .starts_with("subaccount holds an open order")
     );
-    assert!(ev.drop_one.is_none() && ev.place_registries.is_empty());
+    assert!(ev.drops.is_empty() && ev.place_registries.is_empty());
     assert!(!printed.contains("REGISTRY") && !printed.contains("SESSION"));
     let trade = |w: &str| w.starts_with("trade ") && w.ends_with(" subscribe");
     assert!(venue.log().iter().all(|e| !trade(&e.what)));
@@ -3373,9 +3471,10 @@ async fn no_two_sessions_are_ever_open() {
     // and the reads' sockets never arm or subscribe.
     let model = d.venue.model.lock().unwrap();
     assert!(!model.overlapped);
+    // Two sessions on each named account (FBC-77r8), one after the other.
     let sessions = model.conns.values().filter(|c| c.session).count();
-    assert_eq!(sessions, 1);
-    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 1);
+    assert_eq!(sessions, 4);
+    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 4);
 }
 
 #[tokio::test]
@@ -3399,19 +3498,20 @@ async fn a_place_stage_session_never_reconnects() {
 
 #[tokio::test]
 async fn before_the_echo_each_session_places_at_most_one_order() {
-    // X's ACK never comes before its deadline: X ends Unknown, and nothing else is placed.
+    // X's ACK never comes before its deadline: X ends Unknown, and nothing else is placed in
+    // its session; drop session two then places Y alone (FBC-77r8).
     let model = QfexModel {
         ack_delay: Some(Duration::from_secs(3600)),
         ..QfexModel::default()
     };
     let d = dropped(model, "drop-one-place").await;
-    assert_eq!(d.count("add_order"), 1);
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1]);
     let run = d.drop_run();
     assert!(!run.x.acked && !run.x.exact_echo, "{run:?}");
     assert_eq!(run.x.outcome.as_deref(), Some("Unknown"));
-    // And with the echo: still one, X.
+    // And with the echo: still one a session, X or Y (FBC-77r8).
     let d = dropped(QfexModel::default(), "drop-one-place-echoed").await;
-    assert_eq!(d.count("add_order"), 1);
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1]);
     assert!(d.drop_run().x.exact_echo);
 }
 
@@ -3426,10 +3526,16 @@ async fn the_probe_authorizes_no_place_beyond_a_registrys_list() {
     let refused = allowance.take(Step::Drop, X).unwrap_err();
     assert_eq!(refused, places::Stop::BeyondList);
     assert!(refused.marks() && !refused.cancels_in_drop(false));
-    // A run spends its list: X alone reached QFEX, once.
+    // A run spends its list: X and Y alone reached QFEX, once each on each named account.
     let d = dropped(QfexModel::default(), "drop-list").await;
-    assert_eq!(d.count("add_order"), 1);
+    assert_eq!(d.count("add_order"), 4);
     assert_eq!(d.ev.place_registries[0].step, Step::Drop);
+    // Its list holds X and Y once: a third resting place is beyond it.
+    assert_eq!(allowance.take(Step::Drop, ledger::Y), Ok(()));
+    assert_eq!(
+        allowance.take(Step::Drop, ledger::Y),
+        Err(places::Stop::BeyondList)
+    );
     // A run stopped BeyondList reports it by name and marks it, as every stop.
     let (dir, _removed) = temp_dir("drop-list-marker");
     places::tag(&dir).unwrap();
@@ -3475,7 +3581,10 @@ async fn a_graceful_close_that_cancels_x_is_recorded() {
         ),
         "{report}"
     );
-    assert_eq!(json["drop_session_one"]["close_cancelled_x"], true);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+        true
+    );
     assert_after_reads(&d);
     // And one that does not: X rests on, which the next test reports for a hand cancel.
     let d = dropped(QfexModel::default(), "drop-close-keeps").await;
@@ -3484,11 +3593,29 @@ async fn a_graceful_close_that_cancels_x_is_recorded() {
 
 #[tokio::test]
 async fn x_resting_after_session_one_is_reported_for_a_hand_cancel_and_marked() {
-    let d = dropped(QfexModel::default(), "drop-x-resting").await;
+    // X rests after drop session one, and the run ends there: the read before drop session two
+    // cannot read the first account (its first GET /user/positions fails), so X is left
+    // resting, unjudged, a stop with its marker (FBC-77r8: with that read clean, drop session
+    // two would follow).
+    let model = QfexModel {
+        rest_fails: vec![3],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-x-resting").await;
     assert_stopped(&d, places::Stop::LeftResting);
     assert_no_cancel_and_x_resting(&d);
-    // The run ends naming FBC-77r8, X still on QFEX's book.
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with("primary (drop) could not be read:"),
+        "{stopped}"
+    );
+    assert!(
+        stopped.contains("LeftResting in the read before drop session two"),
+        "{stopped}"
+    );
+    // The run ends there, X still on QFEX's book, and no drop session two ran.
+    assert!(d.drop_run().two.is_none());
+    assert_eq!(d.count("subscribe"), 3);
     let model = d.venue.model.lock().unwrap();
     assert_eq!(model.orders[0].state, model::State::Open);
     drop(model);
@@ -3903,7 +4030,10 @@ async fn each_step_is_compared_and_the_first_agreeing_read_is_timed() {
     assert!(first >= Duration::from_millis(1_000), "{first:?}");
     let (report, json) = d.outputs();
     assert!(report.contains("| X's place | 2 |"), "{report}");
-    assert_eq!(json["drop_session_one"]["compared"][0]["ended"], "agreed");
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["compared"][0]["ended"],
+        "agreed"
+    );
     assert!(
         d.printed
             .contains("COMPARE after X's place: 2 reads, the first agreeing")
@@ -4051,7 +4181,10 @@ async fn a_second_ctrl_c_during_the_stops_cancels_is_recorded() {
         report.contains("1 press of Ctrl-C while they ran, each recorded"),
         "{report}"
     );
-    assert_eq!(json["drop_session_one"]["cancels"]["presses"], 1);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["cancels"]["presses"],
+        1
+    );
 }
 
 #[tokio::test]
@@ -4276,9 +4409,11 @@ async fn every_read_and_page_is_charged_to_the_shared_limiter() {
     assert_eq!(auths, 1, "{what:?}");
     // The run's refusals, counted on the shared budget the run and the model share.
     assert!(limiter.counts().refused.user >= 2);
-    // The reads after the session, which must be made, waited the hold out and were made.
+    // The reads after the session, which must be made, waited the hold out and were made; the
+    // drop tests then ran to the run's end (FBC-77r8).
     assert_after_reads(&d);
-    assert_eq!(d.ev.stop, Some("LeftResting"));
+    assert_eq!(d.ev.stop, None);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
 }
 
 #[test]
@@ -4367,22 +4502,21 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
         set(argv, "--namespace", "61437")
     };
     let d = dropped_with(QfexModel::default(), "drop-no-value", caps).await;
-    assert_eq!(d.ev.stop, Some("LeftResting"));
+    assert_eq!(d.ev.stop, None);
     let model = d.venue.model.lock().unwrap();
-    let x = model.orders[0].clone();
+    let orders = model.orders.clone();
     drop(model);
-    // Every synthetic value the run met: the credentials and the subaccount's id, X's venue id
-    // and client id, the user id QFEX's frames name, X's price and size, both caps, the symbol
-    // and the namespace.
+    // Every synthetic value the run met: the credentials and the subaccount's id, X's and Y's
+    // venue ids and client ids on both accounts, the user id QFEX's frames name, their price and
+    // size, both caps, the symbol and the namespace.
     let mut values: Vec<String> = [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB, model::USER_ID]
         .map(str::to_owned)
         .to_vec();
-    values.extend([
-        x.id.clone(),
-        x.cid.clone(),
-        "99.5".to_owned(),
-        "0.01".to_owned(),
-    ]);
+    assert_eq!(orders.len(), 4);
+    for order in &orders {
+        values.extend([order.id.clone(), order.cid.clone()]);
+    }
+    values.extend(["99.5".to_owned(), "0.01".to_owned()]);
     values.extend(["424242", "373737", SYMBOL, "61437"].map(str::to_owned));
     // The report, the evidence and the drop-production/ slice the owner commits.
     let evidence = d.dir.join("evidence");
@@ -4421,18 +4555,22 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
         }
     }
     assert!(d.printed.lines().next().unwrap().contains("424242.17"));
-    // The journal, which stays local (decision 0006), keeps X's add_order as written.
-    assert_eq!(written(&d, "add_order"), [true]);
+    // The journal, which stays local (decision 0006), keeps each add_order as written.
+    assert_eq!(written(&d, "add_order"), [true; 4]);
     // Each output passes scripts/privacy-check.sh, the slice by the run itself.
     assert_report_and_evidence_pass_the_privacy_check(&evidence);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
     evidence::privacy_check(&script, &slice).unwrap();
     let (report, _) = d.outputs();
-    assert!(report.contains("## Drop session one (FBC-23ch, decision 0132 item 4)"));
+    for account in ["primary", "subaccount"] {
+        let heading =
+            format!("## The drop test on {account} (FBC-23ch and FBC-77r8, decision 0132 item 4)");
+        assert!(report.contains(&heading), "{report}");
+    }
     assert!(report.contains("## The place stages' registries"));
     let readme = fs::read_to_string(slice.join("README.md")).unwrap();
     assert!(
-        readme.contains("drop session one of decision 0132 item 4's drop test"),
+        readme.contains("both sessions of each named account's drop test of decision 0132 item 4"),
         "{readme}"
     );
 }
@@ -4631,7 +4769,7 @@ async fn a_close_with_no_room_in_the_shared_budget_is_not_counted_graceful() {
     let ran = stage::run_places(&opts, &places, &lookup, out).await;
     let printed = printed.text();
     let ev = stopped(ran, &printed);
-    let run = ev.drop_one.as_ref().expect("drop session one ran");
+    let run = ev.drops.first().expect("drop session one ran");
     assert_eq!(run.ended_by, Some(stage::NO_ROOM_TO_CLOSE), "{printed}");
     assert_eq!(run.close_cancelled_x, None);
     assert!(
@@ -4703,8 +4841,15 @@ async fn an_x_that_ended_without_resting_is_not_counted_cancelled_by_the_close()
     assert_eq!(run.close_cancelled_x, None);
     assert!(!run.x_resting);
     let (report, json) = d.outputs();
-    assert!(!report.contains("X rested before it"), "{report}");
-    assert_eq!(json["drop_session_one"]["close_cancelled_x"], Value::Null);
+    let primary = report
+        .split("## The drop test on subaccount")
+        .next()
+        .unwrap();
+    assert!(!primary.contains("X rested before it"), "{report}");
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+        Value::Null
+    );
     // And one QFEX cancelled itself after its ACK: acked, but no longer resting as the close
     // was sent, so the close is not measured as cancelling it either.
     let model = QfexModel {
@@ -4816,8 +4961,8 @@ fn a_refusal_is_named_by_its_variant_alone() {
 // ----- PR #272's review findings (FBC-23ch) -----
 
 /// A run of `argv` against `model` whose owner presses Ctrl-C once, as the line holding `at`
-/// is printed ([`PressAt`]), under the provider user `rate_user`.
-async fn pressed_at(
+/// is printed ([`PressAt`]), under the provider user `rate_user` ([`pressed_at`]'s, with those).
+async fn pressed_at_as(
     model: QfexModel,
     what: &str,
     rate_user: RateUserKey,
@@ -4863,7 +5008,7 @@ async fn a_press_while_the_close_waits_for_room_cancels_x_before_the_close() {
         ..QfexModel::default()
     };
     let wait = |argv| set(argv, "--agree-wait-ms", "1000");
-    let d = pressed_at(
+    let d = pressed_at_as(
         model,
         "drop-press-at-close",
         rate_user,
@@ -4915,7 +5060,7 @@ async fn held_drop(
     let ran = stage::run_places(&opts, &places, &lookup, out).await;
     let printed = printed.text();
     let ev = stopped(ran, &printed);
-    assert!(ev.drop_one.is_some(), "{printed}");
+    assert!(!ev.drops.is_empty(), "{printed}");
     Dropped {
         dir,
         _removed: removed,
@@ -4982,7 +5127,7 @@ async fn a_press_while_the_close_waits_is_the_stop_when_the_connection_ends_in_t
         ..QfexModel::default()
     };
     let wait = |argv| set(argv, "--agree-wait-ms", "1000");
-    let d = pressed_at(
+    let d = pressed_at_as(
         model,
         "drop-press-then-end",
         rate_user,
@@ -5014,7 +5159,10 @@ async fn a_close_is_measured_only_on_a_read_of_xs_own_account() {
     assert!(!run.x_read, "{run:?}");
     assert_eq!(run.close_cancelled_x, None, "{run:?}");
     let (report, json) = d.outputs();
-    assert_eq!(json["drop_session_one"]["close_cancelled_x"], Value::Null);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+        Value::Null
+    );
     assert!(
         report.contains("Whether the graceful close cancelled X: not measured"),
         "{report}"
@@ -5067,11 +5215,16 @@ async fn x_gone_with_its_trades_unread_is_not_counted_as_cancelled_by_the_close(
         "{after:?}"
     );
     assert!(!after.trades_read, "{after:?}");
-    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    // FBC-77r8: X's trades or historic orders not read whole after drop session one stop the
+    // run LeftResting before drop session two, X left unjudged.
+    assert_stopped(&d, places::Stop::LeftResting);
     assert_eq!(run.close_cancelled_x, None, "{run:?}");
     assert_not_measured(&d, places::CloseUnmeasured::TradesUnread);
     let (report, json) = d.outputs();
-    assert_eq!(json["drop_session_one"]["after"]["trades_read"], false);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["after"]["trades_read"],
+        false
+    );
     assert!(
         report.contains("0 trade rows since X's send, not read whole, 0 naming X"),
         "{report}"
@@ -5119,9 +5272,18 @@ async fn x_gone_with_its_trades_read_whole_and_naming_it_in_no_row_was_cancelled
     assert_eq!(run.close_cancelled_x, Some(true), "{run:?}");
     assert_eq!(run.close_not_measured, None, "{run:?}");
     let (report, json) = d.outputs();
-    assert_eq!(json["drop_session_one"]["close_cancelled_x"], true);
-    assert_eq!(json["drop_session_one"]["close_not_measured"], Value::Null);
-    assert_eq!(json["drop_session_one"]["after"]["trades_read"], true);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+        true
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_not_measured"],
+        Value::Null
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["after"]["trades_read"],
+        true
+    );
     assert!(
         report.contains(
             "Whether the graceful close cancelled X: yes: X rested before it, no cancel of ours \
@@ -5152,8 +5314,14 @@ async fn x_still_listed_after_the_close_was_not_cancelled_by_it_whatever_its_tra
         assert_eq!(run.close_cancelled_x, Some(false), "{run:?}");
         assert_eq!(run.close_not_measured, None, "{run:?}");
         let (report, json) = d.outputs();
-        assert_eq!(json["drop_session_one"]["close_cancelled_x"], false);
-        assert_eq!(json["drop_session_one"]["close_not_measured"], Value::Null);
+        assert_eq!(
+            json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+            false
+        );
+        assert_eq!(
+            json["drop_tests"][0]["session_one"]["close_not_measured"],
+            Value::Null
+        );
         assert!(
             report.contains(
                 "Whether the graceful close cancelled X: no: X rested before it and still did \
@@ -5161,7 +5329,12 @@ async fn x_still_listed_after_the_close_was_not_cancelled_by_it_whatever_its_tra
             ),
             "{report}"
         );
-        assert_stopped(&d, places::Stop::LeftResting);
+        // FBC-77r8: with X's trades read whole, the drop test runs on and passes; with them
+        // not read whole, the run stops LeftResting before drop session two.
+        match trades_err {
+            true => assert_stopped(&d, places::Stop::LeftResting),
+            false => assert_eq!(d.ev.stop, None, "{}", d.printed),
+        }
     }
 }
 
@@ -5220,6 +5393,55 @@ async fn x_gone_after_a_trade_naming_another_order_or_none_is_not_counted_cancel
 }
 
 #[tokio::test]
+async fn a_trade_of_another_order_after_drop_session_one_on_an_account_still_flat_places_no_y() {
+    // FBC-77r8: as drop session one's graceful close is settled, two trades of an order the
+    // model never had come on X's account, one each way, so the position does not move, and X
+    // still rests. Their rows since X's send name another order, or none: something else traded
+    // on the account, which decision 0132 item 4 rules out, so the drop test has failed already.
+    // The run stops DropFailed before drop session two, which never runs, so Y is never placed,
+    // and nothing is cancelled with no session open (0151 item 2); X is left for the owner's
+    // hand cancel.
+    for (stray, what) in [
+        (model::StrayTrade::Other, "drop-close-netting-other"),
+        (model::StrayTrade::Unnamed, "drop-close-netting-unnamed"),
+    ] {
+        let model = QfexModel {
+            netting_after_close: Some(stray),
+            ..QfexModel::default()
+        };
+        let d = dropped(model, what).await;
+        assert_stopped(&d, places::Stop::DropFailed);
+        let run = d.drop_run();
+        assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+        assert!(run.x_read && run.x_resting, "{run:?}");
+        let after = run.after.as_ref().unwrap();
+        assert_eq!((after.trades, after.trades_naming_x), (2, 0), "{after:?}");
+        assert!(after.trades_read && after.error.is_none(), "{after:?}");
+        assert_eq!(run.close_cancelled_x, Some(false), "{run:?}");
+        assert!(run.two.is_none() && run.verdict.is_none(), "{run:?}");
+        assert_eq!(d.count("add_order"), 1);
+        assert_eq!(d.count("cancel_order"), 0);
+        assert_eq!(d.session_conns().len(), 1);
+        let said = d.ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(
+                "DropFailed after drop session one, a get_user_trades row since X's send naming \
+                 another order or none (decision 0132 item 4)"
+            ),
+            "{said}"
+        );
+        assert!(
+            d.printed
+                .contains(&format!("RESTING {}", places::HAND_CANCEL))
+        );
+        let flat = (d.ev.reads.iter())
+            .filter(|r| r.before == refusals::AFTER_DROP_ONE)
+            .all(|r| r.flat);
+        assert!(flat, "{:?}", d.ev.reads);
+    }
+}
+
+#[tokio::test]
 async fn a_close_whose_historic_orders_read_fails_still_counts_x_cancelled() {
     // A sibling of PR #272's thread 4608720833. The graceful close cancels X, X's trades since
     // its send are read whole with no row, and GET /user/historic-orders then fails HTTP 500.
@@ -5243,10 +5465,18 @@ async fn a_close_whose_historic_orders_read_fails_still_counts_x_cancelled() {
     );
     assert_eq!(run.close_cancelled_x, Some(true), "{run:?}");
     assert_eq!(run.close_not_measured, None, "{run:?}");
-    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    // FBC-77r8: X's trades or historic orders not read whole after drop session one stop the
+    // run LeftResting before drop session two, X left unjudged.
+    assert_stopped(&d, places::Stop::LeftResting);
     let (report, json) = d.outputs();
-    assert_eq!(json["drop_session_one"]["close_cancelled_x"], true);
-    assert_eq!(json["drop_session_one"]["after"]["trades_read"], true);
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+        true
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["after"]["trades_read"],
+        true
+    );
     let said = format!(
         "0 trade rows since X's send, read whole, 0 naming X; X on GET /user/historic-orders: \
          not known; a read failed: {error}"
@@ -5374,8 +5604,14 @@ async fn a_close_with_no_room_is_not_measured_for_its_room() {
 fn assert_not_measured(d: &Dropped, why: places::CloseUnmeasured) {
     assert_eq!(d.drop_run().close_not_measured, Some(why));
     let (report, json) = d.outputs();
-    assert_eq!(json["drop_session_one"]["close_cancelled_x"], Value::Null);
-    assert_eq!(json["drop_session_one"]["close_not_measured"], why.says());
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_cancelled_x"],
+        Value::Null
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_one"]["close_not_measured"],
+        why.says()
+    );
     let said = format!(
         "Whether the graceful close cancelled X: not measured: {}",
         why.says()
@@ -5734,7 +5970,7 @@ async fn a_rate_refusal_in_the_reads_before_drop_session_one_stops_the_run_marke
         );
         let marker = fs::read_to_string(leases_of(&dir).join(places::MARKER)).unwrap_or_default();
         assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
-        assert!(ev.drop_one.is_none());
+        assert!(ev.drops.is_empty());
         assert!(!venue.log().iter().any(|e| e.what.ends_with(" add_order")));
         venue.assert_served();
     }
@@ -5781,7 +6017,9 @@ async fn x_listed_by_its_venue_id_alone_after_the_session_is_still_resting() {
     // PR #272's thread 4606842313. After drop session one, the primary's page lists X by its
     // venue id with an empty client id: X is found there by the venue id the streams gave it,
     // so it is still resting, reported for the owner's hand cancel, and the graceful close is
-    // not counted as cancelling it.
+    // not counted as cancelling it. The read before drop session two still admits X only by
+    // both ids (`AllowedOrder::matches`), so it refuses that row and the run stops there,
+    // ReadDisagrees, marked, with no drop session two (FBC-77r8).
     let model = QfexModel {
         blank_cid_after_session: true,
         ..QfexModel::default()
@@ -5790,7 +6028,13 @@ async fn x_listed_by_its_venue_id_alone_after_the_session_is_still_resting() {
     let run = d.drop_run();
     assert!(run.x.rested_at_close && run.x_read, "{run:?}");
     assert_eq!(run.close_cancelled_x, Some(false), "{run:?}");
-    assert_stopped(&d, places::Stop::LeftResting);
+    assert!(run.two.is_none(), "{run:?}");
+    assert_stopped(&d, places::Stop::ReadDisagrees);
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.contains("ReadDisagrees in the read before drop session two"),
+        "{stopped}"
+    );
     assert_no_cancel_and_x_resting(&d);
     let model = d.venue.model.lock().unwrap();
     assert_eq!(model.orders[0].state, model::State::Open);
@@ -5816,6 +6060,9 @@ async fn an_account_reads_socket_sends_its_close_only_with_room_for_it() {
     assert_eq!(conns.len(), 1, "{printed}");
     assert!(!conns[0].client_closed, "a close sent under the hold");
     let d = dropped(QfexModel::default(), "drop-read-close").await;
+    // The run's last read socket may still be closing as the run ends: its end is waited for.
+    let ended = || d.venue.trade.connections().iter().all(|c| !c.open);
+    until("every read socket's end", ended).await;
     let conns = d.venue.trade.connections();
     let session = (d.venue.model.lock().unwrap().conns.iter())
         .filter(|(_, c)| c.session)
@@ -5971,6 +6218,2299 @@ async fn a_full_page_repeating_the_one_before_fails_the_read_of_x_rather_than_pa
         let after = d.drop_run().after.as_ref().expect("X was read");
         let why = format!("a full {what} page repeated the page before it");
         assert_eq!(after.error.as_deref(), Some(why.as_str()), "{after:?}");
+        d.venue.assert_served();
+    }
+}
+
+// ----- FBC-77r8: the drop test's second session's parts -----
+
+#[test]
+fn an_abrupt_drop_with_no_closed_control_ends_the_capture_at_the_sessions_end() {
+    let (dir, _removed) = temp_dir("abrupt-drop-capture");
+    let ask = r#"{"type":"get_user_orders","params":{"limit":1000,"offset":0}}"#;
+    let asked = |rpc: u64| {
+        Offer::Keep(Record::Outbound {
+            at: MonoNs(0),
+            conn: conn(0),
+            rpc: Some(RpcId(rpc)),
+            opcode: Opcode::Text,
+            frame: WireSlice::plain(ask.as_bytes().to_vec()),
+        })
+    };
+    let paged = || {
+        let page = r#"{"all_orders_response":{"orders":[],"twaps":[]}}"#;
+        Offer::Keep(Record::inbound(stamp(0), RawFrame::Text(page)))
+    };
+    // The first session dropped abruptly: it armed, its arm acked, one page answered and a
+    // second asked, and no Closed control and no deadline of the arm journaled after them.
+    let mut offers = vec![
+        Offer::Keep(Record::Control {
+            at: MonoNs(0),
+            ev: ControlEvent::Opened(conn(0)),
+        }),
+        Offer::Keep(Record::inbound(stamp(0), RawFrame::Text(AUTH_OK))),
+        Offer::Keep(Record::Outbound {
+            at: MonoNs(0),
+            conn: conn(0),
+            rpc: Some(RpcId(1)),
+            opcode: Opcode::Text,
+            frame: WireSlice::plain(ARM.as_bytes().to_vec()),
+        }),
+        ack(0),
+        asked(2),
+        paged(),
+        asked(3),
+    ];
+    // The next session, whole; then a record of the first that the journal holds after the
+    // next one began (none does in a run: it stands for anything after the first one's end).
+    offers.extend(session_records(1, vec![ack(1)]));
+    offers.push(paged());
+    let sink = journal(&dir, offers);
+    let (ev, files) = sliced(&dir, &sink, Ok(()));
+    let files = files.unwrap();
+    // The first session's end is taken as its close: its window ends there, and the page it
+    // waited for is answered by nothing after it.
+    let first = &ev.sessions[0];
+    let whens: Vec<When> = first.frames.iter().map(|f| f.when).collect();
+    let want = [
+        When::BeforeArm,
+        When::InWindow,
+        When::InWindow,
+        When::AfterWindow,
+    ];
+    assert_eq!(whens, want);
+    assert_eq!((first.pages.asked, first.pages.read), (2, 1));
+    // A Closed control missing is no gap: both captures are whole, every frame placed.
+    assert!(ev.sessions.iter().all(|s| s.partial.is_empty()), "{ev:?}");
+    assert!(first.arm_sent);
+    let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(
+        names.contains(&"primary-004-after-window.json"),
+        "{names:?}"
+    );
+    let second = &ev.sessions[1];
+    let whens: Vec<When> = second.frames.iter().map(|f| f.when).collect();
+    assert_eq!(whens, [When::BeforeArm, When::InWindow]);
+}
+
+/// The reads of `d` before drop session two, by label.
+fn reads_before_two(d: &Dropped) -> Vec<&capture::AccountRead> {
+    let reads = d.ev.reads.iter();
+    reads.filter(|r| r.before == places::DROP_TWO).collect()
+}
+
+#[tokio::test]
+async fn the_read_before_session_two_admits_x_alone() {
+    let d = dropped(QfexModel::default(), "before-two-clean").await;
+    // X rests after the graceful close, so the read before drop session two reads both named
+    // accounts, admitting X alone on its own: one open order there, counted once by REST. Each
+    // account's drop test reads so before its second session.
+    let reads = reads_before_two(&d);
+    let labels: Vec<&str> = reads.iter().map(|r| r.label.as_str()).collect();
+    let want = [
+        "primary (drop)",
+        "subaccount",
+        "primary",
+        "subaccount (drop)",
+    ];
+    assert_eq!(labels, want, "{}", d.printed);
+    assert_eq!((reads[0].page_orders, reads[0].page_allowed), (1, 1));
+    assert_eq!(
+        (reads[0].rest_open_orders, reads[0].rest_open_elsewhere),
+        (1, 0)
+    );
+    assert_eq!((reads[1].page_orders, reads[1].page_allowed), (0, 0));
+    assert_eq!((reads[3].page_orders, reads[3].page_allowed), (1, 1));
+    assert!(reads.iter().all(|r| r.refusal().is_none()));
+    let lines = [
+        "READ after drop session one: subaccount",
+        "READ before drop session two: primary (drop): 1 open orders, 0 TWAPs, flat true, REST \
+         open_orders 1",
+        "READ before drop session two: subaccount: 0 open orders",
+        "SESSION primary (drop session two): it arms",
+    ];
+    for pair in lines.windows(2) {
+        assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
+    }
+    // X admitted, drop session two follows: no hand cancel and no stop.
+    assert!(!d.printed.contains("RESTING"), "{}", d.printed);
+    assert_eq!(d.ev.stop, None);
+    assert!(d.ev.drops.iter().all(|r| r.x_before_two == Some(true)));
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains("| before drop session two | primary (drop) | 1 | yes | 1 | 1 | 0 | no |"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "- X listed by the read before drop session two: yes: X open on the account as drop \
+             session two armed"
+        ),
+        "{report}"
+    );
+    assert_eq!(json["drop_tests"][0]["x_before_two"], true);
+}
+
+#[tokio::test]
+async fn any_other_open_order_before_session_two_stops_the_run() {
+    // Another trader's order rests beside X once drop session one closed: the read before drop
+    // session two refuses the first account, so the run stops there, X resting.
+    let model = QfexModel {
+        foreign_after_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "before-two-foreign").await;
+    assert_stopped(&d, places::Stop::ReadDisagrees);
+    assert_no_cancel_and_x_resting(&d);
+    let reads = reads_before_two(&d);
+    assert_eq!(reads.len(), 1, "{}", d.printed);
+    assert_eq!((reads[0].page_orders, reads[0].page_allowed), (2, 1));
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with(
+            "primary (drop) holds an open order, a TWAP or a position that is not flat: no \
+             session starts (decision 0132 item 7); ReadDisagrees in the read before drop \
+             session two:"
+        ),
+        "{stopped}"
+    );
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_the_read_before_drop_session_two_stops_the_run() {
+    // The fourth GET /user/positions or read-socket page after X: the comparison after X made
+    // one, the reads after drop session one two, so the read before drop session two's first.
+    for (limited, on) in [
+        (model::Limited::Rest(3), places::RefusedOn::Rest),
+        (model::Limited::ReadSocket(3), places::RefusedOn::ReadSocket),
+    ] {
+        let model = QfexModel {
+            rate_limit: Some(limited),
+            ..QfexModel::default()
+        };
+        let d = dropped(model, "before-two-rate").await;
+        assert_stopped(&d, places::Stop::RateRefused { on });
+        assert_no_cancel_and_x_resting(&d);
+        assert!(reads_before_two(&d).is_empty(), "{}", d.printed);
+        let stopped = d.ev.stopped.clone().unwrap();
+        assert!(
+            stopped.starts_with("primary (drop) could not be read:"),
+            "{stopped}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_read_before_drop_session_two_is_taken_after_it_and_stops_the_run() {
+    // The read before drop session two's first authentication goes unanswered (the fifth after
+    // X: the comparison's, the two reads after drop session one and X's own read), and the owner
+    // presses Ctrl-C while it waits: the read runs to its end, then the run stops, X resting.
+    let (dir, removed) = temp_dir("before-two-pressed");
+    let model = QfexModel {
+        silent_auth: Some(4),
+        ..QfexModel::default()
+    };
+    let venue = Venue::start(model).await;
+    let argv = set(drop_argv(&dir, &venue), "--read-wait-ms", "5000");
+    let (opts, places) = parsed(&argv).unwrap();
+    let waiting = |log: &[model::Event]| {
+        let after = log.iter().skip_while(|e| !e.what.ends_with(" add_order"));
+        after.filter(|e| e.what.ends_with(" auth")).count() >= 5
+    };
+    let asked = (opts, places);
+    let (ran, printed) = pressed_run(&venue, asked, &environment(), waiting, || {}).await;
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    assert_stopped(&d, places::Stop::Interrupted);
+    assert_no_cancel_and_x_resting(&d);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(
+        stopped.starts_with("primary (drop) could not be read:"),
+        "{stopped}"
+    );
+    assert!(
+        stopped.contains("Interrupted in the read before drop session two"),
+        "{stopped}"
+    );
+}
+
+// ----- FBC-77r8: drop session two, the abrupt drop and the verdict, run against the model -----
+
+/// [`dropped_with`] with the environment `env`, which names the accounts the run reads.
+async fn dropped_in(
+    model: QfexModel,
+    what: &str,
+    env: &HashMap<&'static str, String>,
+    argv: impl Fn(Argv) -> Argv,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let asked = argv(drop_argv(&dir, &venue));
+    let (ran, printed) = place_run(&venue, &asked, env).await;
+    let ev = stopped(ran, &printed);
+    assert!(!ev.drops.is_empty(), "{printed}");
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+/// A short wait for the reads after the drop: at most two reads, at once and a second later.
+fn short_agree(argv: Argv) -> Argv {
+    set(argv, "--agree-wait-ms", "2000")
+}
+
+impl Dropped {
+    /// The first named account's drop session two.
+    fn two(&self) -> &places::TwoRun {
+        self.drop_run().two.as_ref().expect("drop session two ran")
+    }
+
+    /// The first named account's verdict.
+    fn verdict(&self) -> &verdict::DropVerdict {
+        self.drop_run().verdict.as_ref().expect("a verdict")
+    }
+
+    /// How many `add_order`s each of the model's sessions sent, in order.
+    fn places_by_session(&self) -> Vec<usize> {
+        let what = self.what();
+        let sent = |conn: &String| {
+            let place = format!("trade {conn} add_order");
+            what.iter().filter(|w| **w == place).count()
+        };
+        self.session_conns().iter().map(sent).collect()
+    }
+
+    /// The trade connections, in order, of the model's sessions (each subscribed).
+    fn session_conns(&self) -> Vec<String> {
+        let what = self.what();
+        let mut conns: Vec<String> = Vec::new();
+        for w in what
+            .iter()
+            .filter(|w| w.starts_with("trade ") && w.ends_with(" subscribe"))
+        {
+            let conn = w.split(' ').nth(1).unwrap().to_owned();
+            if !conns.contains(&conn) {
+                conns.push(conn);
+            }
+        }
+        conns
+    }
+}
+
+#[tokio::test]
+async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
+    let d = dropped_in(
+        QfexModel::default(),
+        "drop-test-order",
+        &primary_only(),
+        |a| a,
+    )
+    .await;
+    let what = d.what();
+    let at = |w: &str| {
+        what.iter()
+            .position(|e| e == w)
+            .unwrap_or_else(|| panic!("{w}: {what:?}"))
+    };
+    let conns = d.session_conns();
+    assert_eq!(conns.len(), 2, "{what:?}");
+    let (one, two) = (&conns[0], &conns[1]);
+    let on = |conn: &str, kind: &str| at(&format!("trade {conn} {kind}"));
+    // Session one: its arm, X, its graceful close.
+    let first_arm = on(one, "cancel_on_disconnect");
+    assert!(first_arm < on(one, "add_order"));
+    let closed = at(&format!("cod {one} close keeps"));
+    // The read before drop session two, on a socket that never arms, then session two: its
+    // arm, Y, the read before the drop, the abrupt drop.
+    let before_two = (closed..what.len())
+        .find(|i| what[*i].ends_with(" get_user_orders") && !what[*i].contains(&format!(" {two} ")))
+        .unwrap();
+    assert!(before_two < on(two, "auth"), "{what:?}");
+    assert!(on(two, "cancel_on_disconnect") < on(two, "add_order"));
+    let dropped = at(&format!("cod {two} drop cancels"));
+    let before_drop = (on(two, "add_order")..dropped)
+        .find(|i| what[*i].ends_with(" get_user_orders") && !what[*i].contains(&format!(" {two} ")))
+        .unwrap();
+    assert!(on(two, "add_order") < before_drop, "{what:?}");
+    // The reads after the drop, then the trades since X's send and historic-orders, then the
+    // read of every named account.
+    let after_drop = (dropped..what.len())
+        .find(|i| what[*i].ends_with(" get_user_orders"))
+        .unwrap();
+    let trades = (after_drop..what.len())
+        .find(|i| what[*i].ends_with(" get_user_trades"))
+        .unwrap();
+    let historic = (trades..what.len())
+        .find(|i| what[*i].starts_with("GET /user/historic-orders"))
+        .unwrap();
+    let last = what.len() - 1;
+    assert!(
+        dropped < after_drop && after_drop < trades && historic < last,
+        "{what:?}"
+    );
+    // From the first arm to the last read: no cancel, two arms alone, and no reconnect: one
+    // connection attempt a session, and no session connection after the second.
+    let span = &what[first_arm..];
+    assert!(
+        span.iter().all(|w| !w.ends_with(" cancel_order")),
+        "{what:?}"
+    );
+    let arms = span
+        .iter()
+        .filter(|w| w.ends_with(" cancel_on_disconnect"))
+        .count();
+    assert_eq!(arms, 2, "{what:?}");
+    assert_eq!(d.count("subscribe"), 6);
+    let attempts: Vec<(u64, u64)> = (d.ev.sessions.iter())
+        .map(|s| (s.attempts, s.failed_attempts))
+        .collect();
+    assert_eq!(attempts, [(1, 0), (1, 0)]);
+    let ended: Vec<&str> = d.ev.sessions.iter().map(|s| s.ended_by).collect();
+    assert_eq!(ended, [stage::GRACEFUL, stage::DROPPED]);
+    // The abrupt drop sent no WebSocket close; every other socket was closed.
+    let n: usize = two.parse().unwrap();
+    assert!(!d.venue.trade.connections()[n].client_closed);
+    // The lines, in order.
+    let lines = [
+        "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close",
+        "READ before drop session two: primary (drop)",
+        "SESSION primary (drop session two): it arms, places Y",
+        "PLACE Y on primary",
+        "READ before the drop: primary: X listed true, Y listed true",
+        "SESSION primary (drop session two): arm outcome Accepted, ended by the abrupt drop",
+        "READ after the drop: primary:",
+        "VERDICT drop test on primary: passed",
+        "READ after drop session two: primary (drop)",
+        "STOPPED stage two",
+    ];
+    for pair in lines.windows(2) {
+        assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
+    }
+    assert!(d.verdict().passed, "{:?}", d.verdict());
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
+    let d = dropped_in(
+        QfexModel::default(),
+        "drop-one-registry",
+        &primary_only(),
+        |a| a,
+    )
+    .await;
+    // One drop registry for the account, built, tripped and seeded once, whose ledger is read at
+    // the end of each of its two sessions (decision 0148 item 3).
+    assert_eq!(d.ev.place_registries.len(), 1);
+    let ends = &d.ev.place_registries[0].registry_run().ends;
+    let sessions: Vec<&str> = ends.iter().map(|e| e.session).collect();
+    assert_eq!(sessions, [places::DROP_ONE, places::DROP_TWO]);
+    assert_eq!(d.printed.matches("REGISTRY drop on primary").count(), 1);
+    assert_eq!(d.printed.matches("seeded flat").count(), 1);
+    // Started once, by drop session one: drop session two's market stays armed.
+    assert_eq!(d.printed.matches("START primary").count(), 1);
+    assert!(d.at("REGISTRY drop on primary") < d.at("SESSION primary (drop session one)"));
+    let names: Vec<(&str, &str)> = (d.ev.sessions.iter())
+        .map(|s| (s.account, s.label()))
+        .collect();
+    assert_eq!(
+        names,
+        [("primary", places::DROP_ONE), ("primary", places::DROP_TWO)]
+    );
+    // Y went out through the same Link and registry: the market Started in session one placed
+    // it, and drop session two's resync seeded nothing.
+    let two = d.two();
+    assert!(two.y.submitted && two.y.acked && two.resynced, "{two:?}");
+}
+
+#[tokio::test]
+async fn the_drop_cancels_x_and_y_and_the_test_passes() {
+    let d = dropped(QfexModel::default(), "drop-passes").await;
+    // On each named account: X listed before the drop, then X and Y absent after it, named by
+    // no trade and ended on historic orders: the test passes, the drop's reach over X shown.
+    assert_eq!(d.ev.drops.len(), 2);
+    for run in &d.ev.drops {
+        let verdict = run.verdict.as_ref().unwrap();
+        assert!(verdict.passed, "{verdict:?}");
+        assert_eq!(verdict.reach, verdict::Reach::Cancelled);
+        assert_eq!(verdict.arm, verdict::ArmCancel::Survived);
+        let cancelled = Some("CANCELLED".to_owned());
+        assert_eq!(verdict.terminal, [cancelled.clone(), cancelled]);
+        let two = run.two.as_ref().unwrap();
+        assert_eq!(two.before_drop, Some([true, true]));
+        assert_eq!(two.ended_by, Some(stage::DROPPED));
+        let after = two.after_drop.as_ref().unwrap();
+        assert!(after.absent_after.is_some() && after.refused.is_none());
+        assert!(!two.resting && two.read);
+        assert_eq!((run.stop, run.others_clean), (None, Some(true)));
+    }
+    let model = d.venue.model.lock().unwrap();
+    assert!(
+        model
+            .orders
+            .iter()
+            .all(|o| o.state == model::State::Cancelled)
+    );
+    drop(model);
+    assert_eq!((d.ev.stop, d.marker()), (None, None));
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.count("cancel_order"), 0);
+    let (report, json) = d.outputs();
+    for (account, followed) in [
+        ("primary", places::NEXT_ACCOUNT),
+        ("subaccount", places::LAST_ACCOUNT),
+    ] {
+        let section = report
+            .split(&format!("## The drop test on {account}"))
+            .nth(1)
+            .unwrap();
+        for line in [
+            "- The drop test: passed: X and Y absent after the drop, named by no trades row, and \
+             listed by GET /user/historic-orders",
+            "- The drop's reach over X, an order of an earlier connection: shown: the drop \
+             cancelled X",
+            &format!("- What followed: {followed}"),
+            "- Ended by: the abrupt drop",
+        ] {
+            assert!(section.contains(line), "{line}: {section}");
+        }
+    }
+    let tests = json["drop_tests"].as_array().unwrap();
+    assert!(tests.iter().all(|t| t["verdict"]["passed"] == true));
+    assert!(
+        tests
+            .iter()
+            .all(|t| t["session_two"]["ended_by"] == stage::DROPPED)
+    );
+}
+
+#[tokio::test]
+async fn a_graceful_close_that_cancelled_x_is_recorded_and_y_still_judged() {
+    let model = QfexModel {
+        cod_on_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "drop-close-then-y", &primary_only(), |a| a).await;
+    let run = d.drop_run();
+    // The graceful close cancelled X: recorded, and drop session two still runs, for Y.
+    assert_eq!(run.close_cancelled_x, Some(true));
+    assert_eq!(run.x_before_two, Some(false));
+    let two = d.two();
+    assert!(two.y.acked, "{two:?}");
+    assert_eq!(two.before_drop, Some([false, true]));
+    // Y is judged: absent after the drop, ended on historic orders; whether enabling cancels
+    // and the drop's reach over X are not measured, never failed.
+    let verdict = d.verdict();
+    assert!(verdict.passed, "{verdict:?}");
+    assert_eq!(verdict.arm, verdict::ArmCancel::NotMeasured);
+    assert_eq!(verdict.reach, verdict::Reach::NotMeasured);
+    assert_eq!(verdict.terminal[1].as_deref(), Some("CANCELLED"));
+    assert_eq!(d.ev.stop, None);
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(
+            "- Whether a graceful close cancels: yes: X rested before it, no cancel of ours was \
+             sent, and the read after it no longer listed X"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "- X listed by the read before drop session two: no: X no longer open on the account"
+        ),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn the_arm_cancelling_x_reported_is_recorded() {
+    let model = QfexModel {
+        arm_cancels_open: model::ArmCancels::Reported,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "drop-arm-reported", &primary_only(), |a| a).await;
+    let two = d.two();
+    // Drop session two's arm cancelled X and QFEX reported it, in the arm's window, before Y.
+    assert!(two.x_cancel_reported, "{two:?}");
+    assert!(
+        two.echoes
+            .iter()
+            .any(|e| e == "order_response CANCELLED: exact"),
+        "{:?}",
+        two.echoes
+    );
+    let verdict = d.verdict();
+    assert_eq!(verdict.arm, verdict::ArmCancel::Reported);
+    assert!(verdict.passed, "{verdict:?}");
+    assert_eq!(d.ev.stop, None);
+    let two_conn = &d.session_conns()[1];
+    let reported = format!("arm {two_conn} cancels 1 reported");
+    assert!(logged(&d.venue.log(), &reported), "{:?}", d.what());
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "- Whether enabling cancel-on-disconnect cancels open orders, and whether QFEX \
+             reports it: yes, reported: a CANCELLED of X came in the arm's window"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("- A CANCELLED of X reported in the arm's window: yes"),
+        "{report}"
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["x_cancel_reported"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn an_arm_that_cancels_x_silently_is_recorded_and_stops_after_the_drop() {
+    let model = QfexModel {
+        arm_cancels_open: model::ArmCancels::Silent,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-arm-silent").await;
+    assert_stopped(&d, places::Stop::ArmCancelUnreported);
+    // The read before the drop no longer listed X, and no CANCELLED of it came: recorded, and
+    // the run stops after the drop, which still ran.
+    let two = d.two();
+    assert!(!two.x_cancel_reported);
+    assert_eq!(two.before_drop, Some([false, true]));
+    assert_eq!(two.ended_by, Some(stage::DROPPED));
+    let verdict = d.verdict();
+    assert_eq!(verdict.arm, verdict::ArmCancel::Unreported);
+    assert_eq!(verdict.reach, verdict::Reach::NotMeasured);
+    assert!(verdict.passed, "{verdict:?}");
+    let dropped = d.what().iter().position(|w| w.contains(" drop cancels"));
+    assert!(dropped.is_some(), "{:?}", d.what());
+    assert!(d.at("VERDICT drop test on primary") < d.at("STOPPED ArmCancelUnreported"));
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("ArmCancelUnreported after the drop"),
+        "{:?}",
+        d.ev.stopped
+    );
+    // No later account's drop test runs: the subaccount places nothing.
+    assert_eq!(d.ev.drops.len(), 1);
+    assert_eq!(d.count("add_order"), 2);
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(
+            "yes, not reported: the read before the drop no longer listed X and no CANCELLED of \
+             it came (decision 0132 item 4), a stop after the drop"
+        ),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn x_absent_before_the_drop_leaves_the_reach_over_x_not_measured() {
+    // The arm cancelled X with no report of it: the read before the drop lists Y alone, and no
+    // CANCELLED of X came, so X's absence alone leaves the drop's reach over X, an earlier
+    // connection's order, not measured, and the test is not failed for it (the run stops after
+    // the drop on the unreported cancel).
+    let model = QfexModel {
+        arm_cancels_open: model::ArmCancels::Silent,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "drop-x-absent", &primary_only(), |a| a).await;
+    assert_eq!(d.two().before_drop, Some([false, true]));
+    assert!(!d.two().x_cancel_reported && !d.two().x_cancelled_before_drop);
+    let verdict = d.verdict();
+    assert_eq!(verdict.reach, verdict::Reach::NotMeasured);
+    assert!(verdict.passed && verdict.failures.is_empty(), "{verdict:?}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "- The drop's reach over X, an order of an earlier connection: not measured: the \
+             read before the drop did not list X"
+        ),
+        "{report}"
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["before_drop"],
+        super::json(r#"{"x_listed":false,"y_listed":true}"#)
+    );
+}
+
+#[tokio::test]
+async fn y_still_open_after_the_wait_fails_the_drop_test() {
+    // The drop cancels X alone: Y, its own connection's order, is still listed when the wait
+    // ends, so the test fails, a stop with Y resting for the owner's hand cancel.
+    let model = QfexModel {
+        cod_reach: model::Reach::Earlier,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-y-open", short_agree).await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let verdict = d.verdict();
+    assert!(!verdict.passed);
+    // Y still listed, and so not ended on historic orders either (0151 item 13).
+    let y = verdict::Which::Y;
+    let failures = [
+        verdict::Failure::Listed(y),
+        verdict::Failure::NotTerminal(y),
+    ];
+    assert_eq!(verdict.failures, failures);
+    let after = d.two().after_drop.as_ref().unwrap();
+    assert!(
+        after.reads.len() >= 2 && after.absent_after.is_none(),
+        "{after:?}"
+    );
+    assert!(d.two().resting);
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS))
+    );
+    assert_eq!(d.count("cancel_order"), 0);
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "- The drop test: failed: Y still listed by get_user_orders when the wait ended"
+        ),
+        "{report}"
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["hand_cancel"],
+        places::HAND_CANCEL_ORDERS
+    );
+}
+
+#[tokio::test]
+async fn a_trade_row_naming_y_fails_the_drop_test() {
+    // Y filled as the connection dropped: absent after it, but a get_user_trades row names it.
+    let model = QfexModel {
+        fill_on_drop: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-y-traded").await;
+    let verdict = d.verdict();
+    assert!(!verdict.passed);
+    assert!(
+        verdict
+            .failures
+            .contains(&verdict::Failure::Traded(verdict::Which::Y)),
+        "{verdict:?}"
+    );
+    let traded = d.two().after.as_ref().unwrap();
+    assert_eq!(traded.naming, [0, 1]);
+    assert!(traded.trades_whole && traded.historic_whole);
+    assert_eq!(traded.terminal[1].as_deref(), Some("FILLED"));
+    let (report, _) = d.outputs();
+    assert!(report.contains("a get_user_trades row names Y"), "{report}");
+    // The fields the row carried: names alone, never a value.
+    assert!(
+        report.contains("- The members a get_user_trades row carries: client_order_id, fee,"),
+        "{report}"
+    );
+    assert!(traded.fields.iter().any(|f| f == "trade_id"), "{traded:?}");
+}
+
+#[tokio::test]
+async fn a_trade_row_naming_another_order_or_none_after_the_drop_fails_it_unmeasured() {
+    // Carried from FBC-23ch's fourth review fix: as the connection drops, two trades of an order
+    // the model never had, one each way, so the account stays flat; their rows name another
+    // order, or none, which a row of X's own fill could be. Decision 0132 item 4 rules out
+    // anything else trading on the account, so X's absence is not shown the drop's cancel, its
+    // reason given, and the drop test fails on the rows.
+    for (stray, what) in [
+        (model::StrayTrade::Other, "drop-two-other-trade"),
+        (model::StrayTrade::Unnamed, "drop-two-unnamed-trade"),
+    ] {
+        let model = QfexModel {
+            trade_on_drop: Some(stray),
+            ..QfexModel::default()
+        };
+        let d = dropped_in(model, what, &primary_only(), |a| a).await;
+        let stop = Some(places::Stop::DropFailed.name());
+        assert_eq!(d.ev.stop, stop, "{}", d.printed);
+        let traded = d.two().after.as_ref().unwrap();
+        assert_eq!((traded.trades, traded.naming.clone()), (2, vec![0, 0]));
+        assert!(traded.trades_whole && traded.historic_whole, "{traded:?}");
+        let verdict = d.verdict();
+        assert_eq!(
+            verdict.failures,
+            [verdict::Failure::OtherTrade],
+            "{verdict:?}"
+        );
+        let why = verdict::Unmeasured::OtherTrade;
+        assert_eq!(verdict.reach, verdict::Reach::Unmeasured(why));
+        assert_eq!(verdict.arm, verdict::ArmCancel::Survived);
+        let after = (d.ev.reads.iter())
+            .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
+            .unwrap();
+        assert!(after.flat, "{after:?}");
+        let (report, json) = d.outputs();
+        let reach = format!(
+            "- The drop's reach over X, an order of an earlier connection: not measured: the \
+             reads after the drop no longer listed X, but {}",
+            why.says()
+        );
+        assert!(report.contains(&reach), "{report}");
+        assert!(
+            report.contains(
+                "- The drop test: failed: a get_user_trades row since X's send names another \
+                 order or none: something else traded on the account (decision 0132 item 4)"
+            ),
+            "{report}"
+        );
+        assert_eq!(
+            json["drop_tests"][0]["verdict"]["reach_over_x"],
+            verdict.reach.says()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_arm_time_absence_with_another_trade_after_it_is_no_unreported_cancel() {
+    // Carried from FBC-23ch's fourth review fix: the arm cancels X silently, so the read before
+    // the drop no longer lists X, and a trade naming another order comes as the connection
+    // drops. X's absence is not shown a cancel (decision 0132 item 4), so what the arm did is
+    // not measured, its reason given, and the run stops on the failed test, not on an
+    // unreported arm-time cancel.
+    let model = QfexModel {
+        arm_cancels_open: model::ArmCancels::Silent,
+        trade_on_drop: Some(model::StrayTrade::Other),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "drop-arm-silent-other-trade", &primary_only(), |a| a).await;
+    assert_eq!(d.two().before_drop, Some([false, true]));
+    let verdict = d.verdict();
+    let why = verdict::Unmeasured::OtherTrade;
+    assert_eq!(
+        verdict.arm,
+        verdict::ArmCancel::Unmeasured(why),
+        "{verdict:?}"
+    );
+    assert_eq!(verdict.reach, verdict::Reach::NotMeasured);
+    assert_eq!(verdict.failures, [verdict::Failure::OtherTrade]);
+    let stop = Some(places::Stop::DropFailed.name());
+    assert_eq!(d.ev.stop, stop, "{}", d.printed);
+    let (report, json) = d.outputs();
+    let arm = format!(
+        "- Whether enabling cancel-on-disconnect cancels open orders, and whether QFEX reports \
+         it: not measured: the read before the drop no longer listed X and no CANCELLED of it \
+         came, but {}",
+        why.says()
+    );
+    assert!(report.contains(&arm), "{report}");
+    assert_eq!(
+        json["drop_tests"][0]["verdict"]["arm_cancels_open_orders"],
+        verdict.arm.says()
+    );
+}
+
+#[tokio::test]
+async fn a_graceful_close_not_measured_is_said_so_in_the_drop_tests_summary() {
+    // Carried from FBC-23ch's fourth review fix: QFEX cancels X itself after its ACK, so X no
+    // longer rests as drop session one's graceful close is sent. Whether a graceful close
+    // cancels is not measured, its reason given, in the drop test's summary as in drop session
+    // one's section; drop session two still runs for Y, and what the arm did is not measured.
+    let model = QfexModel {
+        venue_cancel: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(
+        model,
+        "drop-close-unmeasured-summary",
+        &primary_only(),
+        |a| a,
+    )
+    .await;
+    let run = d.drop_run();
+    let why = places::CloseUnmeasured::NotRested;
+    assert_eq!(
+        (run.close_cancelled_x, run.close_not_measured),
+        (None, Some(why))
+    );
+    assert_eq!(run.x_before_two, Some(false));
+    assert!(d.two().y.acked, "{:?}", d.two());
+    let verdict = d.verdict();
+    assert_eq!(verdict.arm, verdict::ArmCancel::NotMeasured);
+    let (report, _) = d.outputs();
+    let summary = format!(
+        "- Whether a graceful close cancels: not measured: {}",
+        why.says()
+    );
+    assert!(report.contains(&summary), "{report}");
+    let section = format!(
+        "- Whether the graceful close cancelled X: not measured: {}",
+        why.says()
+    );
+    assert!(report.contains(&section), "{report}");
+}
+
+#[tokio::test]
+async fn historic_orders_not_terminal_fails_the_drop_test() {
+    // GET /user/historic-orders leaves Y out: X and Y absent and untraded, but Y not shown
+    // ended, so the test fails (0151 item 13).
+    let model = QfexModel {
+        historic_omits_last: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-historic").await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let verdict = d.verdict();
+    assert_eq!(
+        verdict.failures,
+        [verdict::Failure::NotTerminal(verdict::Which::Y)]
+    );
+    assert_eq!(verdict.terminal, [Some("CANCELLED".to_owned()), None]);
+    let (report, _) = d.outputs();
+    assert!(
+        report
+            .contains("- terminal_status on GET /user/historic-orders: X CANCELLED; Y not listed"),
+        "{report}"
+    );
+    assert!(
+        report.contains("no GET /user/historic-orders row names Y"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_fill_of_x_in_drop_session_two_stops_with_cancels_not_flat() {
+    // Drop session two's arm comes with a maker fill of X: a fill of ours while the session is
+    // open, so it cancels by venue id (nothing of ours is left open; Y is never placed), closes
+    // gracefully, and the reads after it show a position: the run stops not flat (FBC-ou9g adds
+    // the flatten, 0151 item 9).
+    let model = QfexModel {
+        fill_at_arm: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-fill-x").await;
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    let two = d.two();
+    let cancels = two.cancels.as_ref().expect("a fill of ours cancels");
+    assert!(cancels.ended && !cancels.held, "{cancels:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(!two.y.submitted);
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!(d.count("add_order"), 1);
+    // X filled whole and Y never placed: nothing of ours was left open to cancel.
+    assert_eq!((d.count("cancel_order"), cancels.sent), (0, 0));
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
+        .unwrap();
+    assert!(!after.flat);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("UnexpectedFill in drop session two"),
+        "{:?}",
+        d.ev.stopped
+    );
+    let steps: Vec<&str> = two.compared.iter().map(|c| c.step).collect();
+    assert_eq!(steps, ["the stop's cancels"]);
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(
+            "- The drop test: not judged: the drop test ended before its drop (decision 0132 \
+             item 4), so it did not pass"
+        ),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_fill_of_y_seen_after_the_drop_stops_not_flat() {
+    // Y filled as the connection dropped, which no session was open to hear: the trades row
+    // after the drop shows it, and the run stops not flat, the position the owner's.
+    let model = QfexModel {
+        fill_on_drop: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-y-filled").await;
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    assert_eq!(d.two().ended_by, Some(stage::DROPPED));
+    assert_eq!(d.two().cancels, None);
+    assert_eq!(d.count("cancel_order"), 0);
+    let verdict = d.verdict();
+    assert!(
+        verdict.failures.contains(&verdict::Failure::NotFlat),
+        "{verdict:?}"
+    );
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
+        .unwrap();
+    assert!(!after.flat);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("UnexpectedFill after the drop"),
+        "{:?}",
+        d.ev.stopped
+    );
+    let (report, _) = d.outputs();
+    assert!(report.contains(places::OWNERS_POSITION), "{report}");
+}
+
+#[tokio::test]
+async fn ctrl_c_between_the_drop_sessions_reports_x_resting_and_stops() {
+    // The owner presses Ctrl-C once drop session one closed: the reads after it run to their
+    // end, every named account read, then the run stops, X resting for the owner's hand cancel,
+    // the marker written, and drop session two never opens.
+    let at = "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close";
+    let d = pressed_at(QfexModel::default(), "drop-between", at).await;
+    assert_stopped(&d, places::Stop::Interrupted);
+    assert_no_cancel_and_x_resting(&d);
+    assert!(d.drop_run().two.is_none());
+    assert_eq!(d.count("subscribe"), 3);
+    assert_eq!(d.count("cancel_on_disconnect"), 1);
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders.len(), 1);
+    assert_eq!(model.orders[0].state, model::State::Open);
+    drop(model);
+    // Pressed as the session's end is printed, before the reads after it: they take it.
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("Interrupted during the reads after drop session one"),
+        "{:?}",
+        d.ev.stopped
+    );
+    assert!(reads_before_two(&d).is_empty(), "{}", d.printed);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_span_bound_in_drop_session_two_cancels_nothing_and_fails_it() {
+    let frozen = freeze();
+    // Y is never answered; while drop session two waits for it, the registry's span bound (600
+    // s here) passes: no cancel, a graceful close, no drop and no verdict, and the stop.
+    let model = QfexModel {
+        ack_delay: Some(Duration::from_secs(86_400)),
+        ack_delay_on: 1,
+        ..QfexModel::default()
+    };
+    let (dir, removed) = temp_dir("drop-two-span");
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let drive = async {
+        let placed = |log: &[model::Event]| {
+            log.iter()
+                .filter(|e| e.what.ends_with(" add_order"))
+                .count()
+                == 2
+        };
+        until("Y's place", || placed(&venue.log())).await;
+        tokio::time::advance(Duration::from_secs(601)).await;
+    };
+    let ran = stage::run_places(&opts, &places, &lookup, out);
+    let (ran, ()) = tokio::join!(ran, drive);
+    drop(frozen);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    assert_stopped(&d, places::Stop::SpanBound);
+    assert_eq!(d.count("cancel_order"), 0);
+    let two = d.two();
+    assert_eq!(
+        (two.cancels.as_ref(), two.ended_by),
+        (None, Some(stage::GRACEFUL))
+    );
+    assert!(two.after_drop.is_none() && d.drop_run().verdict.is_none());
+    assert!(two.resting, "{two:?}");
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("SpanBound in drop session two"),
+        "{:?}",
+        d.ev.stopped
+    );
+    let closes: Vec<String> = d
+        .what()
+        .into_iter()
+        .filter(|w| w.starts_with("cod "))
+        .collect();
+    assert!(closes.iter().all(|w| w.contains(" close ")), "{closes:?}");
+}
+
+#[tokio::test]
+async fn a_failed_drop_test_places_nothing_more_on_that_account() {
+    // The drop cancels nothing: X and Y are still listed when the wait ends, so the primary
+    // account's drop test fails, a stop, and nothing more is placed, on it or on the subaccount.
+    let model = QfexModel {
+        cod_on_drop: false,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-failed", short_agree).await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let verdict = d.verdict();
+    let listed = [verdict::Which::X, verdict::Which::Y].map(verdict::Failure::Listed);
+    assert_eq!(verdict.failures[..2], listed);
+    assert_eq!(verdict.reach, verdict::Reach::NotShown);
+    // X and Y, then nothing: no session on the subaccount, and nothing after the drop.
+    assert_eq!(d.count("add_order"), 2);
+    assert_eq!(d.count("subscribe"), 6);
+    assert_eq!(d.ev.drops.len(), 1);
+    let dropped = d
+        .what()
+        .iter()
+        .position(|w| w.contains(" drop keeps"))
+        .unwrap();
+    assert!(
+        d.what()[dropped..]
+            .iter()
+            .all(|w| !w.ends_with(" add_order"))
+    );
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS))
+    );
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(
+            "- What followed: the run's stop, DropFailed: nothing more is placed on this \
+             account, and no later named account's drop test runs (decision 0132 item 7)"
+        ),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_passed_verdict_is_not_carried_into_a_second_run() {
+    // A run whose drop test passes, then a second on the same lease directory: it runs its own
+    // drop test from the start, and its own verdict, failed here, is the one it acts on.
+    let (dir, _removed) = temp_dir("drop-not-carried");
+    let leases = leases_of(&dir);
+    let venue = Venue::start(QfexModel::default()).await;
+    let first = dir.join("first");
+    let argv = set(
+        drop_argv(&first, &venue),
+        "--lease-dir",
+        leases.to_str().unwrap(),
+    );
+    let (ran, printed) = place_run(&venue, &argv, &primary_only()).await;
+    let ev = stopped(ran, &printed);
+    assert!(ev.drops[0].verdict.as_ref().unwrap().passed);
+    assert_eq!(ev.stop, None);
+    // Nothing of it is kept where a later run looks: the lease directory holds no marker and no
+    // verdict.
+    assert!(!leases.join(places::MARKER).exists());
+    for entry in fs::read_dir(&leases).unwrap() {
+        let path = entry.unwrap().path();
+        let text = fs::read(&path).unwrap_or_default();
+        let text = String::from_utf8_lossy(&text);
+        assert!(
+            !text.contains("passed") && !text.contains("verdict"),
+            "{}",
+            path.display()
+        );
+    }
+    let venue = Venue::start(QfexModel {
+        cod_on_drop: false,
+        ..QfexModel::default()
+    })
+    .await;
+    let second = dir.join("second");
+    let argv = set(
+        drop_argv(&second, &venue),
+        "--lease-dir",
+        leases.to_str().unwrap(),
+    );
+    let argv = short_agree(set(argv, "--namespace", "8"));
+    let (ran, printed) = place_run(&venue, &argv, &primary_only()).await;
+    let ev = stopped(ran, &printed);
+    // Its own drop test, from the start: clean reads, its own registry seeded, X and Y.
+    assert!(
+        printed.contains("READ before drop session one: primary (drop)"),
+        "{printed}"
+    );
+    assert!(printed.contains("REGISTRY drop on primary"), "{printed}");
+    assert_eq!(
+        venue
+            .log()
+            .iter()
+            .filter(|e| e.what.ends_with(" add_order"))
+            .count(),
+        2
+    );
+    assert!(!ev.drops[0].verdict.as_ref().unwrap().passed);
+    assert_eq!(ev.stop, Some("DropFailed"));
+}
+
+#[tokio::test]
+async fn the_report_gives_each_accounts_drop_items_and_the_slice_passes_the_privacy_check() {
+    let d = dropped(QfexModel::default(), "drop-report").await;
+    let (report, json) = d.outputs();
+    for account in ["primary", "subaccount"] {
+        let section = report
+            .split(&format!("## The drop test on {account} "))
+            .nth(1)
+            .unwrap();
+        let section = section.split("\n## ").next().unwrap();
+        for item in [
+            "- What answers the arm: drop session one Accepted; drop session two Accepted",
+            "- Whether enabling cancel-on-disconnect cancels open orders, and whether QFEX \
+             reports it: no: X survived drop session two's arm",
+            "- The drop test: passed",
+            "- Whether a graceful close cancels: no: X rested before it and still did after it",
+            "- Whether the other named accounts stayed clean: yes: every read of every other \
+             named account was clean",
+            "- terminal_status on GET /user/historic-orders: X CANCELLED; Y CANCELLED",
+            "- The members a get_user_trades row carries: not shown: no row was read",
+            "### Drop session one (FBC-23ch)",
+            "### Drop session two (FBC-77r8)",
+            "- Y: handed to the session yes; shown resting by an order event yes; an ACK echoing \
+             its client id byte for byte yes",
+            "- The read before the drop: X listed yes; Y listed yes",
+            " reads; the first listing neither X nor Y ended ",
+            "- X's and Y's trades after the drop: 0 trade rows since X's send, 0 naming X, 0 \
+             naming Y",
+        ] {
+            assert!(section.contains(item), "{account}: {item}: {section}");
+        }
+    }
+    let tests = json["drop_tests"].as_array().unwrap();
+    let accounts: Vec<&str> = tests
+        .iter()
+        .map(|t| t["account"].as_str().unwrap())
+        .collect();
+    assert_eq!(accounts, ["primary", "subaccount"]);
+    for t in tests {
+        assert_eq!(
+            t["verdict"]["arm_cancels_open_orders"],
+            "no: X survived drop session two's arm"
+        );
+        assert_eq!(t["others_clean"], true);
+        assert_eq!(
+            t["verdict"]["terminal_status"],
+            super::json(r#"["CANCELLED","CANCELLED"]"#)
+        );
+    }
+    // Every session's capture is whole, drop session two's, which journals no Closed control,
+    // included; its frames are in the drop-production/ slice, which passes the privacy check.
+    assert_eq!(d.ev.sessions.len(), 4);
+    assert!(
+        d.ev.sessions
+            .iter()
+            .all(|s| s.partial.is_empty() && s.arm_sent)
+    );
+    let evidence = d.dir.join("evidence");
+    let slice = evidence.join(stage::DROP_SLICE);
+    for account in ["primary", "subaccount"] {
+        let prefix = format!("{account}-drop-session-two-");
+        assert!(
+            d.ev.fixtures.iter().any(|f| f.starts_with(&prefix)),
+            "{:?}",
+            d.ev.fixtures
+        );
+    }
+    let readme = fs::read_to_string(slice.join("README.md")).unwrap();
+    assert!(
+        readme.contains("drop session two by an abrupt drop"),
+        "{readme}"
+    );
+    assert_report_and_evidence_pass_the_privacy_check(&evidence);
+    assert_no_secret(&evidence);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &slice).unwrap();
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_the_reads_after_the_drop_fails_the_test_and_stops_the_run() {
+    // The first read after the drop has its GET /user/positions answered HTTP 429: a provider
+    // rate refusal, which ends the reads at once, fails the test and stops the run (decision
+    // 0148 item 8), with nothing cancelled.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::RestAfterDrop),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-after-refused").await;
+    let on = places::RefusedOn::Rest;
+    assert_stopped(&d, places::Stop::RateRefused { on });
+    let verdict = d.verdict();
+    assert_eq!(verdict.refused, Some(on));
+    assert!(
+        verdict.failures.contains(&verdict::Failure::RateRefused),
+        "{verdict:?}"
+    );
+    let after = d.two().after_drop.as_ref().unwrap();
+    assert_eq!(after.refused, Some(on));
+    // The refused read is the last: none follows it.
+    let last = after.reads.last().map(|(_, shown)| *shown);
+    assert_eq!(last, Some(verdict::Shown::Refused), "{after:?}");
+    assert_eq!(d.count("cancel_order"), 0);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("RateRefused(Rest) after the drop"),
+        "{:?}",
+        d.ev.stopped
+    );
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains("cut short by a provider rate refusal (decision 0148 item 8)"),
+        "{report}"
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["after_drop"]["refused"],
+        "RateRefused(Rest)"
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_after_the_drop_is_taken_once_the_reads_end_and_stops_the_run() {
+    // The owner presses Ctrl-C as the drop is seen: the reads after it, the trades, historic
+    // orders and every named account's read run to their end, the verdict is judged, and then
+    // the run stops, no session being open, so nothing is cancelled (0151 item 2).
+    let d = pressed_drop(
+        QfexModel::default(),
+        "drop-after-ctrl-c",
+        |a| a,
+        &[" drop cancels"],
+    )
+    .await;
+    assert_stopped(&d, places::Stop::Interrupted);
+    assert!(d.verdict().passed, "{:?}", d.verdict());
+    assert_eq!(d.count("cancel_order"), 0);
+    let read = |label: &str| {
+        (d.ev.reads.iter()).any(|r| r.before == refusals::AFTER_DROP_TWO && r.label == label)
+    };
+    assert!(read("primary (drop)") && read("subaccount"));
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("Interrupted during the reads after drop session two"),
+        "{:?}",
+        d.ev.stopped
+    );
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+/// A place-stage run against `model`, under a directory of its own, in which the owner presses
+/// Ctrl-C as the probe prints `at`: at a known point of the run, whatever the machine's load.
+async fn pressed_at(model: QfexModel, what: &str, at: &'static str) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let (press, presses) = interrupt::Presses::channel();
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at,
+        press: Some(Box::new(press)),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    assert!(!ev.drops.is_empty(), "{printed}");
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+/// A place-stage run against `model`, under a directory of its own, in which `act` is done to the
+/// model as the probe prints `at`: ordered by what the probe did, whatever the machine's load.
+async fn acted_at(
+    model: QfexModel,
+    what: &str,
+    at: &'static str,
+    act: fn(&mut QfexModel),
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let model = std::sync::Arc::clone(&venue.model);
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at,
+        press: Some(Box::new(move || act(&mut model.lock().unwrap()))),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let presses = interrupt::Presses::none();
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    assert!(!ev.drops.is_empty(), "{printed}");
+    assert!(printed.contains(at), "{printed}");
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+/// Whether the run's journal holds an outbound `cancel_order` naming the venue id `id`.
+fn cancel_names(d: &Dropped, id: &str) -> bool {
+    let journal = d.dir.join("evidence").join("journal");
+    let reader = fbc_journal::JournalReader::open(&journal, 0).unwrap();
+    reader.entries().any(|e| match e.unwrap().record {
+        fbc_journal::Record::Outbound { frame, .. } => {
+            let text = String::from_utf8_lossy(frame.bytes()).into_owned();
+            text.contains("cancel_order") && text.contains(id)
+        }
+        _ => false,
+    })
+}
+
+#[tokio::test]
+async fn an_arm_refused_in_drop_session_two_ends_it_marked_with_x_left_resting() {
+    // Drop session two's arm is refused: the session's connection ends with it, a stop, Y not
+    // placed and nothing cancelled. X still rests, reported for the hand cancel, and the stop's
+    // marker is written, so the next run's --reconciled hand-cancel is honoured (0151 item 6).
+    let model = QfexModel {
+        arm_err_on: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-arm-refused").await;
+    assert_stopped(&d, places::Stop::ConnectionEnded);
+    let two = d.two();
+    assert_eq!(two.arm.as_deref(), Some("Rejected"));
+    assert!(!two.y.submitted && two.resting, "{two:?}");
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Open);
+    drop(model);
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS))
+    );
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failure_in_drop_session_two_that_is_no_stop_marks_x_left_resting() {
+    // The touch is crossed by the time Y is priced: a failure that is no stop, Y not placed, a
+    // graceful close with no cancel. X still rests, so the reads after the session add their
+    // stop, LeftResting, marked for the hand cancel the report asks for (0151 item 6).
+    let model = QfexModel {
+        crossed_on_place: Some(0),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-failed").await;
+    assert_stopped(&d, places::Stop::LeftResting);
+    let two = d.two();
+    let error = two.error.clone().unwrap();
+    assert_eq!(error, market::CROSSED);
+    assert_eq!(two.arm.as_deref(), Some("Accepted"));
+    assert!(!two.y.submitted && two.resting, "{two:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Open);
+    drop(model);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(stopped.starts_with(&error), "{stopped}");
+    assert!(
+        stopped.contains("; LeftResting after drop session two"),
+        "{stopped}"
+    );
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS))
+    );
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+#[tokio::test]
+async fn a_trade_naming_x_after_a_failed_drop_session_two_stops_not_flat() {
+    // As a_failure_in_drop_session_two_that_is_no_stop_marks_x_left_resting, but X fills as
+    // its trades are read after the account reads that showed every account flat: X's trades
+    // are read after a failure that is no stop, as after drop session one, so the run stops not
+    // flat, marked, the position the owner's (0151 item 9), and not LeftResting.
+    let model = QfexModel {
+        crossed_on_place: Some(0),
+        fill_on_trades_page: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-failed-fill").await;
+    assert_stopped(&d, places::Stop::NotFlat);
+    let two = d.two();
+    let error = two.error.clone().unwrap();
+    assert_eq!(error, market::CROSSED);
+    assert!(!two.y.submitted && two.resting, "{two:?}");
+    assert!(two.after_drop.is_none(), "{two:?}");
+    let after = two.after.as_ref().expect("X's trades were read");
+    assert_eq!(after.naming, vec![1], "{after:?}");
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(stopped.starts_with(&error), "{stopped}");
+    assert!(
+        stopped.contains("; NotFlat after drop session two"),
+        "{stopped}"
+    );
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "- X's and Y's trades after the session: 1 trade rows since X's send, 1 naming X, 0 \
+             naming Y"
+        ),
+        "{report}"
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["after"]["naming"],
+        super::json("[1]")
+    );
+}
+
+#[tokio::test]
+async fn after_drop_session_two_a_full_page_still_counts_its_account_read() {
+    // With no X to find after drop session two, the account counts as read when its read
+    // ended, a full page included: on pages of one, Y still rests after the drop, so the
+    // account's last page is full, and the evidence says it was read, Y resting.
+    let model = QfexModel {
+        cod_reach: model::Reach::Earlier,
+        ..QfexModel::default()
+    };
+    let paged = |argv| set(short_agree(argv), "--page-size", "1");
+    let d = dropped_with(model, "drop-two-full-page", paged).await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let two = d.two();
+    assert!(two.resting && two.read, "{two:?}");
+    let (report, json) = d.outputs();
+    let session_two = &json["drop_tests"][0]["session_two"];
+    assert_eq!(session_two["read_after"], true);
+    assert_eq!(session_two["resting"], true);
+    assert!(
+        report.contains(&format!(
+            "- An order resting on the account when the run ended: {}",
+            places::HAND_CANCEL_ORDERS
+        )),
+        "{report}"
+    );
+}
+
+#[test]
+fn the_reads_after_drop_session_two_stop_on_the_first_that_applies() {
+    use places::Stop;
+    let refused = Some(Stop::RateRefused {
+        on: places::RefusedOn::Rest,
+    });
+    let after = "after drop session two";
+    let during = "during the reads after drop session two";
+    let cases = [
+        (
+            (refused, true, true, true),
+            refused.map(|s| (s, "in the reads after drop session two")),
+        ),
+        ((None, true, true, true), Some((Stop::Interrupted, during))),
+        ((None, false, true, true), Some((Stop::NotFlat, after))),
+        ((None, false, false, true), Some((Stop::LeftResting, after))),
+        ((None, false, false, false), None),
+    ];
+    for ((refused, pressed, not_flat, resting), want) in cases {
+        let got = stage::read_stop(refused, pressed, not_flat, resting);
+        assert_eq!(got, want, "{refused:?} {pressed} {not_flat} {resting}");
+        // Each is marked (0151 item 6).
+        assert!(got.is_none_or(|(stop, _)| stop.marks()));
+    }
+}
+
+#[tokio::test]
+async fn ctrl_c_in_drop_session_two_cancels_x_and_y_by_venue_id_and_fails_it() {
+    // The owner presses Ctrl-C as the read before the drop is printed, its socket closed and the
+    // drop next: the press is taken before the drop, so X and Y are each cancelled by venue id,
+    // seen to end, and the session closes gracefully, with no drop and no verdict (0151 item 2).
+    let d = pressed_at(
+        QfexModel::default(),
+        "drop-two-ctrl-c",
+        "READ before the drop",
+    )
+    .await;
+    assert_stopped(&d, places::Stop::Interrupted);
+    let two = d.two();
+    assert_eq!(two.before_drop, Some([true, true]));
+    let cancels = two.cancels.as_ref().expect("Ctrl-C cancels");
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (2, false, true)
+    );
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(two.after_drop.is_none() && d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 2);
+    let model = d.venue.model.lock().unwrap();
+    let ids: Vec<String> = model.orders.iter().map(|o| o.id.clone()).collect();
+    assert_eq!(ids.len(), 2);
+    assert!(
+        model
+            .orders
+            .iter()
+            .all(|o| o.state == model::State::Cancelled)
+    );
+    drop(model);
+    for id in &ids {
+        assert!(
+            cancel_names(&d, id),
+            "a cancel names each order by its venue id"
+        );
+    }
+    assert!(
+        d.what().iter().all(|w| !w.contains(" drop ")),
+        "{:?}",
+        d.what()
+    );
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("Interrupted in drop session two"),
+        "{:?}",
+        d.ev.stopped
+    );
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+#[tokio::test]
+async fn a_fill_of_y_in_drop_session_two_stops_with_cancels_not_flat() {
+    // Y fills whole as a maker right after its ACK, the session open: a fill of ours, so X, the
+    // one order of ours still open, is cancelled by its venue id, the session closes gracefully
+    // with no drop, and the reads after it show the position: a stop not flat (0151 items 2 and
+    // 9; FBC-ou9g adds the flatten).
+    let model = QfexModel {
+        on_ack: Some((1, model::OnAck::MakerFill)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-fill-y").await;
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    let two = d.two();
+    assert!(two.y.submitted, "{two:?}");
+    let cancels = two.cancels.as_ref().expect("a fill of ours cancels");
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (1, false, true)
+    );
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 1);
+    // The model held the read pages from Y's fill until the session wrote again: the cancel the
+    // fill's stop sent released them, so the comparison after it agreed, its connection still
+    // open (FBC-77r8).
+    let compared: Vec<_> = (two.compared.iter())
+        .map(|c| c.first_agreed.is_some())
+        .collect();
+    assert_eq!(compared, [true], "{:?}", two.compared);
+    let model = d.venue.model.lock().unwrap();
+    let states: Vec<model::State> = model.orders.iter().map(|o| o.state).collect();
+    assert_eq!(states, [model::State::Cancelled, model::State::Filled]);
+    let x = model.orders[0].id.clone();
+    drop(model);
+    assert!(cancel_names(&d, &x), "the cancel names X by its venue id");
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_TWO && r.label == "primary (drop)")
+        .unwrap();
+    assert!(!after.flat);
+    assert!(
+        d.ev.stopped
+            .as_deref()
+            .unwrap()
+            .starts_with("UnexpectedFill in drop session two"),
+        "{:?}",
+        d.ev.stopped
+    );
+}
+
+#[tokio::test]
+async fn y_ended_before_the_drop_fails_the_drop_test() {
+    // QFEX cancels Y itself right after its ACK, on the open connection: the reads after the
+    // drop show X and Y absent, untraded and ended, but the drop had no Y of its own to cancel,
+    // so the test fails (0151 item 13). Y's CANCELLED is a frame written after its ACK, which
+    // the kernel can hold, and the session writes nothing before the drop, so whether the
+    // session heard it by the drop is not ordered. The read before the drop is: made after Y's
+    // ACK, on a model that ended Y as it acked it, it never lists Y, so the test fails by that
+    // read (`YNotListedBeforeDrop`), with `YEndedBeforeDrop` beside it only when the session
+    // heard the CANCELLED first.
+    let model = QfexModel {
+        on_ack: Some((1, model::OnAck::VenueCancel)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-y-ended").await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let two = d.two();
+    assert!(two.y.acked, "{two:?}");
+    assert_eq!(two.before_drop, Some([true, false]), "{two:?}");
+    assert!(!two.x_cancelled_before_drop);
+    assert_eq!(two.ended_by, Some(stage::DROPPED));
+    let verdict = d.verdict();
+    use verdict::Failure::{YEndedBeforeDrop, YNotListedBeforeDrop};
+    assert!(
+        verdict.failures.contains(&YNotListedBeforeDrop),
+        "{verdict:?}"
+    );
+    let heard = |f: &verdict::Failure| matches!(f, YEndedBeforeDrop | YNotListedBeforeDrop);
+    assert!(verdict.failures.iter().all(heard), "{verdict:?}");
+    assert_eq!(
+        verdict.failures.contains(&YEndedBeforeDrop),
+        !two.y_open_at_drop
+    );
+    assert_eq!(verdict.reach, verdict::Reach::Cancelled);
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "Y rested, but the read before the drop did not list it, so the drop's cancel of Y \
+             is not shown"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("- The read before the drop: X listed yes; Y listed no"),
+        "{report}"
+    );
+    assert_eq!(
+        json["drop_tests"][0]["session_two"]["before_drop"],
+        serde_json::json!({"x_listed": true, "y_listed": false})
+    );
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+#[tokio::test]
+async fn a_late_cancelled_of_x_in_the_arms_window_is_reported_and_leaves_the_reach_unmeasured() {
+    // The arm cancels X and QFEX reports it late, once the resync ended, with Y's answer before
+    // its ACK: still in the arm's window, which ends with the read before the drop, so it is
+    // reported, the drop is not credited with X, and nothing stops the run.
+    let model = QfexModel {
+        arm_cancels_open: model::ArmCancels::Late,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "drop-arm-late", &primary_only(), |a| a).await;
+    let two = d.two();
+    assert!(
+        two.x_cancel_reported && two.x_cancelled_before_drop,
+        "{two:?}"
+    );
+    assert!(two.y_open_at_drop, "{two:?}");
+    assert_eq!(two.before_drop, Some([false, true]));
+    let verdict = d.verdict();
+    assert_eq!(verdict.arm, verdict::ArmCancel::Reported);
+    assert_eq!(verdict.reach, verdict::Reach::NotMeasured);
+    assert!(verdict.passed, "{verdict:?}");
+    assert_eq!((d.ev.stop, d.marker()), (None, None));
+    let two_conn = &d.session_conns()[1];
+    let late = format!("arm {two_conn} cancels 1 reported late");
+    assert!(logged(&d.venue.log(), &late), "{:?}", d.what());
+}
+
+#[tokio::test]
+async fn the_drop_reaching_only_its_own_orders_fails_with_x_left_resting() {
+    // Cancel-on-disconnect reaches only the dropped connection's own orders: Y is cancelled, X,
+    // drop session one's, is not, which is what the drop test is there to show (decision 0132
+    // item 4). The test fails, X is left resting for the owner's hand cancel, and no session
+    // runs on the subaccount.
+    let model = QfexModel {
+        cod_reach: model::Reach::Own,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-reach-own", short_agree).await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let verdict = d.verdict();
+    let x = verdict::Which::X;
+    assert_eq!(
+        verdict.failures,
+        [
+            verdict::Failure::Listed(x),
+            verdict::Failure::NotTerminal(x)
+        ]
+    );
+    assert_eq!(verdict.reach, verdict::Reach::NotShown);
+    let model = d.venue.model.lock().unwrap();
+    let states: Vec<model::State> = model.orders.iter().map(|o| o.state).collect();
+    assert_eq!(states, [model::State::Open, model::State::Cancelled]);
+    drop(model);
+    assert!(d.two().resting);
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS))
+    );
+    assert_eq!(d.count("cancel_order"), 0);
+    assert_eq!(d.ev.drops.len(), 1);
+    assert!(d.ev.sessions.iter().all(|s| s.account == "primary"));
+    assert_eq!(d.session_conns().len(), 2);
+}
+
+#[test]
+fn the_other_named_accounts_stay_clean_only_when_every_read_of_them_is() {
+    let read = |label: &str, page_orders: usize| capture::AccountRead {
+        label: label.to_owned(),
+        flat: true,
+        page_orders,
+        ..capture::AccountRead::default()
+    };
+    let named = [Armed::Primary, Armed::Subaccount];
+    let clean = [read("primary (drop)", 1), read("subaccount", 0)];
+    assert_eq!(
+        stage::others_clean(&clean, &named, Armed::Primary),
+        Some(true)
+    );
+    // The account's own reads are not the others': X listed there is no fault of theirs.
+    let dirty = [read("primary (drop)", 0), read("subaccount", 1)];
+    assert_eq!(
+        stage::others_clean(&dirty, &named, Armed::Primary),
+        Some(false)
+    );
+    assert_eq!(
+        stage::others_clean(&dirty, &named, Armed::Subaccount),
+        Some(true)
+    );
+    assert_eq!(
+        stage::others_clean(&dirty, &named[..1], Armed::Primary),
+        None
+    );
+}
+
+#[test]
+fn a_trade_rows_member_names_are_kept_as_names_alone() {
+    for name in ["trade_id", "fee", "order_type", "x1"] {
+        assert_eq!(places::member_name(name), name);
+    }
+    for odd in ["", "Trade_Id", "trade id", "trade-id", &"a".repeat(33)] {
+        assert_eq!(places::member_name(odd), "(not a member name)", "{odd}");
+    }
+}
+
+#[test]
+fn the_drop_tests_report_says_each_case_with_no_id_or_value() {
+    use places::{DropRun, Traded, TwoRun};
+    // Drop session two that stopped before its drop, X's cancel reported by its arm, the reads
+    // after it not made and the account unread.
+    let stopped = DropRun {
+        account: "primary",
+        x_before_two: None,
+        two: Some(TwoRun {
+            x_cancel_reported: true,
+            ..TwoRun::default()
+        }),
+        stop: Some("SpanBound"),
+        ..DropRun::default()
+    };
+    let mut s = String::new();
+    places::drop_markdown(&mut s, &stopped, false);
+    for said in [
+        "- What answers the arm: drop session one none reported; drop session two none reported",
+        "- Whether enabling cancel-on-disconnect cancels open orders, and whether QFEX reports \
+         it: yes, reported: a CANCELLED of X came in the arm's window",
+        "- The drop test: not judged: the drop test ended before its drop",
+        "- The drop's reach over X, an order of an earlier connection: not measured: the drop \
+         test ended before its drop",
+        "- Whether the other named accounts stayed clean: no other account is named",
+        "- terminal_status on GET /user/historic-orders: X not listed; Y not listed",
+        "- What followed: the run's stop, SpanBound: nothing more is placed on this account",
+        "- X listed by the read before drop session two: not read",
+        "- The read before the drop: not made",
+        "- The reads after the drop: not made: the session ended short of its drop",
+        "- X's and Y's trades after the drop: not read",
+        "- An order resting on the account when the run ended: not known: the account was not \
+         read after the session",
+        "- Ended by: it did not open",
+    ] {
+        assert!(s.contains(said), "{said}: {s}");
+    }
+    // Without drop session two, enabling is not measured; another account read unclean is
+    // said so; a comparison after the stop's cancels is tabled.
+    let one = DropRun {
+        account: "subaccount",
+        others_clean: Some(false),
+        ..DropRun::default()
+    };
+    let mut s = String::new();
+    places::drop_markdown(&mut s, &one, false);
+    assert!(
+        s.contains("not measured: drop session two did not reach its drop"),
+        "{s}"
+    );
+    assert!(
+        s.contains("- Whether the other named accounts stayed clean: no:"),
+        "{s}"
+    );
+    assert!(
+        s.contains(&format!("- What followed: {}", places::NEXT_ACCOUNT)),
+        "{s}"
+    );
+    assert!(!s.contains("### Drop session two"), "{s}");
+    // The reads after the drop cut short by a refusal, its trades read in part.
+    let cut = DropRun {
+        account: "primary",
+        two: Some(TwoRun {
+            after_drop: Some(verdict::AfterDrop {
+                reads: vec![(Duration::ZERO, verdict::Shown::Refused)],
+                refused: Some(places::RefusedOn::Rest),
+                ..verdict::AfterDrop::default()
+            }),
+            after: Some(Traded {
+                trades: 2,
+                naming: vec![0, 1],
+                terminal: vec![Some("CANCELLED".to_owned()), None],
+                error: Some("GET /user/historic-orders: HTTP 500".to_owned()),
+                ..Traded::default()
+            }),
+            compared: vec![compare::Compared {
+                step: "the stop's cancels",
+                reads: Vec::new(),
+                first_agreed: None,
+                ended: compare::Ended::Unread,
+                stop: None,
+            }],
+            ..TwoRun::default()
+        }),
+        ..DropRun::default()
+    };
+    let mut s = String::new();
+    places::drop_markdown(&mut s, &cut, true);
+    for said in [
+        "- The reads after the drop: 1 reads; none listed neither X nor Y; cut short by a \
+         provider rate refusal (decision 0148 item 8)",
+        "- X's and Y's trades after the drop: 2 trade rows since X's send, 0 naming X, 1 naming \
+         Y; not read whole: GET /user/historic-orders: HTTP 500",
+        "- terminal_status on GET /user/historic-orders: X CANCELLED; Y not listed",
+        &format!("- What followed: {}", places::LAST_ACCOUNT),
+        "| the stop's cancels | 0 | none | unread: no read was made |",
+    ] {
+        assert!(s.contains(said), "{said}: {s}");
+    }
+    let json = places::drop_to_json(&cut);
+    assert_eq!(json["session_two"]["after"]["naming"], super::json("[0,1]"));
+    assert_eq!(
+        json["session_two"]["compared"][0]["ended"],
+        "unread: no read was made"
+    );
+    assert_eq!(json["verdict"], Value::Null);
+}
+
+#[test]
+fn a_later_session_watches_only_what_follows_it() {
+    use fbc_runtime::ExecHandler;
+    // An earlier session's fill refused for its time, noted on the Link and raised there.
+    let (mut handler, link) = handled(100);
+    handler.on_exec(fill_env(1, qfex_fill(our_cid(), T1, true), None));
+    assert!(handler.watched.borrow().stop().is_some());
+    // A later session's handler on the same Link takes none of it for its own.
+    let later = places::Watched::after(&link.borrow());
+    let watched = Rc::new(RefCell::new(later));
+    let mut next = places::PlaceHandler {
+        inner: link::LinkHandler {
+            link: Rc::clone(&link),
+            wake: Rc::new(tokio::sync::Notify::new()),
+        },
+        watched: Rc::clone(&watched),
+        control: Rc::default(),
+    };
+    next.on_decode_error(conn(0));
+    let seen = watched.borrow();
+    assert!(seen.stop().is_none() && !seen.fill_of_ours, "{seen:?}");
+    assert!(!seen.authenticated && seen.arm.is_none() && !seen.resynced);
+}
+
+// ----- FBC-77r8: FBC-23ch's review fixes (PR #272), carried into the drop test -----
+
+/// Asserts `d` stopped `RateRefused` on a read socket, marked and named, `when` it was met,
+/// with the last socket labelled `label` showing one refusal, in a frame kept whole.
+fn assert_refused_whole_at(d: &Dropped, when: &str, label: &str) {
+    let stop = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    let name = stop.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(said.contains(&format!("{name} {when}")), "{said}");
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    assert_no_secret(&d.dir.join("evidence"));
+    d.venue.assert_served();
+    let socket = (d.ev.read_sockets.iter()).rev().find(|r| r.label == label);
+    let refusals = socket
+        .unwrap_or_else(|| panic!("{label}: {}", d.printed))
+        .refusals;
+    let shown = (refusals.errs, refusals.unread, refusals.whole);
+    assert_eq!(shown, (0, 1, 1), "{refusals:?}");
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_in_the_read_before_drop_session_two_stops_the_run() {
+    // PR #272's thread 4605918671, in the read before drop session two: the primary's read
+    // socket, the fifth to authenticate after X (the comparison's, the two reads after drop
+    // session one and X's own read first), is answered a RateLimited err echoing it, which the
+    // journal keeps whole, so the adapter reads no hold from it: a provider rate refusal all the
+    // same (decision 0135 item 2), never an account left unread with X resting.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEcho(4)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "before-two-rate-whole").await;
+    assert_refused_whole_at(&d, "in the read before drop session two", "primary (drop)");
+    assert_no_cancel_and_x_resting(&d);
+    assert!(reads_before_two(&d).is_empty(), "{}", d.printed);
+    assert!(d.drop_run().two.is_none());
+    assert_eq!(d.count("add_order"), 1);
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_in_the_read_before_the_drop_stops_drop_session_two() {
+    // The same err on the read before the drop, the eighth socket to authenticate after X
+    // (drop session two's own among them): a stop in drop session two that sends no cancel, so
+    // the session ends by a graceful close, no drop, X and Y left resting for the owner.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEcho(7)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "before-drop-rate-whole").await;
+    let label = "primary (the read before the drop)";
+    assert_refused_whole_at(&d, "in drop session two", label);
+    let two = d.two();
+    assert_eq!(two.before_drop, None);
+    assert_eq!(
+        (two.ended_by, two.cancels.as_ref()),
+        (Some(stage::GRACEFUL), None)
+    );
+    assert!(two.after_drop.is_none() && d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 0);
+    assert!(
+        d.what().iter().all(|w| !w.contains(" drop ")),
+        "{:?}",
+        d.what()
+    );
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders.len(), 2);
+    assert!(model.orders.iter().all(|o| o.state == model::State::Open));
+}
+
+#[tokio::test]
+async fn a_refusal_kept_whole_in_the_reads_after_the_drop_fails_the_drop_test() {
+    // The same err on the first of the reads after the drop (verdict::until_absent), the ninth
+    // socket to authenticate after X: the reads end there, refused, and the verdict's stop is
+    // the provider rate refusal, marked (decision 0148 item 8), never a pass on a later read.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadAuthEcho(8)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "after-drop-rate-whole").await;
+    let label = "primary (the reads after the drop)";
+    assert_refused_whole_at(&d, "after the drop", label);
+    let after = d
+        .two()
+        .after_drop
+        .as_ref()
+        .expect("the reads after the drop");
+    assert_eq!(
+        after.refused,
+        Some(places::RefusedOn::ReadSocket),
+        "{after:?}"
+    );
+    assert_eq!(after.reads.len(), 1, "{after:?}");
+    assert!(!d.verdict().passed);
+}
+
+#[tokio::test]
+async fn a_trade_naming_x_after_drop_session_one_stops_before_drop_session_two() {
+    // PR #272's thread 4605918676, before drop session two: X fills as its trades are read after
+    // drop session one, after the reads that showed every account flat. The run stops not flat,
+    // marked, the position the owner's (0151 item 9), before the read before drop session two:
+    // no account is read again, no second session opens, and Y is never placed.
+    let model = QfexModel {
+        fill_on_trades: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-fill-before-two").await;
+    let after = d.drop_run().after.as_ref().unwrap();
+    assert_eq!(after.trades_naming_x, 1, "{after:?}");
+    assert_stopped(&d, places::Stop::NotFlat);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(said.starts_with("NotFlat after drop session one"), "{said}");
+    assert!(reads_before_two(&d).is_empty(), "{}", d.printed);
+    assert!(d.drop_run().two.is_none());
+    assert_eq!(d.count("subscribe"), 3);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+}
+
+#[tokio::test]
+async fn x_s_reads_failing_after_drop_session_one_stop_before_drop_session_two() {
+    // X's trades and historic orders read after drop session one, where GET
+    // /user/historic-orders is answered HTTP 500, a failure that is no provider rate refusal:
+    // X is left unjudged, so the run stops LeftResting, marked, X still resting for the owner's
+    // hand cancel, before the read before drop session two: no account is read again, no second
+    // session opens, and Y is never placed.
+    let model = QfexModel {
+        historic_fails: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-x-unread-before-two").await;
+    let after = d.drop_run().after.as_ref().unwrap();
+    assert_eq!(after.trades_naming_x, 0, "{after:?}");
+    let error = after.error.as_deref().unwrap_or_default();
+    assert!(error.starts_with("GET /user/historic-orders"), "{after:?}");
+    assert_stopped(&d, places::Stop::LeftResting);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("LeftResting reading X after drop session one"),
+        "{said}"
+    );
+    assert!(d.printed.contains("RESTING "), "{}", d.printed);
+    assert!(reads_before_two(&d).is_empty(), "{}", d.printed);
+    assert!(d.drop_run().two.is_none());
+    assert_eq!(d.count("subscribe"), 3);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+}
+
+#[tokio::test]
+async fn a_touch_that_moves_past_the_caps_before_y_sends_no_y() {
+    // PR #272's thread 4605918689, at Y's place: both caps admit exactly three minimum sizes at
+    // the preflight's touch near 100, where X is placed; at drop session two's arm the touch
+    // moves near 400, where they admit none, while the registry's lot caps, fixed at the
+    // preflight, still admit three. Y is not sent and never resized, and the run stops, marked,
+    // its session ended by a graceful close with no cancel and no drop (decision 0113).
+    let moved = model::Touch {
+        bid: Some(("400.00", "1.00")),
+        ask: Some(("400.10", "2.00")),
+        age_secs: 0,
+    };
+    let model = QfexModel {
+        touch_moves_at_arm: Some((1, moved)),
+        ..QfexModel::default()
+    };
+    let caps = |argv| {
+        let argv = set(argv, "--resting-cap-usd", THREE_MIN_USD);
+        set(argv, "--inventory-cap-usd", THREE_MIN_USD)
+    };
+    let d = dropped_with(model, "drop-caps-moved-y", caps).await;
+    assert_eq!(d.count("add_order"), 1, "{:?}", d.what());
+    assert!(d.drop_run().x.submitted);
+    let two = d.two();
+    assert!(!two.y.submitted, "{two:?}");
+    assert!(!d.printed.contains("PLACE Y"), "{}", d.printed);
+    assert_stopped(&d, places::Stop::BeyondCaps);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(said.starts_with("BeyondCaps in drop session two"), "{said}");
+    assert_eq!(
+        (two.ended_by, two.cancels.as_ref()),
+        (Some(stage::GRACEFUL), None)
+    );
+    assert_eq!(d.count("cancel_order"), 0);
+}
+
+#[tokio::test]
+async fn a_fill_of_ours_while_drop_session_twos_close_waits_for_room_cancels_x_and_y_first() {
+    // The twin above's, in drop session two: the read before the drop is answered a RateLimited
+    // err holding the shared budget for 3 s, a stop that sends no cancel, so the session's
+    // graceful close waits for room; as the probe prints that refusal, while the close waits,
+    // half of Y fills as a maker, the rest resting (ordered by that line, not by a timer): a
+    // fill of ours, so the session cancels (0151 item 2), once there is room and before the
+    // close: Kill, X and Y's rest cancelled by their venue ids and seen to end, the disarm. The
+    // refusal stays the run's stop. Y is ten lots of 0.001 here, so half of it can fill.
+    let model = QfexModel {
+        listed: vec![model::Listed {
+            lot: "0.001",
+            ..model::Listed::trading()
+        }],
+        rate_limit: Some(model::Limited::ReadSocket(5)),
+        ..QfexModel::default()
+    };
+    let refused = "READ before the drop: primary: refused by a provider rate refusal";
+    let d = acted_at(
+        model,
+        "drop-two-fill-at-close",
+        refused,
+        QfexModel::part_fill_last,
+    )
+    .await;
+    let stop = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    assert_stopped(&d, stop);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("RateRefused(ReadSocket) in drop session two"),
+        "{said}"
+    );
+    let two = d.two();
+    assert_eq!(two.before_drop, None);
+    let cancels = two.cancels.as_ref().expect("a fill of ours cancels");
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (2, false, true)
+    );
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(two.after_drop.is_none() && d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 2, "{:?}", d.what());
+    assert!(
+        d.what().iter().all(|w| !w.contains(" drop ")),
+        "{:?}",
+        d.what()
+    );
+    let cancelled = d.at(
+        "STOP cancels: Kill, then 2 cancels by venue id (0151 item 2), every order they named \
+         seen to end; the market disarmed",
+    );
+    assert!(cancelled > d.at("READ before the drop: primary: refused by a provider rate refusal"));
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.fills.len(), 1);
+    assert!(
+        model
+            .orders
+            .iter()
+            .all(|o| o.state == model::State::Cancelled)
+    );
+    let at = |what: &str| model.log.iter().rposition(|e| e.what.contains(what));
+    let (cancel, close) = (at(" cancel_order").unwrap(), at("cod ").unwrap());
+    assert!(cancel < close, "{:?}", model.log);
+}
+
+#[tokio::test]
+async fn a_press_while_drop_session_twos_close_waits_for_room_cancels_x_and_y_first() {
+    // PR #272's thread 4605918659, in drop session two: the read before the drop is answered a
+    // RateLimited err holding the shared budget for 3 s, a stop that sends no cancel, so the
+    // session's graceful close waits for room; the owner presses Ctrl-C as that refusal is
+    // printed, so the press arrives while the close waits. It is taken before the close: once
+    // there is room, Kill, X and Y cancelled by their venue ids and seen to end, the disarm,
+    // then the graceful close (0151 items 2 and 11). The refusal stays the run's stop.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::ReadSocket(5)),
+        ..QfexModel::default()
+    };
+    let at = "READ before the drop: primary: refused by a provider rate refusal";
+    let d = pressed_at(model, "drop-two-press-at-close", at).await;
+    let stop = places::Stop::RateRefused {
+        on: places::RefusedOn::ReadSocket,
+    };
+    assert_stopped(&d, stop);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("RateRefused(ReadSocket) in drop session two"),
+        "{said}"
+    );
+    let two = d.two();
+    assert_eq!(two.before_drop, None);
+    let cancels = two.cancels.as_ref().expect("the press cancels");
+    assert_eq!(
+        (cancels.sent, cancels.held, cancels.ended),
+        (2, false, true)
+    );
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert!(two.after_drop.is_none() && d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 2, "{:?}", d.what());
+    assert!(
+        d.what().iter().all(|w| !w.contains(" drop ")),
+        "{:?}",
+        d.what()
+    );
+    let cancelled = d.at(
+        "STOP cancels: Kill, then 2 cancels by venue id (0151 item 2), every order they named \
+         seen to end; the market disarmed",
+    );
+    assert!(cancelled > d.at(at));
+    let model = d.venue.model.lock().unwrap();
+    assert!(
+        model
+            .orders
+            .iter()
+            .all(|o| o.state == model::State::Cancelled)
+    );
+    let at = |what: &str| model.log.iter().rposition(|e| e.what.contains(what));
+    let (cancel, close) = (at(" cancel_order").unwrap(), at("cod ").unwrap());
+    assert!(cancel < close, "{:?}", model.log);
+}
+
+// ----- FBC-77r8: FBC-23ch's second review fixes carried into the drop test -----
+
+#[tokio::test]
+async fn a_failure_of_drop_session_one_with_an_order_still_resting_is_marked_left_resting() {
+    // FBC-23ch's second review fix to drop_one's ending order, in drop_sessions: drop session one
+    // fails with no stop, X not priced, and the reads after it show an order of ours still
+    // resting (counted by REST, as a stop order would be). The failure comes after every stop
+    // the reads show: LeftResting is marked for the owner's hand cancel, the run ends on the
+    // session's failure, kept as its error, and drop session two never runs (0151 item 6).
+    let model = QfexModel {
+        stop_order_after_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_hooked(model, "drop-failed-resting", |t| t.x_unpriced = true).await;
+    let name = places::Stop::LeftResting.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some("a test's X could not be priced")
+    );
+    let run = d.drop_run();
+    assert_eq!(run.error.as_deref(), Some("a test's X could not be priced"));
+    assert!(
+        run.started && !run.x.submitted && run.two.is_none(),
+        "{run:?}"
+    );
+    assert_after_reads(&d);
+    assert_eq!(d.count("add_order"), 0, "{:?}", d.what());
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_full_page_repeating_the_one_before_after_the_drop_fails_the_read_rather_than_paging_on()
+{
+    // FBC-23ch's second review fix to the history page loops, carried to X's and Y's reads after
+    // drop session two: on pages of one, a venue answering every get_user_trades page as if
+    // asked from offset 0 (a fill of Y at the drop), or every GET /user/historic-orders page
+    // whole (X and Y cancelled by the drop), would be paged without end. The read fails at the
+    // first repeat, so the verdict reads neither whole and the drop test does not pass.
+    let historic = QfexModel::default();
+    let trades = QfexModel {
+        fill_on_drop: true,
+        stuck_trades: true,
+        ..QfexModel::default()
+    };
+    let cases = [
+        (historic, "GET /user/historic-orders"),
+        (trades, "get_user_trades"),
+    ];
+    for (model, what) in cases {
+        let run = dropped_with(model, "drop-two-repeated-page", |argv| {
+            set(argv, "--page-size", "1")
+        });
+        let d = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("the run ended");
+        let two = d.two();
+        assert_eq!(two.ended_by, Some(stage::DROPPED), "{two:?}");
+        let after = two.after.as_ref().expect("X and Y were read");
+        let why = format!("a full {what} page repeated the page before it");
+        assert_eq!(after.error.as_deref(), Some(why.as_str()), "{after:?}");
+        let verdict = d.verdict();
+        assert!(!verdict.passed, "{verdict:?}");
+        assert!(d.ev.stop.is_some(), "{}", d.printed);
         d.venue.assert_served();
     }
 }

@@ -17,20 +17,22 @@
 //! program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
-//! With `--place-stages` (FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0148 and 0151)
-//! it runs the place stages on production (`--production`) and, until FBC-4plj, only against a
-//! loopback test stub: a `CAPS` line first, its lease directory opened ([`places`]: tagged
+//! With `--place-stages` (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions 0148 and
+//! 0151) it runs the place stages on production (`--production`) and, until FBC-4plj, only against
+//! a loopback test stub: a `CAPS` line first, its lease directory opened ([`places`]: tagged
 //! production, a stop marker held to `--reconciled`, the namespace lease taken; 0151 items 1 and
 //! 6), the hold first when `--hold-secs` asks, then the traded instrument's spec from this run's
 //! `GET /refdata`, the ledger's count bound against each place registry's ceiling, the MDS touch
-//! and the caps at it ([`market`]), with `--reconciled` the reads that clear the marker, then
-//! drop session one on the first named account (`stage.rs`): X, one post-only GTC at the
-//! minimum size behind the touch, compared with never-arming reads ([`compare`]), the journal's
-//! frames read on their way by the tee ([`tee`]), then a graceful close and the reads after it.
-//! The run ends there, its outcome not ok, until FBC-77r8 builds drop session two: X still
-//! resting is reported for the owner's hand cancel, and every stop of the place stages (Ctrl-C
-//! among them) writes the report and the stop marker. Ctrl-C from the hold's first read to its
-//! last is the hold's: it stops the run before its preflight, with its report and no stop marker.
+//! and the caps at it ([`market`]), with `--reconciled` the reads that clear the marker, then each
+//! named account's drop test in turn (`stage.rs`): drop session one places X, one post-only GTC at
+//! the minimum size behind the touch, compared with never-arming reads ([`compare`]), the journal's
+//! frames read on their way by the tee ([`tee`]), then closes gracefully; after the reads, the read
+//! before drop session two admitting X alone, drop session two places Y and its connection drops
+//! abruptly; the reads after the drop give the account's verdict ([`verdict`]). The run ends after
+//! the last account's, its outcome not ok, until FBC-su9i builds stage two; every stop of the place
+//! stages (Ctrl-C among them) ends it sooner, an order still resting reported for the owner's hand
+//! cancel, and writes the report and the stop marker. Ctrl-C from the hold's first read to its last
+//! is the hold's: it stops the run before its preflight, with its report and no stop marker.
 //!
 //! ```text
 //! export QFEX_PUBLIC_KEY=...       # the primary account's credential, for the environment run on
@@ -54,8 +56,8 @@
 #[path = "../../src/auth_qfex.rs"]
 mod auth_qfex;
 mod capture;
-// The place stages' comparisons of the streams with the reads (FBC-23ch), which drop session one
-// takes after each step.
+// The place stages' comparisons of the streams with the reads (FBC-23ch), which the drop sessions
+// take after each step.
 mod compare;
 mod ledger;
 // paradex_testnet_acceptance's privacy patterns, privacy check and UTC clock, reused by path,
@@ -75,8 +77,11 @@ mod probe_args;
 mod refusals;
 mod report;
 mod stage;
-// The journal's tee (FBC-23ch), whose stops drop session one waits on.
+// The journal's tee (FBC-23ch), whose stops the drop sessions wait on.
 mod tee;
+// The drop test's verdict (FBC-77r8): what the reads after drop session two's drop show of X
+// and Y, judged per account.
+mod verdict;
 // The Paradex testnet samples' shared command-line pieces and cap conversion, reused by path:
 // the place stages take their caps, lease directory and decimals as those samples do.
 #[allow(dead_code)]

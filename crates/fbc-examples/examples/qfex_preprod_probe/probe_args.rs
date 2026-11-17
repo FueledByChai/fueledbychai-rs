@@ -46,42 +46,54 @@ session's arm, its resync's reads (one GET /user/positions and get_user_orders p
 that never arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming
 at all.
 
-With --place-stages (FBC-c6kw and FBC-23ch, slices of FBC-9sk2; decisions 0148 and 0151) it
-runs the place stages' preflight, then drop session one of decision 0132 item 4's drop test: on
-production alone (--production; 0151 item 1), and, until FBC-4plj lands every stop decisions
-0132 item 7 and 0148 item 8 require, only against a loopback test stub, every origin (trade,
-REST and MDS) a loopback address. It prints a CAPS line with the environment and both caps
-first, before any request; runs the hold first, alone, when --hold-secs is given; reads the
-instrument --symbol names from this run's GET /refdata on the guarded REST origin, refusing one
-that is not listed, not trading, or that does not list both a post-only GTC and a limit IOC
-(decision 0148 item 4); holds --ledger-max-entries above each place registry's fill ceiling
-(0151 item 3); opens the MDS touch (bbo) on the guarded MDS origin and refuses a touch older
-than --touch-max-age-ms, a crossed or locked one, or one from before the MDS connection's
-current epoch; and refuses either cap below three of the instrument's minimum size at the
-touch.
+With --place-stages (FBC-c6kw, FBC-23ch and FBC-77r8, slices of FBC-9sk2; decisions 0148 and
+0151) it runs the place stages' preflight, then decision 0132 item 4's drop test on each named
+account in turn: on production alone (--production; 0151 item 1), and, until FBC-4plj lands
+every stop decisions 0132 item 7 and 0148 item 8 require, only against a loopback test stub,
+every origin (trade, REST and MDS) a loopback address. It prints a CAPS line with the
+environment and both caps first, before any request; runs the hold first, alone, when
+--hold-secs is given; reads the instrument --symbol names from this run's GET /refdata on the
+guarded REST origin, refusing one that is not listed, not trading, or that does not list both a
+post-only GTC and a limit IOC (decision 0148 item 4); holds --ledger-max-entries above each
+place registry's fill ceiling (0151 item 3); opens the MDS touch (bbo) on the guarded MDS origin
+and refuses a touch older than --touch-max-age-ms, a crossed or locked one, or one from before
+the MDS connection's current epoch; and refuses either cap below three of the instrument's
+minimum size at the touch.
 
-Drop session one runs on the first named account: every named account read clean, the drop
-registry built (CodProbeRun::owner_supervised_places on its one market, its CancelOnlyTrip given
-to the journal before any market arms, decision 0139) and seeded flat (decision 0148 item 3);
-one session that arms cancel-on-disconnect, its arm accepted and its resync applied; Start under
-the market lease; X, one post-only GTC at the instrument's minimum size --away-bps behind the
-touch, its client id minted under the run's namespace lease, as an fbc-oms authorization (until
-an ACK echoes our client id, a session places at most one post-only GTC far from the touch,
-decision 0132 item 7); X's ACK or its deadline; the streams compared with never-arming reads at
---read-interval-ms, at most 10 within --agree-wait-ms, every frame charged to the shared limiter
-first; a graceful close; then the read of every named account and of X and its trades. The run
-then ends, its outcome not ok, until FBC-77r8 builds drop session two: X still resting is
-reported for your hand cancel on QFEX's site and the stop marker written (LeftResting).
+Each account's drop test starts only once the one before ended with no stop. Drop session one:
+every named account read clean, the account's drop registry built
+(CodProbeRun::owner_supervised_places on its one market, its CancelOnlyTrip given to the journal
+before any market arms, decision 0139) and seeded flat (decision 0148 item 3); one session that
+arms cancel-on-disconnect, its arm accepted and its resync applied; Start under the market lease;
+X, one post-only GTC at the instrument's minimum size --away-bps behind the touch, its client id
+minted under the run's namespace lease, as an fbc-oms authorization (until an ACK echoes our
+client id, a session places at most one post-only GTC far from the touch, decision 0132 item 7);
+X's ACK or its deadline; the streams compared with never-arming reads at --read-interval-ms, at
+most 10 within --agree-wait-ms, every frame charged to the shared limiter first; a graceful
+close; then the read of every named account and of X and its trades. Drop session two: every
+named account read again, X alone admitted, as one open order on its symbol (decision 0132 item
+7, 0144 item 4); a session on the same registry, seeded nothing, its arm accepted (a CANCELLED of
+X in the arm's window recorded); Y, placed as X was; Y's ACK or its deadline; one never-arming
+read before the drop; then the abrupt drop of its connection, with no WebSocket close. From the
+first arm to the last read nothing cancels X or Y, nothing reconnects and no later arm is sent.
+After the drop: reads of the account at --read-interval-ms until X and Y are absent or
+--agree-wait-ms ends, then the trades since X's send and GET /user/historic-orders; the
+account's verdict, judged in this run and never carried to another, passes only when X and Y
+are absent, named by no trades row and listed by historic-orders (decision 0132 item 4, 0151
+item 13); then the read of every named account. A failed verdict, an arm-time cancel of X QFEX
+did not report, or a fill of X or Y the reads show (the position yours, 0151 item 9) stops the
+run, so nothing more is placed on that account or any other. With no stop the run ends after
+the last account's drop test, its outcome not ok, until FBC-su9i builds stage two.
 
 Each stop decisions 0132 item 7 and 0148 item 8 name stops the run by name, with the read of
 every named account after it, the report and the stop marker: an order event or fill of ours
 without our client id, an order_response naming no order of ours (0151 item 13), a replayed
 fill refused for its time, a resync that disagrees or leaves a fill unsettled, a provider rate
 refusal on the session, a read socket or REST, a read showing an order or a position the streams
-did not, an unplanned end of the connection, the span bound, a fill of X, a position not flat,
-an order left resting, and Ctrl-C. In a drop session only Ctrl-C and a fill of ours cancel (0151
-item 2): Kill, every order of ours cancelled by venue id, a wait of up to --rpc-timeout-ms for
-each to end (a second Ctrl-C meanwhile recorded), the market disarmed, then a graceful close;
+did not, an unplanned end of the connection, the span bound, a fill of X or Y, a position not
+flat, an order left resting, and Ctrl-C. In a drop session only Ctrl-C and a fill of ours cancel
+(0151 item 2): Kill, every order of ours cancelled by venue id, a wait of up to --rpc-timeout-ms
+for each to end (a second Ctrl-C meanwhile recorded), the market disarmed, then a graceful close;
 cancels held by a provider rate refusal or refused locally end it by a graceful close too (0151
 item 11). Every other stop sends no cancel and ends the session by a graceful close.
 
@@ -96,8 +108,10 @@ every read is clean; the declaration is the owner's, which the probe does not ch
 stops (any stop but NoEcho, each named in its report) writes a marker with the stop's name and
 its start time. In a place-stage run Ctrl-C outside the hold's connection never ends the
 program: a press from the hold's first read to its last, its connecting included, is the hold's
-(below), and a press during the preflight, the reads, drop session one or its stop's cancels
-stops the run, Interrupted, and its report and its marker are written.
+(below), and a press during the preflight, the reads, a drop session or its stop's cancels
+stops the run, Interrupted, and its report and its marker are written; between the drop test's
+sessions it stops the run once the reads under way end, X still resting reported for your hand
+cancel; in a drop session it cancels by venue id first.
 
 Before anything connects it refuses any origin but the environment's own (or, for a test stub,
 all of them loopback addresses): without --production, a production origin is refused; with it,
@@ -205,7 +219,7 @@ Options:
                            deadline, the longer of --rpc-timeout-ms and the resync's {resync} s
                            deadline and --agree-wait-ms, and the reads of every named account
                            between them, each --read-wait-ms (0151 item 3)
-  --place-stages           the place stages' preflight and drop session one (above): refused
+  --place-stages           the place stages' preflight and drop tests (above): refused
                            with --arm, and without --production; needs every flag below, each
                            of which it alone takes
   --symbol <SYMBOL>        required: the venue symbol traded, at most 32 ASCII letters, digits
@@ -234,12 +248,13 @@ Options:
                            check; required while that run's stop marker exists, and refused
                            otherwise (0151 item 6)
   --agree-wait-ms <MS>     required, 1 to 60000: how long a read may lag the streams, after
-                           each place, cancel and fill of drop session one
+                           each place, cancel and fill of a drop session, and how long the
+                           reads after the drop wait for X and Y to be absent
   --read-interval-ms <MS>  required, 1000 to 60000: the time between two reads of a comparison;
                            one read, then one each --read-interval-ms within --agree-wait-ms,
                            at most {MAX_READS} in all (0151 item 4)
   --touch-max-age-ms <MS>  required, 1 to 60000: a touch older than this is not priced from,
-                           in the preflight and when X is priced
+                           in the preflight and when X and Y are priced
   --trade-url <URL>        default {PREPROD_TRADE}, or {PRODUCTION_TRADE} with --production
   --rest-url <URL>         default {PREPROD_REST}, or {PRODUCTION_REST} with --production
   --mds-url <URL>          default {PREPROD_MDS}, or {PRODUCTION_MDS} with --production

@@ -271,17 +271,37 @@ impl Kept {
 
     /// Whether QFEX sent an `order_response` whose status is `ACK` and whose client id is
     /// exactly one we sent, byte for byte (decision 0148 item 2's gate, which FBC-su9i opens).
+    #[cfg_attr(not(test), allow(dead_code))] // FBC-su9i's per-run gate reads it
     pub fn exact_ack(&self) -> bool {
-        self.heard.iter().any(
+        self.exact_ack_from(0)
+    }
+
+    /// [`Kept::exact_ack`] among the frames heard from the `from`th on: one session's.
+    pub fn exact_ack_from(&self, from: usize) -> bool {
+        self.heard.iter().skip(from).any(
             |h| matches!(h, Heard::Order { status, cid: Cid::Exact(_), .. } if status == "ACK"),
         )
     }
 
-    /// Whether QFEX sent an `order_response` whose status is `ACK` naming an order of ours: an
-    /// order that rested, whether or not it still does.
-    pub fn acked_ours(&self) -> bool {
-        (self.heard.iter())
+    /// Whether QFEX sent an `order_response` whose status is `ACK` naming an order of ours, among
+    /// the frames heard from the `from`th on: an order that rested, whether or not it still does.
+    pub fn acked_ours_from(&self, from: usize) -> bool {
+        (self.heard.iter().skip(from))
             .any(|h| matches!(h, Heard::Order { status, ours: true, .. } if status == "ACK"))
+    }
+
+    /// Whether QFEX sent an `order_response` whose status is `CANCELLED` naming the order whose
+    /// `add_order` carried `cid`, exactly as written, by that client id, among the frames heard
+    /// from the `from`th on. One naming it with no client id of ours is no report of it: that
+    /// frame raises [`Stop::NotOurCid`].
+    pub fn cancelled_of_from(&self, from: usize, cid: &str) -> bool {
+        let Some(n) = self.sent.iter().position(|s| s.cid == cid) else {
+            return false;
+        };
+        (self.heard.iter().skip(from)).any(|h| {
+            matches!(h, Heard::Order { status, cid, .. }
+                if status == "CANCELLED" && cid.sent() == Some(n))
+        })
     }
 
     fn raise(&mut self, stop: Stop) -> bool {
@@ -895,6 +915,53 @@ mod tests {
         assert!(kept.exact_ack());
         assert!(kept.ours.iter().any(|o| o == ORDER));
         assert_eq!(tap.stop(), None);
+    }
+
+    #[test]
+    fn a_sessions_acks_and_cancels_are_read_from_its_first_frame_on() {
+        let (mut tee, tap) = teed();
+        outbound(&mut tee, &add_order(CID), Vec::new());
+        inbound(
+            &mut tee,
+            &order_response(ORDER, "ACK", Some(&quoted(CID))),
+            &[],
+        );
+        inbound(
+            &mut tee,
+            &order_response(ORDER, "CANCELLED", Some(&quoted(CID))),
+            &[],
+        );
+        // A second order of ours, sent and acknowledged, never cancelled.
+        let other = "0007abcd00000002";
+        let other_order = "22222222-2222-4222-8222-222222222222";
+        outbound(&mut tee, &add_order(other), Vec::new());
+        inbound(
+            &mut tee,
+            &order_response(other_order, "ACK", Some(&quoted(other))),
+            &[],
+        );
+        let kept = tap.kept();
+        // From the first frame: the ACK, exact and ours, and the CANCELLED of the first order.
+        assert!(kept.exact_ack_from(0) && kept.acked_ours_from(0));
+        assert!(kept.cancelled_of_from(0, CID) && kept.cancelled_of_from(1, CID));
+        // The CANCELLED names the first order alone, and a client id never sent names none.
+        assert!(!kept.cancelled_of_from(0, other) && !kept.cancelled_of_from(0, "never-sent"));
+        // From the second: a later session's, which heard the CANCELLED and the second ACK.
+        assert!(kept.exact_ack_from(1) && kept.acked_ours_from(1));
+        assert!(!kept.exact_ack_from(3) && !kept.acked_ours_from(3));
+        // From past every frame: nothing.
+        assert!(!kept.cancelled_of_from(3, CID) && !kept.exact_ack_from(9));
+        drop(kept);
+        // A CANCELLED naming it by its client id written otherwise is still a report of it.
+        let (mut tee, tap) = teed();
+        outbound(&mut tee, &add_order(CID), Vec::new());
+        let upper = CID.to_uppercase();
+        inbound(
+            &mut tee,
+            &order_response(ORDER, "CANCELLED", Some(&quoted(&upper))),
+            &[],
+        );
+        assert!(tap.kept().cancelled_of_from(0, CID));
     }
 
     #[test]

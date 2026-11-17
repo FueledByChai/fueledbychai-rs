@@ -54,7 +54,15 @@
 //! - runs the place stages' drop session one against the QFEX model (FBC-23ch, decisions 0132
 //!   item 4, 0148 and 0151, in [`place_stages`]): X placed at the minimum size as an fbc-oms
 //!   authorization, the streams compared with the reads, a graceful close, the reads after it,
-//!   and every stop with its after-session read, report and stop marker.
+//!   and every stop with its after-session read, report and stop marker;
+//! - runs each named account's whole drop test in turn (FBC-77r8, decisions 0132 items 4 and 7,
+//!   0148 and 0151 items 2, 5, 9 and 13, in [`place_stages`]): the read before drop session two
+//!   admitting X alone, drop session two on the same registry placing Y, the read before the
+//!   drop, the abrupt drop, the reads after it, the trades and historic-orders, the verdict per
+//!   account and every stop it brings; judges the drop test at function level (in `verdict.rs`'s
+//!   own tests); and gives the QFEX model an arm that cancels open orders, reported or not, a
+//!   cancel-on-disconnect whose reach is the account's, its own connection's or the earlier
+//!   ones', and fills at an arm or a drop (in [`drop_two`]).
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -77,6 +85,10 @@ mod capture;
 mod compare;
 #[path = "qfex_preprod_probe/compare_reads.rs"]
 mod compare_reads;
+// The drop test's second session's parts (FBC-77r8): the QFEX model's arm, cancel-on-disconnect
+// and later knobs, and the read before drop session two, which admits X alone.
+#[path = "qfex_preprod_probe/drop_two.rs"]
+mod drop_two;
 #[allow(dead_code)]
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
@@ -127,6 +139,9 @@ mod tee;
 #[allow(dead_code)]
 #[path = "../src/testnet.rs"]
 mod testnet;
+// The drop test's verdict (FBC-77r8), tested in its own unit tests.
+#[path = "../examples/qfex_preprod_probe/verdict.rs"]
+mod verdict;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
