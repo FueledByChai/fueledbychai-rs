@@ -112,6 +112,13 @@ impl Refusals {
         self.limiter.max(frames.saturating_add(self.whole))
     }
 
+    /// The provider rate refusals its frames showed: in clear, as the journal keeps them, and,
+    /// on a read socket, in frames kept whole, read in memory ([`Refusals::hear`]). A read
+    /// socket whose count rose met a refusal, whether or not the adapter read a hold from it.
+    pub fn shown(&self) -> u64 {
+        (self.errs.saturating_add(self.orders)).saturating_add(self.whole)
+    }
+
     /// Counts `text`, a frame as the journal keeps it: a provider rate refusal ([`refusal`]), or
     /// a frame no refusal can be read from ([`Refusals::unread`]). Says whether it was a
     /// refusal.

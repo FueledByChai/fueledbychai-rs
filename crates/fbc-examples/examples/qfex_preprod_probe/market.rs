@@ -38,7 +38,8 @@
 //!   with `testnet::cap_lots`, at `testnet::inventory_price` of the resting price and the touch,
 //!   the highest price any order of the stages takes, and refused below three of the
 //!   instrument's minimum size: stage three rests three (decision 0148 item 7), each at the
-//!   minimum (item 4).
+//!   minimum (item 4); then asked again at the touch each place is priced at ([`caps_admit`]),
+//!   since fbc-oms holds them in lots fixed at the preflight's touch (decision 0113).
 //!
 //! The report and the evidence say which of these the run passed ([`Preflight`]), never a value:
 //! no cap, distance, flatten cap or attempt count, and no symbol (0151 item 10).
@@ -613,13 +614,8 @@ pub struct PlaceCaps {
 /// either is below three of the instrument's minimum size: stage three rests three, each at the
 /// minimum (decision 0148 items 4 and 7).
 pub fn place_caps(places: &Places, found: &Discovered, quote: Quote) -> Result<PlaceCaps, String> {
-    let rest = rest_price(&found.spec, places.side, quote, places.away_bps)?;
-    let (bid, ask) = (Some(found.px(quote.bid)), Some(found.px(quote.ask)));
-    let at = testnet::inventory_price(found.px(rest), bid, ask);
-    let step = found.spec.size_step.get();
+    let PlaceCaps { resting, inventory } = caps_at(places, found, quote)?;
     let three = found.min_size.get().checked_mul(3).and_then(Lots::new);
-    let lots = |usd| testnet::cap_lots(usd, at, step);
-    let (resting, inventory) = (lots(places.resting_cap_usd), lots(places.inventory_cap_usd));
     for (flag, cap) in [
         ("--resting-cap-usd", resting),
         ("--inventory-cap-usd", inventory),
@@ -632,6 +628,40 @@ pub fn place_caps(places: &Places, found: &Discovered, quote: Quote) -> Result<P
         }
     }
     Ok(PlaceCaps { resting, inventory })
+}
+
+/// `places`' two caps in lots at `quote`, as [`place_caps`] takes them, with no floor.
+fn caps_at(places: &Places, found: &Discovered, quote: Quote) -> Result<PlaceCaps, String> {
+    let rest = rest_price(&found.spec, places.side, quote, places.away_bps)?;
+    let (bid, ask) = (Some(found.px(quote.bid)), Some(found.px(quote.ask)));
+    let at = testnet::inventory_price(found.px(rest), bid, ask);
+    let step = found.spec.size_step.get();
+    let lots = |usd| testnet::cap_lots(usd, at, step);
+    let (resting, inventory) = (lots(places.resting_cap_usd), lots(places.inventory_cap_usd));
+    Ok(PlaceCaps { resting, inventory })
+}
+
+/// Whether an order of `qty` lots may go out at `quote`, the touch it is priced at (decision
+/// 0113): `caps`, the registry's lot caps the preflight fixed at its own touch, each no more
+/// than `places`' cap admits in lots at `quote` ([`place_caps`]'s conversion), and `qty` no
+/// more than either. A touch that rose since the preflight can leave fbc-oms's lot caps above
+/// what the USD caps admit, so this is asked again before each place is authorized, and a
+/// `false` stops the run with nothing sent and nothing resized
+/// ([`crate::places::Stop::BeyondCaps`]).
+pub fn caps_admit(
+    places: &Places,
+    found: &Discovered,
+    quote: Quote,
+    caps: PlaceCaps,
+    qty: Lots,
+) -> bool {
+    let Ok(now) = caps_at(places, found, quote) else {
+        return false;
+    };
+    caps.resting <= now.resting
+        && caps.inventory <= now.inventory
+        && qty <= now.resting
+        && qty <= now.inventory
 }
 
 /// The pre-trade caps of a place registry on `inst`: `caps` both ways.
