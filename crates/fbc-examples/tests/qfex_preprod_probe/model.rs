@@ -44,7 +44,10 @@
 //!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`] and
 //!   [`QfexModel::fill_on_trades`]; at the first trade-socket authentication,
 //!   [`QfexModel::touch_moves`]; on every read socket, [`QfexModel::auth_fails`],
-//!   [`QfexModel::stuck_pages`] and [`QfexModel::hold_trades`].
+//!   [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`] and [`QfexModel::hold_trades`], and
+//!   on every read socket's pages [`QfexModel::newest_first`], after the first `add_order`
+//!   [`QfexModel::page_delay`] and, once an armed connection ended,
+//!   [`QfexModel::blank_cid_after_session`].
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -160,6 +163,15 @@ pub enum Limited {
     /// journal keeps whole (decision 0134 item 2), so the adapter reads neither a hold nor a
     /// refusal from it.
     PageKeptWhole(usize),
+    /// The first `get_user_orders` page on a read socket before any `add_order`, answered a
+    /// `RateLimited` err echoing it: the reads' before drop session one, or those that clear a
+    /// stop marker.
+    ReadSocketBefore,
+    /// The first `GET /user/positions` before any `add_order`, answered HTTP 429.
+    RestBefore,
+    /// The first `get_user_orders` page on a read socket before any `add_order`, answered as
+    /// [`Limited::PageKeptWhole`] answers one.
+    PageKeptWholeBefore,
 }
 
 /// What an account's reads answer while [`QfexModel::rest_lag`] holds them back: its open orders
@@ -384,6 +396,18 @@ pub struct QfexModel {
     /// With the first trade-socket authentication, the touch becomes this one, pushed on every
     /// MDS connection: a touch that moved after the preflight read it.
     pub touch_moves: Option<Touch>,
+    /// Once an armed connection ended, a read socket's page lists each order with an empty
+    /// `client_order_id`, its `order_id` as before: a row naming X's venue id alone.
+    pub blank_cid_after_session: bool,
+    /// Whether a read socket's pages list the newest order first.
+    pub newest_first: bool,
+    /// Each read socket's `get_user_orders` page after the first `add_order` is answered this
+    /// long after it, through the pusher, instead of at once: an answer still on its way as a
+    /// comparison's wait ends.
+    pub page_delay: Option<Duration>,
+    /// Whether a read socket's `get_user_trades` pages are each answered as if asked from offset
+    /// 0, whatever offset they name, as a venue ignoring it would.
+    pub stuck_trades: bool,
     /// The MDS stub's push handle, once it is up ([`QfexModel::touch_moves`]).
     pub mds_pusher: Option<Pusher>,
     /// The answers [`QfexModel::hold_trades`] held: each connection and frame.
@@ -456,6 +480,10 @@ impl Default for QfexModel {
             close_after: None,
             fill_on_trades: false,
             touch_moves: None,
+            blank_cid_after_session: false,
+            newest_first: false,
+            page_delay: None,
+            stuck_trades: false,
             mds_pusher: None,
             held: Vec::new(),
             lagging: HashMap::new(),
@@ -506,6 +534,10 @@ impl QfexModel {
                 let n = self.rest_after;
                 self.rest_after += usize::from(after);
                 if after && self.rate_limit == Some(Limited::Rest(n)) {
+                    return status(429, r#"{"error":"Too Many Requests"}"#);
+                }
+                if !after && self.rate_limit == Some(Limited::RestBefore) {
+                    self.rate_limit = None;
                     return status(429, r#"{"error":"Too Many Requests"}"#);
                 }
                 if self.rate_limit == Some(Limited::RestAfterSession) && self.session_ended() {
@@ -667,7 +699,17 @@ impl QfexModel {
             }
             "add_order" => Ok(self.add_order(conn, &v, text)),
             "cancel_order" => Ok(self.cancel_order(conn, &v, text)),
-            "get_user_orders" => Ok(vec![Frame::text(self.orders_page(conn, &v))]),
+            "get_user_orders" => {
+                let session = self.conns.get(&conn).is_some_and(|c| c.session);
+                let page = Frame::text(self.orders_page(conn, &v));
+                match self.page_delay.filter(|_| !session && self.places > 0) {
+                    Some(after) => {
+                        self.later(conn, vec![page], after, false);
+                        Ok(Vec::new())
+                    }
+                    None => Ok(vec![page]),
+                }
+            }
             "get_user_trades" if self.hold_trades => {
                 let page = Frame::text(self.trades_page(conn, &v));
                 self.held.push((conn, page));
@@ -983,6 +1025,16 @@ impl QfexModel {
     fn orders_page(&mut self, conn: usize, v: &Value) -> String {
         let session = self.conns.get(&conn).is_some_and(|c| c.session);
         let account = self.account_of(conn);
+        if !session && self.places == 0 && self.rate_limit == Some(Limited::ReadSocketBefore) {
+            self.rate_limit = None;
+            let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
+            return limited(&echo.to_string(), 3);
+        }
+        if !session && self.places == 0 && self.rate_limit == Some(Limited::PageKeptWholeBefore) {
+            self.rate_limit = None;
+            let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
+            return limited(&echo.to_string(), 3).replace("exceeded,", "exceeded\\u002c");
+        }
         if !session && self.places > 0 {
             let n = self.pages_after;
             self.pages_after += 1;
@@ -1004,12 +1056,20 @@ impl QfexModel {
             true => None,
             false => self.stale_of(&account, |s| &mut s.pages),
         };
-        let open = stale.map_or_else(|| self.open_of(&account), |s| s.orders);
+        let mut open = stale.map_or_else(|| self.open_of(&account), |s| s.orders);
+        if !session && self.newest_first {
+            open.reverse();
+        }
         let mut asked = v.clone();
         if self.stuck_pages {
             asked["params"]["offset"] = serde_json::json!(0);
         }
-        let rows: Vec<Value> = paged(&open, &asked).iter().map(row).collect();
+        let mut rows: Vec<Value> = paged(&open, &asked).iter().map(row).collect();
+        if !session && self.blank_cid_after_session && self.session_ended() {
+            for row in &mut rows {
+                row["client_order_id"] = Value::String(String::new());
+            }
+        }
         serde_json::json!({"all_orders_response": {"orders": rows, "twaps": []}}).to_string()
     }
 
@@ -1020,7 +1080,11 @@ impl QfexModel {
         let fills: Vec<&Filled> = (self.fills.iter())
             .filter(|f| f.account == account && f.at >= start)
             .collect();
-        let rows: Vec<Value> = paged(&fills, v).iter().map(|f| trade_row(f)).collect();
+        let mut asked = v.clone();
+        if self.stuck_trades {
+            asked["params"]["offset"] = serde_json::json!(0);
+        }
+        let rows: Vec<Value> = paged(&fills, &asked).iter().map(|f| trade_row(f)).collect();
         serde_json::json!({"user_trades_response": rows}).to_string()
     }
 

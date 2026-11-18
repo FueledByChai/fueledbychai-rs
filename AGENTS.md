@@ -893,15 +893,24 @@ holds two of them for one pull request. The rules after the three roles bind all
     per comparison, `get_user_orders` from offset 0 until a short page and REST positions under
     `--namespace`, every frame and request charged to the shared limiter first and one without
     room skipping that read, each read `--read-interval-ms` after the last began, at most 10
-    within `--agree-wait-ms`, the first agreeing read timed, `ReadDisagrees` at the end of the
-    wait and lag recorded, a provider refusal on the read socket (one in a frame the journal
-    keeps whole, which holds no budget, included: `Refusals::shown`) or REST a stop.
+    within `--agree-wait-ms`, none beginning at its end or past it nor waited for, a read
+    still running at its end sending nothing more (`Reader::until`) but reading the answer it
+    asked for, so a refusal in it is heard, and otherwise not judged (`Took::Unfinished`), the
+    first agreeing read timed,
+    `ReadDisagrees` at the end of the wait and lag recorded, judged on the last read finished
+    within it, a provider refusal on the read socket (one in a frame the journal keeps whole,
+    which holds no budget, included: `Refusals::shown`) or REST a stop. Every read socket of the
+    run, a comparison's and an account read's, charges its close to the shared limiter first as
+    a control frame and, with no room (under a provider hold, say), is dropped with no close
+    frame; the pong the WebSocket layer writes to a ping on one is recorded there (0030).
     `stage::check_accounts_allowing` admits one order of ours (`capture::AllowedOrder`, at most
     one row) on its account alone, for FBC-77r8; every read before a session so far admits none.
     Drop session one (FBC-23ch, `stage.rs`'s `Run::drop_one`; 0132 items 4 and 7, 0151 items 2,
     4, 9, 11 and 13) runs on the first named account alone (a session on another would start
     with X resting, until FBC-77r8): every named account read clean (or by the
-    reads that cleared a marker), the drop registry built, its trip given to the journal before
+    reads that cleared a marker; a provider refusal in either, one kept whole or a REST 429 or
+    418 included, a stop, marked, `Run::unless_refused`), the drop registry built, its trip given
+    to the journal before
     any market arms, seeded flat; one unchanged `ExecSession` on `place_config` with the
     discovered spec table, the run's `--namespace`, one `RpcIds` for the run, the run's next
     session number, an `AccountWideCodAuthority` for its own account and one connection attempt,
@@ -921,19 +930,23 @@ holds two of them for one pull request. The rules after the three roles bind all
     tee or the handler raised during it once a fill of ours came, taken before the close, its
     cancels sent once there is room, or, with none within the patience, held as 0151 item 11
     says; then the read of every named account and of X
-    and its trades (`account_reads`' trades and historic-orders reads, FBC-be57), waiting out a
-    rate hold rather than skipping, a provider refusal (one kept whole included) or a Ctrl-C
-    during them a stop. The first stop ends the steps, and one raised as the
-    session closes is still the run's; only Ctrl-C and a fill of ours cancel in
-    a drop session (Kill, `cancel_everything` by venue id, a wait up to `--rpc-timeout-ms` with a
-    second Ctrl-C recorded, disarm; cancels held by a rate refusal or refused locally end by a
-    graceful close, 0151 item 11), every other stop sending none. The run then ends with its stop
+    and its trades (`account_reads`' trades and historic-orders reads, FBC-be57; a full page
+    repeating the one before it, as a venue ignoring the offset answers, failing the read of X),
+    waiting out a rate hold rather than skipping, a provider refusal (one kept whole included)
+    or a Ctrl-C during them a stop, raised and marked even after a session that failed with no
+    stop, whose failure the evidence keeps as the session's error. The first stop ends the
+    steps, and one raised as the session closes is still the run's; only Ctrl-C and a fill of ours
+    cancel in a drop session (Kill, `cancel_everything` by venue id, a wait up to `--rpc-timeout-ms`
+    with a second Ctrl-C recorded, disarm; cancels held by a rate refusal or refused locally end by
+    a graceful close, 0151 item 11), every other stop sending none. The run then ends with its stop
     and marker, `NotFlat` on a position after the session or a trade naming X (a fill seen with
     no session open, 0151 item 9), or, with none, X still resting
     reported for the owner's hand cancel and marked `LeftResting`, its line naming FBC-77r8,
     which builds drop session two. The report and the evidence (`"ticket"` FBC-9sk2) give drop
     session one (what answered the arm, whether the graceful close cancelled X, measured on a
-    read of X's own account alone, each frame's
+    read of X's own account alone, X found there by its venue id once known whatever client id
+    its row carries (`AllowedOrder::names`, apart from the stricter `AllowedOrder::matches` a
+    read before a session admits by), and unmeasured on a full page not listing it, each frame's
     client-id echo as a verdict, whether `add_order` went out as encoded, the stop's cancels, each
     comparison, X's reads), the place registries, each session's and read socket's refusals
     (`refusals.rs`, a session named by `SessionRun::label`) and its resync's full pages, read on
