@@ -289,7 +289,15 @@ holds two of them for one pull request. The rules after the three roles bind all
   answered, no frame of its own; FBC-39ks), and its codec sending no client keepalive, since the
   owner's hour-long hold on QFEX production showed server pings about every 10 s after
   authentication and no server close (for production only; FBC-sbbl, 0146 item 8;
-  `fixtures/qfex/exec-recorded/hold-production/`, held by `tests/hold_production.rs`),
+  `fixtures/qfex/exec-recorded/hold-production/`, held by `tests/hold_production.rs`); and,
+  apart from the probe, its clustered-move benchmark (`tests/clustered_move.rs`, FBC-d8uk,
+  measured as Paradex's FBC-vgm: fbc-runtime's shard host runs this crate's MDS `bbo` from a
+  reference server of the test's own (tokio's `net`, `tokio-tungstenite` and `futures-util` as
+  dev-dependencies) beside an unchanged `ExecSession` on the codec under `preprod_probe`, every
+  origin loopback, against the conformance stub, each protective cancel written behind at most
+  one place encoded after its frame arrived; on Linux, with no journal set, as Paradex's runs,
+  it reports their kernel-receive-to-write-done p50, p99 and max, and on every platform their
+  ingest stamp to write done, off Linux read from the session's journal and labelled so),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the

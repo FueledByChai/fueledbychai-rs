@@ -34,5 +34,11 @@ fbc-journal = { path = "../../fbc-journal" }
 # count dev-dependencies.
 fbc-oms = { path = "../../fbc-oms" }
 fbc-runtime = { path = "../../fbc-runtime" }
-# The tests' runtime; tests/liveness.rs runs on a paused clock (test-util).
-tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+# The tests' runtime; tests/liveness.rs runs on a paused clock (test-util). tests/clustered_move.rs
+# (FBC-d8uk) waits on tokio's sync primitives and serves its reference market data from a
+# WebSocket server of its own on another thread (net), as Paradex's benchmark does.
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util", "net", "sync"] }
+# tests/clustered_move.rs's reference server (FBC-d8uk), as fbc-venue-paradex's benchmark
+# serves its own: test-only. scripts/check-deps.sh does not count dev-dependencies.
+futures-util = { workspace = true, features = ["sink", "std"] }
+tokio-tungstenite.workspace = true

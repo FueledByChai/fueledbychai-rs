@@ -685,6 +685,7 @@ dependencies = [
  "fbc-journal",
  "fbc-oms",
  "fbc-runtime",
+ "futures-util",
  "getrandom 0.3.4",
  "hmac",
  "rust_decimal",
@@ -692,6 +693,7 @@ dependencies = [
  "sha2",
  "time",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
