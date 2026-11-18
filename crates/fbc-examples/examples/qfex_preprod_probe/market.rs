@@ -32,8 +32,9 @@
 //!   grid on its safe side as `InstrumentSpec::quantize` snaps, flooring a buy and ceiling a
 //!   sell, so a resting order is never nearer the touch, and a flatten never further through it,
 //!   than asked, however many ticks the price spans. The resting price is taken for the caps
-//!   and for X and Y (FBC-23ch and FBC-77r8, from the touch [`Touch::drive`] keeps current while
-//!   a session runs, [`TouchView`]); later slices price the others.
+//!   and for X and Y (FBC-23ch and FBC-77r8, from the touch [`Touch::driven`] keeps current from
+//!   the preflight's first touch until the place stages end, [`TouchView`]); later slices price
+//!   the others.
 //! - **The caps** ([`place_caps`]): each of `--resting-cap-usd` and `--inventory-cap-usd` in lots
 //!   with `testnet::cap_lots`, at `testnet::inventory_price` of the resting price and the touch,
 //!   the highest price any order of the stages takes, and refused below three of the
@@ -45,7 +46,9 @@
 //! no cap, distance, flatten cap or attempt count, and no symbol (0151 item 10).
 
 use std::cell::RefCell;
+use std::convert::Infallible;
 use std::fmt::Write as _;
+use std::future::Future;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -496,24 +499,37 @@ impl Touch {
         self.view().now(max_age)
     }
 
-    /// What its connection gives, to judge while [`Touch::drive`] runs it.
+    /// What its connection gives, to judge while [`Touch::driven`] runs it.
     pub fn view(&self) -> TouchView {
         TouchView {
             state: Rc::clone(&self.state),
         }
     }
 
-    /// Drives the touch's connection on, as [`Touch::first`] began it, so each later touch
-    /// reaches its [`TouchView`] (FBC-23ch: the drop session prices X from it). It resolves
-    /// never, but after the connection ended, from which no touch then arrives and the view says
+    /// Runs `work` with the touch's connection driven on beside it, as [`Touch::first`] began it,
+    /// until `work` ends (FBC-kllr): each later touch reaches its [`TouchView`], which the place
+    /// stages price X, Y and the later orders from, and each server ping on the MDS socket is
+    /// answered, whatever `work` awaits, between the sessions as well as during them. The touch
+    /// is polled first on every wake, so a touch that arrived is in the view before `work` reads
+    /// it. A connection that ended is not opened again: no touch then arrives, and the view says
     /// so.
-    pub async fn drive(&mut self) {
+    pub async fn driven<T>(&mut self, work: impl Future<Output = T>) -> T {
+        tokio::select! {
+            biased;
+            never = self.drive() => match never {},
+            out = work => out,
+        }
+    }
+
+    /// Drives the touch's connection on. It never resolves: once the connection ended, it waits
+    /// on nothing.
+    async fn drive(&mut self) -> Infallible {
         let _ = self.venue.run().await;
-        std::future::pending::<()>().await;
+        std::future::pending().await
     }
 }
 
-/// The touch [`Touch::drive`] keeps current, read without the venue it runs on.
+/// The touch [`Touch::driven`] keeps current, read without the venue it runs on.
 #[derive(Clone)]
 pub struct TouchView {
     state: Rc<RefCell<TouchState>>,

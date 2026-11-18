@@ -157,6 +157,26 @@
 //!   budget across its registries; a position frame before or after a fill changing nothing; a
 //!   connection that ends, Ctrl-C, other orders not seen to end, no touch and a rate refusal
 //!   during it.
+//!
+//! FBC-kllr's done line: the MDS touch driven from the preflight's first touch until the place
+//! stages end, against the model's MDS reached through a relay that pings each connection every
+//! second, streams the touch before each ping and closes a connection whose ping goes unanswered
+//! for longer than 5 s ([`super::mds_pings`]), each run held between two sessions by a read the
+//! model holds while the test moves a paused clock 45 s, a ping at a time:
+//!
+//! - between drop sessions one and two, every ping is answered and Y is priced from the touch
+//!   streamed during the gap, no older than `--touch-max-age-ms`, which is shorter than the gap
+//!   (`the_touch_is_driven_between_the_place_stages_sessions`);
+//! - the same across the gap between the primary account's drop test and the subaccount's, the
+//!   subaccount's X and Y priced from that touch (`the_touch_is_driven_between_named_accounts`);
+//! - an MDS connection the model closes between the sessions, its close answered meanwhile, is
+//!   not opened again, so Y is not placed, and the run stops LeftResting, marked, X resting for
+//!   the owner's hand cancel (`a_touch_ended_between_the_sessions_stops_before_the_next_place`);
+//! - a press of Ctrl-C in the driven gap is the run's stop, Interrupted, marked, every ping still
+//!   answered (`a_press_in_the_driven_gap_between_the_sessions_stops_the_run_interrupted`), and
+//!   one as the last read after a drop session two that a touch ended between the sessions failed
+//!   outranks LeftResting, X said resting as the read showed it
+//!   (`a_press_as_the_last_read_after_a_touch_ended_between_the_sessions_outranks_left_resting`).
 
 use super::*;
 
@@ -224,7 +244,7 @@ pub(super) fn argv_on(dir: &Path, trade: &str, rest: &str, mds: &str) -> Argv {
 /// it (FBC-77r8).
 pub(super) fn argv(dir: &Path, venue: &Venue) -> Argv {
     let (trade, rest) = (venue.trade.ws_url(""), venue.trade.http_url(""));
-    let argv = argv_on(dir, &trade, &rest, &venue.mds.ws_url(""));
+    let argv = argv_on(dir, &trade, &rest, &venue.mds_url());
     set(argv, "--touch-max-age-ms", "60000")
 }
 
@@ -16395,4 +16415,459 @@ async fn a_verdicts_stop_before_an_account_not_read_after_drop_session_two_is_ke
     );
     assert_eq!(d.ev.last_unread, ["subaccount"], "{}", d.printed);
     assert_eq!(d.ev.drops.len(), 1, "{}", d.printed);
+}
+
+// ----- FBC-kllr: the MDS touch driven between the place stages' sessions ---------------------
+
+/// How often the model's MDS relay pings in FBC-kllr's tests ([`super::mds_pings`]), how long it
+/// lets a ping go unanswered before it closes the connection, and how many of its pings a gap
+/// between two sessions lasts: longer than that window, and than [`GAP_TOUCH_AGE_MS`].
+const PING_EVERY: Duration = Duration::from_secs(1);
+const PING_WITHIN: Duration = Duration::from_secs(5);
+const GAP_PINGS: u64 = 45;
+
+/// Each move of the clock in the gap: a ping's interval and a millisecond. The clock is paused
+/// at an instant real time chose, off the timer wheel's whole milliseconds, and the runtime
+/// rounds a timer's deadline up to the next one, so a move of exactly the interval would stop
+/// just short of the relay's next ping.
+const PING_STEP: Duration = Duration::from_millis(1001);
+
+/// `--touch-max-age-ms` in those tests: shorter than the gap on the runtime's clock, so a touch
+/// from before the gap is too old to price from, and long enough for the rest of a run on a
+/// loaded machine, on real time once the gap ends.
+const GAP_TOUCH_AGE_MS: &str = "40000";
+
+/// The touch the model streams once the gap began: 99.00 bid, 99.10 asked, below the preflight's,
+/// so both caps still admit what they admitted there (decision 0113).
+fn gap_touch() -> model::Touch {
+    model::Touch {
+        bid: Some(("99.00", "1.00")),
+        ask: Some(("99.10", "2.00")),
+        age_secs: 0,
+    }
+}
+
+/// A place-stage run against `model` with `env`, its MDS reached through the relay
+/// ([`super::mds_pings`], FBC-kllr), held between two sessions: as the probe prints `at`, the next
+/// read socket's page is held ([`QfexModel::hold_page`]); once it is, the clock is paused and
+/// frozen, the model's touch becomes [`gap_touch`], the relay pings, and the test moves the clock
+/// one ping at a time, [`GAP_PINGS`] times, waiting after each for that ping's pong or the MDS
+/// connection's end; then the relay stops pinging, the page is released and the clock resumes.
+/// The gap is ordered by what the probe printed and what the relay heard, never by the wall
+/// clock; the rest of the run is on real time, as every other place-stage run here is, since the
+/// model settles a dropped connection on the stub's own task.
+async fn gapped(
+    model: QfexModel,
+    what: &str,
+    env: &HashMap<&'static str, String>,
+    at: &'static str,
+) -> Dropped {
+    gapped_pressing(model, what, env, at, None).await
+}
+
+/// As [`gapped`], and, given `press_after`, the owner presses Ctrl-C once in the gap, as soon as
+/// the relay heard that many pongs, while the read stays held.
+async fn gapped_pressing(
+    model: QfexModel,
+    what: &str,
+    env: &HashMap<&'static str, String>,
+    at: &'static str,
+    press_after: Option<u64>,
+) -> Dropped {
+    let pings = super::mds_pings::Pings {
+        every: PING_EVERY,
+        within: PING_WITHIN,
+    };
+    let model = QfexModel {
+        mds_pings: Some(pings),
+        ..model
+    };
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let argv = set(drop_argv(&dir, &venue), "--read-wait-ms", "60000");
+    let argv = set(argv, "--touch-max-age-ms", GAP_TOUCH_AGE_MS);
+    let (mut opts, places) = parsed(&argv).unwrap();
+    opts.rate_user = user();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let model = Arc::clone(&venue.model);
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at,
+        press: Some(Box::new(move || model.lock().unwrap().hold_page = true)),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let (mut press, pressing) = interrupt::Presses::channel();
+    let presses = match press_after {
+        Some(_) => pressing,
+        None => interrupt::Presses::none(),
+    };
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses);
+    let relay = venue.relay.as_ref().expect("the relay");
+    let gap = async {
+        until("the read after the line, held", || venue.holding()).await;
+        let frozen = freeze();
+        tokio::time::pause();
+        venue.model.lock().unwrap().touch = gap_touch();
+        relay.pinging(true);
+        let pinging = |on: bool| venue.pinged().first().is_some_and(|p| p.on == on);
+        until("the relay pinging", || pinging(true)).await;
+        for k in 1..=GAP_PINGS {
+            tokio::time::advance(PING_STEP).await;
+            until("the ping's pong, or the MDS connection's end", || {
+                let pinged = venue.pinged();
+                pinged.first().is_some_and(|p| p.answered >= k || p.ended)
+            })
+            .await;
+            if press_after == Some(k) {
+                press();
+            }
+        }
+        relay.pinging(false);
+        until("the relay not pinging", || pinging(false)).await;
+        venue.release_held().await;
+        tokio::time::resume();
+        drop(frozen);
+    };
+    let (ran, ()) = tokio::join!(ran, gap);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    assert!(printed.contains(at), "{printed}");
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+/// Asserts the gap outlasted the relay's window and the touch's age bound, and every ping the
+/// relay sent on the run's one MDS connection was answered, after the touch streamed before it,
+/// and none closed it.
+fn assert_every_ping_answered(d: &Dropped) {
+    let gap = PING_STEP * u32::try_from(GAP_PINGS).unwrap();
+    let max_age = Duration::from_millis(GAP_TOUCH_AGE_MS.parse().unwrap());
+    assert!(gap > PING_WITHIN && gap > max_age);
+    let pinged = d.venue.pinged();
+    assert_eq!(pinged.len(), 1, "{pinged:?}");
+    let p = &pinged[0];
+    assert_eq!(
+        (p.touches, p.sent, p.answered),
+        (GAP_PINGS, GAP_PINGS, GAP_PINGS)
+    );
+    assert!(!p.closed_unanswered, "{p:?}");
+    assert_eq!(d.venue.mds.connections().len(), 1);
+}
+
+/// How many `add_order`s the model saw before it held a read's page ([`QfexModel::hold_page`]).
+fn places_before_the_hold(d: &Dropped) -> usize {
+    let what = d.what();
+    let held = what.iter().position(|w| w.ends_with(" page held"));
+    let before = &what[..held.expect("a page held")];
+    before.iter().filter(|w| w.ends_with(" add_order")).count()
+}
+
+/// The prices of the first two post-only GTC buys the model rested on `account`, in order: the
+/// account's X and Y.
+fn resting_prices(d: &Dropped, account: Option<&str>) -> Vec<Value> {
+    let model = d.venue.model.lock().unwrap();
+    let ours = (model.orders.iter())
+        .filter(|o| o.account.as_deref() == account && o.kind == "ALO" && o.tif == "GTC")
+        .filter(|o| o.side == "BUY");
+    ours.map(|o| o.price.clone()).take(2).collect()
+}
+
+#[tokio::test]
+async fn the_touch_is_driven_between_the_place_stages_sessions() {
+    // As drop session one ends, the read after it is held, and the test moves a paused clock
+    // 45 s, nine times the 5 s the model's MDS lets a ping go unanswered before it closes the
+    // connection: every ping is answered while the run waits on that read, so the connection
+    // stays open, and the touch streamed before each ping reaches the view. Y is then placed
+    // from a touch no older than --touch-max-age-ms: 40 s, shorter than the gap, so only a touch
+    // streamed during it admits Y, priced 50 bps behind the touch that moved to 99.00 meanwhile,
+    // where X was priced behind the preflight's 100.00 (FBC-kllr).
+    let at = "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close";
+    let d = gapped(
+        QfexModel::default(),
+        "kllr-between-sessions",
+        &primary_only(),
+        at,
+    )
+    .await;
+    assert_every_ping_answered(&d);
+    assert_eq!(places_before_the_hold(&d), 1);
+    let two = d.two();
+    assert!(two.y.submitted && two.y.acked, "{two:?}");
+    assert_eq!(two.error, None);
+    assert_eq!(
+        resting_prices(&d, None),
+        [super::json("99.5"), super::json("98.5")]
+    );
+    assert!(d.drop_run().verdict.as_ref().unwrap().passed);
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn the_touch_is_driven_between_named_accounts() {
+    // Once the primary account's drop test ended, its last read made, the subaccount's drop
+    // test begins with the read of every named account, and the first of them is held for 45 s,
+    // as above: every ping is answered across the gap between the primary account's drop
+    // session two and the subaccount's drop session one, and the subaccount's X and Y are priced
+    // behind the touch streamed during it, where the primary account's were priced behind the
+    // preflight's (FBC-kllr).
+    let at = "READ after drop session two: subaccount: ";
+    let d = gapped(
+        QfexModel::default(),
+        "kllr-between-accounts",
+        &environment(),
+        at,
+    )
+    .await;
+    assert_every_ping_answered(&d);
+    assert_eq!(d.ev.drops.len(), 2);
+    assert!(
+        d.ev.drops
+            .iter()
+            .all(|r| r.verdict.as_ref().unwrap().passed)
+    );
+    let at_100 = super::json("99.5");
+    assert_eq!(resting_prices(&d, None), [at_100.clone(), at_100]);
+    let at_99 = super::json("98.5");
+    assert_eq!(resting_prices(&d, Some(SUB)), [at_99.clone(), at_99]);
+    // The read held came after the primary account's X and Y, and before the subaccount's.
+    assert_eq!(places_before_the_hold(&d), 2);
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_touch_ended_between_the_sessions_stops_before_the_next_place() {
+    // As drop session one ends, the read after it is held, and the model closes the MDS
+    // connection meanwhile: the probe, driving the touch between the sessions, answers that
+    // close, which the model sees. The connection is not opened again, so once the read is
+    // released no touch of its current epoch prices Y: Y is not placed, as before FBC-kllr, a
+    // failure that is no stop, and the reads after the session add theirs, LeftResting, marked,
+    // X resting for the owner's hand cancel (FBC-77r8, 0151 item 6).
+    let at = "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close";
+    let (dir, removed) = temp_dir("kllr-touch-ended");
+    let venue = Venue::start(QfexModel::default()).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let model = Arc::clone(&venue.model);
+    let out: stage::Out = Rc::new(RefCell::new(PressAt {
+        printed: printed.clone(),
+        at,
+        press: Some(Box::new(move || model.lock().unwrap().hold_page = true)),
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let presses = interrupt::Presses::none();
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses);
+    let gap = async {
+        until("the read after the line, held", || venue.holding()).await;
+        let mds = venue.model.lock().unwrap().mds_pusher.clone().unwrap();
+        mds.close(0).await.unwrap();
+        // The probe's close reply, which only a touch read between the sessions sends.
+        until("the probe's reply to the MDS close", || {
+            venue.mds.connections()[0].client_closed
+        })
+        .await;
+        venue.release_held().await;
+    };
+    let (ran, ()) = tokio::join!(ran, gap);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    assert_stopped(&d, places::Stop::LeftResting);
+    let two = d.two();
+    assert_eq!(two.error.as_deref(), Some(market::BEFORE_EPOCH));
+    assert_eq!(two.arm.as_deref(), Some("Accepted"));
+    assert!(!two.y.submitted && two.resting, "{two:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    assert_eq!(places_before_the_hold(&d), 1);
+    assert_eq!(d.venue.mds.connections().len(), 1);
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Open);
+    drop(model);
+    let stopped = d.ev.stopped.clone().unwrap();
+    assert!(stopped.starts_with(market::BEFORE_EPOCH), "{stopped}");
+    assert!(
+        stopped.contains("; LeftResting after drop session two"),
+        "{stopped}"
+    );
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS))
+    );
+    let (report, _) = d.outputs();
+    assert!(report.contains(places::HAND_CANCEL_ORDERS), "{report}");
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+// ----- FBC-kllr's restack onto PR #274's and PR #277's review fixes ---------------------------
+
+/// What [`ActsAt`] runs once a line holding its text is printed.
+type Act = (&'static str, Box<dyn FnMut()>);
+
+/// Where the probe's lines go in a test that acts on two of them: the model's [`Printed`], and
+/// each act, in order, run once as soon as a line holding its text is printed.
+struct ActsAt {
+    printed: Printed,
+    acts: Vec<Act>,
+}
+
+impl std::io::Write for ActsAt {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.printed.write(buf)?;
+        while let Some((at, _)) = self.acts.first()
+            && self.printed.text().contains(at)
+        {
+            let (_, mut act) = self.acts.remove(0);
+            act();
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_press_in_the_driven_gap_between_the_sessions_stops_the_run_interrupted() {
+    // FBC-su9i's review fixes to the presses a wait takes, on FBC-kllr's own path: as drop
+    // session one ends, the read after it is held and the relay pings, as in
+    // the_touch_is_driven_between_the_place_stages_sessions, and the owner presses Ctrl-C after
+    // the gap's 22nd pong. The touch driven beside the read takes no press and ends nothing: the
+    // read takes the press, every ping is still answered to the gap's end, and once the read is
+    // released the run stops Interrupted after drop session one, marked, X resting for the
+    // owner's hand cancel, and drop session two is never built.
+    let at = "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close";
+    let d = gapped_pressing(
+        QfexModel::default(),
+        "kllr-press-in-gap",
+        &primary_only(),
+        at,
+        Some(GAP_PINGS / 2),
+    )
+    .await;
+    assert_every_ping_answered(&d);
+    assert_eq!(places_before_the_hold(&d), 1);
+    let name = places::Stop::Interrupted.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let line = format!(
+        "Interrupted during the reads after drop session one: {}; no further session runs",
+        places::Stop::Interrupted.says()
+    );
+    assert_eq!(d.ev.stopped.as_deref(), Some(line.as_str()));
+    let run = d.drop_run();
+    assert!(run.x_resting && run.two.is_none(), "{run:?}");
+    assert!(reads_before_two(&d).is_empty(), "{}", d.printed);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Open);
+    drop(model);
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn a_press_as_the_last_read_after_a_touch_ended_between_the_sessions_outranks_left_resting() {
+    // FBC-su9i's review fix to the reads after a session (a press made as the last read ends is
+    // still taken), on FBC-kllr's own path: the model closes the MDS connection while the read
+    // after drop session one is held, as in
+    // a_touch_ended_between_the_sessions_stops_before_the_next_place, so Y is not placed, a
+    // failure of drop session two that is no stop. The owner presses Ctrl-C as the last named
+    // account's read after that session prints its line, in the poll that ends that read: the
+    // press is the run's stop after the session's failure, Interrupted, marked, ahead of
+    // LeftResting, and X, which the read of its account after the session listed, is said
+    // resting as that read showed it, not counted resting, for the owner's hand cancel.
+    let session_one =
+        "SESSION primary (drop session one): arm outcome Accepted, ended by a graceful close";
+    let last_read = "READ after drop session two: subaccount";
+    let (dir, removed) = temp_dir("kllr-touch-ended-press");
+    let venue = Venue::start(QfexModel::default()).await;
+    let (mut opts, places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let model = Arc::clone(&venue.model);
+    let (press, presses) = interrupt::Presses::channel();
+    let out: stage::Out = Rc::new(RefCell::new(ActsAt {
+        printed: printed.clone(),
+        acts: vec![
+            (
+                session_one,
+                Box::new(move || model.lock().unwrap().hold_page = true),
+            ),
+            (last_read, Box::new(press)),
+        ],
+    }));
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses);
+    let gap = async {
+        until("the read after the line, held", || venue.holding()).await;
+        let mds = venue.model.lock().unwrap().mds_pusher.clone().unwrap();
+        mds.close(0).await.unwrap();
+        until("the probe's reply to the MDS close", || {
+            venue.mds.connections()[0].client_closed
+        })
+        .await;
+        venue.release_held().await;
+    };
+    let (ran, ()) = tokio::join!(ran, gap);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    let name = places::Stop::Interrupted.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let line = format!("{}; {}", market::BEFORE_EPOCH, interrupted_after_two());
+    assert_eq!(d.ev.stopped.as_deref(), Some(line.as_str()));
+    let two = d.two();
+    assert_eq!(two.error.as_deref(), Some(market::BEFORE_EPOCH));
+    assert!(!two.y.submitted && two.resting && two.x_resting, "{two:?}");
+    assert_eq!(two.unread, None, "{two:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS)),
+        "{}",
+        d.printed
+    );
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+    assert_eq!(d.venue.mds.connections().len(), 1);
+    let (report, json) = d.outputs();
+    let x_at_end =
+        format!("{X_AT_END}yes, shown by the read of X's account after drop session two: ");
+    assert!(report.contains(&x_at_end), "{report}");
+    assert!(!report.contains(places::X_COUNTED_AFTER_TWO), "{report}");
+    let two = &json["drop_tests"][0]["session_two"];
+    assert_eq!(two["counted_resting"], Value::Null);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
 }

@@ -71,7 +71,12 @@
 //!   0132 item 7, 0148 items 5 and 10, 0151 items 8 and 10, in [`place_stages`], its pure parts,
 //!   the report's declarations and the QFEX model's fee_sign and ioc_frame_order knobs in
 //!   [`taker_run`]): filled at the touch and flattened through Exit, expired and recorded, left
-//!   open with a fill and stopped not flat, the taker fee's sign and the order of its frames.
+//!   open with a fill and stopped not flat, the taker fee's sign and the order of its frames;
+//! - drives the MDS touch from the preflight's first touch until the place stages end (FBC-kllr,
+//!   in [`place_stages`], against the QFEX model's pinging MDS relay in [`mds_pings`]), so every
+//!   ping on the MDS socket is answered and each later place is priced from a current touch,
+//!   between the sessions and between named accounts too, and a touch connection that ended
+//!   between the sessions still stops the run before the next place.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -118,6 +123,9 @@ mod ledger;
 mod link;
 #[path = "../examples/qfex_preprod_probe/market.rs"]
 mod market;
+// The QFEX model's pinging MDS relay (FBC-kllr), declared by path as `model` is.
+#[path = "qfex_preprod_probe/mds_pings.rs"]
+mod mds_pings;
 // The QFEX model the place stages' tests run against (FBC-c6kw), on the conformance stub's
 // serving scripts (decision 0150), declared by path as `place_registries` is.
 #[path = "qfex_preprod_probe/model.rs"]

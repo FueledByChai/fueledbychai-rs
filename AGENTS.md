@@ -865,7 +865,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     snapped to its safe side in whole ticks (a resting order `--away-bps` behind the touch, the
     crossing orders at the far touch, a flatten IOC at most `--flatten-cap-bps` through the touch
     it crosses), of which the resting price is used for the caps, X and Y and the far touch for
-    the crossing post-only, the touch kept current by `Touch::drive` while each session runs.
+    the crossing post-only, the touch kept current by `Touch::driven`, which `stage.rs` runs the
+    reads that clear a marker and every place stage beside, from the preflight's first touch until
+    they end, so each server ping on the MDS socket is answered between the sessions as well as
+    during them, and a touch connection that ended is not opened again (FBC-kllr).
     `stage::place_config` adds `qfex.exec.production_places` to a place stage's session
     configuration alone (0148 item 4).
     Its report and evidence give the fences met and the steps passed, never a value, and its
@@ -1289,7 +1292,11 @@ holds two of them for one pull request. The rules after the three roles bind all
     listing one TWAP), and, for FBC-8mwz, `silent_sub_after_drop_reads` (once an armed connection
     dropped and a historic-orders read came, the first authentication naming a subaccount left
     unanswered, once) and `stop_order_after_drop_reads` (from then on, every subaccount's
-    `GET /user/positions` counting one open order no page lists), all declared by path; eleven paths
+    `GET /user/positions` counting one open order no page lists), and, for FBC-kllr, `mds_pings`
+    (the MDS reached through a relay of the test's own, `tests/qfex_preprod_probe/mds_pings.rs`,
+    that pings each connection on the runtime's clock, streams the touch before each ping and closes
+    a connection whose ping goes unanswered too long) and `hold_page` (the next read socket's page
+    held for the test's release, set as the probe prints a line), all declared by path; eleven paths
     no flag or answer reaches, X spent from its list, X not priced, Y not priced (FBC-gisx), a
     session failing after its order's answer,
     the journal past its soft limit, another order of ours held in a cross registry before a

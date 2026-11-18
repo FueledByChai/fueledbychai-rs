@@ -106,9 +106,13 @@
 //!   it before its preflight, with no stop marker, [`Run::hold`]),
 //!   then runs [`crate::market`]'s preflight (the spec from this run's
 //!   `GET /refdata`, the count bound, the MDS touch and the caps), then each named account's
-//!   drop test ([`Run::drop_tests`], below). [`place_config`] is the configuration a place
-//!   stage's sessions take, the only one with `qfex.exec.production_places` (decision 0148 item
-//!   4).
+//!   drop test ([`Run::drop_tests`], below). The MDS touch is driven from the preflight's first
+//!   touch until the place stages end ([`market::Touch::driven`], FBC-kllr): beside every read,
+//!   wait and close between two sessions as well as during them, so each server ping on its
+//!   socket is answered and each touch reaches the view every place is priced from; a touch
+//!   connection that ends is not opened again, and the next place it would price is refused.
+//!   [`place_config`] is the configuration a place stage's sessions take, the only one with
+//!   `qfex.exec.production_places` (decision 0148 item 4).
 //!   Before anything connects it opens its lease directory ([`places::RunLeases::open`], FBC-23ch:
 //!   the production tag, the stop markers held to `--reconciled`, the namespace lease and the
 //!   run's mint; 0151 items 1 and 6). With `--reconciled` it reads every named account after the
@@ -1032,7 +1036,9 @@ impl Run<'_> {
     }
 
     /// The hold, when the run asks for one, then each session, each after the checks of every
-    /// account the configuration names; a place-stage run's preflight and drop tests.
+    /// account the configuration names; a place-stage run's preflight, then its reads that clear
+    /// a stop marker and its place stages, the MDS touch driven beside them from the preflight's
+    /// first touch until they end (FBC-kllr).
     async fn stage(&mut self) -> Result<(), String> {
         self.line(format_args!(
             "ACCOUNTS {} named by the run's configuration, not listed by QFEX (decision 0144): {}",
@@ -1050,12 +1056,20 @@ impl Run<'_> {
             let passed = unless_pressed(&mut presses, self.preflight(places, &mut pre)).await;
             self.presses = presses;
             self.ev.preflight = Some(pre);
-            let market = match passed {
+            let (market, mut touch) = match passed {
                 Some(passed) => passed?,
                 None => return Err(self.halt(Stop::Interrupted, "during the preflight")),
             };
-            let read = self.reconcile().await?;
-            return self.drop_tests(places, market, read).await;
+            // The MDS touch driven from its first read until the place stages end, between the
+            // sessions as well as during them, so no read, wait or close between two sessions
+            // leaves its pings unanswered (FBC-kllr). The stages' future is put on the heap, so
+            // every run's future, stage one's too, holds it by pointer: inline, beside the touch,
+            // it overflowed a debug build's test thread's stack.
+            let stages = Box::pin(async {
+                let read = self.reconcile().await?;
+                self.drop_tests(places, market, read).await
+            });
+            return touch.driven(stages).await;
         }
         let arms = self.opts.arms.clone();
         for (n, armed) in arms.into_iter().enumerate() {
@@ -1125,8 +1139,13 @@ impl Run<'_> {
     /// the spec from this run's `GET /refdata` on the configuration the guard admitted, the count
     /// bound against each place registry's ceiling, the MDS touch, and the caps at it. No account
     /// connects, and nothing authenticated opens. What it gives the drop session: the spec, the
-    /// registries' bounds, the caps in lots and the touch, still open.
-    async fn preflight(&mut self, places: &Places, pre: &mut Preflight) -> Result<Market, String> {
+    /// registries' bounds, the caps in lots and the touch's view, and the touch itself, still
+    /// open, for [`Run::stage`] to drive.
+    async fn preflight(
+        &mut self,
+        places: &Places,
+        pre: &mut Preflight,
+    ) -> Result<(Market, market::Touch), String> {
         let (cfg, _) = configured(&self.base, self.lookup, self.named[0])?;
         let cfg = market::market_config(&cfg, self.opts.read_wait);
         self.line(format_args!(
@@ -1159,12 +1178,13 @@ impl Run<'_> {
             "PREFLIGHT passed: the spec, the count bound, the touch and the caps"
         ));
         self.specs = Some(found.specs.clone());
-        Ok(Market {
+        let market = Market {
             found,
             bounds,
             caps,
-            touch,
-        })
+            touch: touch.view(),
+        };
+        Ok((market, touch))
     }
 
     /// The client-id namespace reads decode ours by: a place-stage run's `--namespace`, stage
@@ -2146,12 +2166,14 @@ impl ExecHandler for Watch {
 // ----- Drop session one (FBC-23ch; decisions 0132 items 4 and 7, 0148, 0151) -----
 
 /// What the place stages' preflight gives the drop session ([`Run::preflight`]): the traded
-/// instrument, the registries' bounds, the caps in lots and the MDS touch, kept open.
+/// instrument, the registries' bounds, the caps in lots and the MDS touch's view, which
+/// [`market::Touch::driven`] keeps current from the preflight's first touch until the place
+/// stages end ([`Run::stage`], FBC-kllr).
 pub struct Market {
     found: Discovered,
     bounds: PlaceBounds,
     caps: PlaceCaps,
-    touch: market::Touch,
+    touch: market::TouchView,
 }
 
 /// What ends a drop session's steps before their course is run: a stop of the place stages, or
@@ -3205,21 +3227,21 @@ impl Run<'_> {
     /// A drop session on `on` (decision 0132 item 4): drop session one, or, given X (`x`, which
     /// session one placed), drop session two. An unchanged `ExecSession` whose handler is a
     /// [`PlaceHandler`] over the drop registry's `link`, its steps ([`Run::drop_steps`] or
-    /// [`Run::two_steps`]) run beside it and the MDS touch driven on. Whatever ends the steps, a
-    /// stop that cancels in a drop session (the owner's Ctrl-C, or any stop once a fill of ours
-    /// came: 0151 item 2) is followed by its cancels ([`Run::stop_cancels`]) and a comparison
-    /// after them; every other stop sends no cancel. Then the session ends by a graceful close
-    /// (0151 item 11: no drop test passed yet), unless its connection ended first, after waiting
-    /// for the shared budget's room when a provider refusal holds it; a Ctrl-C while it waits,
-    /// with no cancels run yet, is taken as one made during the steps, and so is a stop the tee
-    /// or the handler raised meanwhile, a fill of ours among them: its cancels run once there is
-    /// room, or, with none within the patience, are held as 0151 item 11 says. But drop session
-    /// two that ran its course, Y placed and the read before the drop made, ends by the abrupt
-    /// drop: its run is dropped, unpolled, and its connection with it, with no WebSocket close,
-    /// no wait for room and no cancel (decision 0132 item 4). Gives the run's stop, if any came,
-    /// the order it placed (X, or Y), once it was submitted, and each flatten IOC it sent, so the
-    /// reads after it count one left resting as ours; an error is a failure before the session
-    /// opened.
+    /// [`Run::two_steps`]) run beside it, the MDS touch driven on by [`Run::stage`] meanwhile
+    /// (FBC-kllr). Whatever ends the steps, a stop that cancels in a drop session (the owner's
+    /// Ctrl-C, or any stop once a fill of ours came: 0151 item 2) is followed by its cancels
+    /// ([`Run::stop_cancels`]) and a comparison after them; every other stop sends no cancel. Then
+    /// the session ends by a graceful close (0151 item 11: no drop test passed yet), unless its
+    /// connection ended first, after waiting for the shared budget's room when a provider refusal
+    /// holds it; a Ctrl-C while it waits, with no cancels run yet, is taken as one made during the
+    /// steps, and so is a stop the tee or the handler raised meanwhile, a fill of ours among them:
+    /// its cancels run once there is room, or, with none within the patience, are held as 0151 item
+    /// 11 says. But drop session two that ran its course, Y placed and the read before the drop
+    /// made, ends by the abrupt drop: its run is dropped, unpolled, and its connection with it,
+    /// with no WebSocket close, no wait for room and no cancel (decision 0132 item 4). Gives the
+    /// run's stop, if any came, the order it placed (X, or Y), once it was submitted, and each
+    /// flatten IOC it sent, so the reads after it count one left resting as ours; an error is a
+    /// failure before the session opened.
     async fn drop_session(
         &mut self,
         places: &Places,
@@ -3292,7 +3314,7 @@ impl Run<'_> {
         let mut presses = std::mem::take(&mut self.presses);
         let mut placed = None;
         let (mut stop, mut error) = (None, None);
-        let view = market.touch.view();
+        let view = market.touch.clone();
         let found = market.found.clone();
         // Whether `running` completed: an `async fn` polled again once it completed panics, so
         // every select on it after the first one that took it is skipped.
@@ -3301,8 +3323,6 @@ impl Run<'_> {
         {
             let running = session.run();
             tokio::pin!(running);
-            let drive = market.touch.drive();
-            tokio::pin!(drive);
             let steps: Pin<Box<dyn Future<Output = Result<(), Halt>> + '_>> = match x {
                 None => Box::pin(self.drop_steps(
                     places,
@@ -3325,7 +3345,6 @@ impl Run<'_> {
             let stepped = tokio::select! {
                 biased;
                 ended = &mut running => Err(ended),
-                () = &mut drive => unreachable!("the touch is driven until dropped"),
                 stepped = steps => Ok(stepped),
             };
             match stepped {
@@ -3352,7 +3371,7 @@ impl Run<'_> {
                         places,
                         (&found, &view),
                         &d,
-                        (&mut running, &mut drive),
+                        &mut running,
                         (allowance, &mut presses),
                         (&ours, which.name()),
                         stop,
@@ -3367,7 +3386,7 @@ impl Run<'_> {
                     places,
                     (&found, &view),
                     &d,
-                    (&mut running, &mut drive, &control),
+                    (&mut running, &control),
                     (allowance, &mut presses),
                     policy,
                     (stop, error.is_some(), over, flattened, false),
@@ -3504,13 +3523,12 @@ impl Run<'_> {
     /// of `ours` on `view`'s market compared with the reads, the comparison's stop the session's
     /// when none came before it; then the flatten of a fill of ours that reached the session only
     /// during those cancels or after them, the taker IOC's own under `late_taker` once it left the
-    /// position off flat ([`Run::late_fill`]), the session still open ([`Run::flatten_late`], its
-    /// touch's `drive` polled meanwhile, from the account's `allowance`), the stop that came
-    /// first, the comparison's included, kept before the flatten's own; then the market disarmed
-    /// once those cancels ran to their end ([`Run::stop_disarm`]); then the ending
-    /// [`Policy::ending`] gives: a graceful close, which waits first for the shared budget's room
-    /// when a provider rate refusal holds it (0151 item 11), or the abrupt drop, its end planned
-    /// and its run left for the caller to drop unpolled.
+    /// position off flat ([`Run::late_fill`]), the session still open ([`Run::flatten_late`], from
+    /// the account's `allowance`), the stop that came first, the comparison's included, kept
+    /// before the flatten's own; then the market disarmed once those cancels ran to their end
+    /// ([`Run::stop_disarm`]); then the ending [`Policy::ending`] gives: a graceful close, which
+    /// waits first for the shared budget's room when a provider rate refusal holds it (0151 item
+    /// 11), or the abrupt drop, its end planned and its run left for the caller to drop unpolled.
     /// While the close waits for room with no cancels run, a press of Ctrl-C, or a stop the tee or
     /// the handler raised that cancels under `policy` (a fill of ours in a drop session), is the
     /// session's stop, and its cancels run first, then that flatten, then the disarm (0151 items
@@ -3520,21 +3538,18 @@ impl Run<'_> {
     /// whether or not the connection's end cuts the cancels short (decision 0148 item 8). A
     /// fill of ours that reaches the session while the close waits for room after those cancels
     /// ran is flattened once there is room, the market disarmed again after it, and the close
-    /// waits again. The touch's `drive` is polled throughout, so the touch a late flatten prices
-    /// from is current and its age counts the waits. A connection that ended first ends it, and
-    /// nothing waits on its run again. `own` is the session's own order, whose state the close is
-    /// sent with; `before`, the shared limiter's refusal count as the session began.
+    /// waits again. The touch is driven throughout by [`Run::stage`] (FBC-kllr), so the touch a
+    /// late flatten prices from is current and its age counts the waits. A connection that ended
+    /// first ends it, and nothing waits on its run again. `own` is the session's own order, whose
+    /// state the close is sent with; `before`, the shared limiter's refusal count as the session
+    /// began.
     #[allow(clippy::too_many_arguments)]
-    async fn end_session<F, D>(
+    async fn end_session<F>(
         &mut self,
         places: &Places,
         view: (&Discovered, &market::TouchView),
         d: &DropCtx,
-        (running, drive, control): (
-            &mut Pin<&mut F>,
-            &mut Pin<&mut D>,
-            &RefCell<Option<ExecControl>>,
-        ),
+        (running, control): (&mut Pin<&mut F>, &RefCell<Option<ExecControl>>),
         (allowance, presses): (&mut Allowance, &mut Presses),
         policy: Policy,
         (stop, failed, mut over, mut flattened, late_taker): (Option<Stop>, bool, bool, bool, bool),
@@ -3546,7 +3561,6 @@ impl Run<'_> {
     ) -> Closed
     where
         F: Future<Output = Result<(), ExecSessionError>>,
-        D: Future<Output = ()>,
     {
         let found = view.0;
         let mut closed = Closed {
@@ -3581,7 +3595,6 @@ impl Run<'_> {
                 let cut_short = tokio::select! {
                     biased;
                     _ = &mut *running => true,
-                    () = &mut *drive => unreachable!("the touch is driven until dropped"),
                     () = self.stop_cancels(d, presses, &mut cancels) => false,
                 };
                 over |= cut_short;
@@ -3609,7 +3622,6 @@ impl Run<'_> {
                     let compared = tokio::select! {
                         biased;
                         _ = &mut *running => None,
-                        () = &mut *drive => unreachable!("the touch is driven until dropped"),
                         c = compare => Some(c),
                     };
                     over |= compared.is_none();
@@ -3639,7 +3651,7 @@ impl Run<'_> {
                         places,
                         view,
                         d,
-                        (&mut *running, &mut *drive),
+                        &mut *running,
                         (&mut *allowance, &mut *presses),
                         (ours, d.which.name()),
                         (first, killed, after),
@@ -3672,7 +3684,6 @@ impl Run<'_> {
                     tokio::select! {
                         biased;
                         _ = &mut *running => break None,
-                        () = &mut *drive => unreachable!("the touch is driven until dropped"),
                         () = presses.pressed(), if !cancelled && !pressed => pressed = true,
                         room = &mut room => break Some(room),
                     }
@@ -4443,30 +4454,29 @@ impl Run<'_> {
 
     /// The flatten on session `d` while it is open ([`Run::flatten`]), on the latest read of each
     /// named account made before the session named `before` ([`Run::latest_reads`]), its run,
-    /// `running`, and the touch's `drive` polled meanwhile, the session's first stop `stop`. Gives
-    /// the session's stop, the flatten's own in place of the fill it answered
-    /// ([`crate::flatten::session_stop`]), and whether the run completed first (its connection
-    /// ended), which drops the flatten where it was and says so in its record. A press of the
-    /// owner's Ctrl-C the flatten took, which ended nothing of it, is the session's stop when
-    /// neither gives one ([`Stop::Interrupted`], decision 0148 item 8), so that a session whose
-    /// flatten ended flat, the taker IOC's, still stops the run and no later session starts; a
-    /// stop the tee or the handler raised during the flatten before its first press came first,
-    /// and is the session's in its place ([`Run::note_press`]). Both hold when the connection's
-    /// end drops the flatten, whose record then counts every press it took.
+    /// `running`, polled meanwhile, the session's first stop `stop`. Gives the session's stop, the
+    /// flatten's own in place of the fill it answered ([`crate::flatten::session_stop`]), and
+    /// whether the run completed first (its connection ended), which drops the flatten where it
+    /// was and says so in its record. A press of the owner's Ctrl-C the flatten took, which ended
+    /// nothing of it, is the session's stop when neither gives one ([`Stop::Interrupted`],
+    /// decision 0148 item 8), so that a session whose flatten ended flat, the taker IOC's, still
+    /// stops the run and no later session starts; a stop the tee or the handler raised during the
+    /// flatten before its first press came first, and is the session's in its place
+    /// ([`Run::note_press`]). Both hold when the connection's end drops the flatten, whose record
+    /// then counts every press it took.
     #[allow(clippy::too_many_arguments)]
-    async fn flatten_open<F, D>(
+    async fn flatten_open<F>(
         &mut self,
         places: &Places,
         view: (&Discovered, &market::TouchView),
         d: &DropCtx,
-        (running, drive): (&mut Pin<&mut F>, &mut Pin<&mut D>),
+        running: &mut Pin<&mut F>,
         (allowance, presses): (&mut Allowance, &mut Presses),
         (ours, before): (&[fbc_core::ClientOrderId], &'static str),
         stop: Option<Stop>,
     ) -> (Option<Stop>, bool)
     where
         F: Future<Output = Result<(), ExecSessionError>>,
-        D: Future<Output = ()>,
     {
         let reads = self.latest_reads(before);
         let taken = presses.taken();
@@ -4477,7 +4487,6 @@ impl Run<'_> {
         let flattened = tokio::select! {
             biased;
             _ = &mut *running => None,
-            () = &mut *drive => unreachable!("the touch is driven until dropped"),
             own = flatten => Some(own),
         };
         let took = presses.taken().saturating_sub(taken);
@@ -4505,19 +4514,18 @@ impl Run<'_> {
     /// the flatten ended the market is Killed again, as the Stop left it, for
     /// [`Run::end_session`] to disarm.
     #[allow(clippy::too_many_arguments)]
-    async fn flatten_late<F, D>(
+    async fn flatten_late<F>(
         &mut self,
         places: &Places,
         view: (&Discovered, &market::TouchView),
         d: &DropCtx,
-        session: (&mut Pin<&mut F>, &mut Pin<&mut D>),
+        session: &mut Pin<&mut F>,
         budget: (&mut Allowance, &mut Presses),
         ours: (&[fbc_core::ClientOrderId], &'static str),
         (stop, killed, after): (Option<Stop>, bool, &'static str),
     ) -> (Option<Stop>, bool)
     where
         F: Future<Output = Result<(), ExecSessionError>>,
-        D: Future<Output = ()>,
     {
         self.flatten_run(d.which).after = after;
         if killed {
@@ -5659,10 +5667,10 @@ impl Run<'_> {
 
     /// Stage two's session `which` on `on` (decision 0132 item 7), the crossing session or the
     /// taker IOC session: an unchanged `ExecSession` whose handler is a [`PlaceHandler`] over its
-    /// registry's `link`, its steps ([`Run::cross_steps`] or [`Run::take_steps`]) run beside it
-    /// and the MDS touch driven on, its span bound met one `--rpc-timeout-ms` early
-    /// ([`cancels_begin`]; decision 0148 item 8). Once its steps end, how its order came back is
-    /// read before any cancel of ours: the crossing post-only's refusal
+    /// registry's `link`, its steps ([`Run::cross_steps`] or [`Run::take_steps`]) run beside it and
+    /// the MDS touch driven on by [`Run::stage`] meanwhile (FBC-kllr), its span bound met one
+    /// `--rpc-timeout-ms` early ([`cancels_begin`]; decision 0148 item 8). Once its steps end, how
+    /// its order came back is read before any cancel of ours: the crossing post-only's refusal
     /// ([`crate::stage_two::Crossed::of`]), or the taker IOC's end, its fees' signs and its frames'
     /// order ([`Run::taken`]), which may call for the flatten or stop the run left open with a fill
     /// ([`crate::taker::after_ioc`]). A fill of ours that calls for it is flattened while the
@@ -5742,7 +5750,7 @@ impl Run<'_> {
         let mut presses = std::mem::take(&mut self.presses);
         let mut placed = None;
         let (mut stop, mut error) = (None, None);
-        let view = market.touch.view();
+        let view = market.touch.clone();
         let found = market.found.clone();
         let passed = two::crossers(&self.ev.drops, &[label]) == [label];
         let mut over = false;
@@ -5750,8 +5758,6 @@ impl Run<'_> {
         {
             let running = session.run();
             tokio::pin!(running);
-            let drive = market.touch.drive();
-            tokio::pin!(drive);
             let steps = async {
                 let ctx = (&found, &view);
                 let state = (&mut placed, reads);
@@ -5765,7 +5771,6 @@ impl Run<'_> {
             let stepped = tokio::select! {
                 biased;
                 ended = &mut running => Err(ended),
-                () = &mut drive => unreachable!("the touch is driven until dropped"),
                 stepped = steps => Ok(stepped),
             };
             match stepped {
@@ -5812,7 +5817,7 @@ impl Run<'_> {
                         places,
                         (&found, &view),
                         &d,
-                        (&mut running, &mut drive),
+                        &mut running,
                         (allowance, &mut presses),
                         (&ours, which.name()),
                         stop,
@@ -5827,7 +5832,7 @@ impl Run<'_> {
                     places,
                     (&found, &view),
                     &d,
-                    (&mut running, &mut drive, &control),
+                    (&mut running, &control),
                     (allowance, &mut presses),
                     policy,
                     (stop, error.is_some(), over, flattened, late_taker),
