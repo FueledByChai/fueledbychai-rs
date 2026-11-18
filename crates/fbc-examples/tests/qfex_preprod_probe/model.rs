@@ -46,7 +46,7 @@
 //!   [`QfexModel::position_after_close`], [`QfexModel::foreign_after_close`] (FBC-77r8),
 //!   [`QfexModel::cancel_place`],
 //!   [`QfexModel::venue_cancel`],
-//!   [`QfexModel::close_on_cancel`], [`QfexModel::stray_after`],
+//!   [`QfexModel::close_on_cancel`], [`QfexModel::hold_cancel`], [`QfexModel::stray_after`],
 //!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`],
 //!   [`QfexModel::fill_on_trades`] and [`QfexModel::fill_on_trades_page`]; as the first graceful
 //!   close of an armed connection is settled, [`QfexModel::fill_after_close`],
@@ -639,6 +639,10 @@ pub struct QfexModel {
     /// Every `get_user_trades` page is held unanswered until the test releases it
     /// ([`Venue::release_held`]).
     pub hold_trades: bool,
+    /// The first `cancel_order`'s answer, or with [`QfexModel::close_on_cancel`] the close of its
+    /// connection, held until the test releases it ([`Venue::release_held`]), so a test can
+    /// press Ctrl-C while the cancels wait for it (FBC-su9i's review).
+    pub hold_cancel: bool,
     /// This long after the first `add_order`, an `order_response` naming an order no run placed
     /// is pushed on its connection ([`QfexModel::stray_order`]'s frame, later).
     pub stray_after: Option<Duration>,
@@ -708,8 +712,11 @@ pub struct QfexModel {
     /// The trades whose `get_user_trades` rows carry neither `order_id` nor `client_order_id`
     /// ([`StrayTrade::Unnamed`]), by trade id.
     pub unnamed: Vec<String>,
-    /// The answers [`QfexModel::hold_trades`] held: each connection and frame.
+    /// The answers [`QfexModel::hold_trades`] and [`QfexModel::hold_cancel`] held: each
+    /// connection and frame.
     pub(super) held: Vec<(usize, Frame)>,
+    /// The connections [`QfexModel::hold_cancel`] holds a close of, closed once released.
+    pub(super) held_closes: Vec<usize>,
     /// The connection each order was placed on, by its id ([`Reach::Own`]).
     pub(super) placed_on: HashMap<String, usize>,
     /// The connection the first `add_order` came on.
@@ -833,6 +840,7 @@ impl Default for QfexModel {
             venue_cancel: false,
             close_on_cancel: false,
             hold_trades: false,
+            hold_cancel: false,
             stray_after: None,
             part_fill_after: None,
             close_after: None,
@@ -853,6 +861,7 @@ impl Default for QfexModel {
             trade_on_drop: None,
             unnamed: Vec::new(),
             held: Vec::new(),
+            held_closes: Vec::new(),
             placed_on: HashMap::new(),
             first_placed_on: None,
             fill_after_ack_on: None,
@@ -1882,7 +1891,10 @@ impl QfexModel {
             return vec![Frame::text(limited(text, 1))];
         }
         if self.cancels == 1 && self.close_on_cancel {
-            self.later(conn, Vec::new(), Duration::ZERO, true);
+            match self.hold_cancel {
+                true => self.held_closes.push(conn),
+                false => self.later(conn, Vec::new(), Duration::ZERO, true),
+            }
             return Vec::new();
         }
         let account = self.account_of(conn);
@@ -1905,6 +1917,11 @@ impl QfexModel {
         self.before_change(&account);
         self.orders[n].state = State::Cancelled;
         let answer = vec![order_response(&self.orders[n], "CANCELLED", true)];
+        if self.cancels == 1 && self.hold_cancel {
+            self.held
+                .extend(answer.into_iter().map(|frame| (conn, frame)));
+            return Vec::new();
+        }
         match self.cancel_delay.filter(|_| self.cancels == 1) {
             Some(after) => {
                 self.later(conn, answer, after, false);
@@ -2238,15 +2255,22 @@ impl Venue {
         self.model.lock().unwrap().log.clone()
     }
 
-    /// Sends each answer [`QfexModel::hold_trades`] held, in order, on its connection.
+    /// Sends each answer [`QfexModel::hold_trades`] and [`QfexModel::hold_cancel`] held, in
+    /// order, on its connection, then closes each connection whose close
+    /// [`QfexModel::hold_cancel`] held.
     pub async fn release_held(&self) {
-        let (held, pusher) = {
+        let (held, closes, pusher) = {
             let mut model = self.model.lock().unwrap();
-            (std::mem::take(&mut model.held), model.pusher.clone())
+            let held = std::mem::take(&mut model.held);
+            let closes = std::mem::take(&mut model.held_closes);
+            (held, closes, model.pusher.clone())
         };
         let pusher = pusher.expect("the stub is up");
         for (conn, frame) in held {
             let _ = pusher.push(conn, frame).await;
+        }
+        for conn in closes {
+            let _ = pusher.close(conn).await;
         }
     }
 

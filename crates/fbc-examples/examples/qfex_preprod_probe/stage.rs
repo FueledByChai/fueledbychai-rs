@@ -2267,9 +2267,10 @@ pub fn cancels_begin(
 /// when they ran, the comparison after them when one was made, and whether the session's own
 /// order rested as its close was sent.
 struct Closed {
-    /// The session's stop: the one its steps ended with, or, when none came, the stop the
-    /// comparison after the stop's cancels raised, a press of Ctrl-C or a stop the tee or the
-    /// handler raised as the close waited for room.
+    /// The session's stop: the one its steps ended with, or, when none came: once the stop's
+    /// cancels took a press of Ctrl-C, a stop the tee or the handler raised before that press,
+    /// else [`Stop::Interrupted`]; the stop the comparison after them raised; or a press of
+    /// Ctrl-C or a stop the tee or the handler raised as the close waited for room.
     stop: Option<Stop>,
     ended_by: &'static str,
     cancels: Option<Cancels>,
@@ -3221,10 +3222,12 @@ impl Run<'_> {
     /// drop, its end planned and its run left for the caller to drop unpolled.
     /// While the close waits for room with no cancels run, a press of Ctrl-C, or a stop the tee or
     /// the handler raised that cancels under `policy` (a fill of ours in a drop session), is the
-    /// session's stop, and its cancels run first (0151 items 2 and 11); [`Closed::stop`] gives
-    /// it. A connection that ended first ends it, and nothing waits on its run again. `own` is the
-    /// session's own order, whose state the close is sent with; `before`, the shared limiter's
-    /// refusal count as the session began.
+    /// session's stop, and its cancels run first (0151 items 2 and 11); a press the cancels take
+    /// is the session's stop too, unless a stop the tee or the handler raised came before it,
+    /// whether or not the connection's end cuts them short (decision 0148 item 8);
+    /// [`Closed::stop`] gives it. A connection that ended first ends it, and nothing waits on its
+    /// run again. `own` is the session's own order, whose state the close is sent with; `before`,
+    /// the shared limiter's refusal count as the session began.
     #[allow(clippy::too_many_arguments)]
     async fn end_session<F>(
         &self,
@@ -3262,17 +3265,29 @@ impl Run<'_> {
             let fill = d.watched.borrow().fill_of_ours || self.tee.kept().fill_of_ours;
             if !cancelled && !over && (pressed || policy.cancels(closed.stop, fill)) {
                 cancelled = true;
-                let cancels = tokio::select! {
+                // The cancels record into `cancels` as they go, so what they sent and the presses
+                // they took survive the connection's end cutting them short.
+                let mut cancels = Cancels::default();
+                let cut_short = tokio::select! {
                     biased;
-                    _ = &mut *running => None,
-                    c = self.stop_cancels(d, presses) => Some(c),
+                    _ = &mut *running => true,
+                    () = self.stop_cancels(d, presses, &mut cancels) => false,
                 };
-                over |= cancels.is_none();
-                let cancels = cancels.unwrap_or_else(|| Cancels {
-                    held: true,
-                    ..Cancels::default()
-                });
+                over |= cut_short;
+                if cut_short {
+                    cancels.held = true;
+                    cancels.cut_short = true;
+                }
                 let compare = !cancels.held && cancels.ended && !over;
+                // A press of Ctrl-C those cancels took, which ended none of them, is the session's
+                // stop when none came before it (decision 0148 item 8): under `Policy::Stage` they
+                // run on a session that ran its course too, and the press is not lost there. A
+                // stop the tee or the handler raised before that press came first, and is the
+                // session's ([`Run::halt`]: the first stop is the run's).
+                if cancels.presses > 0 {
+                    let first = cancels.stop_at_press.unwrap_or(Stop::Interrupted);
+                    closed.stop = closed.stop.or(Some(first));
+                }
                 closed.cancels = Some(cancels);
                 if compare {
                     let step = "the stop's cancels";
@@ -3865,9 +3880,11 @@ impl Run<'_> {
     /// early; then the market disarmed. A cancel refused locally, answered other than accepted,
     /// or met by a provider rate refusal holds them: the wait ends there ([`Cancels::held`]);
     /// refused locally or met by a rate refusal, it is one of 0151 item 11's causes too
-    /// ([`Cancels::blocked`]).
-    async fn stop_cancels(&self, d: &DropCtx, presses: &mut Presses) -> Cancels {
-        let mut c = Cancels::default();
+    /// ([`Cancels::blocked`]). They are recorded in `c`, the caller's, as they go: what was sent
+    /// and each press taken survive a connection's end that cuts them short and drops this
+    /// future, and so does the stop the tee or the handler had raised as the first press came
+    /// ([`Cancels::stop_at_press`]).
+    async fn stop_cancels(&self, d: &DropCtx, presses: &mut Presses, c: &mut Cancels) {
         let refusals_before = self.tee.kept().stops.len();
         let (cmds, mut waiting, refused) = {
             let mut link = d.link.borrow_mut();
@@ -3945,6 +3962,8 @@ impl Run<'_> {
                     Err(_) => c.refused_locally(),
                 }
             }
+            // Every cancel handed to the session so far, before any wait.
+            c.sent = rpcs.len();
             let (named, answered) = {
                 let link = d.link.borrow();
                 let named: Vec<_> = rpcs.iter().flat_map(|r| link.cids_of(*r)).collect();
@@ -3961,7 +3980,14 @@ impl Run<'_> {
             }
             tokio::select! {
                 biased;
-                () = presses.pressed() => c.presses += 1,
+                () = presses.pressed() => {
+                    // The stop that came before the owner's first press, if one did: the
+                    // session's stop then, not the press (decision 0148 item 8).
+                    if c.presses == 0 {
+                        c.stop_at_press = self.stop_now(d);
+                    }
+                    c.presses += 1;
+                }
                 () = woken => {}
                 () = tokio::time::sleep_until(until) => {
                     // The wait's end: a rate refusal met by then holds them too (0151 item 11).
@@ -3970,7 +3996,6 @@ impl Run<'_> {
                 }
             }
         }
-        c.sent = rpcs.len();
         d.link.borrow_mut().reg().disarm(d.inst);
         let why = match d.which {
             Which::Cross => "decision 0132 item 7, 0148 item 8",
@@ -3987,11 +4012,11 @@ impl Run<'_> {
         ));
         if c.presses > 0 {
             self.line(format_args!(
-                "STOP cancels: {} more presses of Ctrl-C while they ran, recorded",
-                c.presses
+                "STOP cancels: {} press{} of Ctrl-C while they ran, recorded",
+                c.presses,
+                if c.presses == 1 { "" } else { "es" }
             ));
         }
-        c
     }
 
     /// The read of every named account after drop session `which` on `on` (decision 0132 item
@@ -4052,6 +4077,8 @@ impl Run<'_> {
                 }
             }
         }
+        // A press made as the last read ended, which the read's own end outran.
+        pressed |= presses.try_pressed();
         self.presses = presses;
         after.pressed = pressed;
         after.refused = self.refused_since(mark);

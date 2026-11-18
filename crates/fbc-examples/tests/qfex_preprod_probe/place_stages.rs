@@ -4181,6 +4181,43 @@ async fn pressed_drop(
     }
 }
 
+/// As [`pressed_drop`], under `rate_user`, with one press of Ctrl-C once `ready` holds of the
+/// venue, then the release of what the model held.
+async fn pressed_once_when(
+    model: QfexModel,
+    what: &str,
+    rate_user: RateUserKey,
+    argv: impl Fn(Argv) -> Argv,
+    ready: impl Fn(&Venue) -> bool,
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, places) = parsed(&argv(drop_argv(&dir, &venue))).unwrap();
+    opts.rate_user = rate_user;
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let (mut press, presses) = interrupt::Presses::channel();
+    let hold: stage::Interrupt = Box::pin(std::future::pending());
+    let drive = async {
+        until("the moment to press", || ready(&venue)).await;
+        press();
+        venue.release_held().await;
+    };
+    let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses);
+    let (ran, ()) = tokio::join!(ran, drive);
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
 #[tokio::test]
 async fn ctrl_c_in_a_drop_session_cancels_by_venue_id_and_fails_it() {
     let d = pressed_drop(QfexModel::default(), "drop-ctrl-c", |a| a, &[" add_order"]).await;
@@ -4246,7 +4283,7 @@ async fn a_second_ctrl_c_during_the_stops_cancels_is_recorded() {
     assert!(cancels.ended && !cancels.held, "{cancels:?}");
     assert!(
         d.printed
-            .contains("STOP cancels: 1 more presses of Ctrl-C while they ran, recorded")
+            .contains("STOP cancels: 1 press of Ctrl-C while they ran, recorded")
     );
     let (report, json) = d.outputs();
     assert!(
@@ -9983,6 +10020,164 @@ async fn stop_on_ctrl_c_cancels_by_venue_id() {
         "{:?}",
         d.ev.stopped
     );
+}
+
+#[tokio::test]
+async fn ctrl_c_during_the_crossing_sessions_stop_cancels_stops_the_run() {
+    // The primary account's crossing post-only rests to its deadline, so the crossing session
+    // runs its course with no stop and its Stop cancels the order by its venue id (decision 0132
+    // item 7). QFEX holds the answer to that cancel, the run's first, until the owner has pressed
+    // Ctrl-C while the cancels wait for it: the press ends none of them and is the session's stop
+    // (decision 0148 item 8), so the run stops Interrupted, marked, and no crossing order goes
+    // out on the subaccount (FBC-su9i's review).
+    let model = QfexModel {
+        hold_cancel: true,
+        ..resting_cross()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "5000");
+    let d = pressed_drop(model, "cross-stop-cancels-ctrl-c", rpc, &[" cancel_order"]).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    assert_eq!(d.stage_two().crosses.len(), 1, "{}", d.printed);
+    assert_eq!(d.crossing_orders().len(), 1, "{}", d.printed);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 1), "{cancels:?}");
+    assert!(cancels.ended && !cancels.held, "{cancels:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.starts_with("Interrupted in the crossing session"),
+        "{stopped}"
+    );
+    assert!(
+        d.printed
+            .contains("STOP cancels: 1 press of Ctrl-C while they ran, recorded"),
+        "{}",
+        d.printed
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_during_stop_cancels_that_the_connections_end_cuts_short_stops_the_run() {
+    // As above, but QFEX leaves the cancel unanswered and closes the crossing session's
+    // connection once the owner has pressed Ctrl-C: the press, taken while the cancels wait, came
+    // before the connection's end, so the session's stop is Interrupted, the press and the cancel
+    // sent recorded, though the connection's end cut the cancels short (decision 0148 item 8;
+    // FBC-su9i's review).
+    let model = QfexModel {
+        close_on_cancel: true,
+        hold_cancel: true,
+        ..resting_cross()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "5000");
+    let d = pressed_drop(model, "cross-cut-cancels-ctrl-c", rpc, &[" cancel_order"]).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    assert_eq!(d.stage_two().crosses.len(), 1, "{}", d.printed);
+    let run = d.cross(0);
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED), "{run:?}");
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 1), "{cancels:?}");
+    assert!(
+        cancels.held && cancels.cut_short && !cancels.ended && !cancels.blocked,
+        "{cancels:?}"
+    );
+    assert_eq!(d.count("cancel_order"), 1, "{:?}", d.what());
+    let (report, json) = d.outputs();
+    let section = cross_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "Kill, then 1 cancel by venue id; {}",
+            places::CUT_SHORT
+        )),
+        "{section}"
+    );
+    let cancels = &json["stage_two"]["crossings"][0]["cancels"];
+    assert_eq!(cancels["sent"], 1, "{cancels}");
+    assert_eq!(cancels["cut_short"], true, "{cancels}");
+}
+
+#[tokio::test]
+async fn a_rate_refusal_before_a_press_during_the_crossing_sessions_cancels_is_the_stop() {
+    // The crossing post-only rests to its deadline, and QFEX answers the Stop's cancel of it with
+    // a RateLimited err, which settles nothing, so the cancels wait. The owner presses Ctrl-C only
+    // once the probe has met that refusal, the shared limiter counting it: the refusal came first,
+    // so it is the session's stop, and the run's, the press recorded (FBC-su9i's review).
+    let rate_user = user();
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        ..resting_cross()
+    };
+    let rpc = |argv| set(argv, "--rpc-timeout-ms", "5000");
+    let limiter = shared_limiter(rate_user);
+    let refused = |venue: &Venue| {
+        let read = venue
+            .log()
+            .iter()
+            .any(|e| e.what.ends_with(" cancel_order"));
+        read && limiter.counts().rejected.user > 0
+    };
+    let d = pressed_once_when(model, "cross-refused-then-ctrl-c", rate_user, rpc, refused).await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::Session,
+    };
+    assert_cross_stopped(&d, refused);
+    assert_eq!(d.stage_two().crosses.len(), 1, "{}", d.printed);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 1), "{cancels:?}");
+    assert!(cancels.held && cancels.blocked, "{cancels:?}");
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    let said = format!("{} in the crossing session", refused.name());
+    assert!(stopped.starts_with(&said), "{stopped}");
+}
+
+#[tokio::test]
+async fn a_press_after_the_crossing_sessions_cancels_is_taken_by_the_reads_after_it() {
+    // The primary account's crossing post-only rests to its deadline and its Stop cancels it, seen
+    // to end. The owner presses Ctrl-C as the cancels' line is printed, once they took their last
+    // press, so the comparison after them, which takes none, runs with the press waiting. The
+    // cancels took no press, so the session has no stop; the reads after it take the press, which
+    // stops the run, marked, after every named account was read, and no crossing order goes out
+    // on the subaccount (FBC-su9i's review).
+    let at = "STOP cancels: Kill, then";
+    let d = pressed_at_as(resting_cross(), "cross-press-at-compare", user(), |a| a, at).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    let said = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        said.starts_with("Interrupted during the reads after the crossing session"),
+        "{said}"
+    );
+    assert_eq!(d.stage_two().crosses.len(), 1, "{}", d.printed);
+    assert_eq!(d.crossing_orders().len(), 1, "{}", d.printed);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().expect("the session's Stop");
+    assert_eq!((cancels.sent, cancels.presses), (1, 0), "{cancels:?}");
+    assert!(cancels.ended && !cancels.held, "{cancels:?}");
+    let steps: Vec<&str> = run.compared.iter().map(|c| c.step).collect();
+    assert_eq!(steps, ["the crossing post-only", "the stop's cancels"]);
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+}
+
+#[tokio::test]
+async fn a_press_as_the_last_read_after_a_crossing_session_ends_is_taken_by_those_reads() {
+    // The owner presses Ctrl-C as the last named account's read after the primary account's
+    // crossing session prints its line, so the press is made in the poll that ends that read,
+    // which wins the reads' wait for it: the reads still take it as they end, so the run stops
+    // Interrupted after them, marked, and the subaccount's reads before its own crossing session
+    // never begin (FBC-su9i's review).
+    let at = "READ after the crossing session: subaccount: ";
+    let d = pressed_at_as(resting_cross(), "cross-press-last-read", user(), |a| a, at).await;
+    assert_cross_stopped(&d, places::Stop::Interrupted);
+    let said = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        said.starts_with("Interrupted during the reads after the crossing session"),
+        "{said}"
+    );
+    assert_eq!(d.stage_two().crosses.len(), 1, "{}", d.printed);
+    assert_eq!(d.crossing_orders().len(), 1, "{}", d.printed);
+    let before = (d.ev.reads.iter()).filter(|r| r.before == places::CROSS);
+    assert_eq!(before.count(), 2, "{}", d.printed);
 }
 
 /// Where the probe's lines go in [`the_span_bound_begins_cancels_one_rpc_timeout_early`]: the

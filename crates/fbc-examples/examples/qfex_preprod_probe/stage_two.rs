@@ -1008,6 +1008,7 @@ fn cross_cancels_said(cancels: Option<&crate::places::Cancels>) -> String {
             c.sent,
             if c.sent == 1 { "" } else { "s" },
             match (c.held, c.blocked, c.ended) {
+                _ if c.cut_short => crate::places::CUT_SHORT,
                 (_, true, _) =>
                     "refused locally or met by a provider rate refusal, so not every \
                                  order was seen to end (0151 item 11)",
@@ -1166,7 +1167,7 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
             let compared: Vec<serde_json::Value> = run.compared.iter().map(compared_json).collect();
             let cancels = run.cancels.as_ref().map(|c| {
                 json!({"sent": c.sent, "held": c.held, "blocked": c.blocked, "ended": c.ended,
-                    "presses": c.presses})
+                    "presses": c.presses, "cut_short": c.cut_short})
             });
             json!({"account": run.account, "authenticated": run.authenticated, "arm": run.arm,
                 "resynced": run.resynced, "started": run.started, "blocked": run.blocked,
