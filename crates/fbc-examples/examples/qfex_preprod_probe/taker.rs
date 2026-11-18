@@ -233,6 +233,15 @@ pub const HAND_CANCEL_TAKE: &str = "an order rests on the account after the take
      cancel it by hand on QFEX production's site, then give the next place-stage run \
      --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
 
+/// What the report says of an order of ours the take registry still counts resting after a taker
+/// IOC session when no read after it listed one, for the owner: counted resting, never seen
+/// resting (decision 0005, the owner's ruling under 0151 item 6 on FBC-gisx).
+pub const HAND_CANCEL_TAKE_COUNTED: &str = "the take registry still counts an order of ours \
+     resting, open with a fill, Unknown or in flight, never resent (decision 0005), which no read \
+     after the session listed: counted resting, not seen resting (the owner's ruling under 0151 \
+     item 6); if it still rests, cancel it by hand on QFEX production's site, then give the next \
+     place-stage run --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
+
 /// What the report says when the reads after a taker IOC session list an order or a TWAP not
 /// ours (decision 0148 item 8; FBC-77r8's review, carried).
 pub const OTHERS_TAKE: &str = "an order or a TWAP that is not ours is listed on a named account \

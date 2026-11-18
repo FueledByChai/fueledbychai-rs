@@ -986,13 +986,16 @@ impl Run<'_> {
     /// evidence. Returns what the run stopped with, its name and what it is, never an id or an
     /// amount.
     fn halt(&mut self, stop: Stop, when: &str) -> String {
-        let stop = *self.stop.get_or_insert(stop);
-        self.ev.stop = Some(stop.name());
-        format!(
-            "{} {when}: {}; no further session runs",
-            stop.name(),
-            stop.says()
-        )
+        self.halt_as(stop, when, None)
+    }
+
+    /// [`Run::halt`], `says` given in place of [`Stop::says`] when `stop` is the run's: what an
+    /// order counted resting, or left unjudged, after a session is said as, never as seen
+    /// resting (FBC-gisx). An earlier stop is said as itself.
+    fn halt_as(&mut self, stop: Stop, when: &str, says: Option<&str>) -> String {
+        let first = *self.stop.get_or_insert(stop);
+        self.ev.stop = Some(first.name());
+        stop_said(first, stop, when, says)
     }
 
     /// Writes the stop marker for the run's stop, when it marks one (0151 item 6), in its lease
@@ -1311,9 +1314,10 @@ impl Run<'_> {
         account: Armed,
         allowed: Option<&AllowedOrder>,
     ) -> Result<(), String> {
-        let read = self
-            .read_one(before, on, mark, account, (allowed, &[]))
-            .await?;
+        let mut failed = places::AccountUnread::Positions;
+        let admits = (allowed, &[][..]);
+        let read = self.read_one(before, on, mark, account, admits, &mut failed);
+        let read = read.await?;
         let label = &read.label;
         if let Some(why) = read.refusal() {
             let starts = match before {
@@ -1332,7 +1336,8 @@ impl Run<'_> {
     /// Reads `account` before `before` (on `on`, its label marked `mark`), admitting `allowed`
     /// when it is on it, and records the read in the evidence and on a `READ` line: the read, or
     /// why it could not be made, `account` then kept among the reads not made
-    /// ([`Run::unread`]). Its read socket's refusals are recorded either way.
+    /// ([`Run::unread`]) and `failed` naming the step that failed (FBC-gisx). Its read socket's
+    /// refusals are recorded either way.
     async fn read_one(
         &mut self,
         before: &'static str,
@@ -1340,8 +1345,10 @@ impl Run<'_> {
         mark: &'static str,
         account: Armed,
         admits: (Option<&AllowedOrder>, &[&AllowedOrder]),
+        failed: &mut places::AccountUnread,
     ) -> Result<AccountRead, String> {
-        let read = self.reading_one(before, on, mark, account, admits).await;
+        let read = self.reading_one(before, on, mark, account, admits, failed);
+        let read = read.await;
         // Whether the account's last read was made, for the hand actions the run leaves.
         self.ev.last_unread.retain(|a| *a != name(account));
         if read.is_err() {
@@ -1359,6 +1366,7 @@ impl Run<'_> {
         mark: &'static str,
         account: Armed,
         (allowed, known): (Option<&AllowedOrder>, &[&AllowedOrder]),
+        failed: &mut places::AccountUnread,
     ) -> Result<AccountRead, String> {
         let mut label = name(account).to_owned();
         label.push_str(if account == on { mark } else { "" });
@@ -1366,9 +1374,8 @@ impl Run<'_> {
         let selection = account_selection(&cfg).map_err(|e| e.to_string())?;
         let mut met = None;
         let admits = (allowed, account);
-        let read = self
-            .read_account(&cfg, selection, admits, known, &mut met)
-            .await;
+        let read = self.read_account(&cfg, selection, admits, known, (&mut met, failed));
+        let read = read.await;
         // A read socket's refusals are reported whether or not its read succeeded.
         if let Some(refusals) = met {
             self.ev.read_sockets.push(ReadSocket {
@@ -1397,14 +1404,15 @@ impl Run<'_> {
     /// those that are `admits.0` when it is on `admits.1`, the account read
     /// ([`AccountRead::of`]), and those that are none of `known` on it
     /// ([`AccountRead::page_unknown`]); `met` is the provider rate refusals that socket met, once
-    /// it opened.
+    /// it opened, and `failed` the step it reached past `GET /user/positions`, which names the
+    /// one that failed when it fails.
     async fn read_account(
         &mut self,
         cfg: &VenueConfig,
         account: AccountSelection<'_>,
         admits: (Option<&AllowedOrder>, Armed),
         known: &[&AllowedOrder],
-        met: &mut Option<Refusals>,
+        (met, failed): (&mut Option<Refusals>, &mut places::AccountUnread),
     ) -> Result<AccountRead, String> {
         let reader = auth_qfex::reader(self.lookup, account)?;
         let ctx = self.ctx();
@@ -1425,11 +1433,12 @@ impl Run<'_> {
             account_reads::decode_positions(&resp, scope)
         });
         let positions = positions.map_err(|e| format!("GET /user/positions: {e}"))?;
+        *failed = places::AccountUnread::Socket;
         let url = account_reads::trade_url(cfg, &reader).map_err(|e| e.to_string())?;
         let mut ws = auth_qfex::open(&self.connector, &url, self.opts.connect_wait).await?;
         let before = self.rejected();
         let mut heard = Refusals::default();
-        let page = self.page(cfg, &reader, &mut ws, &mut heard).await;
+        let page = self.page(cfg, &reader, &mut ws, &mut heard, failed).await;
         heard.limiter = self.rejected().saturating_sub(before);
         *met = Some(heard);
         let closed = self.close_read(ws).await;
@@ -1442,13 +1451,15 @@ impl Run<'_> {
 
     /// The socket's authentication, its success, then one `get_user_orders` page from offset 0;
     /// each of the two frames it reads counted in `heard` ([`Run::heard`]), which holds the
-    /// shared budget for a `RateLimited` err in either.
+    /// shared budget for a `RateLimited` err in either. `failed` is [`places::AccountUnread::Page`]
+    /// when the page's answer came and did not decode, and is left as it was otherwise.
     async fn page(
         &mut self,
         cfg: &VenueConfig,
         reader: &ReadAuth,
         ws: &mut WebSocket,
         heard: &mut Refusals,
+        failed: &mut places::AccountUnread,
     ) -> Result<OrdersPage, String> {
         let ctx = self.ctx();
         let auth = account_reads::authentication(cfg, reader, &ctx).map_err(|e| e.to_string())?;
@@ -1463,7 +1474,10 @@ impl Run<'_> {
         self.write(ws, &ask_frame).await?;
         let reply = next(ws, self.opts.read_wait, &self.limiter).await?;
         let page = self.heard(heard, reader, &reply, ask);
-        page.map_err(|e| format!("get_user_orders: {e}"))
+        page.map_err(|e| {
+            *failed = places::AccountUnread::Page;
+            format!("get_user_orders: {e}")
+        })
     }
 
     /// Counts `frame`, off `reader`'s read socket, in `heard` ([`Refusals::hear`]): as a journal
@@ -2464,15 +2478,19 @@ impl Run<'_> {
     /// one: the session's stop; a provider rate refusal in the reads after it, then one reading
     /// X; the owner's Ctrl-C during them; a position not flat or a trade naming X (0151 item 9);
     /// a trade naming another order or none ([`Stop::DropFailed`], decision 0132 item 4); X's
-    /// trades or historic orders not read whole ([`Stop::LeftResting`]); then a failure of
-    /// the session that raised no stop, with [`Stop::ReadDisagrees`] marked when an order none
-    /// of ours or a TWAP shows, else [`Stop::LeftResting`] when an order of ours rests or X was
-    /// placed on an account that could not be read; then a stop of the read before drop session
-    /// two. After drop session two: the session's stop; a failure that raised no stop, with the
-    /// stop the reads after it show ([`after_stop`]: a provider rate refusal, Ctrl-C, a position
-    /// not flat or a trade naming X or Y, an order none of ours or a TWAP, an order of ours
-    /// still resting), or else [`Stop::LeftResting`] when X's account was not read, so an order
-    /// that may rest is marked; the verdict's stop (0151 items 9 and 13), unless the reads' stop
+    /// account not read for a reason that is no provider rate refusal, X counted resting, unless
+    /// the streams showed it end, as decision 0005 counts an order whose end nothing showed, then
+    /// X's trades or historic orders not read whole, X left unjudged ([`Stop::LeftResting`] both;
+    /// the owner's ruling under 0151 item 6 on FBC-gisx); then a failure of the session that
+    /// raised no stop, with [`Stop::ReadDisagrees`] marked when an order none of ours or a TWAP
+    /// shows, else [`Stop::LeftResting`] when an order of ours rests; then a stop of the read
+    /// before drop session two. After drop session two: the session's stop; a failure that
+    /// raised no stop, with the stop the reads after it show ([`after_stop`]: a provider rate
+    /// refusal, Ctrl-C, a position not flat or a trade naming X or Y, an order none of ours or a
+    /// TWAP, an order of ours still resting), or, with none, X's account not read for a reason
+    /// that is no provider rate refusal, the orders sent whose end the streams did not show
+    /// counted resting ([`places::Counted`], FBC-gisx), so an order still resting, or counted
+    /// resting, is marked; the verdict's stop (0151 items 9 and 13), unless the reads' stop
     /// outranks it ([`outranks`]: a position not flat, or an order none of ours or a TWAP, over
     /// a stop after it in the verdict's own order; FBC-77r8's review); then the reads' stop.
     /// With none it ends `Ok`, the next account's drop test next.
@@ -2600,12 +2618,16 @@ impl Run<'_> {
         let ours: Vec<&AllowedOrder> = x_allowed.iter().chain(&flattened_one).collect();
         let after = self.read_after(Which::One, on, &ours).await;
         let (mut x_refused, mut x_pressed, mut x_unread) = (None, false, false);
+        let mut x_shown_ended = false;
         if let (Some(x), Some(allowed)) = (x, &x_allowed) {
             let read = self
                 .read_orders(Which::One, on, x.wall_secs, &[allowed])
                 .await;
             self.drop_run().after = Some(read.0.x_after());
-            x_unread = !(read.0.trades_whole && read.0.historic_whole);
+            // A historic-orders row naming X shows X ended, whether or not a later page could be
+            // read: what a page showed survives an unfinished read (FBC-77r8's review, carried).
+            x_shown_ended = read.0.terminal.first().is_some_and(Option::is_some);
+            x_unread = !read.0.trades_whole || !(read.0.historic_whole || x_shown_ended);
             (x_refused, x_pressed) = (read.1, read.2);
         }
         self.patient = None;
@@ -2629,15 +2651,37 @@ impl Run<'_> {
             (false, true) => Some(places::HAND_CANCEL),
             (false, false) => None,
         };
+        // X placed and left unjudged with no provider rate refusal in the way: its account not
+        // read while the streams did not show X end, X then counted resting as decision 0005
+        // counts an order whose end nothing showed, or its trades or historic orders not read
+        // whole (the owner's ruling under 0151 item 6 on FBC-gisx).
+        // X's end is shown by the registry, or by a historic-orders row naming X (FBC-77r8's
+        // review, carried).
+        let x_ended = x.is_some_and(|x| ended_on(&link.borrow(), x.cid)) || x_shown_ended;
+        let on_unread = after.on_unread.filter(|_| !x_ended);
+        let unseen = match (on_unread, x_unread && x_refused.is_none()) {
+            (Some(why), _) => Some(places::Unseen::Account(why)),
+            (None, true) => Some(places::Unseen::History),
+            (None, false) => None,
+        };
+        run.x_unseen = unseen.filter(|_| x.is_some());
+        run.x_ended = x_ended;
+        // X counted resting with its account not read: the owner's hand cancel says so, never
+        // as seen resting (FBC-gisx). A flatten IOC is sent only once the flatten saw X end, so
+        // none is counted beside X here.
+        if run.hand_cancel.is_none() && matches!(run.x_unseen, Some(places::Unseen::Account(_))) {
+            run.hand_cancel = Some(places::HAND_CANCEL_UNREAD);
+        }
         // The run's end, the first that applies: the session's stop; a provider rate refusal in
         // the reads after it, then one reading X; the owner's Ctrl-C during those reads; a
         // position not flat, or a trade naming X; a trade naming another order or none, which
-        // fails the drop test already; X's trades or historic orders not read whole, X left
-        // unjudged; then a failure of the session that was no stop, kept in the evidence as
-        // the session's error whichever stop came after it, with any order of ours still resting
-        // marked for the owner's hand cancel; then a stop of the read before drop session two. A
-        // stop after the session is raised, and marked, whether or not the session failed (0151
-        // item 6). X still resting then is the owner's to cancel by hand (decision 0132 item 7).
+        // fails the drop test already; X's account not read, X counted resting, then X's trades
+        // or historic orders not read whole, X left unjudged; then a failure of the session that
+        // was no stop, kept in the evidence as the session's error whichever stop came after it,
+        // with any order of ours still resting marked for the owner's hand cancel; then a stop of
+        // the read before drop session two. A stop after the session is raised, and marked,
+        // whether or not the session failed (0151 item 6). X still resting, or counted resting,
+        // then is the owner's to cancel by hand (decision 0132 item 7).
         let ended = 'ended: {
             if let Some(said) = said {
                 break 'ended Err(said);
@@ -2670,26 +2714,65 @@ impl Run<'_> {
                             another order or none (decision 0132 item 4)";
                 break 'ended Err(self.halt(Stop::DropFailed, when));
             }
+            // X's account not read after the session, with no provider rate refusal: X counts as
+            // resting, its end not seen (decision 0005, the owner's ruling under 0151 item 6 on
+            // FBC-gisx), so the run stops for the owner's hand cancel, marked. Nothing more is
+            // placed, and nothing is cancelled with no session open (0151 item 2).
+            // An order none of ours or a TWAP a read listed is what the streams did not show
+            // (decision 0148 item 8): it outranks X counted resting or left unjudged, as an
+            // order or a TWAP not ours outranks an order of ours resting after drop session two
+            // (FBC-77r8's review, carried). X is still the owner's to cancel by hand.
+            let unseen = self.drop_run().x_unseen;
+            if after.unexpected && unseen.is_some() {
+                let said = self.halt(Stop::ReadDisagrees, "after drop session one");
+                break 'ended Err(match self.drop_run().error.clone() {
+                    Some(why) => format!("{why}; {said}"),
+                    None => said,
+                });
+            }
+            if let Some(places::Unseen::Account(why)) = unseen {
+                let when = format!(
+                    "after drop session one, X's account not read after it ({}), so X counts as \
+                     resting (decision 0005)",
+                    why.name()
+                );
+                let says = Some(places::COUNTED_RESTING);
+                let said = self.halt_as(Stop::LeftResting, &when, says);
+                // A failure of the session that raised no stop is kept beside it, as after drop
+                // session two.
+                break 'ended Err(match self.drop_run().error.clone() {
+                    Some(why) => format!("{why}; {said}"),
+                    None => said,
+                });
+            }
             // A read of X's trades or historic orders that failed with no refusal leaves X
             // unjudged, as an account that could not be read does before drop session two: Y is
-            // not placed beside an X whose fills were never read.
+            // not placed beside an X whose fills were never read. It is said so, never that X was
+            // seen resting (the owner's ruling under 0151 item 6 on FBC-gisx).
             if x_unread {
-                let when = "reading X after drop session one";
-                break 'ended Err(self.halt(Stop::LeftResting, when));
+                let when = "reading X after drop session one: its get_user_trades or GET \
+                            /user/historic-orders pages not all read, X left unjudged (decision \
+                            0005)";
+                let says = Some(places::LEFT_UNJUDGED);
+                break 'ended Err(self.halt_as(Stop::LeftResting, when, says));
             }
             // A failure of the session that raised no stop, after every stop the reads showed:
             // an order none of ours or a TWAP is what the streams did not show (decision 0148
-            // item 8), and otherwise an order of ours still resting, or X placed on an account
-            // that could not be read, so X may rest unjudged (as the read before drop session two
-            // marks one), is marked for the owner's hand cancel (0151 item 6).
+            // item 8), and otherwise an order of ours still resting is marked for the owner's
+            // hand cancel (0151 item 6). X placed on an account that could not be read was
+            // counted resting above (FBC-gisx), and a full page not listing X lists an order.
+            // The stop is said after the failure, as after drop session two and every other
+            // stop after a failed drop session one here (FBC-gisx's review).
             if let Some(why) = self.drop_run().error.clone() {
-                let unread = x.is_some() && !after.x_read;
-                if after.unexpected {
-                    self.halt(Stop::ReadDisagrees, "after drop session one");
-                } else if after.resting || unread {
-                    self.halt(Stop::LeftResting, "after drop session one");
-                }
-                break 'ended Err(why);
+                let stop = match (after.unexpected, after.resting) {
+                    (true, _) => Some(Stop::ReadDisagrees),
+                    (false, true) => Some(Stop::LeftResting),
+                    (false, false) => None,
+                };
+                break 'ended Err(match stop {
+                    Some(stop) => format!("{why}; {}", self.halt(stop, "after drop session one")),
+                    None => why,
+                });
             }
             // X, placed and ended with no stop: the read before drop session two admits it
             // alone, whether it still rests or a graceful close cancelled it (decision 0132
@@ -2746,7 +2829,13 @@ impl Run<'_> {
         };
         // X and Y, which count ended for a later registry only as 0151 item 5 rules.
         self.built[at].xy = std::iter::once(x).chain(y).map(|p| p.cid).collect();
-        let said = stop.map(|stop| self.halt(stop, "in drop session two"));
+        // The read before the drop not made is said as counted resting, never as an order seen
+        // resting, before any read after the session (FBC-gisx's review).
+        let unmade = self.two_run().before_drop_unread;
+        let said = stop.map(|stop| {
+            let says = (stop == Stop::LeftResting && unmade).then_some(places::UNREAD_BEFORE_DROP);
+            self.halt_as(stop, "in drop session two", says)
+        });
         self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
         let (mut verdict, mut pressed) = (None, false);
         let allowed = |p: Placed| AllowedOrder {
@@ -2774,7 +2863,9 @@ impl Run<'_> {
         let ours: Vec<&AllowedOrder> = std::iter::once(&x_allowed)
             .chain(y_allowed.as_ref())
             .collect();
-        let flattened = ioc_allowed(&[iocs_one, iocs_two].concat());
+        let iocs: Vec<fbc_core::ClientOrderId> = [iocs_one, iocs_two].concat();
+        let iocs_open = (iocs.iter()).any(|&cid| !ended_on(&link.borrow(), cid));
+        let flattened = ioc_allowed(&iocs);
         let read_ours: Vec<&AllowedOrder> = ours.iter().copied().chain(&flattened).collect();
         let mut after = self.read_after(Which::Two, on, &read_ours).await;
         // A failure that raised no stop: X's trades, and Y's once it was submitted, read after
@@ -2791,30 +2882,56 @@ impl Run<'_> {
             self.two_run().after = Some(traded);
         }
         self.patient = None;
+        // X's account not read with no provider rate refusal and no verdict judging X and Y: X,
+        // unless the streams showed it end, and Y, once submitted, count as resting (decision
+        // 0005, the owner's ruling under 0151 item 6 on FBC-gisx). A verdict, passed or failed,
+        // rests on the reads after the drop, which showed their ends or stopped the run. Y's end
+        // is not looked for: a session that failed hands back no Y to look up.
+        let x_open = !ended_on(&link.borrow(), x.cid);
+        let counted = places::Counted::of(x_open, self.two_run().y.submitted, iocs_open);
+        let unread = (after.on_unread.filter(|_| verdict.is_none())).zip(counted);
         let two = self.two_run();
         two.resting = after.resting;
         two.read = after.read;
         two.x_resting = after.x_listed;
         two.x_read = after.x_read;
-        if after.resting {
-            self.line(format_args!("RESTING {}", places::HAND_CANCEL_ORDERS));
+        two.unread = unread;
+        two.x_ended = !x_open;
+        match unread {
+            _ if after.resting => self.line(format_args!("RESTING {}", places::HAND_CANCEL_ORDERS)),
+            Some((_, counted)) => self.line(format_args!("RESTING {}", counted.hand_cancel())),
+            None => {}
         }
         // The run's end, the first that applies: the session's stop; a failure that was no stop,
         // with the reads' stop after it when they show one (a provider rate refusal, Ctrl-C, a
-        // position not flat or a trade naming X or Y, an order still resting), so an order still
-        // resting is marked for the hand cancel the report asks for (0151 items 6 and 9); the
-        // verdict's stop (decision 0132 item 7, 0151 items 9 and 13); then the reads' stop.
+        // position not flat or a trade naming X or Y, an order still resting), or, with none, X's
+        // account not read, the orders sent whose end the streams did not show counted resting,
+        // so an order still resting, or counted resting, is marked for the hand cancel the report
+        // asks for (0151 items 6 and 9); the verdict's stop (decision 0132 item 7, 0151 items 9
+        // and 13); then the reads' stop.
         let read_stop = after_stop(&after, pressed);
         if let Some(said) = said {
             return Err(said);
         }
         if let Some(why) = self.two_run().error.clone() {
-            // X's account not read, or read on a full page not listing X: X, and Y once placed,
-            // may rest unjudged, marked as the read before drop session two marks an account it
-            // could not read (0151 item 6; FBC-77r8's review).
-            let unread = (!after.x_read).then_some((Stop::LeftResting, UNREAD_AFTER_TWO));
-            return Err(match read_stop.or(unread) {
-                Some((stop, when)) => format!("{why}; {}", self.halt(stop, when)),
+            let stop = match (read_stop, unread) {
+                (Some((stop, when)), _) => Some((stop, when.to_owned(), None)),
+                (None, Some((failed, counted))) => Some((
+                    Stop::LeftResting,
+                    format!(
+                        "after drop session two, X's account not read after it ({}), so {} as \
+                         resting (decision 0005)",
+                        failed.name(),
+                        counted.count()
+                    ),
+                    Some(places::COUNTED_RESTING),
+                )),
+                (None, None) => None,
+            };
+            return Err(match stop {
+                Some((stop, when, says)) => {
+                    format!("{why}; {}", self.halt_as(stop, &when, says))
+                }
                 None => why,
             });
         }
@@ -3860,6 +3977,7 @@ impl Run<'_> {
                 "READ before the drop: {}: not made, so no drop",
                 name(d.on)
             ));
+            self.two_run().before_drop_unread = true;
             return Err(Halt::Stop(Stop::LeftResting));
         }
         if disagrees {
@@ -3925,10 +4043,14 @@ impl Run<'_> {
         let quote = touch.now(places.touch_max_age).map_err(Halt::Error)?;
         let px = market::rest_price(&found.spec, places.side, quote, places.away_bps);
         let px = px.map_err(Halt::Error)?;
-        // A test's X not priced: a failure of drop session one that is no stop.
+        // A test's X, or Y, not priced: a failure of its drop session that is no stop.
         #[cfg(test)]
         if places.test.x_unpriced && d.which == Which::One {
             return Err(Halt::Error("a test's X could not be priced".to_owned()));
+        }
+        #[cfg(test)]
+        if places.test.y_unpriced && d.which == Which::Two {
+            return Err(Halt::Error("a test's Y could not be priced".to_owned()));
         }
         let new = fbc_core::NewOrder {
             cid,
@@ -4833,7 +4955,9 @@ impl Run<'_> {
     /// taken, none ending the reads: the run stops after them. A provider rate refusal they
     /// meet, a `GET /user/positions` answered 429 or 418, any rise in the shared limiter's
     /// `rejected.user` count, or one their read sockets' frames show, in clear or kept whole
-    /// ([`Refusals::shown`]), is a stop too, once they all ran.
+    /// ([`Refusals::shown`]), is a stop too, once they all ran. A read of `on`'s account that
+    /// failed with no such refusal is named by the step that failed ([`AfterReads::on_unread`],
+    /// FBC-gisx).
     async fn read_after(&mut self, which: Which, on: Armed, ours: &[&AllowedOrder]) -> AfterReads {
         let mut after = AfterReads::default();
         let mark = self.read_mark();
@@ -4841,8 +4965,18 @@ impl Run<'_> {
         let mut pressed = false;
         let x = ours.first().copied();
         for account in self.named.clone() {
+            let at = self.read_mark();
+            let mut failed = places::AccountUnread::Positions;
             let read = {
-                let read = self.read_one(which.after(), on, which.mark(), account, (x, ours));
+                let admits = (x, ours);
+                let read = self.read_one(
+                    which.after(),
+                    on,
+                    which.mark(),
+                    account,
+                    admits,
+                    &mut failed,
+                );
                 tokio::pin!(read);
                 loop {
                     tokio::select! {
@@ -4880,6 +5014,9 @@ impl Run<'_> {
                 Err(why) => {
                     after.unread = true;
                     self.ev.errors.push(why);
+                    if account == on && self.refused_since(at).is_none() {
+                        after.on_unread = Some(failed);
+                    }
                 }
             }
         }
@@ -5048,7 +5185,12 @@ impl Run<'_> {
             (None, false, Err(_)) => Stop::LeftResting,
         };
         let why = read.err().map_or(String::new(), |why| format!("{why}; "));
-        let said = self.halt(stop, "in the read before drop session two");
+        // An account not read, X not listed by the reads after drop session one: counted
+        // resting, never seen resting (the owner's ruling under 0151 item 6 on FBC-gisx; its
+        // review). X listed by them was seen resting after a session.
+        let seen = self.drop_run().x_resting;
+        let says = (stop == Stop::LeftResting && !seen).then_some(places::COUNTED_UNREAD);
+        let said = self.halt_as(stop, "in the read before drop session two", says);
         Err(format!("{why}{said}"))
     }
 
@@ -5429,7 +5571,13 @@ impl Run<'_> {
         link.borrow_mut().reg().disarm(inst);
         placed.session_ended(&link.borrow(), which.name(), self.mono());
         self.ev.place_registries.push(placed);
-        let said = ran.map(|stop| self.halt(stop, &format!("in {}", which.name())));
+        // A registry's order that kept the session's order back is counted resting, never seen
+        // resting (the owner's ruling under 0151 item 6 on FBC-gisx; its review).
+        let blocked = self.stage_run(which).blocked.is_some();
+        let said = ran.map(|stop| {
+            let says = (stop == Stop::LeftResting && blocked).then_some(places::COUNTED_BLOCKED);
+            self.halt_as(stop, &format!("in {}", which.name()), says)
+        });
         // The session's orders, once placed (the crossing post-only or the taker IOC, then its
         // flatten IOCs), are ours on its own account, by their venue ids once the streams named
         // them: an order or a TWAP any read lists that is none of them is what the streams did
@@ -5465,11 +5613,11 @@ impl Run<'_> {
             (false, true) => None,
             (false, false) => Some(false),
         };
-        if after.ours_resting {
-            let hand = match which {
-                Which::Take => crate::taker::HAND_CANCEL_TAKE,
-                _ => two::HAND_CANCEL_CROSS,
-            };
+        // The owner's hand cancel: an order of ours a read listed, one only the registry counts
+        // resting, or the account not read once an order was sent there, each said as it is,
+        // never an order seen resting that no read listed (FBC-gisx's review).
+        let hand = two::hand_cancel(self.stage_run(which), which == Which::Take);
+        if let Some(hand) = hand {
             self.line(format_args!("RESTING {hand}"));
         }
         if after.unexpected {
@@ -5483,13 +5631,17 @@ impl Run<'_> {
         let shown = (after.not_flat, after.unexpected);
         let resting = (after.ours_resting || counted, after.unread);
         let read = stage_after_stop(which == Which::Take, first, shown, resting);
+        // An order of ours no read listed, counted resting by the registry or on an account not
+        // read, is said so, never as seen resting (the owner's ruling under 0151 item 6 on
+        // FBC-gisx).
+        let says = read.and_then(|(stop, _)| stage_counted_says(stop, after.ours_resting, counted));
         let ended = match (said, self.stage_run(which).error.clone(), read) {
             (Some(said), ..) => Err(said),
             (None, Some(why), Some((stop, when))) => {
-                Err(format!("{why}; {}", self.halt(stop, when)))
+                Err(format!("{why}; {}", self.halt_as(stop, when, says)))
             }
             (None, Some(why), None) => Err(why),
-            (None, None, Some((stop, when))) => Err(self.halt(stop, when)),
+            (None, None, Some((stop, when))) => Err(self.halt_as(stop, when, says)),
             (None, None, None) => Ok(()),
         };
         let stop = self.stop.map(Stop::name);
@@ -6376,6 +6528,19 @@ pub fn stage_after_stop(
     (shown.or(unexpected)).or_else(rest)
 }
 
+/// What a stage-two session's `stop` says in place of [`Stop::says`] ([`Run::halt_as`]): for a
+/// [`Stop::LeftResting`] that no read listing an order of ours made (`listed`), an order the
+/// session's registry counts resting (`counted`, [`places::COUNTED_BY_REGISTRY`]), or else a
+/// named account not read ([`places::COUNTED_UNREAD`]): counted resting, never seen resting (the
+/// owner's ruling under 0151 item 6 on FBC-gisx). `None`, [`Stop::says`], otherwise.
+pub fn stage_counted_says(stop: Stop, listed: bool, counted: bool) -> Option<&'static str> {
+    match (stop, listed, counted) {
+        (Stop::LeftResting, false, true) => Some(places::COUNTED_BY_REGISTRY),
+        (Stop::LeftResting, false, false) => Some(places::COUNTED_UNREAD),
+        _ => None,
+    }
+}
+
 /// When the reads after a taker IOC session listed an order or a TWAP not ours.
 pub const TAKE_OTHERS: &str =
     "after the taker IOC session, a read listing an order or a TWAP not ours";
@@ -6408,6 +6573,9 @@ pub struct AfterReads {
     pub x_flat: bool,
     /// Whether a named account could not be read.
     pub unread: bool,
+    /// Why the session's own account could not be read, when its read failed with no provider
+    /// rate refusal (FBC-gisx): the step that failed.
+    pub on_unread: Option<places::AccountUnread>,
     /// Whether the owner pressed Ctrl-C while they ran.
     pub pressed: bool,
     /// The provider rate refusal they met, if any: a stop ([`Run::read_after`]).
@@ -6450,6 +6618,20 @@ impl AfterReads {
     }
 }
 
+/// The line a stop ends the run with ([`Run::halt_as`]): the run's stop, `first`, by name, met
+/// `when`, then what it is, `says` when `stop` is the run's and [`Stop::says`] otherwise.
+pub fn stop_said(first: Stop, stop: Stop, when: &str, says: Option<&str>) -> String {
+    let says = says.filter(|_| first == stop).unwrap_or(first.says());
+    format!("{} {when}: {says}; no further session runs", first.name())
+}
+
+/// Whether `link`'s registry holds the order `cid` as ended, so the streams showed its end
+/// (decision 0005): one it does not hold, or holds in any other state, an `Unknown` one included,
+/// did not (FBC-gisx).
+fn ended_on(link: &Link, cid: fbc_core::ClientOrderId) -> bool {
+    (link.registry().get(cid)).is_some_and(|r| r.state().is_terminal())
+}
+
 /// The stop the reads after drop session two make, given `after` and whether the owner pressed
 /// Ctrl-C during the reads after the drop, or during X's and Y's trades read after a failure
 /// (`pressed`): [`read_stop`]'s, with [`Stop::ReadDisagrees`] for an order none of ours or a
@@ -6462,10 +6644,6 @@ fn after_stop(after: &AfterReads, pressed: bool) -> Option<(Stop, &'static str)>
     let unexpected = (after.unexpected).then_some((Stop::ReadDisagrees, "after drop session two"));
     (shown.or(unexpected)).or_else(|| read_stop(None, false, false, after.resting))
 }
-
-/// When the reads after drop session two met no stop of their own but did not read X's account
-/// ([`Run::drop_sessions`]).
-const UNREAD_AFTER_TWO: &str = "after drop session two, X's account not read";
 
 /// Whether `read`, the stop the reads after drop session two make, outranks `judged`, the
 /// verdict's, in the verdict's own order ([`crate::verdict::DropVerdict::stop`]): a position

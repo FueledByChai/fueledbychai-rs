@@ -486,6 +486,9 @@ pub struct TestHooks {
     /// with no stop (`stage::Halt::Error`), that order left resting: a failure after a place,
     /// which no answer of the QFEX model makes (FBC-77r8's review).
     pub fail_after_place: Option<usize>,
+    /// Y not priced once the arm was accepted, so drop session two fails with no stop
+    /// (`stage::Halt::Error`), its reads after it made as after any failure (FBC-gisx).
+    pub y_unpriced: bool,
     /// Before the `n`th crossing session's check for no other order of ours (0 the first named
     /// account's), an order of ours, never sent, held in the first named account's cross
     /// registry (FBC-su9i): decision 0148 item 6's refusal, which the reads before each session
