@@ -42,9 +42,13 @@
 //!   [`QfexModel::venue_cancel`],
 //!   [`QfexModel::close_on_cancel`], [`QfexModel::stray_after`],
 //!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`] and
-//!   [`QfexModel::fill_on_trades`]; at the first trade-socket authentication,
+//!   [`QfexModel::fill_on_trades`]; as the first graceful close of an armed connection is
+//!   settled, [`QfexModel::fill_after_close`], [`QfexModel::part_fill_after_close`] and
+//!   [`QfexModel::trade_after_close`]; at the first trade-socket authentication,
 //!   [`QfexModel::touch_moves`]; on every read socket, [`QfexModel::auth_fails`],
-//!   [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`] and [`QfexModel::hold_trades`], and
+//!   [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`], [`QfexModel::trades_err`] and
+//!   [`QfexModel::hold_trades`], on every `GET /user/historic-orders`
+//!   [`QfexModel::historic_fails`], and
 //!   on every read socket's pages [`QfexModel::newest_first`], after the first `add_order`
 //!   [`QfexModel::page_delay`] and, once an armed connection ended,
 //!   [`QfexModel::blank_cid_after_session`]. With [`QfexModel::stray_order`] or
@@ -132,6 +136,15 @@ pub struct Filled {
     pub at: i64,
 }
 
+/// A trade on an account of an order the model never had ([`QfexModel::trade_after_close`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum StrayTrade {
+    /// Its row names a made-up order by its `order_id` and its `client_order_id`.
+    Other,
+    /// Its row names no order: it carries neither id, which a decoder reads, not refuses.
+    Unnamed,
+}
+
 /// A provider rate refusal the model answers in place of one request ([`QfexModel::rate_limit`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Limited {
@@ -174,6 +187,9 @@ pub enum Limited {
     /// The first `get_user_orders` page on a read socket before any `add_order`, answered as
     /// [`Limited::PageKeptWhole`] answers one.
     PageKeptWholeBefore,
+    /// The first `get_user_trades` page on a read socket, answered a `RateLimited` err echoing
+    /// it.
+    Trades,
 }
 
 /// What an account's reads answer while [`QfexModel::rest_lag`] holds them back: its open orders
@@ -412,6 +428,26 @@ pub struct QfexModel {
     /// Whether a read socket's `get_user_trades` pages are each answered as if asked from offset
     /// 0, whatever offset they name, as a venue ignoring it would.
     pub stuck_trades: bool,
+    /// Once an armed connection closed gracefully, as the model settles that close and before
+    /// any answer after it, that connection's account's first open order fills whole as a
+    /// maker, no frame telling any socket: a fill after the close and before the read after it.
+    /// With [`QfexModel::part_fill_after_close`], half of it fills instead, and with
+    /// [`QfexModel::cod_on_close`] the close then cancels the rest.
+    pub fill_after_close: bool,
+    pub part_fill_after_close: bool,
+    /// Whether every read socket's `get_user_trades` page is answered an `InvalidRequest` err
+    /// echoing it, which is no rate refusal: X's trades are not read.
+    pub trades_err: bool,
+    /// Once an armed connection closed gracefully, as the model settles that close, a trade on
+    /// that connection's account of an order the model never had, the size of the account's
+    /// first order, which moves its position: a trade after X's send naming another order, or
+    /// none, as [`StrayTrade`] says.
+    pub trade_after_close: Option<StrayTrade>,
+    /// Whether every `GET /user/historic-orders` is answered HTTP 500.
+    pub historic_fails: bool,
+    /// The trades whose `get_user_trades` rows carry neither `order_id` nor `client_order_id`
+    /// ([`StrayTrade::Unnamed`]), by trade id.
+    pub unnamed: Vec<String>,
     /// The MDS stub's push handle, once it is up ([`QfexModel::touch_moves`]).
     pub mds_pusher: Option<Pusher>,
     /// The answers [`QfexModel::hold_trades`] held: each connection and frame.
@@ -493,6 +529,12 @@ impl Default for QfexModel {
             newest_first: false,
             page_delay: None,
             stuck_trades: false,
+            fill_after_close: false,
+            part_fill_after_close: false,
+            trades_err: false,
+            trade_after_close: None,
+            historic_fails: false,
+            unnamed: Vec::new(),
             mds_pusher: None,
             held: Vec::new(),
             placed_on: None,
@@ -561,6 +603,7 @@ impl QfexModel {
                 ok(&self.positions_of(account))
             }
             "/user/subaccounts" => listing_refused(),
+            _ if self.historic_fails => status(500, r#"{"error":"synthetic failure"}"#),
             _ => ok(&self.historic(account)),
         }
     }
@@ -725,6 +768,14 @@ impl QfexModel {
                     None => Ok(vec![page]),
                 }
             }
+            "get_user_trades" if self.trades_err => Ok(vec![Frame::text(format!(
+                r#"{{"type":"Err","error_code":"InvalidRequest","message":"synthetic","incoming_message":{text}}}"#
+            ))]),
+            "get_user_trades" if self.rate_limit == Some(Limited::Trades) => {
+                self.rate_limit = None;
+                let echo = serde_json::json!({"type": "get_user_trades", "params": v["params"]});
+                Ok(vec![Frame::text(limited(&echo.to_string(), 1))])
+            }
             "get_user_trades" if self.hold_trades => {
                 let page = Frame::text(self.trades_page(conn, &v));
                 self.held.push((conn, page));
@@ -823,6 +874,23 @@ impl QfexModel {
                 true => ("close", self.cod_on_close),
                 false => ("drop", self.cod_on_drop),
             };
+            let fills = self.fill_after_close || self.part_fill_after_close;
+            if graceful && fills {
+                let whole = !std::mem::take(&mut self.part_fill_after_close);
+                self.fill_after_close = false;
+                let open = (self.orders.iter())
+                    .find(|o| o.account == account && o.state == State::Open)
+                    .map(|o| (o.id.clone(), o.quantity - o.filled));
+                if let Some((id, left)) = open {
+                    match whole {
+                        true => self.fill(&id),
+                        false => self.fill_part(&id, left / Decimal::TWO),
+                    };
+                }
+            }
+            if let Some(stray) = self.trade_after_close.take_if(|_| graceful) {
+                self.stray_trade(account.clone(), stray);
+            }
             if cancels {
                 self.before_change(&account);
                 let open = self.orders.iter_mut();
@@ -986,6 +1054,32 @@ impl QfexModel {
         self.fill_part(id, quantity)
     }
 
+    /// A trade on `account` of an order the model never had, the size of the account's first
+    /// order, its row naming that made-up order or none ([`QfexModel::trade_after_close`]).
+    fn stray_trade(&mut self, account: Option<String>, stray: StrayTrade) {
+        let first = self.orders.iter().find(|o| o.account == account).cloned();
+        let template = first.expect("an order on the account");
+        self.before_change(&account);
+        let order = Order {
+            id: "77777777-7777-4777-8777-777777777777".to_owned(),
+            cid: STRAY_CID.to_owned(),
+            filled: template.quantity,
+            state: State::Filled,
+            ..template
+        };
+        let filled = Filled {
+            account,
+            trade_id: format!("55555555-5555-4555-8555-{:012x}", self.fills.len() + 1),
+            quantity: order.quantity,
+            order,
+            at: now_secs(),
+        };
+        if stray == StrayTrade::Unnamed {
+            self.unnamed.push(filled.trade_id.clone());
+        }
+        self.fills.push(filled);
+    }
+
     /// Fills `quantity` of the open order `id` as a maker, which ends it once nothing is left.
     fn fill_part(&mut self, id: &str, quantity: Decimal) -> Filled {
         let n = self
@@ -1139,7 +1233,8 @@ impl QfexModel {
         if self.stuck_trades {
             asked["params"]["offset"] = serde_json::json!(0);
         }
-        let rows: Vec<Value> = paged(&fills, &asked).iter().map(|f| trade_row(f)).collect();
+        let row = |f: &&Filled| trade_row(f, self.unnamed.contains(&f.trade_id));
+        let rows: Vec<Value> = paged(&fills, &asked).iter().map(row).collect();
         serde_json::json!({"user_trades_response": rows}).to_string()
     }
 
@@ -1255,15 +1350,21 @@ fn fill_response(filled: &Filled, cid: bool) -> Frame {
     Frame::text(serde_json::json!({ "fill_response": members }).to_string())
 }
 
-/// `filled`'s row on a `get_user_trades` page.
-fn trade_row(filled: &Filled) -> Value {
+/// `filled`'s row on a `get_user_trades` page, with neither order id when `unnamed`.
+fn trade_row(filled: &Filled, unnamed: bool) -> Value {
     let order = &filled.order;
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "trade_id": filled.trade_id, "symbol": SYMBOL, "price": order.price,
         "quantity": number(filled.quantity), "side": order.side, "order_id": order.id,
         "client_order_id": order.cid, "fee": 0.001, "timestamp": filled.at,
         "order_type": order.kind, "tif": order.tif
-    })
+    });
+    if unnamed {
+        let members = row.as_object_mut().expect("an object");
+        members.remove("order_id");
+        members.remove("client_order_id");
+    }
+    row
 }
 
 /// A frame as JSON, refused when it is not a JSON text frame.

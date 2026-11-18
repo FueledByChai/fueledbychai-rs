@@ -2148,13 +2148,17 @@ impl Run<'_> {
             (x_refused, x_pressed) = (refused, pressed);
         }
         self.patient = None;
-        // X rested as the close was sent, and no cancel of ours was sent: the read after the
-        // close shows whether the close cancelled it.
+        // Whether the close cancelled X, measured on a read of X's own account alone (another
+        // account's says nothing of X) and, for X absent, on that account flat and X's trades
+        // read whole with no row since its send (decision 0132 item 4).
         let run = self.drop_run();
-        let rested =
-            run.x.rested_at_close && run.cancels.is_none() && run.ended_by == Some(GRACEFUL);
-        // Measured on a read of X's own account alone: another account's says nothing of X.
-        run.close_cancelled_x = (rested && after.x_read).then_some(!after.x_listed);
+        let read = places::XAccountRead {
+            read: after.x_read,
+            listed: after.x_listed,
+            flat: after.x_flat,
+        };
+        let verdict = places::close_verdict(run, read);
+        (run.close_cancelled_x, run.close_not_measured) = (verdict.ok(), verdict.err());
         run.x_resting = after.x_listed;
         run.x_read = after.x_read;
         if after.x_listed {
@@ -2949,6 +2953,7 @@ impl Run<'_> {
                     // X's account is read when its page listed X or was the last: a full page
                     // not listing X leaves X unread, not absent.
                     after.x_read |= account == on && (read.page_lists_it || !read.page_full);
+                    after.x_flat |= account == on && read.flat;
                     after.not_flat |= !read.flat;
                     after.resting |= read.page_orders > 0 || read.rest_open_orders > 0;
                     // X by its venue id once known, whatever client id its row carries.
@@ -3118,6 +3123,7 @@ impl Run<'_> {
             after.trades += page.rows().len();
             after.trades_naming_x += page.rows().iter().filter(|r| naming(r)).count();
             if page.rows().len() < usize::from(ask.limit()) {
+                after.trades_read = true;
                 break;
             }
             // A full page the same as the one before it, row for row: a venue ignoring the
@@ -3234,6 +3240,8 @@ struct AfterReads {
     x_listed: bool,
     /// Whether X's account, the first named, was read, on a page that listed X or was its last.
     x_read: bool,
+    /// Whether X's account was read and its position was flat.
+    x_flat: bool,
     /// Whether the owner pressed Ctrl-C while they ran.
     pressed: bool,
     /// The provider rate refusal they met, if any: a stop ([`Run::read_after`]).

@@ -962,6 +962,9 @@ pub struct XAfter {
     /// The trades rows read since X's send, and those naming X by its venue or client id.
     pub trades: usize,
     pub trades_naming_x: usize,
+    /// Whether every `get_user_trades` page since X's send was read, to a short page: what
+    /// rules out a fill of X once no row since then is on the account (decision 0132 item 4).
+    pub trades_read: bool,
     /// X's `terminal_status` on historic-orders when a row names its client id, as a status
     /// name (capitals, digits and underscores) or `(not a status name)`.
     pub terminal_status: Option<String>,
@@ -988,10 +991,13 @@ pub struct DropRun {
     pub compared: Vec<crate::compare::Compared>,
     /// How the session ended: a graceful close, or its connection's own end.
     pub ended_by: Option<&'static str>,
-    /// Whether the graceful close cancelled X: the read of X's own account after it no longer
-    /// listing X, which rested before it with no cancel of ours; `None` when not measured, that
-    /// account's read not made included.
+    /// Whether the graceful close cancelled X ([`close_verdict`]): the read of X's own account
+    /// after it no longer listing X, which rested before it with no cancel of ours, that account
+    /// flat, and X's trades since its send read whole with no row since then (decision 0132 item
+    /// 4); `None` when not measured, [`DropRun::close_not_measured`] saying why.
     pub close_cancelled_x: Option<bool>,
+    /// Why [`DropRun::close_cancelled_x`] was not measured, when it was not.
+    pub close_not_measured: Option<CloseUnmeasured>,
     /// Whether X still rested once the session ended, for the owner's hand cancel (decision
     /// 0132 item 7).
     pub x_resting: bool,
@@ -1008,6 +1014,123 @@ pub struct DropRun {
     /// Whether every `add_order` the session sent went out as encoded, carrying none of
     /// `take_profit`, `stop_loss` and `reduce_only` (FBC-blcw); `None` when none was sent.
     pub as_encoded: Option<bool>,
+}
+
+/// Why the graceful close's cancel of X was not measured ([`close_verdict`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CloseUnmeasured {
+    /// The session's connection ended first ([`crate::stage::CONNECTION_ENDED`]), so no close
+    /// was sent.
+    NotClosed,
+    /// The shared budget had no room for the close ([`crate::stage::NO_ROOM_TO_CLOSE`]), so it
+    /// may not have been graceful (0151 item 11).
+    NoRoomToClose,
+    /// The session did not reach its close: it failed before it, or did not open.
+    NoClose,
+    /// A stop that cancels came (0151 item 2), its cancels sent, held or refused, so the close
+    /// was not all that could end X.
+    CancelStop,
+    /// X was not held Open or PartiallyFilled as the close was sent.
+    NotRested,
+    /// X's account was not read after the session, or its page was full and did not list X.
+    XUnread,
+    /// X was absent, and a `get_user_trades` row names it: a fill of X, whole or in part.
+    XTraded,
+    /// X was absent, and a `get_user_trades` row since its send names another order or none,
+    /// so a trade decision 0132 item 4 rules out came, or a fill of X its row does not name.
+    OtherTrade,
+    /// X was absent, and its account's position was not flat after the session.
+    XNotFlat,
+    /// X was absent, but its trades since its send were not read whole.
+    TradesUnread,
+}
+
+impl CloseUnmeasured {
+    /// Why, in the report's and the evidence's words.
+    pub fn says(self) -> &'static str {
+        match self {
+            CloseUnmeasured::NotClosed => "the session's connection ended before a close was sent",
+            CloseUnmeasured::NoRoomToClose => {
+                "the shared budget had no room for the close, which may not have been graceful \
+                 (0151 item 11)"
+            }
+            CloseUnmeasured::NoClose => "the session did not reach its close",
+            CloseUnmeasured::CancelStop => {
+                "a stop that cancels came before the close (0151 item 2), its cancels sent, held \
+                 or refused"
+            }
+            CloseUnmeasured::NotRested => "X did not rest as the close was sent",
+            CloseUnmeasured::XUnread => {
+                "X's account was not read after it, or its page was full and did not list X"
+            }
+            CloseUnmeasured::XTraded => {
+                "the read after it no longer listed X, but a get_user_trades row names X: a fill \
+                 of X was seen, so its absence is not a cancel (decision 0132 item 4)"
+            }
+            CloseUnmeasured::OtherTrade => {
+                "the read after it no longer listed X, but a get_user_trades row since X's send \
+                 names another order or none: something traded on the account, so a fill of X \
+                 is not ruled out (decision 0132 item 4)"
+            }
+            CloseUnmeasured::XNotFlat => {
+                "the read after it no longer listed X, but X's account was not flat after it: \
+                 something traded on the account, so a fill of X is not ruled out (decision 0132 \
+                 item 4)"
+            }
+            CloseUnmeasured::TradesUnread => {
+                "the read after it no longer listed X, but X's trades since its send were not \
+                 read whole, so a fill of X is not ruled out (decision 0132 item 4)"
+            }
+        }
+    }
+}
+
+/// The read of X's own account after drop session one, as [`close_verdict`] takes it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct XAccountRead {
+    /// Whether it was read, on a page that listed X or was its last.
+    pub read: bool,
+    /// Whether its page listed X.
+    pub listed: bool,
+    /// Whether its position was flat.
+    pub flat: bool,
+}
+
+/// Whether drop session one's graceful close cancelled X (decision 0132 item 4), from `run` as
+/// the session left it and `x`, the read of X's own account after it. Not measured, and why,
+/// unless the session ended by a graceful close, with no stop that cancels before it, X rested
+/// as the close was sent, and X's account was read. Then X listed was not cancelled by it, and
+/// X absent was only when nothing else could have ended it: X's account flat, and X's trades
+/// since its send read whole with no row on the account since then. A row naming X, a part
+/// fill included, is a fill, not the close's cancel; any other row, or a position that moved,
+/// is a trade 0132 item 4 rules out, which leaves the cause of X's absence unknown.
+pub fn close_verdict(run: &DropRun, x: XAccountRead) -> Result<bool, CloseUnmeasured> {
+    use crate::stage::{CONNECTION_ENDED, GRACEFUL, NO_ROOM_TO_CLOSE};
+    match run.ended_by {
+        Some(GRACEFUL) => {}
+        Some(CONNECTION_ENDED) => return Err(CloseUnmeasured::NotClosed),
+        Some(NO_ROOM_TO_CLOSE) => return Err(CloseUnmeasured::NoRoomToClose),
+        _ => return Err(CloseUnmeasured::NoClose),
+    }
+    if run.cancels.is_some() {
+        return Err(CloseUnmeasured::CancelStop);
+    }
+    if !run.x.rested_at_close {
+        return Err(CloseUnmeasured::NotRested);
+    }
+    if !x.read {
+        return Err(CloseUnmeasured::XUnread);
+    }
+    if x.listed {
+        return Ok(false);
+    }
+    match &run.after {
+        Some(a) if a.trades_naming_x > 0 => Err(CloseUnmeasured::XTraded),
+        Some(a) if a.trades > a.trades_naming_x => Err(CloseUnmeasured::OtherTrade),
+        _ if !x.flat => Err(CloseUnmeasured::XNotFlat),
+        Some(a) if a.trades_read => Ok(true),
+        _ => Err(CloseUnmeasured::TradesUnread),
+    }
 }
 
 /// How each frame the tee heard gave back our client id ([`DropRun::echoes`]).
@@ -1070,16 +1193,16 @@ pub fn variant_name(value: &impl std::fmt::Debug) -> String {
 pub fn drop_markdown(s: &mut String, run: &DropRun) {
     let yn = |b: bool| if b { "yes" } else { "no" };
     let arm = run.arm.as_deref().unwrap_or("none reported");
-    let close = match run.close_cancelled_x {
-        Some(true) => {
-            "yes: X rested before it, no cancel of ours was sent, and the read after it \
-                       no longer listed X"
-        }
-        Some(false) => "no: X rested before it and still did after it",
-        None => {
-            "not measured (X did not rest before the close, a cancel of ours was sent, or X's \
-                 account was not read after it)"
-        }
+    let close = match (run.close_cancelled_x, run.close_not_measured) {
+        (Some(true), _) => "yes: X rested before it, no cancel of ours was sent, and the read \
+             after it no longer listed X, with X's account flat after it and X's trades since \
+             its send read whole, no row since then on the account (decision 0132 item 4)"
+            .to_owned(),
+        (Some(false), _) => "no: X rested before it and still did after it".to_owned(),
+        (None, why) => format!(
+            "not measured: {}",
+            why.map_or("the session did not reach its close", CloseUnmeasured::says)
+        ),
     };
     let cancels = match &run.cancels {
         None => "none: no stop that cancels in a drop session came (0151 item 2)".to_owned(),
@@ -1100,13 +1223,21 @@ pub fn drop_markdown(s: &mut String, run: &DropRun) {
     let after = match &run.after {
         None => "not read".to_owned(),
         Some(a) => format!(
-            "{} trade rows since X's send, {} naming X; X on GET /user/historic-orders: {}{}",
+            "{} trade rows since X's send{}, {} naming X; X on GET /user/historic-orders: {}{}",
             a.trades,
+            match a.trades_read {
+                true => ", read whole",
+                false => ", not read whole",
+            },
             a.trades_naming_x,
-            a.terminal_status.as_deref().unwrap_or("not listed"),
+            // Not listed only on a read that ended; a failed one, or none, says nothing of X.
+            (a.terminal_status.as_deref()).unwrap_or(match a.error {
+                Some(_) => "not known",
+                None => "not listed",
+            }),
             a.error
                 .as_ref()
-                .map_or(String::new(), |e| format!("; not read whole: {e}"))
+                .map_or(String::new(), |e| format!("; a read failed: {e}"))
         ),
     };
     let _ = writeln!(
@@ -1202,7 +1333,8 @@ pub fn drop_to_json(run: &DropRun) -> Value {
         .map(|c| json!({"sent": c.sent, "held": c.held, "ended": c.ended, "presses": c.presses}));
     let after = run.after.as_ref().map(|a| {
         json!({"trades": a.trades, "trades_naming_x": a.trades_naming_x,
-            "terminal_status": a.terminal_status, "error": a.error})
+            "trades_read": a.trades_read, "terminal_status": a.terminal_status,
+            "error": a.error})
     });
     json!({"account": run.account, "authenticated": run.authenticated, "arm": run.arm,
         "resynced": run.resynced, "started": run.started,
@@ -1210,7 +1342,9 @@ pub fn drop_to_json(run: &DropRun) -> Value {
             "exact_echo": run.x.exact_echo, "outcome": run.x.outcome,
             "ack_after_ms": run.x.ack_after.map(ms)},
         "cancels": cancels, "compared": compared, "ended_by": run.ended_by,
-        "close_cancelled_x": run.close_cancelled_x, "x_resting": run.x_resting,
+        "close_cancelled_x": run.close_cancelled_x,
+        "close_not_measured": run.close_not_measured.map(CloseUnmeasured::says),
+        "x_resting": run.x_resting,
         "x_read_after": run.x_read,
         "hand_cancel": run.x_resting.then_some(HAND_CANCEL), "after": after,
         "echoes": run.echoes, "add_order_as_encoded": run.as_encoded, "error": run.error})
