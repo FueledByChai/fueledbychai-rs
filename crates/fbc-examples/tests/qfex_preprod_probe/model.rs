@@ -109,9 +109,16 @@
 //!   later, [`QfexModel::fill_in_resync`], an arm's fills sent with its connection's next page,
 //!   [`QfexModel::resync_page_held`], that page held for the test to release,
 //!   and [`Limited::ReadSocketAfterIoc`] and [`Limited::ReadAuthEchoAfterIoc`], refusals counted
-//!   from the run's first limit IOC; and, for the restack onto FBC-su9i's review fixes,
+//!   from the run's first limit IOC; for the restack onto FBC-su9i's review fixes,
 //!   [`QfexModel::hold_ioc_sell`], the first sell limit IOC's answer or close held for the test to
-//!   release, and [`QfexModel::rate_with_ioc_sell`], a `RateLimited` err sent with it.
+//!   release, and [`QfexModel::rate_with_ioc_sell`], a `RateLimited` err sent with it. FBC-gisx's,
+//!   once an armed connection ended: [`QfexModel::page_after_session`] ([`PageFault`]), a read
+//!   socket's first page answered with a frame that is no page, or by a server close, and
+//!   [`QfexModel::rest_fails_after_drop_reads`], the read of the account after drop session two
+//!   answered HTTP 500; and, for its restack onto FBC-77r8's review fixes,
+//!   [`QfexModel::twap_elsewhere_after_close`], a TWAP on every other account once an armed
+//!   connection ended, and [`QfexModel::page_after_ioc_end`], a read socket's first page once the
+//!   run's first limit IOC's connection ended, answered as [`PageFault`] says.
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -223,6 +230,17 @@ pub enum Echo {
     Null,
     /// `client_order_id` empty.
     Empty,
+}
+
+/// How the model answers a read socket's first `get_user_orders` page once an armed connection
+/// ended ([`QfexModel::page_after_session`]; FBC-gisx): a read that fails with no provider rate
+/// refusal.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PageFault {
+    /// A JSON object that is no page, which the adapter does not decode.
+    Undecodable,
+    /// No answer: the server closes the read socket.
+    Close,
 }
 
 /// How the model answers a post-only (`ALO`) order priced through its touch, a buy at or above
@@ -758,6 +776,18 @@ pub struct QfexModel {
     pub drop_lag: Option<(usize, usize)>,
     /// The `GET /user/positions` reads after the first `add_order`, from 0, answered HTTP 500.
     pub rest_fails: Vec<usize>,
+    /// The first `get_user_orders` page on a read socket once an armed connection ended,
+    /// answered as it says (FBC-gisx): the after-session read of the account read first.
+    pub page_after_session: Option<PageFault>,
+    /// The first `get_user_orders` page on a read socket once the trade connection the run's
+    /// first limit IOC arrived on ended ([`QfexModel::first_ioc_on`]), answered as it says: the
+    /// read of the account after a session that sent a flatten IOC (FBC-gisx's restack).
+    pub page_after_ioc_end: Option<PageFault>,
+    /// Once an armed connection dropped abruptly, the first `GET /user/positions` after a
+    /// `GET /user/historic-orders` answered HTTP 500 (FBC-gisx): the read of the account after
+    /// drop session two, which follows the reads of X's and Y's trades and historic orders after
+    /// the drop, however many reads the wait after the drop made.
+    pub rest_fails_after_drop_reads: bool,
     /// The first `cancel_order`'s answer is pushed this long after it, instead of at once.
     pub cancel_delay: Option<Duration>,
     /// Once an armed connection ended, its account's positions show a position on [`SYMBOL`]
@@ -784,11 +814,21 @@ pub struct QfexModel {
     /// Once an armed connection ended, its account's read sockets' pages list one TWAP
     /// (FBC-77r8's review).
     pub twap_after_close: bool,
+    /// Once an armed connection ended, the read sockets' pages of every account but its own
+    /// list one TWAP (FBC-gisx's restack: what another account's read shows beside the session's
+    /// own account not read).
+    pub twap_elsewhere_after_close: bool,
     /// What the first `GET /user/historic-orders` after an armed connection's drop changes on
     /// its account, once answered ([`AfterHistoric`]; FBC-77r8's review).
     pub after_drop_historic: Option<AfterHistoric>,
     /// The accounts whose read sockets' pages list a TWAP.
     pub(super) twaps: Vec<Option<String>>,
+    /// The account whose armed connection's end made every other account list a TWAP
+    /// ([`QfexModel::twap_elsewhere_after_close`]).
+    pub(super) twap_beside: Option<Option<String>>,
+    /// Whether the trade connection the run's first limit IOC arrived on ended
+    /// ([`QfexModel::page_after_ioc_end`]).
+    pub(super) ioc_conn_ended: bool,
     /// As it reads the first `add_order`, before answering it, the model holds this limiter's
     /// every frame budget for the time given, as a provider refusal echoing nothing would: the
     /// run's shared limiter, under the run's provider user.
@@ -953,6 +993,9 @@ pub struct QfexModel {
     /// How many drops of an armed connection were seen, for [`QfexModel::drop_lag`].
     pub(super) drops: usize,
     pub(super) rest_after: usize,
+    /// Whether a `GET /user/historic-orders` came once an armed connection dropped abruptly
+    /// ([`QfexModel::rest_fails_after_drop_reads`]).
+    pub(super) historic_after_drop: bool,
     /// Trade-socket authentications answered since the first `add_order`, a session's included
     /// ([`Limited::ReadAuth`]).
     pub(super) auths_after: usize,
@@ -1048,6 +1091,10 @@ impl Default for QfexModel {
             drop_lag: None,
             drops: 0,
             rest_fails: Vec::new(),
+            page_after_session: None,
+            page_after_ioc_end: None,
+            rest_fails_after_drop_reads: false,
+            historic_after_drop: false,
             cancel_delay: None,
             position_after_close: false,
             position_on_place: false,
@@ -1056,8 +1103,11 @@ impl Default for QfexModel {
             position_on_place_on: None,
             foreign_on_drop: false,
             twap_after_close: false,
+            twap_elsewhere_after_close: false,
             after_drop_historic: None,
             twaps: Vec::new(),
+            twap_beside: None,
+            ioc_conn_ended: false,
             foreign_order: false,
             hold_on_place: None,
             hold_on_cancel: None,
@@ -1141,6 +1191,9 @@ impl QfexModel {
             .as_deref()
             .map_or(String::new(), |a| format!(" {a}"));
         self.event(format!("GET {}{shown}", req.path), None);
+        if req.path == "/user/historic-orders" && self.dropped() {
+            self.historic_after_drop = true;
+        }
         match req.path.as_str() {
             "/refdata" if self.refdata.is_some() => {
                 let (status, body) = self.refdata.expect("set");
@@ -1180,6 +1233,10 @@ impl QfexModel {
                         return status(500, r#"{"error":"synthetic failure"}"#);
                     }
                     failing.1 -= 1;
+                }
+                if self.rest_fails_after_drop_reads && self.historic_after_drop {
+                    self.rest_fails_after_drop_reads = false;
+                    return status(500, r#"{"error":"synthetic failure"}"#);
                 }
                 ok(&self.positions_of(account))
             }
@@ -1466,6 +1523,26 @@ impl QfexModel {
             "cancel_order" => Ok(self.cancel_order(conn, &v, text)),
             "get_user_orders" => {
                 let session = self.conns.get(&conn).is_some_and(|c| c.session);
+                let fault = self
+                    .page_after_session
+                    .filter(|_| !session && self.session_ended());
+                let ioc_fault = (self.page_after_ioc_end)
+                    .filter(|_| fault.is_none() && !session && self.ioc_conn_ended);
+                if fault.is_some() {
+                    self.page_after_session = None;
+                }
+                if ioc_fault.is_some() {
+                    self.page_after_ioc_end = None;
+                }
+                if let Some(fault) = fault.or(ioc_fault) {
+                    return Ok(match fault {
+                        PageFault::Undecodable => vec![Frame::text(r#"{"type":"synthetic"}"#)],
+                        PageFault::Close => {
+                            self.later(conn, Vec::new(), Duration::ZERO, true);
+                            Vec::new()
+                        }
+                    });
+                }
                 let page = Frame::text(self.orders_page(conn, &v));
                 if let Some((on, fills)) = self.resync_fills.take() {
                     match on == conn {
@@ -1772,7 +1849,11 @@ impl QfexModel {
                 self.after_historic(account.clone(), change);
             }
         }
+        if self.twap_elsewhere_after_close && self.twap_beside.is_none() {
+            self.twap_beside = Some(account.clone());
+        }
         if self.first_ioc_on == Some(n) {
+            self.ioc_conn_ended = true;
             for change in std::mem::take(&mut self.after_take_end) {
                 self.after_historic(account.clone(), change);
             }
@@ -2556,7 +2637,8 @@ impl QfexModel {
                 row["client_order_id"] = Value::String(String::new());
             }
         }
-        let twaps = match !session && self.twaps.contains(&account) {
+        let beside = (self.twap_beside.as_ref()).is_some_and(|on| *on != account);
+        let twaps = match !session && (self.twaps.contains(&account) || beside) {
             true => vec![serde_json::json!({"symbol": SYMBOL, "status": "ACTIVE"})],
             false => Vec::new(),
         };

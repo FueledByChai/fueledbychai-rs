@@ -1307,6 +1307,17 @@ pub struct TwoRun {
     /// Whether X's account was read after the session on a page that listed X or was its last,
     /// so [`TwoRun::x_resting`] is known.
     pub x_read: bool,
+    /// Why the account could not be read after the session, when that was no provider rate
+    /// refusal, no verdict judged X and Y, and an order of ours there ended in nothing the
+    /// streams showed: the orders then counted resting ([`Counted`]; decision 0005, as the owner
+    /// ruled under 0151 item 6 on FBC-gisx).
+    pub unread: Option<(AccountUnread, Counted)>,
+    /// Whether the registry held X ended once the session and the reads after it were over, so
+    /// the streams showed X's end (FBC-gisx's review).
+    pub x_ended: bool,
+    /// Whether the read before the drop could not be made, a stop before the drop
+    /// ([`UNREAD_BEFORE_DROP`]; FBC-gisx's review).
+    pub before_drop_unread: bool,
     /// Why the session could not run its course, when that was no stop: never an id or value.
     pub error: Option<String>,
     /// How QFEX gave back our client id on the session, frame by frame ([`DropRun::echoes`]).
@@ -1353,8 +1364,16 @@ pub struct DropRun {
     pub x_read: bool,
     /// The owner's hand cancel the reads after the session ask for: [`HAND_CANCEL`] for X, or
     /// [`HAND_CANCEL_ONE_ORDERS`] once the session sent a flatten IOC and an order of ours
-    /// rests (the restack's review); `None` when none rests.
+    /// rests (the restack's review); [`HAND_CANCEL_UNREAD`] with X's account not read and X
+    /// counted resting (FBC-gisx); `None` when none rests or counts.
     pub hand_cancel: Option<&'static str>,
+    /// Why X was left unjudged after the session, when it was and that was no provider rate
+    /// refusal ([`Unseen`]): the run then stops [`Stop::LeftResting`], marked, unless a stop came
+    /// before it (decision 0005, as the owner ruled under 0151 item 6 on FBC-gisx).
+    pub x_unseen: Option<Unseen>,
+    /// Whether X's end was shown once the session was over, by the registry or by a
+    /// `GET /user/historic-orders` row naming X (FBC-gisx's review).
+    pub x_ended: bool,
     /// The reads of X and its trades after the session.
     pub after: Option<XAfter>,
     /// Why the session could not run its course, when that was no stop: never an id or value.
@@ -1423,6 +1442,197 @@ impl OthersClean {
         }
     }
 }
+
+/// Why an account could not be read after a session, when that was no provider rate refusal
+/// (FBC-gisx): the step of [`crate::capture::AccountRead`]'s read that failed, never its text.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AccountUnread {
+    /// `GET /user/positions` was not sent (its reader, its request or the shared limiter's room
+    /// failing first), gave no answer, or gave one that is no success or does not decode.
+    Positions,
+    /// The read socket did not open, authenticate, take a frame or answer within
+    /// `--read-wait-ms`, closed before it answered, or did not close.
+    Socket,
+    /// The read socket's `get_user_orders` page did not decode.
+    Page,
+}
+
+impl AccountUnread {
+    /// Its name, as the report, the evidence and a stop's line give it.
+    pub fn name(self) -> &'static str {
+        match self {
+            AccountUnread::Positions => "Positions",
+            AccountUnread::Socket => "Socket",
+            AccountUnread::Page => "Page",
+        }
+    }
+
+    /// What it is, in the report's words.
+    pub fn says(self) -> &'static str {
+        match self {
+            AccountUnread::Positions => {
+                "GET /user/positions was not sent, gave no answer, or gave one that is no \
+                 success or does not decode"
+            }
+            AccountUnread::Socket => {
+                "the read socket did not open, authenticate, take a frame, answer within \
+                 --read-wait-ms or close, or closed before it answered"
+            }
+            AccountUnread::Page => "the read socket's get_user_orders page did not decode",
+        }
+    }
+}
+
+/// Why X was left unjudged after drop session one, which stops the run [`Stop::LeftResting`],
+/// marked (decision 0005, as the owner ruled under 0151 item 6 on FBC-gisx). Neither is a
+/// provider rate refusal, which is a stop of its own.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Unseen {
+    /// X's account could not be read after the session.
+    Account(AccountUnread),
+    /// X's `get_user_trades` or `GET /user/historic-orders` pages after the session were not read
+    /// whole.
+    History,
+}
+
+impl Unseen {
+    /// Its name, as the evidence gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Unseen::Account(AccountUnread::Positions) => "Account(Positions)",
+            Unseen::Account(AccountUnread::Socket) => "Account(Socket)",
+            Unseen::Account(AccountUnread::Page) => "Account(Page)",
+            Unseen::History => "History",
+        }
+    }
+
+    /// What it is, in the report's words: never that X was seen resting.
+    pub fn says(self) -> String {
+        match self {
+            Unseen::Account(why) => format!(
+                "X's account could not be read after the session ({}: {}): X was not seen \
+                 resting or ended, so it counts as resting",
+                why.name(),
+                why.says()
+            ),
+            Unseen::History => "X's get_user_trades or GET /user/historic-orders pages after the \
+                                session were not all read: neither a fill of X nor its end is \
+                                shown by them"
+                .to_owned(),
+        }
+    }
+}
+
+/// The orders of ours counted resting after drop session two with its account not read after it
+/// and no verdict judging X and Y (decision 0005, as the owner ruled under 0151 item 6 on
+/// FBC-gisx): X unless the streams showed it end, Y once it was submitted, and any flatten IOC
+/// either session sent whose end the streams did not show. Only the orders counted are named.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Counted {
+    /// X alone: Y was never submitted.
+    X,
+    /// Y alone: the streams showed X end.
+    Y,
+    /// X and Y.
+    Both,
+    /// A flatten IOC, beside X when `x` (the streams did not show X end) and Y when `y` (Y was
+    /// submitted): the restack's review names a flatten IOC as ours.
+    WithFlatten { x: bool, y: bool },
+}
+
+impl Counted {
+    /// The orders counted resting, given whether X's end was not shown by the streams
+    /// (`x_open`), whether Y was submitted (`y_sent`) and whether a flatten IOC's end was not
+    /// shown (`ioc_open`); `None` when none counts.
+    pub fn of(x_open: bool, y_sent: bool, ioc_open: bool) -> Option<Counted> {
+        match (x_open, y_sent, ioc_open) {
+            (x, y, true) => Some(Counted::WithFlatten { x, y }),
+            (true, true, false) => Some(Counted::Both),
+            (true, false, false) => Some(Counted::X),
+            (false, true, false) => Some(Counted::Y),
+            (false, false, false) => None,
+        }
+    }
+
+    /// Whether it counts X.
+    pub fn counts_x(self) -> bool {
+        matches!(
+            self,
+            Counted::X | Counted::Both | Counted::WithFlatten { x: true, .. }
+        )
+    }
+
+    /// Its name, as the evidence gives it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Counted::X => "X",
+            Counted::Y => "Y",
+            Counted::Both => "X and Y",
+            Counted::WithFlatten { x: false, y: false } => "a flatten IOC",
+            Counted::WithFlatten { x: true, y: false } => "X and a flatten IOC",
+            Counted::WithFlatten { x: false, y: true } => "Y and a flatten IOC",
+            Counted::WithFlatten { x: true, y: true } => "X, Y and a flatten IOC",
+        }
+    }
+
+    /// The orders it names with their verb, as a stop's line gives them.
+    pub fn count(self) -> &'static str {
+        match self {
+            Counted::X => "X counts",
+            Counted::Y => "Y counts",
+            Counted::Both => "X and Y count",
+            Counted::WithFlatten { x: false, y: false } => "a flatten IOC counts",
+            Counted::WithFlatten { x: true, y: false } => "X and a flatten IOC count",
+            Counted::WithFlatten { x: false, y: true } => "Y and a flatten IOC count",
+            Counted::WithFlatten { x: true, y: true } => "X, Y and a flatten IOC count",
+        }
+    }
+
+    /// The hand cancel the report and the `RESTING` line ask for: never that an order was seen
+    /// resting.
+    pub fn hand_cancel(self) -> &'static str {
+        match self {
+            Counted::X => HAND_CANCEL_X_UNREAD,
+            Counted::Y => HAND_CANCEL_Y_UNREAD,
+            Counted::Both => HAND_CANCEL_ORDERS_UNREAD,
+            Counted::WithFlatten { .. } => HAND_CANCEL_FLATTEN_UNREAD,
+        }
+    }
+}
+
+/// What a [`Stop::LeftResting`] says of an order of ours whose account could not be read after a
+/// session, in place of [`Stop::says`]'s, which says an order was seen resting (FBC-gisx).
+pub const COUNTED_RESTING: &str = "an order of ours whose account could not be read after a \
+     session, so nothing showed its end: counted resting, not seen resting (decision 0005, the \
+     owner's ruling under 0151 item 6)";
+
+/// What a stage-two session's [`Stop::LeftResting`] says of an order of ours its registry still
+/// holds open or `Unknown` when no read after the session listed one, in place of
+/// [`Stop::says`]'s (`stage::stage_counted_says`, FBC-gisx).
+pub const COUNTED_BY_REGISTRY: &str = "an order of ours the session's registry still holds open \
+     or Unknown, which no read after the session listed, so nothing showed its end: counted \
+     resting, not seen resting (decision 0005, the owner's ruling under 0151 item 6)";
+
+/// What a stage-two session's [`Stop::LeftResting`] says of a named account that could not be
+/// read after the session, when no read listed an order of ours and its registry counts none
+/// resting, in place of [`Stop::says`]'s (`stage::stage_counted_says`, FBC-gisx).
+pub const COUNTED_UNREAD: &str = "a named account that could not be read after a session, so \
+     nothing showed the end of an order of ours that may rest there: counted resting, not seen \
+     resting (decision 0005, the owner's ruling under 0151 item 6)";
+
+/// What a stage-two session's [`Stop::LeftResting`] says when the check before its order kept it
+/// back, a registry of the run holding an order of ours open, in flight or `Unknown`, or its
+/// count overflowing (`stage_two::Blocked`), in place of [`Stop::says`]'s (FBC-gisx's review).
+pub const COUNTED_BLOCKED: &str = "an order of ours a registry of the run still holds open, in \
+     flight or Unknown, or whose count overflowed, kept the next order back: counted resting, not \
+     seen resting (decision 0005, the owner's ruling under 0151 item 6)";
+
+/// What a [`Stop::LeftResting`] says of X when its `get_user_trades` or
+/// `GET /user/historic-orders` pages after drop session one were not all read, in place of
+/// [`Stop::says`]'s (FBC-gisx).
+pub const LEFT_UNJUDGED: &str = "an order of ours whose get_user_trades or GET \
+     /user/historic-orders pages after a session were not all read: left unjudged, not seen \
+     resting (decision 0005, the owner's ruling under 0151 item 6)";
 
 /// Why the graceful close's cancel of X was not measured ([`close_verdict`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1595,6 +1805,15 @@ pub const HAND_CANCEL_ONE_ORDERS: &str = "an order of ours rests on the account 
      production's site, then give the next place-stage run --reconciled hand-cancel (0151 item \
      6); no order is named by its ids here";
 
+/// What the report says of X counted resting after drop session one with its account not read
+/// after it (decision 0005, as the owner ruled under 0151 item 6 on FBC-gisx), for the owner:
+/// never that X was seen resting.
+pub const HAND_CANCEL_UNREAD: &str = "X's account could not be read after drop session one, so \
+     X counts as resting, as decision 0005 counts an order whose end nothing showed; it was not \
+     seen resting: if it still rests, cancel it by hand on QFEX production's site, then give the \
+     next place-stage run --reconciled hand-cancel (0151 item 6); the order is named by none of \
+     its ids here";
+
 /// What a comparison came to, as the report and the evidence name it.
 fn ended(e: crate::compare::Ended) -> &'static str {
     use crate::compare::Ended;
@@ -1639,6 +1858,68 @@ pub const HAND_CANCEL_ORDERS: &str = "an order rests on the account after drop s
      cancel every order of ours (X, Y and any flatten IOC) by hand on QFEX production's site, \
      then give the next place-stage run --reconciled hand-cancel (0151 item 6); no order is \
      named by its ids here";
+
+/// What the report says of X and Y counted resting after drop session two with its account not
+/// read after it and no verdict showing their end (decision 0005, as the owner ruled under 0151
+/// item 6 on FBC-gisx), for the owner: never that an order was seen resting.
+pub const HAND_CANCEL_ORDERS_UNREAD: &str = "the account could not be read after drop session \
+     two, so X and Y count as resting, as decision 0005 counts an order whose end nothing showed; \
+     neither was seen resting: cancel every order of ours (X, Y) still resting by hand on QFEX \
+     production's site, then give the next place-stage run --reconciled hand-cancel (0151 item \
+     6); no order is named by its ids here";
+
+/// [`HAND_CANCEL_ORDERS_UNREAD`] with a flatten IOC counted resting, beside X or Y when they
+/// count ([`Counted::WithFlatten`], which the evidence's `counted_resting` names).
+pub const HAND_CANCEL_FLATTEN_UNREAD: &str = "the account could not be read after drop session \
+     two, so every order of ours sent whose end nothing showed counts as resting, a flatten IOC \
+     among them (the evidence's counted_resting names each), as decision 0005 counts one; none \
+     was seen resting: cancel every order of ours still resting by hand on QFEX production's \
+     site, then give the next place-stage run --reconciled hand-cancel (0151 item 6); no order is \
+     named by its ids here";
+
+/// [`HAND_CANCEL_ORDERS_UNREAD`] with X alone counted resting, Y never submitted ([`Counted::X`]).
+pub const HAND_CANCEL_X_UNREAD: &str = "the account could not be read after drop session two, \
+     so X counts as resting, as decision 0005 counts an order whose end nothing showed; it was \
+     not seen resting, and Y was never sent: if X still rests, cancel it by hand on QFEX \
+     production's site, then give the next place-stage run --reconciled hand-cancel (0151 item \
+     6); the order is named by none of its ids here";
+
+/// [`HAND_CANCEL_ORDERS_UNREAD`] with Y alone counted resting, the streams having shown X end
+/// ([`Counted::Y`]).
+pub const HAND_CANCEL_Y_UNREAD: &str = "the account could not be read after drop session two, \
+     so Y counts as resting, as decision 0005 counts an order whose end nothing showed; it was \
+     not seen resting, and the streams showed X end: if Y still rests, cancel it by hand on QFEX \
+     production's site, then give the next place-stage run --reconciled hand-cancel (0151 item \
+     6); the order is named by none of its ids here";
+
+/// What the report says of X resting when the run ended, once X's account could not be read
+/// after drop session two and X counts as resting ([`Counted::counts_x`]): never
+/// that X was seen resting (FBC-gisx).
+pub const X_COUNTED_AFTER_TWO: &str = "counted resting, not seen resting: X's account could not \
+     be read after drop session two and nothing showed X end (decision 0005, the owner's ruling \
+     under 0151 item 6); its hand cancel is in drop session two's section below";
+
+/// What the report says of X when the run ended, once X's end was shown, by the registry or a
+/// `GET /user/historic-orders` row naming X, and its account was not read after drop session one
+/// (FBC-gisx's review): from what showed X's end, never from the run's shape.
+pub const X_ENDED_AFTER_ONE: &str = "no: X's end was shown, by the registry or a GET \
+     /user/historic-orders row naming it, though X's account was not read after drop session one";
+
+/// What the report says of X when the run ended, once the streams showed X end and the read of
+/// X's account after drop session two did not show it (FBC-gisx's review): from the streams,
+/// never from the run's shape.
+pub const X_ENDED_AFTER_TWO: &str = "no: the streams showed X end, though the read of X's \
+     account after drop session two did not show it (it was not read, or its page was full and \
+     did not list X)";
+
+/// What a [`Stop::LeftResting`] says when the read before drop session two's drop could not be
+/// made, in place of [`Stop::says`]'s, which says an order was seen resting: the drop is not made
+/// and the session closes gracefully, cancelling nothing (0151 item 2), before any read after it
+/// (FBC-gisx's review).
+pub const UNREAD_BEFORE_DROP: &str = "the read before the drop could not be made, so the drop was \
+     not made and the session closed gracefully, cancelling nothing (0151 item 2): X and Y count \
+     as resting until a read shows their end, not seen resting (decision 0005, the owner's ruling \
+     under 0151 item 6)";
 
 /// What follows a drop test that did not stop the run: the next named account's.
 pub const NEXT_ACCOUNT: &str = "the next named account's drop test, which starts only after \
@@ -1909,6 +2190,8 @@ fn one_markdown(s: &mut String, run: &DropRun) {
          - Whether the graceful close cancelled X: {}\n\
          - X and its trades after the session: {after}\n\
          - X resting when the run ended: {}\n\
+         - X left unjudged after the session (decision 0005; the owner's ruling under 0151 \
+           item 6): {}\n\
          - Our client id as QFEX gave it back, frame by frame (decision 0148 item 2; never the \
            id): {}\n\
          - add_order sent as encoded, with no take_profit, stop_loss or reduce_only (FBC-blcw): \
@@ -1922,6 +2205,8 @@ fn one_markdown(s: &mut String, run: &DropRun) {
         run.ended_by.unwrap_or("it did not open"),
         close_said(run),
         x_at_end(run),
+        run.x_unseen
+            .map_or("no".to_owned(), |why| format!("yes: {}", why.says())),
         echoes_said(&run.echoes),
         run.as_encoded.map_or("none sent", yn),
         run.error.as_deref().unwrap_or("none"),
@@ -1957,6 +2242,12 @@ fn x_at_end(run: &DropRun) -> String {
             (false, true) => {
                 "no: the read of X's account after drop session two no longer listed it".to_owned()
             }
+            // X counted resting, its account not read after drop session two (FBC-gisx).
+            (false, false) if two.unread.is_some_and(|(_, c)| c.counts_x()) => {
+                X_COUNTED_AFTER_TWO.to_owned()
+            }
+            // The streams showed X end (FBC-gisx's review).
+            (false, false) if two.x_ended => X_ENDED_AFTER_TWO.to_owned(),
             (false, false) => "not known: X's account was not read after drop session two, or \
                                its page was full and did not list X; read it on QFEX's site \
                                before the next run"
@@ -1967,6 +2258,11 @@ fn x_at_end(run: &DropRun) -> String {
         (true, _, _) => HAND_CANCEL,
         (false, false, _) => "no: X was not placed",
         (false, true, true) => "no",
+        (false, true, false) if matches!(run.x_unseen, Some(Unseen::Account(_))) => {
+            HAND_CANCEL_UNREAD
+        }
+        // X's end was shown though its account was not read (FBC-gisx's review).
+        (false, true, false) if run.x_ended => X_ENDED_AFTER_ONE,
         (false, true, false) => {
             "not known: the account was not read after the session; read it on QFEX's site \
              before the next run"
@@ -2038,13 +2334,18 @@ fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
         true => yn(b),
         false => "not measured: the session did not reach its drop",
     };
-    let resting = match (two.resting, two.read) {
-        (true, _) => HAND_CANCEL_ORDERS,
-        (false, true) => "no",
-        (false, false) => {
-            "not known: the account was not read after the session; read it on QFEX's site \
-             before the next run"
-        }
+    let resting = match (two.resting, two.read, two.unread) {
+        (true, ..) => HAND_CANCEL_ORDERS.to_owned(),
+        (false, true, _) => "no".to_owned(),
+        (false, false, Some((why, counted))) => format!(
+            "{}; the read that failed: {}: {}",
+            counted.hand_cancel(),
+            why.name(),
+            why.says()
+        ),
+        (false, false, None) => "not known: the account was not read after the session; read \
+                                 it on QFEX's site before the next run"
+            .to_owned(),
     };
     let _ = writeln!(
         s,
@@ -2135,7 +2436,8 @@ pub fn drop_to_json(run: &DropRun) -> Value {
         "close_not_measured": run.close_not_measured.map(CloseUnmeasured::says),
         "x_resting": run.x_resting,
         "x_read_after": run.x_read,
-        "hand_cancel": run.hand_cancel.filter(|_| run.two.is_none()),
+        "x_unseen": run.x_unseen.map(Unseen::name),
+        "hand_cancel": hand_cancel_one(run),
         "after": after,
         "echoes": run.echoes, "add_order_as_encoded": run.as_encoded, "error": run.error,
         "flatten": run.flatten.as_ref().map(crate::flatten::to_json)});
@@ -2144,6 +2446,13 @@ pub fn drop_to_json(run: &DropRun) -> Value {
     json!({"account": run.account, "session_one": one, "x_before_two": run.x_before_two,
         "session_two": two, "verdict": verdict, "others_clean": run.others_clean.to_json(),
         "stop": run.stop})
+}
+
+/// The hand cancel drop session one's entry asks for, once the run ended after it
+/// ([`DropRun::hand_cancel`]): X or a flatten IOC seen resting, or X counted resting with its
+/// account not read after it ([`HAND_CANCEL_UNREAD`]).
+fn hand_cancel_one(run: &DropRun) -> Option<&'static str> {
+    run.hand_cancel.filter(|_| run.two.is_none())
 }
 
 /// Drop session two's entry.
@@ -2175,7 +2484,13 @@ fn two_to_json(two: &TwoRun) -> Value {
         "ended_by": two.ended_by, "after_drop": after_drop, "after": after,
         "resting": two.resting, "read_after": two.read,
         "x_resting": two.x_resting, "x_read_after": two.x_read,
-        "hand_cancel": two.resting.then_some(HAND_CANCEL_ORDERS),
+        "read_after_failed": two.unread.map(|(why, _)| why.name()),
+        "counted_resting": two.unread.map(|(_, counted)| counted.name()),
+        "hand_cancel": match (two.resting, two.unread) {
+            (true, _) => Some(HAND_CANCEL_ORDERS),
+            (false, Some((_, counted))) => Some(counted.hand_cancel()),
+            (false, None) => None,
+        },
         "echoes": two.echoes, "add_order_as_encoded": two.as_encoded, "error": two.error,
         "flatten": two.flatten.as_ref().map(crate::flatten::to_json)})
 }

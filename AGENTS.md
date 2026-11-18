@@ -942,20 +942,35 @@ holds two of them for one pull request. The rules after the three roles bind all
     repeating the one before it, as a venue ignoring the offset answers, failing the read, and so in
     every such read after a session), waiting out a rate hold rather than skipping, a provider
     refusal (one kept whole included) or a Ctrl-C during them a stop, a trade naming X in them
-    `NotFlat` (a fill seen with no session open, 0151 item 9), and X's trades or historic-orders not
-    read whole `LeftResting`, X left unjudged, then a failure of drop session one that was no stop,
-    kept as the session's error, with `ReadDisagrees` marked for an order none of ours or a TWAP,
-    else `LeftResting` when an order of ours rests or X's account could not be read. Drop session
+    `NotFlat` (a fill seen with no session open, 0151 item 9), then X's own account not read for a
+    reason that is no provider rate refusal `LeftResting` (FBC-gisx; decision 0005 as the owner
+    ruled under 0151 item 6: X counted resting unless its registry holds it ended,
+    `stage::ended_on`, or a historic-orders row named it, which survives a later page that failed;
+    the read's step that failed named by `places::AccountUnread`, `GET /user/positions` not sent
+    or not answered, the read socket or its page, recorded through `Run::read_one` and never its
+    text; the hand cancel asked for as `places::HAND_CANCEL_UNREAD` and the stop said as
+    `places::COUNTED_RESTING` through `Run::halt_as`, never as X seen resting, after the session's
+    failure when it failed), then X's trades or historic-orders not read whole with no provider
+    rate refusal `LeftResting`, X left unjudged and said so (`places::Unseen` in the report and
+    evidence, the stop said as `places::LEFT_UNJUDGED`; X's status on a page read keeping it
+    judged), each after `ReadDisagrees` for an order none of ours or a TWAP a read listed, then a
+    failure of drop session one that was no stop, kept as the session's error, with
+    `ReadDisagrees` marked for an order none of ours or a TWAP, else `LeftResting` when an order
+    of ours rests, each said after the session's error; X's account not read once X's end was
+    shown counts nothing, the report saying X's end was shown (`places::X_ENDED_AFTER_ONE`). Drop
+    session
     two (FBC-77r8): every named account read again, admitting X alone (`Run::read_before_two`, a
-    refusal kept whole on its sockets a stop); a session on the same `Link` and registry, seeded
+    refusal kept whole on its sockets a stop, an account not read with X not listed after drop
+    session one said as `places::COUNTED_UNREAD`); a session on the same `Link` and registry, seeded
     nothing and not Started again (its market armed from drop session one), whose handler watches
     only what follows its start (`places::Watched::after`): its arm accepted; Y, placed as X was
     (`Run::place_resting`, held to `market::caps_admit` at its own touch); Y's ACK or its deadline;
     the read before the drop, one never-arming read beside the session, a `CANCELLED` naming X heard
     by its end recorded as the arm's, reported (`tee::Kept::cancelled_of_from`), and a stop or a
     press met as its socket closes taken before the drop; then that read not made a stop,
-    `LeftResting`, and that read showing an order or a TWAP neither X nor Y (`verdict::others`) or
-    a position the registry does not hold a stop, `ReadDisagrees` (0148 item 8), each before the
+    `LeftResting`, said as X and Y counted resting (`places::UNREAD_BEFORE_DROP`), and that read
+    showing an order or a TWAP neither X nor Y (`verdict::others`) or a position the registry
+    does not hold a stop, `ReadDisagrees` (0148 item 8), each before the
     drop and cancelling nothing; then the abrupt drop, the session's run dropped unpolled and its
     connection with it, no WebSocket close (`stage::DROPPED`), the capture taking the session's
     end as its close (`capture.rs`), with what the session showed as it dropped
@@ -989,23 +1004,33 @@ holds two of them for one pull request. The rules after the three roles bind all
     way end. The run ends with its stop and marker, any order of ours still resting reported for the
     owner's hand cancel: a stop of either session; `NotFlat` on a position after a session or a
     trade naming X after drop session one; `DropFailed` for a trade naming another order or none
-    after drop session one, Y never placed; `LeftResting` for X's trades or historic-orders not read
-    whole after drop session one; a failure of drop session one that is no stop, with
-    `ReadDisagrees` added when its reads show an order none of ours or a TWAP, else `LeftResting`
-    when an order of ours rests or X's account could not be read; a stop of the read before drop
-    session two; a failure of drop session two that is no stop, with X's trades, and Y's once
-    submitted, read after the account reads, and `NotFlat`, `ReadDisagrees` or `LeftResting` added
-    when those reads show a position or a trade naming X or Y, an order none of the drop test's or
-    a TWAP, or an order resting (`stage::after_stop`, after `stage::read_stop`'s refusal and
-    Ctrl-C), or else `LeftResting` when X's account was not read; the verdict's (`DropFailed`,
-    `ArmCancelUnreported` recorded and stopped on after the drop, `UnexpectedFill` for a trades row
-    naming X or Y, the run not flat and the position the owner's, 0151 item 9, said so beside a
-    provider refusal that came first, `ReadDisagrees` for an order or a TWAP not ours after the
-    drop, or a provider refusal), but the read of every named account after the drop outranking a
-    stop after its own in the verdict's order (`stage::outranks`: `NotFlat` over `ReadDisagrees`,
-    `ArmCancelUnreported` and `DropFailed`, `ReadDisagrees` over the last two); or `ReadDisagrees`
-    or `LeftResting` after drop session two. A failed drop test is a stop, so nothing more is
-    placed on its account or any other; the drop registry is disarmed once its second session
+    after drop session one, Y never placed; `LeftResting` for X's own account not read after drop
+    session one for a reason that is no provider rate refusal, X counted resting, then for X's
+    trades or historic-orders not read whole after it, X left unjudged (FBC-gisx), each after
+    `ReadDisagrees` for an order none of ours or a TWAP; a failure of drop session one that is no
+    stop, with `ReadDisagrees` added when its reads show an order none of ours or a TWAP, else
+    `LeftResting` when an order of ours rests; a stop of the read before drop session two; a
+    failure of drop session two that is no stop, with X's trades, and Y's once submitted, read
+    after the account reads, and `NotFlat`, `ReadDisagrees` or `LeftResting` added when those
+    reads show a position or a trade naming X or Y, an order none of the drop test's or a TWAP, or
+    an order resting (`stage::after_stop`, after `stage::read_stop`'s refusal and Ctrl-C), or,
+    with none, `LeftResting` when X's account could not be read after it for a reason that is no
+    provider rate refusal and no verdict judged X and Y, the orders sent whose end the streams did
+    not show counted resting (`places::Counted`: X unless its registry holds it ended, Y once
+    submitted, and any flatten IOC whose end the registry did not show), each named alone
+    (`Counted::WithFlatten` naming X and Y only as they count), X's end shown said so
+    (`places::X_ENDED_AFTER_TWO`), and reported for the owner's hand cancel as not read
+    (`Counted::hand_cancel`, the account's step that failed in `TwoRun::unread`, the stop said
+    as `places::COUNTED_RESTING`, FBC-gisx; none counted, no stop); the verdict's (`DropFailed`,
+    `ArmCancelUnreported` recorded and stopped on after the drop, `UnexpectedFill` for a trades
+    row naming X or Y, the run not flat and the position the owner's, 0151 item 9, said so
+    beside a provider refusal that came first, `ReadDisagrees` for an order or a TWAP not ours
+    after the drop, or a provider refusal), but the read of every
+    named account after the drop outranking a stop after its own in the verdict's order
+    (`stage::outranks`: `NotFlat` over `ReadDisagrees`, `ArmCancelUnreported` and `DropFailed`,
+    `ReadDisagrees` over the last two); or `ReadDisagrees` or `LeftResting` after drop session
+    two. A failed drop test is a stop, so nothing more is placed on its account or any other; the
+    drop registry is disarmed once its second session
     ends, giving up its market lease. With none, stage two follows (FBC-su9i; `stage.rs`'s
     `Run::cross_tests`, `stage_two.rs`; decisions 0005, 0132 item 7, 0148 items 2, 6 and 8, 0151
     items 5, 9 and 11): the run's exact-echo gate (`stage_two::EchoGate`, open only once an
@@ -1061,7 +1086,15 @@ holds two of them for one pull request. The rules after the three roles bind all
     the session, listed by a read, counted open by REST and listed by no page, or counted resting by
     the session's registry (`stage_two::counted_resting`: an `Unknown` one, from an unmapped status
     or an err echo too), is `LeftResting`, so it blocks every crossing order after it, and so is a
-    named account that could not be read after the session, marked so the next run reconciles.
+    named account that could not be read after the session, marked so the next run reconciles;
+    one no read listed is said as counted resting, by the registry or on an account not read, never
+    as seen resting (`stage::stage_counted_says`, `places::COUNTED_BY_REGISTRY`,
+    `places::COUNTED_UNREAD`, through `Run::halt_as`; FBC-gisx), as is an order a registry holds
+    that kept the session's order back (`places::COUNTED_BLOCKED`), and the report, the evidence
+    and the `RESTING` line give the hand cancel alike (`stage_two::hand_cancel`: counted by the
+    registry, `stage_two::HAND_CANCEL_CROSS_COUNTED` or `taker::HAND_CANCEL_TAKE_COUNTED`, unless
+    the reads after the abrupt drop listed none, or the account not read once an order was sent,
+    `stage_two::HAND_CANCEL_STAGE_UNREAD`).
     With no stop the account's taker IOC session follows (FBC-ou9g; `taker.rs`; `Run::cross_test`
     and `Run::cross_session` under `Which::Take`, `Run::take_steps`, `Run::place_taker`), before the
     next account's crossing session (0148 item 1: the stages on each named account in turn): every
@@ -1241,8 +1274,14 @@ holds two of them for one pull request. The rules after the three roles bind all
     page held for the test's release, `Venue::release_held`), the read sockets' pages held after a
     `maker_fill` the reads lag until its connection's client writes again (`knob_frames_unread`),
     and `Limited::ReadSocketAfterIoc` and `ReadAuthEchoAfterIoc` (a refusal counted from the run's
-    first limit IOC), all declared by path; ten paths no flag or
-    answer reaches, X spent from its list, X not priced, a session failing after its order's answer,
+    first limit IOC), and, for FBC-gisx, `page_after_session` (the first `get_user_orders` page a
+    read socket asks for once an armed connection ended answered with a frame that is no page, or
+    by a server close), `page_after_ioc_end` (the same, once the connection the run's first limit
+    IOC arrived on ended), `rest_fails_after_drop_reads` (once an armed connection dropped, the
+    first `GET /user/positions` after a historic-orders read answered HTTP 500) and
+    `twap_elsewhere_after_close` (once an armed connection ended, every other account's pages
+    listing one TWAP), all declared by path; eleven paths no flag or answer reaches, X spent from
+    its list, X not priced, Y not priced (FBC-gisx), a session failing after its order's answer,
     the journal past its soft limit, another order of ours held in a cross registry before a
     crossing order or a taker IOC, the account's flatten budget spent by its drop registry on the
     allowance its later registries are handed, the flatten's market Killed before the owner's

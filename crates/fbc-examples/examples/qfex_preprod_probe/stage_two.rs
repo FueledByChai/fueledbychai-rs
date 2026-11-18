@@ -965,6 +965,65 @@ pub const HAND_CANCEL_CROSS: &str = "an order rests on the account after the cro
      cancel it by hand on QFEX production's site, then give the next place-stage run \
      --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
 
+/// What the report says of an order of ours the cross registry still counts resting after a
+/// crossing session when no read after it listed one, for the owner: counted resting, never seen
+/// resting (decision 0005, the owner's ruling under 0151 item 6 on FBC-gisx).
+pub const HAND_CANCEL_CROSS_COUNTED: &str = "the cross registry still counts an order of ours \
+     resting, Unknown and never resent (decision 0005), which no read after the session listed: \
+     counted resting, not seen resting (the owner's ruling under 0151 item 6); if it still rests, \
+     cancel it by hand on QFEX production's site, then give the next place-stage run \
+     --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
+
+/// What the report says of a stage-two session's account not read after the session, once the
+/// session sent an order of ours, for the owner: an order of ours may rest there, counted
+/// resting, never seen resting (decision 0005, the owner's ruling under 0151 item 6 on FBC-gisx).
+pub const HAND_CANCEL_STAGE_UNREAD: &str = "not known: the account was not read after the \
+     session, so nothing showed the end of an order of ours that may rest there: counted \
+     resting, not seen resting (decision 0005, the owner's ruling under 0151 item 6); read it on \
+     QFEX's site, cancel any order of ours still resting by hand, then give the next place-stage \
+     run --reconciled hand-cancel (0151 item 6); no order is named by its ids here";
+
+/// What the report says of a stage-two session's account not read after the session when the
+/// session sent no order of ours.
+const NOT_READ: &str = "not known: the account was not read after the session; read it on \
+     QFEX's site before the next run";
+
+/// The owner's hand cancel after stage-two session `run`, the taker IOC session's when `take`:
+/// the session's own words when a read after it listed an order of ours resting; counted
+/// resting, never seen resting, when only its registry still counts one; and the account not
+/// read, an order of ours sent there counted resting, when it was not read after the session
+/// (decision 0005, the owner's ruling under 0151 item 6 on FBC-gisx). After the abrupt drop the
+/// registry hears nothing more, and its reads, read again until one lists no order of ours, are
+/// what show the drop's cancel (0151 item 11): once they read the account and listed none, no
+/// order of ours is counted resting by the registry alone. `None` when a read showed none and
+/// the registry counts none, or nothing was sent on an account not read. The report, the
+/// evidence and the `RESTING` line give the same.
+pub fn hand_cancel(run: &CrossRun, take: bool) -> Option<&'static str> {
+    use crate::taker::{HAND_CANCEL_TAKE, HAND_CANCEL_TAKE_COUNTED};
+    let (seen, counted) = match take {
+        true => (HAND_CANCEL_TAKE, HAND_CANCEL_TAKE_COUNTED),
+        false => (HAND_CANCEL_CROSS, HAND_CANCEL_CROSS_COUNTED),
+    };
+    let dropped = run.ended_by == Some(crate::stage::DROPPED);
+    match (run.resting, run.counted_resting, run.read) {
+        (true, _, _) => Some(seen),
+        (false, true, true) if dropped => None,
+        (false, true, _) => Some(counted),
+        (false, false, false) if run.placed.submitted => Some(HAND_CANCEL_STAGE_UNREAD),
+        (false, false, _) => None,
+    }
+}
+
+/// What the report says of an order resting on `run`'s account after a stage-two session, the
+/// taker IOC session's when `take`: [`hand_cancel`]'s, or else whether the account was read.
+fn resting_said(run: &CrossRun, take: bool) -> &'static str {
+    match (hand_cancel(run, take), run.read) {
+        (Some(hand), _) => hand,
+        (None, true) => "no",
+        (None, false) => NOT_READ,
+    }
+}
+
 /// What the report says when the reads after a crossing session list an order or a TWAP not
 /// ours (decision 0148 item 8).
 pub const OTHERS_CROSS: &str = "an order or a TWAP that is not ours is listed on a named account \
@@ -1076,19 +1135,7 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
             Some(Crossed::Filled) => format!("; {CROSS_FILLED}"),
             _ => String::new(),
         };
-        let resting = match (run.resting, run.counted_resting, run.read) {
-            (true, _, _) => HAND_CANCEL_CROSS,
-            (false, true, _) => {
-                "the cross registry still counts an order of ours resting, Unknown and never \
-                 resent (decision 0005): an order of ours still resting after a session, a stop \
-                 (decision 0132 item 7)"
-            }
-            (false, false, true) => "no",
-            (false, false, false) => {
-                "not known: the account was not read after the session; read it on QFEX's site \
-                 before the next run"
-            }
-        };
+        let resting = resting_said(run, false);
         let others = match run.others {
             Some(true) => OTHERS_CROSS,
             Some(false) => "none",
@@ -1190,21 +1237,9 @@ enum Next {
 /// after it.
 fn take_markdown(s: &mut String, run: &CrossRun, next: Next) {
     use crate::places::{echoes_said, ms, placed_said, yn};
-    use crate::taker::{HAND_CANCEL_TAKE, LAST_TAKE, NEXT_ACCOUNT, OTHERS_TAKE, RUN_ENDED};
+    use crate::taker::{LAST_TAKE, NEXT_ACCOUNT, OTHERS_TAKE, RUN_ENDED};
     use std::fmt::Write as _;
-    let resting = match (run.resting, run.counted_resting, run.read) {
-        (true, _, _) => HAND_CANCEL_TAKE,
-        (false, true, _) => {
-            "the take registry still counts an order of ours resting, open with a fill, Unknown or \
-             in flight, never resent (decision 0005): an order of ours still resting after a \
-             session, a stop (decision 0132 item 7)"
-        }
-        (false, false, true) => "no",
-        (false, false, false) => {
-            "not known: the account was not read after the session; read it on QFEX's site \
-             before the next run"
-        }
-    };
+    let resting = resting_said(run, true);
     let others = match run.others {
         Some(true) => OTHERS_TAKE,
         Some(false) => "none",
@@ -1285,7 +1320,7 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
     let echoes: serde_json::Map<String, serde_json::Value> = (two.echoes.says().into_iter())
         .map(|(kind, said)| (kind.to_owned(), json!(said)))
         .collect();
-    let session = |run: &CrossRun, hand_cancel: &str| {
+    let session = |run: &CrossRun, take: bool| {
         let compared: Vec<serde_json::Value> = run.compared.iter().map(compared_json).collect();
         let cancels = run.cancels.as_ref().map(|c| {
             json!({"sent": c.sent, "held": c.held, "blocked": c.blocked, "ended": c.ended,
@@ -1300,14 +1335,14 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
             "others_after": run.others, "not_flat_after": run.not_flat_after,
             "owners_position": (run.not_flat_after == Some(true))
                 .then(|| position_said(run.not_flat_after, run.stop)),
-            "hand_cancel": run.resting.then_some(hand_cancel),
+            "hand_cancel": hand_cancel(run, take),
             "echoes": run.echoes, "add_order_as_encoded": run.as_encoded,
             "error": run.error, "stop": run.stop,
             "flatten": run.flatten.as_ref().map(crate::flatten::to_json)})
     };
     let crosses: Vec<serde_json::Value> = (two.crosses.iter())
         .map(|run| {
-            let mut entry = session(run, HAND_CANCEL_CROSS);
+            let mut entry = session(run, false);
             entry["crossing_post_only"] = placed_json(&run.placed);
             entry["refused"] = json!(run.crossed.as_ref().map(Crossed::says));
             entry
@@ -1315,7 +1350,7 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
         .collect();
     let takes: Vec<serde_json::Value> = (two.takes.iter())
         .map(|run| {
-            let mut entry = session(run, crate::taker::HAND_CANCEL_TAKE);
+            let mut entry = session(run, true);
             entry["taker_ioc"] = placed_json(&run.placed);
             entry["taken"] = crate::taker::taken_json(run.taken.as_ref());
             entry
