@@ -15,19 +15,27 @@
 //!   journal keeps whole, which holds no budget, included (decision 0135 item 2,
 //!   [`Refusals::shown`]), and any rise in the limiter's `rejected.user` count during a
 //!   read; a REST answer with status 429 or 418 is one on [`RefusedOn::Rest`] (decision 0148
-//!   item 8). Each frame the socket reads is counted as a read socket's ([`Refusals`]). A read
-//!   whose socket failed drops it, and the next read opens another.
+//!   item 8). Each frame the socket reads is counted as a read socket's ([`Refusals`]), and the
+//!   pong the WebSocket layer writes to a ping on it is recorded on the limiter as a control
+//!   frame (`stage::next`). A read whose socket failed drops it, and the next read opens
+//!   another. Its close is charged first as a control frame, and with no room the socket is
+//!   dropped with no close frame ([`Socket::close`], decision 0030).
 //! - **The cadence** ([`Cadence`], [`compare`]): the first read at once, then each one
 //!   `--read-interval-ms` after the one before began, so a read that runs long delays the rest,
-//!   at most [`MAX_READS`] and none beginning past `--agree-wait-ms` from the comparison's start
-//!   (0151 item 4); the comparison ends at the first read that agrees.
+//!   at most [`MAX_READS`] and none beginning at or past the end of `--agree-wait-ms` from the
+//!   comparison's start (0151 item 4), nor waited for when it would be due there. A read still
+//!   running at that end sends nothing more ([`Reader::until`]), but the answer to the frame or
+//!   request it already sent is still read, within `--read-wait-ms`, so a provider rate refusal
+//!   it brings is heard and stops the comparison; any other read finished past the end is not
+//!   judged ([`Took::Unfinished`]), so none is taken as agreeing after the wait (0109). The
+//!   comparison ends at the first read that agrees.
 //! - **Agreement** ([`judge`]): every order a read lists is one of ours, open or in flight in the
 //!   streams; every order of ours the streams show open is listed; and the REST position on the
 //!   traded symbol equals the registry's. An order of ours in flight may be listed or not. The
 //!   time from the step to the first read that agrees is kept ([`Compared::first_agreed`]).
-//! - **At the end of the wait**, judged on the last read made: an order listed that is not ours
-//!   or that the streams showed ended, or a position that still differs, is a stop,
-//!   [`Stop::ReadDisagrees`] (decision 0148 item 8); a read still missing an order of ours is
+//! - **At the end of the wait**, judged on the last read finished within it: an order listed
+//!   that is not ours or that the streams showed ended, or a position that still differs, is a
+//!   stop, [`Stop::ReadDisagrees`] (decision 0148 item 8); a read still missing an order of ours is
 //!   recorded as lag ([`Ended::Lagged`]); and a comparison none of whose reads was made is
 //!   recorded as unread ([`Ended::Unread`]), which the reads after the session then judge.
 
@@ -52,7 +60,7 @@ use crate::refusals::{self, Refusals};
 use crate::stage::{self, Data, NO_CONN};
 
 /// When a comparison reads: one read at once, then each one `interval` after the one before
-/// began, at most `cap` and none beginning past `wait` from its start (0151 item 4).
+/// began, at most `cap` and none beginning at or past `wait` from its start (0151 item 4).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Cadence {
     pub interval: Duration,
@@ -194,11 +202,19 @@ pub enum Attempt {
     Failed(String),
     /// A provider rate refusal, and where it was met.
     Refused(RefusedOn),
+    /// The comparison's wait ended before it sent its next frame or request, so it sent no
+    /// more and was not made.
+    Cut,
 }
 
 /// What makes a comparison's reads ([`Socket`] on a run; a test's own otherwise).
 pub trait Reader {
     fn read(&mut self) -> impl Future<Output = Attempt>;
+
+    /// Told once, before its first read, when the comparison's wait ends: from then on a read
+    /// sends no frame or request, ending [`Attempt::Cut`], though it still reads the answer to
+    /// one it already sent. A reader that is told nothing never cuts a read.
+    fn until(&mut self, _end: Instant) {}
 }
 
 /// One read of a comparison, as recorded.
@@ -212,6 +228,9 @@ pub enum Took {
     Skipped,
     Failed,
     Refused,
+    /// Begun within the wait and not finished by its end: cut there, sending nothing more, and
+    /// not judged.
+    Unfinished,
 }
 
 /// How a comparison ended.
@@ -264,17 +283,30 @@ pub async fn compare<R: Reader>(
     // When the read before began: the next is due one interval after it, so no two reads begin
     // closer than the interval, however long one took (0151 item 4).
     let mut before: Option<Instant> = None;
+    let end = start + cadence.wait;
+    reader.until(end);
     for _ in 0..cadence.reads() {
         if let Some(before) = before {
-            tokio::time::sleep_until(before + cadence.interval).await;
+            // A read due at or past the end of the wait never begins, so it is not waited for.
+            let due = before + cadence.interval;
+            if due >= end {
+                break;
+            }
+            tokio::time::sleep_until(due).await;
         }
         let now = Instant::now();
         let began = now.duration_since(start);
-        if before.is_some() && began > cadence.wait {
+        if before.is_some() && began >= cadence.wait {
             break;
         }
         before = Some(now);
-        let took = match reader.read().await {
+        let attempt = reader.read().await;
+        // A read finished past the wait is not judged, so none is taken as agreeing after it
+        // (0109, 0151 item 4); a provider rate refusal it heard still stops the comparison.
+        let late = Instant::now() > end;
+        let took = match attempt {
+            Attempt::Cut => Took::Unfinished,
+            Attempt::Read(_) if late => Took::Unfinished,
             Attempt::Read(read) => {
                 let judged = judge(&streams(), &read);
                 last = Some(judged);
@@ -294,6 +326,9 @@ pub async fn compare<R: Reader>(
             }
         };
         compared.reads.push((began, took));
+        if took == Took::Unfinished {
+            break;
+        }
         if took == Took::Agreed {
             compared.first_agreed = Some(Instant::now().duration_since(since));
             compared.ended = Ended::Agreed;
@@ -336,6 +371,8 @@ pub struct Socket<'a> {
     ctx: &'a mut dyn FnMut() -> EncodeCtx,
     ws: Option<WebSocket>,
     authenticated: bool,
+    /// When its comparison's wait ends ([`Reader::until`]): from then on it sends nothing.
+    end: Option<Instant>,
     /// The provider rate refusals its frames showed, as a read socket's are counted, and, as its
     /// limiter count, each one it held the shared budget for: never one of the session it runs
     /// beside, which counts its own (`stage.rs`, `Run::drop_session`).
@@ -357,14 +394,21 @@ impl<'a> Socket<'a> {
             ctx,
             ws: None,
             authenticated: false,
+            end: None,
             heard: Refusals::default(),
         }
     }
 
-    /// Closes it, waiting at most `--read-wait-ms`, and gives back what its frames showed.
+    /// Closes it, waiting at most `--read-wait-ms`, and gives back what its frames showed. Its
+    /// close frame is charged to the shared limiter first as a control frame, as a session
+    /// charges its own (decision 0030); with no room, under a provider hold say (decision 0126),
+    /// the socket is dropped with no close frame, as the hold's and a session's are.
     pub async fn close(mut self) -> Refusals {
         if let Some(mut ws) = self.ws.take() {
-            let _ = tokio::time::timeout(self.io.read_wait, ws.close(None)).await;
+            let control = stage::CONTROL;
+            if self.admit(control.charge, control.via, control.class) {
+                let _ = tokio::time::timeout(self.io.read_wait, ws.close(None)).await;
+            }
         }
         self.heard
     }
@@ -395,10 +439,20 @@ impl<'a> Socket<'a> {
         }
     }
 
+    /// [`Attempt::Cut`] once its comparison's wait has ended: nothing more is sent.
+    fn not_cut(&self) -> Result<(), Attempt> {
+        match self.end.is_some_and(|end| Instant::now() >= end) {
+            true => Err(Attempt::Cut),
+            false => Ok(()),
+        }
+    }
+
     /// Writes `write` on the open socket and reads its answer, within `--read-wait-ms` each: the
-    /// read [`Attempt::Skipped`], nothing written, when the limiter has no room, and failed, the
-    /// socket dropped, when either does not go.
+    /// read [`Attempt::Cut`], nothing charged or written, once the comparison's wait has ended,
+    /// [`Attempt::Skipped`], nothing written, when the limiter has no room, and failed, the
+    /// socket dropped, when either does not go. An answer is read whenever the wait ends.
     async fn ask(&mut self, write: &account_reads::SocketWrite) -> Result<Data, Attempt> {
+        self.not_cut()?;
         if !self.admit(write.charge, Via::Frame, write.class) {
             return Err(Attempt::Skipped);
         }
@@ -407,7 +461,7 @@ impl<'a> Socket<'a> {
         let written = tokio::time::timeout(wait, auth_qfex::write(ws, &write.frame)).await;
         let written = written.unwrap_or_else(|_| Err("the read socket took no frame".to_owned()));
         let answered = match written {
-            Ok(()) => stage::next(ws, wait).await,
+            Ok(()) => stage::next(ws, wait, self.io.limiter).await,
             Err(e) => Err(e),
         };
         answered.map_err(|e| self.failed(e))
@@ -426,6 +480,7 @@ impl<'a> Socket<'a> {
     async fn reading(&mut self) -> Result<Read, Attempt> {
         let failed = |e: String| Attempt::Failed(e);
         let (cfg, reader) = (self.cfg, self.reader);
+        self.not_cut()?;
         if self.ws.is_none() {
             let url = account_reads::trade_url(cfg, reader).map_err(|e| failed(e.to_string()))?;
             let opened = auth_qfex::open(self.io.connector, &url, self.io.connect_wait).await;
@@ -481,6 +536,7 @@ impl<'a> Socket<'a> {
         let ctx = (self.ctx)();
         let rest =
             account_reads::positions(cfg, reader, &ctx).map_err(|e| failed(e.to_string()))?;
+        self.not_cut()?;
         if !self.admit(rest.charge, Via::Http, rest.class) {
             return Err(Attempt::Skipped);
         }
@@ -526,6 +582,10 @@ impl Reader for Socket<'_> {
             _ if rose => Attempt::Refused(RefusedOn::ReadSocket),
             attempt => attempt,
         }
+    }
+
+    fn until(&mut self, end: Instant) {
+        self.end = Some(end);
     }
 }
 
@@ -815,7 +875,85 @@ mod tests {
         assert_eq!((compared.ended, compared.stop), (Ended::Lagged, None));
         let took: Vec<Took> = compared.reads.iter().map(|(_, t)| *t).collect();
         assert_eq!(&took[..2], [Took::Disagreed, Took::Lagged]);
-        assert_eq!(took.len(), 6);
+        // One read at once and one each second before the 5 s wait ends: a read due at the end
+        // itself is not made, so none is cut as it begins (0151 item 4).
+        assert_eq!(took.len(), 5);
+        assert_eq!(reader.at.len(), 5);
+        let began: Vec<Duration> = compared.reads.iter().map(|(at, _)| *at).collect();
+        assert_eq!(began.last(), Some(&Duration::from_millis(4_000)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_still_running_at_the_end_of_the_wait_is_cut_and_the_last_finished_is_judged() {
+        // Thread 4606842288. The third read begins inside the wait, two seconds in, and agrees a
+        // second later, past it: it is not judged, so the comparison is judged on the last read
+        // that finished within it (0109, 0151 item 4).
+        let short = Cadence {
+            wait: Duration::from_millis(2_500),
+            ..CADENCE
+        };
+        let disagreeing = Attempt::Read(Read {
+            listed: vec![listed(1, CidMatch::Ours(cid(1)))],
+            position: dec("0.01"),
+            ..Read::default()
+        });
+        let cases = [
+            (lagging(), Ended::Lagged, None),
+            (disagreeing, Ended::Disagreed, Some(Stop::ReadDisagrees)),
+        ];
+        for (finished, ended, stop) in cases {
+            let mut reader = played(vec![lagging(), finished, agreeing()]);
+            reader.lengths = [30, 30, 1_000].map(Duration::from_millis).into();
+            let start = Instant::now();
+            let compared = compare("place X", &mut reader, streams, short, start).await;
+            assert_eq!(
+                (compared.ended, compared.stop),
+                (ended, stop),
+                "{compared:?}"
+            );
+            assert_eq!(compared.first_agreed, None);
+            let took: Vec<Took> = compared.reads.iter().map(|(_, t)| *t).collect();
+            assert_eq!(took[2], Took::Unfinished, "{took:?}");
+            assert_eq!(took.len(), 3);
+            // The answer the cut read had asked for is still read, so the comparison ends with
+            // it, a second past the wait's start, not at the wait's end.
+            assert_eq!(start.elapsed(), Duration::from_millis(3_000));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_a_read_hears_past_the_end_of_the_wait_still_stops_the_comparison() {
+        // The second review of thread 4606842288: the third read begins inside the wait and its
+        // answer, a provider rate refusal, comes past its end. The refusal is heard, not thrown
+        // away with the read, so the comparison stops on it (decision 0148 item 8).
+        let short = Cadence {
+            wait: Duration::from_millis(2_500),
+            ..CADENCE
+        };
+        for on in [RefusedOn::ReadSocket, RefusedOn::Rest] {
+            let mut reader = played(vec![lagging(), lagging(), Attempt::Refused(on)]);
+            reader.lengths = [30, 30, 600].map(Duration::from_millis).into();
+            let start = Instant::now();
+            let compared = compare("place X", &mut reader, streams, short, start).await;
+            assert_eq!(compared.ended, Ended::Refused, "{compared:?}");
+            assert_eq!(compared.stop, Some(Stop::RateRefused { on }));
+            let took: Vec<Took> = compared.reads.iter().map(|(_, t)| *t).collect();
+            assert_eq!(took, [Took::Lagged, Took::Lagged, Took::Refused]);
+            assert_eq!(start.elapsed(), Duration::from_millis(2_600));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_comparison_waits_for_no_read_due_past_the_end_of_its_wait() {
+        // A sibling of thread 4606842288: the first read runs 4.5 s of a 5 s wait, so the second
+        // begins at once and the third would be due at 5.5 s, past the wait. The comparison ends
+        // after the second read, not by waiting for a slot no read may begin in (0151 item 4).
+        let mut reader = played(Vec::new());
+        reader.lengths = [4_500].map(Duration::from_millis).into();
+        let start = Instant::now();
+        let compared = compare("place X", &mut reader, streams, CADENCE, start).await;
+        assert_eq!(compared.reads.len(), 2, "{compared:?}");
+        assert_eq!(start.elapsed(), Duration::from_millis(4_530));
     }
 
     #[tokio::test(start_paused = true)]

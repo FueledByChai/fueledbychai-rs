@@ -394,6 +394,9 @@ pub struct TestHooks {
     /// The run's journal answering every Normal record dropped (`tee::Tee::refusing_normal`), so
     /// its soft limit is reached on the session's first Normal record (decision 0139).
     pub refuse_normal: bool,
+    /// X not priced once the market armed, so drop session one fails with no stop
+    /// (`stage::Halt::Error`), its reads after it made as after any session.
+    pub x_unpriced: bool,
 }
 
 /// What `--reconciled` declares the owner did by hand after an earlier place-stage run's stop
@@ -663,11 +666,11 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// The reads one comparison makes within `agree_wait` at `read_interval`: one, then one each
-/// interval (0151 item 4).
+/// interval, none beginning at or past the wait's end (0151 item 4).
 pub fn reads(agree_wait: Duration, read_interval: Duration) -> u64 {
     let each = read_interval.as_millis().max(1);
-    let more = agree_wait.as_millis() / each;
-    u64::try_from(more).unwrap_or(u64::MAX).saturating_add(1)
+    let within = agree_wait.as_millis().div_ceil(each).max(1);
+    u64::try_from(within).unwrap_or(u64::MAX)
 }
 
 /// The floor a place-stage run's `--registry-span` must be above (0151 item 3): the drop

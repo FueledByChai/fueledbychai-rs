@@ -201,7 +201,9 @@ async fn every_frame_and_request_of_a_read_is_charged_first_and_one_without_room
     let sent = bench.received(0);
     let kinds: Vec<String> = sent.iter().map(|f| json(f)["type"].to_string()).collect();
     assert_eq!(kinds, [r#""auth""#, r#""get_user_orders""#]);
+    // Its close is a control frame too, which has no room: refused, and not sent.
     socket.close().await;
+    assert_eq!(limiter.counts().refused.ip, 2);
     // A second socket's authentication has no room either, so nothing is written on it.
     let mut ctx = || ctx_of(&mut nonces);
     let mut second = Socket::new(
@@ -211,7 +213,7 @@ async fn every_frame_and_request_of_a_read_is_charged_first_and_one_without_room
         &mut ctx,
     );
     assert_eq!(second.read().await, Attempt::Skipped);
-    assert_eq!(limiter.counts().refused.ip, 2);
+    assert_eq!(limiter.counts().refused.ip, 3);
     second.close().await;
     assert!(bench.received(1).is_empty());
     // With room for pages but one REST read, the second read's REST read is the one refused.
@@ -544,7 +546,8 @@ async fn the_runs_cadence_is_its_read_interval_and_agree_wait_and_ten_reads() {
     let cadence = Cadence::of(&places);
     assert_eq!(cadence.interval, Duration::from_millis(1_000));
     assert_eq!(cadence.wait, Duration::from_millis(5_000));
-    assert_eq!((cadence.cap, cadence.reads()), (10, 6));
+    // One read at once and one each second before the 5 s wait ends, at 0 to 4 s (0151 item 4).
+    assert_eq!((cadence.cap, cadence.reads()), (10, 5));
 }
 
 /// The `get_user_orders` page `model` answers, as a read decodes it under [`NS`].
@@ -1065,6 +1068,198 @@ async fn a_page_refused_in_a_frame_kept_whole_refuses_on_the_read_socket() {
     // The authentication and the one page, on the one connection; no REST read.
     assert_eq!(bench.received(0).len(), 2);
     assert_eq!(bench.venue.trade.connections().len(), 1);
+    assert_eq!(bench.positions_read(), 0);
+    bench.venue.assert_served();
+}
+
+/// Whether the client of trade connection `conn` sent a close frame, once the stub saw it end.
+async fn closed_by_client(bench: &Bench, conn: usize) -> bool {
+    let ended = || (bench.venue.trade.connections().get(conn)).is_some_and(|c| !c.open);
+    until("the read socket's end", ended).await;
+    bench.venue.trade.connections()[conn].client_closed
+}
+
+#[tokio::test]
+async fn a_read_socket_sends_its_close_only_with_room_and_charges_it_as_a_control_frame() {
+    // PR #272's thread 4606842296. A page answered a RateLimited err puts a hold on the shared
+    // budget (decision 0126): the socket's close has no room under it, so the socket is dropped
+    // with no close frame, as the hold's and a session's closes are (decisions 0030, 0135).
+    let bench = Bench::start(QfexModel {
+        rate_limit: Some(Limited::ReadSocket(0)),
+        ..QfexModel::default()
+    })
+    .await;
+    placed(&mut bench.model());
+    let limiter = bench.limiter();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut socket = Socket::new(
+        bench.io(&limiter, 1000),
+        &bench.cfg,
+        &bench.reader,
+        &mut ctx,
+    );
+    assert_eq!(socket.read().await, Attempt::Refused(RefusedOn::ReadSocket));
+    let heard = socket.close().await;
+    assert_eq!(heard.errs, 1);
+    assert!(
+        !closed_by_client(&bench, 0).await,
+        "a close sent under the hold"
+    );
+    // With room, the close is sent and charged first as a control frame: with room for two an
+    // hour, the authentication and the close take both, so a second socket's authentication
+    // has none and is not sent.
+    let limits = [hourly(OpKind::Control, 2)];
+    let limiter = RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut socket = Socket::new(
+        bench.io(&limiter, 1000),
+        &bench.cfg,
+        &bench.reader,
+        &mut ctx,
+    );
+    assert!(matches!(socket.read().await, Attempt::Read(_)));
+    socket.close().await;
+    assert!(
+        closed_by_client(&bench, 1).await,
+        "no close sent with room for it"
+    );
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut second = Socket::new(
+        bench.io(&limiter, 1000),
+        &bench.cfg,
+        &bench.reader,
+        &mut ctx,
+    );
+    assert_eq!(second.read().await, Attempt::Skipped);
+    second.close().await;
+    assert_eq!(bench.venue.trade.connections().len(), 3);
+    assert!(bench.received(2).is_empty());
+    bench.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_ping_on_a_read_socket_records_its_pong_on_the_shared_limiter() {
+    // A sibling of PR #272's thread 4606842296: the pong the WebSocket layer writes to a ping on
+    // a read socket is a control frame of the run's, recorded on the shared limiter, past its
+    // cap if need be, as the hold's and a session's are (decision 0030).
+    let steps = vec![
+        Step::Accept,
+        Step::Barrier { conn: 0 },
+        Step::Push {
+            conn: 0,
+            frame: Frame::text(r#"{"type":"auth","result":"success"}"#),
+        },
+    ];
+    let server = StubServer::start(WsScript::new(steps), HttpRouter::new())
+        .await
+        .unwrap();
+    let connector = fbc_runtime::Connector::new(ProxyConfig::Direct);
+    let url = fbc_core::WireUrl::plain(server.ws_url(""));
+    let wait = Duration::from_secs(5);
+    let mut ws = auth_qfex::open(&connector, &url, wait).await.unwrap();
+    let limits = [hourly(OpKind::Control, 1)];
+    let limiter = RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap();
+    let read = stage::next(&mut ws, wait, &limiter).await.unwrap();
+    assert!(matches!(read, stage::Data::Text(_)));
+    server.finished().await.unwrap();
+    // The pong took the hour's one control frame: none is left.
+    let now = tokio::time::Instant::now();
+    let left = limiter.charge(now, stage::NO_CONN, &[stage::CONTROL]);
+    assert!(left.is_err(), "the pong was not recorded");
+}
+
+#[tokio::test]
+async fn a_refusal_answering_a_page_past_the_end_of_the_wait_stops_the_comparison() {
+    // The second review of PR #272's thread 4606842288. The read's page is asked inside the
+    // wait and answered past its end, a RateLimited err: the answer is still read, so its hold
+    // goes on the shared budget, the comparison stops RateRefused, and the socket's close, with
+    // no room under the hold, is not sent (decisions 0126, 0148 item 8).
+    let bench = Bench::start(QfexModel {
+        rate_limit: Some(Limited::ReadSocket(0)),
+        page_delay: Some(Duration::from_millis(400)),
+        ..QfexModel::default()
+    })
+    .await;
+    placed(&mut bench.model());
+    let limiter = bench.limiter();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut socket = Socket::new(
+        bench.io(&limiter, 1000),
+        &bench.cfg,
+        &bench.reader,
+        &mut ctx,
+    );
+    let cadence = Cadence {
+        interval: Duration::from_millis(1_000),
+        wait: Duration::from_millis(150),
+        cap: 10,
+    };
+    let start = tokio::time::Instant::now();
+    let compared = compare::compare("place X", &mut socket, Streams::default, cadence, start).await;
+    assert!(
+        start.elapsed() >= Duration::from_millis(400),
+        "{compared:?}"
+    );
+    let took: Vec<Took> = compared.reads.iter().map(|(_, t)| *t).collect();
+    assert_eq!(took, [Took::Refused], "{compared:?}");
+    assert_eq!(compared.ended, Ended::Refused);
+    assert_eq!(
+        compared.stop,
+        Some(places::Stop::RateRefused {
+            on: RefusedOn::ReadSocket
+        })
+    );
+    assert!(limiter.counts().rejected.user >= 1);
+    let heard = socket.close().await;
+    assert_eq!(heard.errs, 1);
+    assert!(
+        !closed_by_client(&bench, 0).await,
+        "a close sent under the hold"
+    );
+    assert_eq!(bench.positions_read(), 0);
+    bench.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_read_the_wait_ends_during_sends_nothing_more_and_is_not_judged() {
+    // A sibling of PR #272's thread 4606842288: two orders on pages of one, the first page
+    // answered past the end of the wait. The read reads that answer and then sends nothing more,
+    // neither the second page nor the REST read, and is not judged (0109, 0151 item 4).
+    let bench = Bench::start(QfexModel {
+        page_delay: Some(Duration::from_millis(300)),
+        ..QfexModel::default()
+    })
+    .await;
+    placed(&mut bench.model());
+    placed(&mut bench.model());
+    let limiter = bench.limiter();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut socket = Socket::new(bench.io(&limiter, 1), &bench.cfg, &bench.reader, &mut ctx);
+    let cadence = Cadence {
+        interval: Duration::from_millis(1_000),
+        wait: Duration::from_millis(150),
+        cap: 10,
+    };
+    let start = tokio::time::Instant::now();
+    let compared = compare::compare("place X", &mut socket, Streams::default, cadence, start).await;
+    assert!(
+        start.elapsed() >= Duration::from_millis(300),
+        "{compared:?}"
+    );
+    let took: Vec<Took> = compared.reads.iter().map(|(_, t)| *t).collect();
+    assert_eq!(took, [Took::Unfinished], "{compared:?}");
+    assert_eq!((compared.ended, compared.stop), (Ended::Unread, None));
+    socket.close().await;
+    assert!(closed_by_client(&bench, 0).await, "no close sent with room");
+    let sent = bench.received(0);
+    let pages = sent
+        .iter()
+        .filter(|f| f.contains("get_user_orders"))
+        .count();
+    assert_eq!((sent.len(), pages), (2, 1), "{sent:?}");
     assert_eq!(bench.positions_read(), 0);
     bench.venue.assert_served();
 }

@@ -95,6 +95,10 @@ pub struct AccountRead {
     /// How many of the page's orders were the one order the read admits ([`AllowedOrder`]):
     /// none unless one was admitted on this account.
     pub page_allowed: usize,
+    /// Whether the page listed that order at all, found by its venue id once the streams named
+    /// it, whatever client id its row carries ([`AllowedOrder::names`]): what the reads after a
+    /// session say of whether X rests, apart from what a read before a session admits.
+    pub page_lists_it: bool,
 }
 
 impl AccountRead {
@@ -145,6 +149,26 @@ impl AllowedOrder {
     pub fn matches(&self, order: &VenueOrderId, client: &CidMatch) -> bool {
         let venue = self.venue.as_ref().is_none_or(|v| v == order);
         venue && *client == CidMatch::Ours(self.cid)
+    }
+
+    /// Whether a page's order, `order` with the client id `client`, names it: by its venue id
+    /// once that is known, whatever the row's client id, and otherwise by its client id. Looser
+    /// than [`AllowedOrder::matches`], which admits it before a session: a row naming its venue
+    /// id with an empty or unreadable client id still shows it resting.
+    pub fn names(&self, order: &VenueOrderId, client: &CidMatch) -> bool {
+        match &self.venue {
+            Some(venue) => venue == order,
+            None => *client == CidMatch::Ours(self.cid),
+        }
+    }
+
+    /// Whether `orders`, a page of `account`'s, list it ([`AllowedOrder::names`]): never when
+    /// `allowed` is none or is on another account.
+    pub fn listed(allowed: Option<&AllowedOrder>, account: Armed, orders: &[PageOrder]) -> bool {
+        let listing = |a: &AllowedOrder| orders.iter().any(|o| a.names(&o.order, &o.client));
+        allowed
+            .filter(|a| a.account == account)
+            .is_some_and(listing)
     }
 
     /// How many of `orders`, a page of `account`'s, are it ([`AccountRead::page_allowed`]): none

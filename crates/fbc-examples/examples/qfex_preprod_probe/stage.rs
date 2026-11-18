@@ -212,10 +212,10 @@ pub type Out = Rc<RefCell<dyn Write>>;
 /// (decision 0146 item 4).
 pub type Interrupt = Pin<Box<dyn Future<Output = ()>>>;
 
-/// What a pong, a close reply or the hold's own close is charged: a control frame, which safety
-/// traffic may send from the reserve, as a session charges one (fbc-runtime's session core,
-/// decision 0030).
-const CONTROL: fbc_runtime::Request = fbc_runtime::Request {
+/// What a pong, a close reply, the hold's own close or a read socket's close is charged: a
+/// control frame, which safety traffic may send from the reserve, as a session charges one
+/// (fbc-runtime's session core, decision 0030).
+pub const CONTROL: fbc_runtime::Request = fbc_runtime::Request {
     charge: RateCharge::one(OpKind::Control, None),
     via: Via::Frame,
     class: TrafficClass::Safety,
@@ -894,7 +894,9 @@ impl Run<'_> {
 
     /// With `--reconciled` and a stop marker found (0151 item 6), reads every named account, as
     /// before drop session one ([`places::DROP_ONE`]), and clears the marker only if every read
-    /// is clean; a read that is not clean stops the run with the marker kept. Without them it
+    /// is clean; a read that is not clean stops the run with the marker kept, and a provider rate
+    /// refusal they met is the run's stop, marked before the stops kept ([`Run::unless_refused`]).
+    /// Without them it
     /// reads nothing. Whether it read every named account, clean, so drop session one needs no
     /// reads of its own before it.
     async fn reconcile(&mut self) -> Result<bool, String> {
@@ -902,11 +904,15 @@ impl Run<'_> {
             return Ok(false);
         };
         let marked = leases.marked.clone();
+        let mark = self.read_mark();
         let mut presses = std::mem::take(&mut self.presses);
         let on = self.named[0];
         let reads = self.check_accounts(places::DROP_ONE, on, " (drop)");
         let read = unless_pressed(&mut presses, reads).await;
         self.presses = presses;
+        // A provider rate refusal they met is the run's stop, the marker kept with it.
+        let when = "in the reads that clear the marker";
+        let read = read.map(|reads| self.unless_refused(mark, reads, when));
         match read {
             None => Err(self.halt(Stop::Interrupted, "during the reads that clear the marker")),
             Some(Err(why)) => Err(format!("{why}; the stop marker is kept (0151 item 6)")),
@@ -1032,6 +1038,27 @@ impl Run<'_> {
     async fn rest(&self, read: &RestRead) -> Result<(u16, Vec<u8>), String> {
         self.admitted(read.charge, Via::Http, read.class).await?;
         auth_qfex::send(&self.connector, &read.req, self.opts.read_wait).await
+    }
+
+    /// Closes a read socket, its close frame charged to the shared limiter first as a control
+    /// frame, as a session charges its own (decision 0030), and as every frame of the read is
+    /// ([`Run::admitted`]); with no room, under a provider hold say (decision 0126), it is
+    /// dropped with no close frame, as the hold's and a session's are. A close the peer refuses
+    /// is passed over (it may have closed first); one it never takes within `--read-wait-ms` is
+    /// an error, so the run cannot hang on it.
+    async fn close_read(&self, mut ws: WebSocket) -> Result<(), String> {
+        let admitted = self.admitted(CONTROL.charge, CONTROL.via, CONTROL.class);
+        if admitted.await.is_err() {
+            return Ok(());
+        }
+        let wait = self.opts.read_wait;
+        let closed = tokio::time::timeout(wait, ws.close(None)).await;
+        closed.map(|_| ()).map_err(|_| {
+            format!(
+                "the read socket did not close within {} ms",
+                wait.as_millis()
+            )
+        })
     }
 
     /// Writes one of the adapter's frames on a read socket or the hold's connection, waiting at
@@ -1196,17 +1223,9 @@ impl Run<'_> {
         let page = self.page(cfg, &reader, &mut ws, &mut heard).await;
         heard.limiter = self.rejected().saturating_sub(before);
         *met = Some(heard);
-        let wait = self.opts.read_wait;
-        let closed = tokio::time::timeout(wait, ws.close(None)).await;
+        let closed = self.close_read(ws).await;
         let page = page?;
-        // A close the peer refuses is passed over (it may have closed first); one it never
-        // takes fails the read, so the run cannot hang on it.
-        let _ = closed.map_err(|_| {
-            format!(
-                "the read socket did not close within {} ms",
-                wait.as_millis()
-            )
-        })?;
+        closed?;
         Ok(AccountRead {
             rows: positions.rows().len(),
             flat: positions.is_flat(),
@@ -1215,6 +1234,7 @@ impl Run<'_> {
             page_twaps: page.twaps(),
             page_full: page.is_full(),
             page_allowed: AllowedOrder::count(admits.0, admits.1, page.orders()),
+            page_lists_it: AllowedOrder::listed(admits.0, admits.1, page.orders()),
             ..AccountRead::default()
         })
     }
@@ -1233,14 +1253,14 @@ impl Run<'_> {
         let auth = account_reads::authentication(cfg, reader, &ctx).map_err(|e| e.to_string())?;
         let ask = PageAsk::new(self.opts.page_size, 0).map_err(|e| e.to_string())?;
         self.write(ws, &auth).await?;
-        let reply = next(ws, self.opts.read_wait).await?;
+        let reply = next(ws, self.opts.read_wait, &self.limiter).await?;
         let _ = self.heard(heard, reader, &reply, ask);
         if !account_reads::authenticated(reader, reply.raw()) {
             return Err("QFEX did not authenticate the read socket".to_owned());
         }
         let ask_frame = account_reads::user_orders(cfg, ask).map_err(|e| e.to_string())?;
         self.write(ws, &ask_frame).await?;
-        let reply = next(ws, self.opts.read_wait).await?;
+        let reply = next(ws, self.opts.read_wait, &self.limiter).await?;
         let page = self.heard(heard, reader, &reply, ask);
         page.map_err(|e| format!("get_user_orders: {e}"))
     }
@@ -1825,14 +1845,24 @@ impl Data {
     }
 }
 
-/// The next data frame on a read socket within `wait`; pings and pongs are passed over.
-pub async fn next(ws: &mut WebSocket, wait: Duration) -> Result<Data, String> {
+/// The next data frame on a read socket within `wait`; pings and pongs are passed over. The pong
+/// the WebSocket layer writes to each ping, which it answers while the socket is open both ways,
+/// as it is while this reads, is recorded on `limiter` as a control frame, past its cap if need
+/// be, as the hold's and a session's are (decision 0030).
+pub async fn next(
+    ws: &mut WebSocket,
+    wait: Duration,
+    limiter: &RateLimiter,
+) -> Result<Data, String> {
     let read = async {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => return Ok(Data::Text(text.as_str().to_owned())),
                 Some(Ok(Message::Binary(bytes))) => return Ok(Data::Binary(bytes.to_vec())),
-                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                Some(Ok(Message::Ping(_))) => {
+                    limiter.record(tokio::time::Instant::now(), NO_CONN, CONTROL);
+                }
+                Some(Ok(Message::Pong(_))) => {}
                 _ => return Err("the read socket closed before it answered".to_owned()),
             }
         }
@@ -1996,8 +2026,10 @@ pub fn ended_first(
 impl Run<'_> {
     /// Drop session one (FBC-23ch) on the first named account, after the preflight gave
     /// `market` and, unless `read` (the reads that cleared a stop marker), every named account
-    /// read clean: the drop registry built and its trip given to the journal before any market
-    /// arms (decision 0139), seeded flat (0148 item 3), then the session ([`Run::drop_session`]),
+    /// read clean, a provider rate refusal those reads met a stop, marked ([`Run::unless_refused`];
+    /// decision 0148 item 8, 0151 item 6): the drop registry built and its trip given to the
+    /// journal before any market arms (decision 0139), seeded flat (0148 item 3), then the session
+    /// ([`Run::drop_session`]),
     /// the after-session read of every named account, and X and its trades read (FBC-be57). The
     /// run then ends: with the stop that came, or, when none did, after those reads with X still
     /// resting reported for the owner's hand cancel ([`Stop::LeftResting`], marked) or a position
@@ -2016,6 +2048,7 @@ impl Run<'_> {
         let on = self.named[0];
         let label = name(on);
         if !read {
+            let mark = self.read_mark();
             let mut presses = std::mem::take(&mut self.presses);
             let reads = self.check_accounts(places::DROP_ONE, on, " (drop)");
             let reads = unless_pressed(&mut presses, reads).await;
@@ -2025,7 +2058,10 @@ impl Run<'_> {
                     let when = "during the reads before drop session one";
                     return Err(self.halt(Stop::Interrupted, when));
                 }
-                Some(reads) => reads?,
+                Some(reads) => {
+                    let when = "in the reads before drop session one";
+                    self.unless_refused(mark, reads, when)?;
+                }
             }
         }
         let (cfg, creds) = place_config(&self.base, self.lookup, on)?;
@@ -2124,16 +2160,15 @@ impl Run<'_> {
         if after.x_listed {
             self.line(format_args!("RESTING {}", places::HAND_CANCEL));
         }
-        // The run's end, the first that applies: the session's stop; a failure that was no stop;
-        // a provider rate refusal in the reads after it, then one reading X; the owner's Ctrl-C
-        // during those reads; a position not flat, or a trade naming X; then X or another order
-        // of ours still resting, for the owner's hand cancel, marked, with drop session two not
-        // built.
+        // The run's end, the first that applies: the session's stop; a provider rate refusal in
+        // the reads after it, then one reading X; the owner's Ctrl-C during those reads; a
+        // position not flat, or a trade naming X; then X or another order of ours still resting,
+        // for the owner's hand cancel, marked; then a failure of the session that was no stop,
+        // kept in the evidence as the session's error whichever stop came after it; and
+        // otherwise drop session two not built. A stop after the session is raised, and marked,
+        // whether or not the session failed (0151 item 6).
         if let Some(said) = said {
             return Err(said);
-        }
-        if let Some(why) = self.drop_run().error.clone() {
-            return Err(why);
         }
         if let Some(stop) = after.refused {
             return Err(self.halt(stop, "in the reads after drop session one"));
@@ -2148,13 +2183,14 @@ impl Run<'_> {
         // A trade naming X, seen with no session open, is a fill of ours: not flat, the
         // position the owner's, whatever the position read before it showed (0151 item 9).
         let x_traded = (self.drop_run().after.as_ref()).is_some_and(|a| a.trades_naming_x > 0);
+        let failed = self.drop_run().error.clone();
         match (after.not_flat || x_traded, after.resting) {
             (true, _) => Err(self.halt(Stop::NotFlat, "after drop session one")),
             (false, true) => {
                 self.halt(Stop::LeftResting, "after drop session one");
-                Err(NOT_BUILT.to_owned())
+                Err(failed.unwrap_or_else(|| NOT_BUILT.to_owned()))
             }
-            (false, false) => Err(NOT_BUILT.to_owned()),
+            (false, false) => Err(failed.unwrap_or_else(|| NOT_BUILT.to_owned())),
         }
     }
 
@@ -2586,6 +2622,11 @@ impl Run<'_> {
         let quote = touch.now(places.touch_max_age).map_err(Halt::Error)?;
         let px = market::rest_price(&found.spec, places.side, quote, places.away_bps);
         let px = px.map_err(Halt::Error)?;
+        // A test's X not priced: a failure of the session that is no stop.
+        #[cfg(test)]
+        if places.test.x_unpriced {
+            return Err(Halt::Error("a test's X could not be priced".to_owned()));
+        }
         let new = fbc_core::NewOrder {
             cid,
             inst: d.inst,
@@ -2887,8 +2928,7 @@ impl Run<'_> {
     /// or kept whole ([`Refusals::shown`]), is a stop too, once they all ran.
     async fn read_after(&mut self, x: Option<&AllowedOrder>) -> AfterReads {
         let mut after = AfterReads::default();
-        let (rejected, rest) = (self.rejected(), self.rest_refused);
-        let sockets = self.ev.read_sockets.len();
+        let mark = self.read_mark();
         let mut presses = std::mem::take(&mut self.presses);
         let on = self.named[0];
         let mut pressed = false;
@@ -2906,19 +2946,41 @@ impl Run<'_> {
             };
             match read {
                 Ok(read) => {
-                    after.x_read |= account == on;
+                    // X's account is read when its page listed X or was the last: a full page
+                    // not listing X leaves X unread, not absent.
+                    after.x_read |= account == on && (read.page_lists_it || !read.page_full);
                     after.not_flat |= !read.flat;
                     after.resting |= read.page_orders > 0 || read.rest_open_orders > 0;
-                    after.x_listed |= read.page_allowed > 0;
+                    // X by its venue id once known, whatever client id its row carries.
+                    after.x_listed |= read.page_lists_it;
                 }
                 Err(why) => self.ev.errors.push(why),
             }
         }
         self.presses = presses;
         after.pressed = pressed;
-        let shown = (self.ev.read_sockets[sockets..].iter()).any(|r| r.refusals.shown() > 0);
-        let socket = self.rejected() > rejected || shown;
-        after.refused = match (self.rest_refused > rest, socket) {
+        after.refused = self.refused_since(mark);
+        after
+    }
+
+    /// Where the account reads stand, for [`Run::refused_since`].
+    fn read_mark(&self) -> ReadMark {
+        ReadMark {
+            rejected: self.rejected(),
+            rest: self.rest_refused,
+            sockets: self.ev.read_sockets.len(),
+        }
+    }
+
+    /// The provider rate refusal the account reads met since `mark`, if any, a stop (decision
+    /// 0148 item 8): a `GET /user/positions` answered 429 or 418, then any rise in the shared
+    /// limiter's `rejected.user` count, or one their read sockets' frames show, in clear or kept
+    /// whole ([`Refusals::shown`]).
+    fn refused_since(&self, mark: ReadMark) -> Option<Stop> {
+        let sockets = &self.ev.read_sockets[mark.sockets..];
+        let shown = sockets.iter().any(|r| r.refusals.shown() > 0);
+        let socket = self.rejected() > mark.rejected || shown;
+        match (self.rest_refused > mark.rest, socket) {
             (true, _) => Some(Stop::RateRefused {
                 on: places::RefusedOn::Rest,
             }),
@@ -2926,16 +2988,35 @@ impl Run<'_> {
                 on: places::RefusedOn::ReadSocket,
             }),
             (false, false) => None,
+        }
+    }
+
+    /// `reads`, the account reads made since `mark`, before `when`: a provider rate refusal they
+    /// met is the run's stop, marked (decision 0148 item 8, 0151 item 6), whether or not they
+    /// failed on it, the failure kept among the errors; otherwise their own result.
+    fn unless_refused(
+        &mut self,
+        mark: ReadMark,
+        reads: Result<(), String>,
+        when: &str,
+    ) -> Result<(), String> {
+        let Some(stop) = self.refused_since(mark) else {
+            return reads;
         };
-        after
+        if let Err(why) = reads {
+            self.ev.errors.push(why);
+        }
+        Err(self.halt(stop, when))
     }
 
     /// X and its trades read after drop session one (FBC-be57) on a socket of `on`'s that never
     /// arms: every `get_user_trades` page from X's send, `since` in whole seconds, and every
     /// `GET /user/historic-orders` page, each charged to the shared limiter first; the trades
-    /// naming X counted and X's `terminal_status` kept as a status name. A provider rate refusal
-    /// is a stop. The owner's presses meanwhile, and one made before they end, are taken, none
-    /// ending them: whether one was is the last given.
+    /// naming X counted and X's `terminal_status` kept as a status name. A full page the same as
+    /// the one before it, row for row, as a venue ignoring the offset answers, fails the read
+    /// rather than paging on. A provider rate refusal is a stop. The owner's presses meanwhile,
+    /// and one made before they end, are taken, none ending them: whether one was is the last
+    /// given.
     async fn read_x(
         &mut self,
         on: Armed,
@@ -2999,14 +3080,17 @@ impl Run<'_> {
             .to_string();
         let vid = x.venue.as_ref().map(|v| v.as_str().to_owned());
         let url = account_reads::trade_url(&cfg, &reader).map_err(|e| plain(e.to_string()))?;
-        let mut ws = auth_qfex::open(&self.connector, &url, self.opts.connect_wait).await;
-        let ws = ws.as_mut().map_err(|e| plain(e.clone()))?;
+        let opened = auth_qfex::open(&self.connector, &url, self.opts.connect_wait).await;
+        let mut opened = opened.map_err(plain)?;
+        let ws = &mut opened;
         let ctx = self.ctx();
         let auth = account_reads::authentication(&cfg, &reader, &ctx);
         self.write(ws, &auth.map_err(|e| plain(e.to_string()))?)
             .await
             .map_err(plain)?;
-        let reply = next(ws, self.opts.read_wait).await.map_err(plain)?;
+        let reply = next(ws, self.opts.read_wait, &self.limiter)
+            .await
+            .map_err(plain)?;
         self.heard_x(heard, &reader, &reply)?;
         if !account_reads::authenticated(&reader, reply.raw()) {
             return Err(plain(
@@ -3014,12 +3098,15 @@ impl Run<'_> {
             ));
         }
         let mut offset = 0;
+        let mut before: Option<Vec<account_reads::TradeRow>> = None;
         loop {
             let ask = account_reads::TradesAsk::new(since, self.opts.page_size, offset);
             let ask = ask.map_err(|e| plain(e.to_string()))?;
             let write = account_reads::user_trades(&cfg, ask).map_err(|e| plain(e.to_string()))?;
             self.write(ws, &write).await.map_err(plain)?;
-            let reply = next(ws, self.opts.read_wait).await.map_err(plain)?;
+            let reply = next(ws, self.opts.read_wait, &self.limiter)
+                .await
+                .map_err(plain)?;
             self.heard_x(heard, &reader, &reply)?;
             let page = account_reads::decode_trades_page(&reader, reply.raw());
             let page =
@@ -3033,10 +3120,20 @@ impl Run<'_> {
             if page.rows().len() < usize::from(ask.limit()) {
                 break;
             }
+            // A full page the same as the one before it, row for row: a venue ignoring the
+            // offset, which would otherwise be paged for as long as the limiter had room. Rows
+            // are compared whole, since a row may carry no trade id.
+            if before.as_deref() == Some(page.rows()) {
+                return Err(plain(
+                    "a full get_user_trades page repeated the page before it".to_owned(),
+                ));
+            }
+            before = Some(page.rows().to_vec());
             offset += u32::from(ask.limit());
         }
-        let _ = tokio::time::timeout(self.opts.read_wait, ws.close(None)).await;
+        let _ = self.close_read(opened).await;
         let mut offset = 0;
+        let mut before: Option<Vec<account_reads::HistoricOrder>> = None;
         loop {
             let ask = account_reads::HistoricAsk::new(self.opts.page_size, offset);
             let ask = ask.map_err(|e| plain(e.to_string()))?;
@@ -3067,6 +3164,15 @@ impl Run<'_> {
             if page.rows().len() < usize::from(ask.limit()) {
                 break;
             }
+            // As for the trades, a full page the same as the one before it, which QFEX, declaring
+            // no REST bucket, would otherwise let the read page without end. A row carries no
+            // order id, and two orders' rows may be alike, so a page is compared whole.
+            if before.as_deref() == Some(page.rows()) {
+                return Err(plain(
+                    "a full GET /user/historic-orders page repeated the page before it".to_owned(),
+                ));
+            }
+            before = Some(page.rows().to_vec());
             offset += u32::from(ask.limit());
         }
         Ok(())
@@ -3108,6 +3214,15 @@ impl Run<'_> {
     }
 }
 
+/// Where the account reads stood ([`Run::read_mark`]): the shared limiter's `rejected.user`
+/// count, the REST refusals and the read sockets recorded.
+#[derive(Copy, Clone, Debug)]
+struct ReadMark {
+    rejected: u64,
+    rest: u64,
+    sockets: usize,
+}
+
 /// What the after-session read of every named account showed ([`Run::read_after`]).
 #[derive(Copy, Clone, Debug, Default)]
 struct AfterReads {
@@ -3117,7 +3232,7 @@ struct AfterReads {
     not_flat: bool,
     /// Whether X was listed on its account's page.
     x_listed: bool,
-    /// Whether X's account, the first named, was read.
+    /// Whether X's account, the first named, was read, on a page that listed X or was its last.
     x_read: bool,
     /// Whether the owner pressed Ctrl-C while they ran.
     pressed: bool,

@@ -395,22 +395,23 @@ fn place_stage_flags_are_refused_naming_the_flag() {
         err.contains("the values are not shown") && !err.contains("50"),
         "{err}"
     );
-    // One read, then one each second within 10 s, is 11 reads: more than 10. Within 9.999 s it
-    // is 10.
-    let err = refusal(&set(parse_only(), "--agree-wait-ms", "10000"));
+    // One read, then one each second within 10.001 s, none beginning at its end, is 11 reads:
+    // more than 10. Within 10 s it is 10, the last beginning at 9 s, since one due at the end
+    // itself is not made.
+    let err = refusal(&set(parse_only(), "--agree-wait-ms", "10001"));
     assert!(
         err.starts_with("--agree-wait-ms with --read-interval-ms allows more than 10 reads"),
         "{err}"
     );
-    assert!(!err.contains("10000"), "{err}");
-    let ten = parsed(&set(parse_only(), "--agree-wait-ms", "9999"))
+    assert!(!err.contains("10001"), "{err}");
+    let ten = parsed(&set(parse_only(), "--agree-wait-ms", "10000"))
         .unwrap()
         .1;
     assert_eq!(probe_args::reads(ten.agree_wait, ten.read_interval), 10);
     let longer = set(parse_only(), "--read-interval-ms", "2000");
-    let longer = set(longer, "--agree-wait-ms", "19999");
+    let longer = set(longer, "--agree-wait-ms", "20000");
     assert!(parsed(&longer).is_ok());
-    assert!(refusal(&set(longer, "--agree-wait-ms", "20000")).contains("more than 10 reads"));
+    assert!(refusal(&set(longer, "--agree-wait-ms", "20001")).contains("more than 10 reads"));
 
     // Every required flag, missing, refused naming it.
     for flag in [
@@ -3923,8 +3924,9 @@ async fn a_comparison_reads_no_more_than_its_cap() {
         orders: Vec::new(),
         position: Decimal::ONE,
     };
-    // The run's cadence at the longest wait the command line takes at its interval: ten reads.
-    let argv = set(parse_only(), "--agree-wait-ms", "9000");
+    // The run's cadence at the longest wait the command line takes at its interval: ten reads,
+    // the last beginning at 9 s, since none begins at the wait's end.
+    let argv = set(parse_only(), "--agree-wait-ms", "10000");
     let argv = set(argv, "--read-interval-ms", "1000");
     let (_, places) = parsed(&argv).unwrap();
     let cadence = compare::Cadence::of(&places);
@@ -5222,4 +5224,286 @@ fn the_caps_are_asked_again_at_the_touch_a_place_is_priced_at() {
         Lots::new(4).unwrap()
     ));
     assert!(market::caps_admit(&places, &found, QUOTE, small, two));
+}
+
+/// The provider rate refusals [`Limited`](model::Limited) answers in the reads before any place,
+/// each with the stop it is: one in clear, one the journal keeps whole, and a REST 429.
+fn refused_before() -> [(model::Limited, places::Stop); 3] {
+    let on = |on| places::Stop::RateRefused { on };
+    [
+        (
+            model::Limited::ReadSocketBefore,
+            on(places::RefusedOn::ReadSocket),
+        ),
+        (
+            model::Limited::PageKeptWholeBefore,
+            on(places::RefusedOn::ReadSocket),
+        ),
+        (model::Limited::RestBefore, on(places::RefusedOn::Rest)),
+    ]
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_the_reads_before_drop_session_one_stops_the_run_marked() {
+    // PR #272's thread 4606842299. The primary's read before drop session one is answered a
+    // RateLimited err on its page, or HTTP 429 on its GET /user/positions: a provider rate
+    // refusal, so a stop (decision 0148 item 8), marked, so the next run needs --reconciled
+    // (0151 item 6). Nothing is placed.
+    for (limited, stop) in refused_before() {
+        let (dir, _removed) = temp_dir("place-rate-before");
+        let venue = Venue::start(QfexModel {
+            rate_limit: Some(limited),
+            ..QfexModel::default()
+        })
+        .await;
+        let (ran, printed) = place_run(&venue, &drop_argv(&dir, &venue), &environment()).await;
+        let ev = stopped(ran, &printed);
+        let name = stop.name();
+        assert_eq!(ev.stop, Some(name), "{printed}");
+        let said = ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(&format!("{name} in the reads before drop session one")),
+            "{said}"
+        );
+        let marker = fs::read_to_string(leases_of(&dir).join(places::MARKER)).unwrap_or_default();
+        assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+        assert!(ev.drop_one.is_none());
+        assert!(!venue.log().iter().any(|e| e.what.ends_with(" add_order")));
+        venue.assert_served();
+    }
+}
+
+#[tokio::test]
+async fn a_rate_refusal_in_the_reads_that_clear_a_marker_stops_the_run_and_keeps_it() {
+    // The twin on the reconciliation's reads (0151 item 6): the refusal is this run's stop,
+    // marked before the earlier one, which stays unreconciled.
+    for (limited, stop) in refused_before() {
+        let (dir, _removed) = temp_dir("place-rate-reconcile");
+        let leases = leases_of(&dir);
+        places::tag(&leases).unwrap();
+        places::write_marker(&leases, places::Stop::LeftResting, &[], "synthetic").unwrap();
+        let venue = Venue::start(QfexModel {
+            rate_limit: Some(limited),
+            ..QfexModel::default()
+        })
+        .await;
+        let asked = set(drop_argv(&dir, &venue), "--reconciled", "hand-cancel");
+        let (ran, printed) = place_run(&venue, &asked, &environment()).await;
+        let ev = stopped(ran, &printed);
+        let name = stop.name();
+        assert_eq!(ev.stop, Some(name), "{printed}");
+        let said = ev.stopped.as_deref().unwrap();
+        assert!(
+            said.starts_with(&format!("{name} in the reads that clear the marker")),
+            "{said}"
+        );
+        let marker = fs::read_to_string(leases.join(places::MARKER)).unwrap();
+        assert!(
+            marker.starts_with(&format!("stop: {name}\nstop: LeftResting\n")),
+            "{marker}"
+        );
+        let run = ev.marker.unwrap();
+        assert!(!run.cleared);
+        assert!(!venue.log().iter().any(|e| e.what.ends_with(" add_order")));
+        venue.assert_served();
+    }
+}
+
+#[tokio::test]
+async fn x_listed_by_its_venue_id_alone_after_the_session_is_still_resting() {
+    // PR #272's thread 4606842313. After drop session one, the primary's page lists X by its
+    // venue id with an empty client id: X is found there by the venue id the streams gave it,
+    // so it is still resting, reported for the owner's hand cancel, and the graceful close is
+    // not counted as cancelling it.
+    let model = QfexModel {
+        blank_cid_after_session: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-x-venue-id").await;
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.x_read, "{run:?}");
+    assert_eq!(run.close_cancelled_x, Some(false), "{run:?}");
+    assert_stopped(&d, places::Stop::LeftResting);
+    assert_no_cancel_and_x_resting(&d);
+    let model = d.venue.model.lock().unwrap();
+    assert_eq!(model.orders[0].state, model::State::Open);
+}
+
+#[tokio::test]
+async fn an_account_reads_socket_sends_its_close_only_with_room_for_it() {
+    // A sibling of PR #272's thread 4606842296: the primary's read before drop session one is
+    // answered a RateLimited err, which holds the shared budget (decision 0126), so its socket
+    // has no room for its close and is dropped with no close frame (decisions 0030, 0135). With
+    // room, every read socket of a run closes with one.
+    let (dir, _removed) = temp_dir("place-read-close");
+    let venue = Venue::start(QfexModel {
+        rate_limit: Some(model::Limited::ReadSocketBefore),
+        ..QfexModel::default()
+    })
+    .await;
+    let (ran, printed) = place_run(&venue, &drop_argv(&dir, &venue), &environment()).await;
+    stopped(ran, &printed);
+    let ended = || venue.trade.connections().iter().all(|c| !c.open);
+    until("the read socket's end", ended).await;
+    let conns = venue.trade.connections();
+    assert_eq!(conns.len(), 1, "{printed}");
+    assert!(!conns[0].client_closed, "a close sent under the hold");
+    let d = dropped(QfexModel::default(), "drop-read-close").await;
+    let conns = d.venue.trade.connections();
+    let session = (d.venue.model.lock().unwrap().conns.iter())
+        .filter(|(_, c)| c.session)
+        .map(|(n, _)| *n)
+        .collect::<Vec<usize>>();
+    let reads = (0..conns.len()).filter(|n| !session.contains(n));
+    assert!(reads.clone().count() >= 4, "{conns:?}");
+    for n in reads {
+        assert!(
+            conns[n].client_closed,
+            "read socket {n} closed with no close frame"
+        );
+    }
+}
+
+#[tokio::test]
+async fn x_absent_from_a_full_page_after_the_session_is_not_measured() {
+    // A sibling of PR #272's thread 4606842313: the after-session read asks one page, of one
+    // order here, and the account holds another order, listed first. The full page leaves X
+    // unread, not absent, so whether the graceful close cancelled it is not measured.
+    let model = QfexModel {
+        foreign_order: true,
+        newest_first: true,
+        ..QfexModel::default()
+    };
+    let paged = |argv| set(short_wait(argv), "--page-size", "1");
+    let d = dropped_with(model, "drop-x-full-page", paged).await;
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_DROP_ONE && r.label == "primary (drop)")
+        .unwrap();
+    assert!(after.page_full && !after.page_lists_it, "{after:?}");
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+    assert!(!run.x_read, "{run:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_eq!(d.ev.stop, Some(places::Stop::ReadDisagrees.name()));
+}
+
+/// [`dropped`], with the test hooks `hooked` sets on the run's parsed command line.
+async fn dropped_hooked(
+    model: QfexModel,
+    what: &str,
+    hooked: impl FnOnce(&mut probe_args::TestHooks),
+) -> Dropped {
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let (mut opts, mut places) = parsed(&drop_argv(&dir, &venue)).unwrap();
+    hooked(&mut places.test);
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let ran = stage::run_places(&opts, &places, &lookup, out).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    }
+}
+
+#[tokio::test]
+async fn a_stop_after_a_session_that_failed_with_no_stop_is_raised_and_marked() {
+    // The second review of PR #272's thread 4606842299: drop session one fails with no stop, X
+    // not priced once the market armed, and the reads after it meet a provider rate refusal or
+    // show a position not flat. The stop is raised and its marker written, the session's
+    // failure kept as its error (decision 0148 item 8, 0151 item 6).
+    // The model answers a page's RateLimited err only after an add_order, which this run never
+    // sends, so the refusal is REST's.
+    let refused = |limited, on| {
+        let model = QfexModel {
+            rate_limit: Some(limited),
+            ..QfexModel::default()
+        };
+        (model, places::Stop::RateRefused { on })
+    };
+    let not_flat = QfexModel {
+        position_after_close: true,
+        ..QfexModel::default()
+    };
+    let cases = [
+        refused(model::Limited::RestAfterSession, places::RefusedOn::Rest),
+        (not_flat, places::Stop::NotFlat),
+    ];
+    for (model, stop) in cases {
+        let d = dropped_hooked(model, "drop-failed-then-stop", |t| t.x_unpriced = true).await;
+        let name = stop.name();
+        assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+        let marker = d.marker().unwrap_or_default();
+        assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+        let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+        let when = match stop {
+            places::Stop::NotFlat => "after drop session one",
+            _ => "in the reads after drop session one",
+        };
+        assert!(stopped.starts_with(&format!("{name} {when}")), "{stopped}");
+        let run = d.drop_run();
+        assert_eq!(run.error.as_deref(), Some("a test's X could not be priced"));
+        assert!(run.started && !run.x.submitted, "{run:?}");
+        assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+        assert_eq!(d.count("add_order"), 0, "{:?}", d.what());
+        d.venue.assert_served();
+    }
+}
+
+#[tokio::test]
+async fn a_session_that_failed_with_no_stop_and_clean_reads_after_it_ends_on_its_failure() {
+    // A sibling of the test above: with clean reads after it, the run ends on the session's
+    // failure, with no stop and no marker.
+    let d = dropped_hooked(QfexModel::default(), "drop-failed-clean", |t| {
+        t.x_unpriced = true;
+    })
+    .await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    assert!(d.marker().is_none());
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some("a test's X could not be priced")
+    );
+    assert_after_reads(&d);
+}
+
+#[tokio::test]
+async fn a_full_page_repeating_the_one_before_fails_the_read_of_x_rather_than_paging_on() {
+    // The second review of PR #272's thread 4606842313: on pages of one, a venue answering every
+    // get_user_trades page, or every GET /user/historic-orders page, as if asked from offset 0
+    // would be paged without end, for as long as the limiter had room or, for historic orders,
+    // which QFEX declares no bucket for, for ever. The read of X fails at the first repeat.
+    let historic = QfexModel {
+        cod_on_close: true,
+        ..QfexModel::default()
+    };
+    let trades = QfexModel {
+        maker_fill: true,
+        stuck_trades: true,
+        ..QfexModel::default()
+    };
+    let cases = [
+        (historic, "GET /user/historic-orders"),
+        (trades, "get_user_trades"),
+    ];
+    for (model, what) in cases {
+        let run = dropped_with(model, "drop-repeated-page", |argv| {
+            set(argv, "--page-size", "1")
+        });
+        let d = tokio::time::timeout(Duration::from_secs(60), run)
+            .await
+            .expect("the run ended");
+        let after = d.drop_run().after.as_ref().expect("X was read");
+        let why = format!("a full {what} page repeated the page before it");
+        assert_eq!(after.error.as_deref(), Some(why.as_str()), "{after:?}");
+        d.venue.assert_served();
+    }
 }
