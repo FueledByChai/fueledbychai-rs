@@ -2,20 +2,23 @@
 //! market and account), plus the account lease where the venue's nonce scope is per account.
 //! Both are file locks in a directory the caller supplies, keyed by stable names (the venue's
 //! `VenueFactory::id()`, an account name the consumer supplies, the instrument's venue symbol),
-//! never by the per-process `InstrumentId` or `AccountKey` numbering. Names and symbols here are
-//! synthetic.
+//! never by the per-process `InstrumentId` or `AccountKey` numbering. A dropped lease is free at
+//! once, though a child process spawned while it was held still shares its descriptor, and a
+//! lease another process holds is refused (FBC-qtjn). Names and symbols here are synthetic.
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 mod common;
 
 use common::market_data_only_caps;
 use fbc_core::{
-    AccountLease, InstrumentId, LeaseName, MAX_LOCK_FILE_NAME_LEN, MarketLease, NamedLeaseError,
-    VenueSymbol, dispatch_market_data,
+    AccountKey, AccountLease, InstrumentId, LeaseError, LeaseName, MAX_LOCK_FILE_NAME_LEN,
+    MarketLease, NamedLeaseError, Namespace, NamespaceLease, VenueSymbol, dispatch_market_data,
 };
 
 /// A fresh lock directory per test, removed when dropped. The library names no path; the caller
@@ -298,4 +301,197 @@ fn a_lease_in_a_missing_directory_is_an_io_error_naming_the_lock_file() {
     );
     // The directory is the caller's to create: the lease never makes it.
     assert!(!missing.exists());
+}
+
+const NS_ACCOUNT: AccountKey = AccountKey::new(7);
+const NS: Namespace = Namespace::new(3);
+
+/// A child process held between its fork and its `exec`, where every child a process spawns
+/// spends a moment: it shares every descriptor the parent had open at the fork, each lock
+/// file's included, until its `exec` closes them, since each is opened close-on-exec. A pipe
+/// holds it there for as long as the test needs, so the window needs no load or sleep (FBC-qtjn).
+#[cfg(unix)]
+struct ChildInItsForkWindow {
+    release: Option<std::io::PipeWriter>,
+    spawner: Option<std::thread::JoinHandle<std::io::Result<std::process::Child>>>,
+}
+
+#[cfg(unix)]
+impl ChildInItsForkWindow {
+    /// Forks a child and returns once it has forked and waits before its `exec`.
+    fn spawn() -> ChildInItsForkWindow {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+
+        let (ready_rx, ready_tx) = std::io::pipe().unwrap();
+        let (release_rx, release_tx) = std::io::pipe().unwrap();
+        // The test binary itself, listing its tests: a program that exists wherever the test
+        // runs, and that touches no lease.
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.arg("--list")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: the hook runs in the forked child before its exec and calls only write and
+        // read on two pipes it owns: no allocation, no lock, nothing a fork leaves unsafe.
+        unsafe {
+            cmd.pre_exec(move || {
+                (&ready_tx).write_all(&[1])?;
+                (&release_rx).read_exact(&mut [0])?;
+                Ok(())
+            });
+        }
+        // A spawn waits for the child's exec, so it runs on a thread of its own.
+        let spawner = std::thread::spawn(move || cmd.spawn());
+        (&ready_rx).read_exact(&mut [0]).unwrap();
+        ChildInItsForkWindow {
+            release: Some(release_tx),
+            spawner: Some(spawner),
+        }
+    }
+
+    /// Lets the child run its `exec` and waits for it to end, asserting that it succeeded.
+    fn finish(mut self) {
+        let status = self.release_and_wait().unwrap();
+        assert!(status.success(), "the child failed: {status}");
+    }
+
+    fn release_and_wait(&mut self) -> Option<std::process::ExitStatus> {
+        let mut release = self.release.take()?;
+        release.write_all(&[1]).unwrap();
+        let mut child = self.spawner.take()?.join().unwrap().unwrap();
+        Some(child.wait().unwrap())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildInItsForkWindow {
+    /// A test that fails still lets the child go, so no process is left waiting before its exec.
+    fn drop(&mut self) {
+        if let Some(mut release) = self.release.take() {
+            let _ = release.write_all(&[1]);
+            if let Some(spawner) = self.spawner.take()
+                && let Ok(Ok(mut child)) = spawner.join()
+            {
+                let _ = child.wait();
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn every_lease_dropped_while_a_child_shares_its_descriptor_is_free_to_retake_at_once() {
+    let dir = LockDir::new();
+    let sym = symbol("SYN-USD-PERP");
+    let market = MarketLease::acquire(dir.path(), VENUE, ACCOUNT, &sym).unwrap();
+    let account = AccountLease::acquire(dir.path(), VENUE, ACCOUNT).unwrap();
+    let namespace = NamespaceLease::acquire(dir.path(), NS_ACCOUNT, NS).unwrap();
+    // Spawned while every lease is held, the child shares each lock file's description.
+    let child = ChildInItsForkWindow::spawn();
+
+    drop((market, account, namespace));
+    // Retaken while the child still holds its copies: the drop unlocked each description, so no
+    // copy keeps the lock. A retake is exclusive again, child or not.
+    let market = MarketLease::acquire(dir.path(), VENUE, ACCOUNT, &sym).unwrap();
+    let account = AccountLease::acquire(dir.path(), VENUE, ACCOUNT).unwrap();
+    let namespace = NamespaceLease::acquire(dir.path(), NS_ACCOUNT, NS).unwrap();
+    assert!(matches!(
+        MarketLease::acquire(dir.path(), VENUE, ACCOUNT, &sym),
+        Err(NamedLeaseError::Held { .. })
+    ));
+    assert!(matches!(
+        AccountLease::acquire(dir.path(), VENUE, ACCOUNT),
+        Err(NamedLeaseError::Held { .. })
+    ));
+    assert!(matches!(
+        NamespaceLease::acquire(dir.path(), NS_ACCOUNT, NS),
+        Err(LeaseError::Held)
+    ));
+    child.finish();
+    drop((market, account, namespace));
+}
+
+/// Set on the child that [`a_lease_another_process_holds_is_refused_until_that_process_drops_it`]
+/// runs: the lock directory the child takes its leases in.
+const HOLDER_DIR: &str = "FBC_CORE_LEASE_HOLDER_DIR";
+const HELD_MARK: &str = "fbc-core-lease-holder:held";
+const RELEASED_MARK: &str = "fbc-core-lease-holder:released";
+
+/// The other process: unless [`HOLDER_DIR`] is set it does nothing. With it set, it takes every
+/// kind of lease, says so, waits for a line on its standard input, drops them and says so.
+#[test]
+fn lease_holder_in_another_process() {
+    let Some(dir) = std::env::var_os(HOLDER_DIR) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let market = MarketLease::acquire(&dir, VENUE, ACCOUNT, &symbol("SYN-USD-PERP")).unwrap();
+    let account = AccountLease::acquire(&dir, VENUE, ACCOUNT).unwrap();
+    let namespace = NamespaceLease::acquire(&dir, NS_ACCOUNT, NS).unwrap();
+    println!("{HELD_MARK}");
+    std::io::stdin().read_line(&mut String::new()).unwrap();
+    drop((market, account, namespace));
+    println!("{RELEASED_MARK}");
+}
+
+/// Reads `out` until a line holding `mark`, failing if the child ends first.
+fn read_until(out: &mut impl BufRead, mark: &str) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        assert_ne!(
+            out.read_line(&mut line).unwrap(),
+            0,
+            "the child ended before {mark}"
+        );
+        if line.contains(mark) {
+            return;
+        }
+    }
+}
+
+#[test]
+fn a_lease_another_process_holds_is_refused_until_that_process_drops_it() {
+    let dir = LockDir::new();
+    let sym = symbol("SYN-USD-PERP");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "lease_holder_in_another_process",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(HOLDER_DIR, dir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    read_until(&mut out, HELD_MARK);
+
+    // Held by another process, each lease is refused.
+    assert!(matches!(
+        MarketLease::acquire(dir.path(), VENUE, ACCOUNT, &sym),
+        Err(NamedLeaseError::Held { .. })
+    ));
+    assert!(matches!(
+        AccountLease::acquire(dir.path(), VENUE, ACCOUNT),
+        Err(NamedLeaseError::Held { .. })
+    ));
+    assert!(matches!(
+        NamespaceLease::acquire(dir.path(), NS_ACCOUNT, NS),
+        Err(LeaseError::Held)
+    ));
+
+    writeln!(child.stdin.as_mut().unwrap()).unwrap();
+    read_until(&mut out, RELEASED_MARK);
+    // Dropped by the other process, each is free, before that process has ended.
+    let market = MarketLease::acquire(dir.path(), VENUE, ACCOUNT, &sym).unwrap();
+    let account = AccountLease::acquire(dir.path(), VENUE, ACCOUNT).unwrap();
+    let namespace = NamespaceLease::acquire(dir.path(), NS_ACCOUNT, NS).unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "the holder failed: {status}");
+    drop((market, account, namespace));
 }

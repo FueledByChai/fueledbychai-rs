@@ -9,25 +9,28 @@
 //! market (that is the [`MarketLease`](crate::MarketLease), decision 0013).
 
 use core::fmt;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use crate::ids::{AccountKey, ClientOrderId, IdError, Namespace};
-use crate::lease::try_lock;
+use crate::lease::{HeldLock, try_lock};
 use crate::time::WallNs;
 
 /// An exclusive lock on one (account, namespace) pair, held until it is dropped.
 ///
 /// The lock is an advisory file lock (`flock` on Unix) on `account-<a>-ns-<n>.lock` in the
-/// directory given to [`NamespaceLease::acquire`]. The operating system releases it when the
-/// process exits, however it exits, so a crashed process never leaves a stale lease. The file
+/// directory given to [`NamespaceLease::acquire`]. Dropping it unlocks the lock before closing
+/// the file, so a child process spawned while it was held never keeps it from a retake. A
+/// process that exits without dropping it, however it exits, leaves the release to the
+/// operating system, which releases it once no child process still shares the lock file: a
+/// child shares it from its fork until its `exec` or its end. Both are as the
+/// [`lease`](crate::lease) module documents under "Release, and child processes". The file
 /// itself is left in place: deleting a lock file while another process opens it would let two
 /// holders lock two different files.
 #[derive(Debug)]
 pub struct NamespaceLease {
     account: AccountKey,
     ns: Namespace,
-    _file: File,
+    _file: HeldLock,
 }
 
 impl NamespaceLease {
@@ -35,7 +38,8 @@ impl NamespaceLease {
     ///
     /// Fails with [`LeaseError::Held`] while any holder, in this process or another, has it,
     /// and with [`LeaseError::Io`] when the lock file cannot be opened (for example when `dir`
-    /// does not exist; the caller creates it).
+    /// does not exist; the caller creates it). A lease this process dropped is never refused
+    /// because a child process it spawned meanwhile still shares the old descriptor.
     pub fn acquire(
         dir: &Path,
         account: AccountKey,

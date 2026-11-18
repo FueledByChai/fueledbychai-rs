@@ -214,6 +214,8 @@ holds two of them for one pull request. The rules after the three roles bind all
 
 - A Cargo workspace (0001, 0008). `crates/fbc-core` exists, with time, units,
   price grids, exact prices, sealed ids, the client-id codec, `NamespaceLease`, `CidMint`,
+  the `MarketLease` and `AccountLease` (0013; every fbc-core lease's drop unlocks before it
+  closes, so a child spawned while one was held never keeps it from a retake, FBC-qtjn),
   `Fee`/`FeeBook`, `DecodeScope`, `InstrumentSpec` (maker-safe `quantize`; `SigningParams` and
   a clock-free `SessionCalendar`, 0125), instrument
   resolution (`AssetKey`, `AliasTable`, `InstrumentResolver`, `InstrumentSpecDraft`; 0035),
