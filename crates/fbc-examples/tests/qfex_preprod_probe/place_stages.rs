@@ -6652,7 +6652,8 @@ async fn the_drop_cancels_x_and_y_and_the_test_passes() {
         let after = two.after_drop.as_ref().unwrap();
         assert!(after.absent_after.is_some() && after.refused.is_none());
         assert!(!two.resting && two.read);
-        assert_eq!((run.stop, run.others_clean), (None, Some(true)));
+        let clean = places::OthersClean::Clean;
+        assert_eq!((run.stop, run.others_clean), (None, clean));
     }
     let model = d.venue.model.lock().unwrap();
     assert!(
@@ -8029,7 +8030,7 @@ fn the_drop_tests_report_says_each_case_with_no_id_or_value() {
         "- The drop's reach over X, an order of an earlier connection: not measured: the drop \
          test ended before its drop",
         "- Whether the other named accounts stayed clean: no other account is named",
-        "- terminal_status on GET /user/historic-orders: X not listed; Y not listed",
+        "- terminal_status on GET /user/historic-orders: X not read; Y not read",
         "- What followed: the run's stop, SpanBound: nothing more is placed on this account",
         "- X listed by the read before drop session two: not read",
         "- The read before the drop: not made",
@@ -8045,7 +8046,7 @@ fn the_drop_tests_report_says_each_case_with_no_id_or_value() {
     // said so; a comparison after the stop's cancels is tabled.
     let one = DropRun {
         account: "subaccount",
-        others_clean: Some(false),
+        others_clean: places::OthersClean::NotClean,
         ..DropRun::default()
     };
     let mut s = String::new();
@@ -8097,7 +8098,7 @@ fn the_drop_tests_report_says_each_case_with_no_id_or_value() {
          provider rate refusal (decision 0148 item 8)",
         "- X's and Y's trades after the drop: 2 trade rows since X's send, 0 naming X, 1 naming \
          Y; not read whole: GET /user/historic-orders: HTTP 500",
-        "- terminal_status on GET /user/historic-orders: X CANCELLED; Y not listed",
+        "- terminal_status on GET /user/historic-orders: X CANCELLED; Y not read",
         &format!("- What followed: {}", places::LAST_ACCOUNT),
         "| the stop's cancels | 0 | none | unread: no read was made |",
     ] {
@@ -8513,4 +8514,664 @@ async fn a_full_page_repeating_the_one_before_after_the_drop_fails_the_read_rath
         assert!(d.ev.stop.is_some(), "{}", d.printed);
         d.venue.assert_served();
     }
+}
+
+// ----- FBC-77r8's review of PR #273: positive evidence, unexpected orders, X's end ------------
+
+/// The line the report gives of X when the run ended, after drop session two's reads.
+const X_AT_END: &str = "- X resting when the run ended: ";
+
+#[tokio::test]
+async fn a_fill_a_trades_page_names_before_a_later_page_fails_stops_the_run_unexpected_fill() {
+    // PR #273's thread 4611183910: after the drop, X fills as a maker as its trades are first
+    // asked, no frame telling any socket, and on pages of one a venue answering every page as if
+    // asked from offset 0 fails the read at its second page, with no provider rate refusal. The
+    // page read named X: a fill of ours seen with no session open, which the unfinished read
+    // does not erase. With no refusal, the verdict's first stop is UnexpectedFill, the position
+    // the owner's (0151 item 9), not DropFailed for the trades not read whole.
+    let model = QfexModel {
+        fill_on_trades_page: Some(1),
+        stuck_trades: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-two-fill-then-unread", |argv| {
+        set(argv, "--page-size", "1")
+    })
+    .await;
+    assert_stopped(&d, places::Stop::UnexpectedFill);
+    let two = d.two();
+    assert_eq!(two.ended_by, Some(stage::DROPPED), "{two:?}");
+    let after = two.after.as_ref().expect("X and Y were read");
+    assert!(!after.trades_whole, "{after:?}");
+    assert_eq!(
+        after.error.as_deref(),
+        Some("a full get_user_trades page repeated the page before it")
+    );
+    // The reads after the drop showed the account flat and X and Y absent: the fill came after.
+    let last = two.after_drop.as_ref().and_then(|a| a.last).unwrap();
+    assert!(last.flat && !last.x && !last.y, "{last:?}");
+    let verdict = d.verdict();
+    let x = verdict::Which::X;
+    for failure in [verdict::Failure::Traded(x), verdict::Failure::TradesNotRead] {
+        assert!(verdict.failures.contains(&failure), "{verdict:?}");
+    }
+    assert_eq!(
+        verdict.reach,
+        verdict::Reach::Unmeasured(verdict::Unmeasured::Traded)
+    );
+    let (report, _) = d.outputs();
+    assert!(report.contains(places::OWNERS_POSITION), "{report}");
+    assert!(report.contains("a get_user_trades row names X"), "{report}");
+    assert_eq!(d.ev.drops.len(), 1);
+}
+
+#[tokio::test]
+async fn a_status_a_historic_orders_page_shows_before_a_later_page_fails_is_kept() {
+    // A sibling of thread 4611183910: on pages of one, a venue answering every GET
+    // /user/historic-orders page whole fails the read at its second page, after the first named
+    // X and Y CANCELLED. Those rows show X and Y terminal (0151 item 5), so the verdict keeps
+    // their statuses and shows the drop's reach over X, though the test does not pass.
+    let d = dropped_with(QfexModel::default(), "drop-two-historic-unread", |argv| {
+        set(argv, "--page-size", "1")
+    })
+    .await;
+    assert_stopped(&d, places::Stop::DropFailed);
+    let after = d.two().after.as_ref().expect("X and Y were read");
+    assert!(after.trades_whole && !after.historic_whole, "{after:?}");
+    let verdict = d.verdict();
+    assert_eq!(verdict.failures, [verdict::Failure::HistoricNotRead]);
+    let cancelled = Some("CANCELLED".to_owned());
+    assert_eq!(verdict.terminal, [cancelled.clone(), cancelled]);
+    assert_eq!(verdict.reach, verdict::Reach::Cancelled);
+}
+
+#[tokio::test]
+async fn a_position_the_reads_after_a_failed_drop_test_show_stops_the_run_not_flat() {
+    // A sibling of thread 4611183910: historic-orders leaves Y out, so the drop test fails, and
+    // the account's position moves once that read is answered, after the reads after the drop
+    // showed it flat and with no trade row. The read of every named account after them shows the
+    // position: a stop not flat, the position the owner's (0151 item 9), which a test that only
+    // did not pass does not outrank.
+    let model = QfexModel {
+        historic_omits_last: true,
+        after_drop_historic: Some(model::AfterHistoric::Position),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-position-after").await;
+    assert_stopped(&d, places::Stop::NotFlat);
+    let verdict = d.verdict();
+    let y = verdict::Which::Y;
+    assert_eq!(verdict.failures, [verdict::Failure::NotTerminal(y)]);
+    assert_eq!(verdict.stop(), Some(places::Stop::DropFailed));
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.starts_with("NotFlat after drop session two"),
+        "{stopped}"
+    );
+    let (report, _) = d.outputs();
+    assert!(report.contains(places::OWNERS_POSITION), "{report}");
+}
+
+#[tokio::test]
+async fn an_order_not_ours_in_the_read_before_the_drop_stops_drop_session_two_before_its_drop() {
+    // PR #273's thread 4611183918: beside Y, the account holds an order no run placed, which the
+    // read before the drop lists. That read shows an order the streams did not, a stop (decision
+    // 0148 item 8), before the drop, so the account-wide drop never cancels it out of sight. The
+    // stop cancels nothing (0151 item 2): the session ends by a graceful close, X and Y left for
+    // the owner's hand cancel, and no drop test runs on the subaccount.
+    let model = QfexModel {
+        foreign_order_on: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-foreign-before-drop").await;
+    assert_stopped(&d, places::Stop::ReadDisagrees);
+    let two = d.two();
+    assert_eq!(two.before_drop, Some([true, true]), "{two:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(
+        (two.cancels.as_ref(), two.after_drop.as_ref()),
+        (None, None)
+    );
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 0);
+    let what = d.what();
+    assert!(!what.iter().any(|w| w.contains(" drop ")), "{what:?}");
+    let model = d.venue.model.lock().unwrap();
+    let open =
+        |cid: &str| (model.orders.iter()).any(|o| o.cid == cid && o.state == model::State::Open);
+    assert!(open(model::STRAY_CID));
+    assert_eq!(
+        (model.orders.iter())
+            .filter(|o| o.state == model::State::Open)
+            .count(),
+        3
+    );
+    drop(model);
+    assert!(two.resting, "{two:?}");
+    assert!(d.ev.sessions.iter().all(|s| s.account == "primary"));
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.starts_with("ReadDisagrees in drop session two"),
+        "{stopped}"
+    );
+    let disagrees = "READ before the drop: primary: an order, a TWAP or a position the streams \
+                     did not show (decision 0148 item 8): no drop";
+    assert!(d.at("READ before the drop: primary: X listed true, Y listed true") < d.at(disagrees));
+    let (report, json) = d.outputs();
+    let said = "- The read before the drop: X listed yes; Y listed yes; it showed an order, a \
+                TWAP or a position the streams did not, a stop before the drop (decision 0148 \
+                item 8)";
+    assert!(report.contains(said), "{report}");
+    let two = &json["drop_tests"][0]["session_two"];
+    assert_eq!(two["before_drop_disagrees"], Value::Bool(true), "{two}");
+}
+
+#[tokio::test]
+async fn an_order_not_ours_the_reads_after_the_drop_list_fails_the_test_read_disagrees() {
+    // A sibling of thread 4611183918: once the drop cancelled X and Y, the account holds an order
+    // no run placed, which the reads after the drop list. X and Y are absent and the position
+    // flat, but the reads show an order the streams did not: the test fails and the run stops
+    // ReadDisagrees (decision 0148 item 8), not LeftResting for an order of ours.
+    let model = QfexModel {
+        foreign_on_drop: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-foreign-after-drop").await;
+    assert_stopped(&d, places::Stop::ReadDisagrees);
+    let two = d.two();
+    let after = two.after_drop.as_ref().unwrap();
+    assert!(after.absent_after.is_some(), "{after:?}");
+    let verdict = d.verdict();
+    assert_eq!(verdict.failures.len(), 1, "{verdict:?}");
+    assert_eq!(verdict.stop(), Some(places::Stop::ReadDisagrees));
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.starts_with("ReadDisagrees after the drop"),
+        "{stopped}"
+    );
+    assert_eq!(d.ev.drops.len(), 1);
+    let (report, json) = d.outputs();
+    let failed = "- The drop test: failed: an order or a TWAP not ours listed by a read after the \
+                  drop: something else trades on the account (decision 0132 item 4)";
+    assert!(report.contains(failed), "{report}");
+    let after = &json["drop_tests"][0]["session_two"]["after_drop"];
+    assert_eq!(after["others"], Value::Bool(true), "{after}");
+}
+
+#[tokio::test]
+async fn an_order_or_twap_not_ours_the_reads_after_drop_session_two_show_stops_read_disagrees() {
+    // A sibling of thread 4611183918: the drop test passes, then, once its historic-orders read
+    // is answered, the account holds an order no run placed, or lists a TWAP. The read of every
+    // named account after the drop shows what the streams did not: a stop, ReadDisagrees
+    // (decision 0148 item 8), not LeftResting for an order of ours nor, for a TWAP, no stop at
+    // all, which left the next account's reads to refuse with no marker.
+    for (change, what) in [
+        (model::AfterHistoric::Foreign, "drop-two-foreign-end"),
+        (model::AfterHistoric::Twap, "drop-two-twap-end"),
+    ] {
+        let model = QfexModel {
+            after_drop_historic: Some(change),
+            ..QfexModel::default()
+        };
+        let d = dropped(model, what).await;
+        assert_stopped(&d, places::Stop::ReadDisagrees);
+        assert!(d.verdict().passed, "{:?}", d.verdict());
+        let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+        assert!(
+            stopped.starts_with("ReadDisagrees after drop session two"),
+            "{stopped}"
+        );
+        assert!(d.ev.sessions.iter().all(|s| s.account == "primary"));
+    }
+}
+
+#[tokio::test]
+async fn a_twap_the_reads_after_a_failed_drop_session_one_show_stops_read_disagrees() {
+    // A sibling of thread 4611183918: drop session one fails with no stop, X not priced, and once
+    // its connection ended the account lists a TWAP. The reads after the session show what the
+    // streams did not: a stop, marked (decision 0148 item 8, 0151 item 6), not the session's
+    // failure alone with no marker.
+    let model = QfexModel {
+        twap_after_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_hooked(model, "drop-failed-twap", |t| t.x_unpriced = true).await;
+    assert_eq!(d.ev.stop, Some("ReadDisagrees"), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with("stop: ReadDisagrees\n"), "{marker}");
+    // The session's failure stays the run's end, as with an order of ours left resting.
+    let error = "a test's X could not be priced";
+    assert_eq!(d.ev.stopped.as_deref(), Some(error));
+    assert_eq!(d.drop_run().error.as_deref(), Some(error));
+    assert_eq!(d.count("add_order"), 0, "{:?}", d.what());
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn x_resting_when_the_run_ended_is_said_from_the_reads_after_drop_session_two() {
+    // PR #273's thread 4611183928: what the report says of X when the run ended comes from the
+    // read of X's account after drop session two, never from session two having been built. X
+    // survives a drop that reaches only its own connection's orders, and survives a session two
+    // whose arm was refused: it still rests, for the owner's hand cancel. A drop that cancelled
+    // it leaves it absent, as that read confirms.
+    let resting = format!(
+        "{X_AT_END}yes, shown by the read of X's account after drop session two: {}",
+        places::HAND_CANCEL
+    );
+    let own = QfexModel {
+        cod_reach: model::Reach::Own,
+        ..QfexModel::default()
+    };
+    let refused = QfexModel {
+        arm_err_on: Some(1),
+        ..QfexModel::default()
+    };
+    for (model, what) in [
+        (own, "drop-two-x-survives"),
+        (refused, "drop-two-x-unarmed"),
+    ] {
+        let d = dropped(model, what).await;
+        let (report, json) = d.outputs();
+        assert!(report.contains(&resting), "{report}");
+        assert!(!report.contains(&format!("{X_AT_END}no")), "{report}");
+        let two = &json["drop_tests"][0]["session_two"];
+        assert_eq!(
+            (&two["x_resting"], &two["x_read_after"]),
+            (&Value::Bool(true), &Value::Bool(true))
+        );
+    }
+    let d = dropped(QfexModel::default(), "drop-two-x-absent").await;
+    let (report, json) = d.outputs();
+    let two = &json["drop_tests"][0]["session_two"];
+    assert_eq!(
+        (&two["x_resting"], &two["x_read_after"]),
+        (&Value::Bool(false), &Value::Bool(true))
+    );
+    let absent =
+        format!("{X_AT_END}no: the read of X's account after drop session two no longer listed it");
+    assert!(report.contains(&absent), "{report}");
+}
+
+#[test]
+fn x_resting_when_the_run_ended_is_not_known_when_its_account_was_not_read() {
+    // Thread 4611183928's third case: drop session two built, but X's account not read after it
+    // (or read on a full page not listing X), so whether X rests is not known.
+    use places::{DropRun, TwoRun};
+    let unread = DropRun {
+        account: "primary",
+        x_resting: true,
+        x_read: true,
+        x: places::XRun {
+            submitted: true,
+            ..places::XRun::default()
+        },
+        two: Some(TwoRun::default()),
+        ..DropRun::default()
+    };
+    let mut s = String::new();
+    places::drop_markdown(&mut s, &unread, false);
+    let said = format!(
+        "{X_AT_END}not known: X's account was not read after drop session two, or its page was \
+         full and did not list X; read it on QFEX's site before the next run"
+    );
+    assert!(s.contains(&said), "{s}");
+    // Statuses not read are said so, apart from statuses read and not listed.
+    assert!(
+        s.contains("- terminal_status on GET /user/historic-orders: X not read; Y not read"),
+        "{s}"
+    );
+}
+
+#[tokio::test]
+async fn a_terminal_status_not_read_is_said_not_read_rather_than_not_listed() {
+    // A sibling of thread 4611183928: X's GET /user/historic-orders read after drop session one
+    // fails, so the run stops before drop session two. The report's terminal_status line says
+    // X's was not read, and Y's too (Y was never placed), rather than that neither was listed.
+    let model = QfexModel {
+        historic_fails: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-one-historic-unread").await;
+    assert_stopped(&d, places::Stop::LeftResting);
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains("- terminal_status on GET /user/historic-orders: X not read; Y not read"),
+        "{report}"
+    );
+}
+
+// ----- FBC-77r8's second review of PR #273: unread accounts, the read before the drop, ranks ---
+
+/// Asserts that `d` stopped with `stop`, marked, its report and evidence naming it and passing
+/// the privacy check: [`assert_stopped`] for a run whose reads after drop session one need not
+/// all have been made.
+fn assert_marked(d: &Dropped, stop: places::Stop) {
+    let name = stop.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+    assert_eq!(json["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    assert_no_secret(&d.dir.join("evidence"));
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_failure_of_drop_session_one_with_x_s_account_unread_is_marked_left_resting() {
+    // Drop session one fails with no stop once X was answered, X resting, and the read of X's
+    // account after it fails with no provider refusal (the first GET /user/positions after X's
+    // place, answered HTTP 500). X may rest unjudged: LeftResting is marked for the owner's hand
+    // cancel (0151 item 6), as the read before drop session two marks an account it could not
+    // read, and the run ends on the session's failure.
+    let model = QfexModel {
+        rest_fails: vec![0],
+        ..QfexModel::default()
+    };
+    let d = dropped_hooked(model, "drop-one-failed-unread", |t| {
+        t.fail_after_place = Some(0);
+    })
+    .await;
+    assert_marked(&d, places::Stop::LeftResting);
+    let error = "a test's session failed after X's answer";
+    assert_eq!(d.ev.stopped.as_deref(), Some(error));
+    let run = d.drop_run();
+    assert_eq!(run.error.as_deref(), Some(error));
+    assert!(run.x.submitted && run.x.acked, "{run:?}");
+    assert!(
+        !run.x_read && !run.x_resting && run.two.is_none(),
+        "{run:?}"
+    );
+    let model = d.venue.model.lock().unwrap();
+    assert!(
+        (model.orders.iter()).all(|o| o.state == model::State::Open),
+        "X still rests"
+    );
+    drop(model);
+    let (report, _) = d.outputs();
+    let said = "- X resting when the run ended: not known: the account was not read after the \
+                session";
+    assert!(report.contains(said), "{report}");
+}
+
+#[tokio::test]
+async fn a_failure_of_drop_session_two_with_x_s_account_unread_is_marked_left_resting() {
+    // PR #273's second review, its first P1: drop session two fails with no stop once Y was
+    // answered, X and Y resting, and the read of X's account after it fails with no provider
+    // refusal (the seventh GET /user/positions after X's place: after the comparison, the two
+    // account reads after drop session one, the two before drop session two and session two's
+    // resync). X and Y may rest unjudged: LeftResting is marked (0151 item 6), so the next run
+    // needs --reconciled, and the run ends on the session's failure.
+    let model = QfexModel {
+        rest_fails: vec![6],
+        ..QfexModel::default()
+    };
+    let d = dropped_hooked(model, "drop-two-failed-unread", |t| {
+        t.fail_after_place = Some(1);
+    })
+    .await;
+    assert_marked(&d, places::Stop::LeftResting);
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    let said = "a test's session failed after Y's answer; LeftResting after drop session two, X's \
+                account not read: ";
+    assert!(stopped.starts_with(said), "{stopped}");
+    let two = d.two();
+    assert_eq!(
+        two.error.as_deref(),
+        Some("a test's session failed after Y's answer")
+    );
+    assert!(two.y.submitted && two.y.acked, "{two:?}");
+    assert!(!two.read && !two.x_read && !two.resting, "{two:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    let model = d.venue.model.lock().unwrap();
+    let open = (model.orders.iter()).filter(|o| o.state == model::State::Open);
+    assert_eq!(open.count(), 2, "X and Y still rest");
+    drop(model);
+    let (report, _) = d.outputs();
+    let said = format!(
+        "{X_AT_END}not known: X's account was not read after drop session two, or its page was \
+         full and did not list X"
+    );
+    assert!(report.contains(&said), "{report}");
+    assert!(d.ev.sessions.iter().all(|s| s.account == "primary"));
+}
+
+#[tokio::test]
+async fn a_read_before_the_drop_not_made_stops_drop_session_two_before_its_drop() {
+    // PR #273's second review: beside Y the account holds an order no run placed, and the read
+    // before the drop fails (its GET /user/positions answered HTTP 500, the sixth after session
+    // two's resync's), so nothing looked at the account. The drop is not made, so it cannot
+    // cancel that order out of sight: a stop, LeftResting, that cancels nothing (0151 item 2),
+    // the session ending by a graceful close, X, Y and that order left for the owner.
+    let model = QfexModel {
+        foreign_order_on: Some(1),
+        rest_fails: vec![6],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-before-drop-unread").await;
+    assert_stopped(&d, places::Stop::LeftResting);
+    let two = d.two();
+    assert_eq!(two.before_drop, None, "{two:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(
+        (two.cancels.as_ref(), two.after_drop.as_ref()),
+        (None, None)
+    );
+    assert!(d.drop_run().verdict.is_none());
+    assert_eq!(d.count("cancel_order"), 0);
+    let what = d.what();
+    assert!(!what.iter().any(|w| w.contains(" drop ")), "{what:?}");
+    let model = d.venue.model.lock().unwrap();
+    let open = (model.orders.iter()).filter(|o| o.state == model::State::Open);
+    assert_eq!(open.count(), 3, "X, Y and the order not ours still rest");
+    drop(model);
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.starts_with("LeftResting in drop session two"),
+        "{stopped}"
+    );
+    let _ = d.at("READ before the drop: primary: not made, so no drop");
+}
+
+#[tokio::test]
+async fn a_position_the_streams_never_showed_in_the_read_before_the_drop_stops_before_it() {
+    // PR #273's second review: the position half of the read before the drop. With Y's place the
+    // account's position moves with no fill frame, so the read lists X and Y but shows a position
+    // the registry does not hold: ReadDisagrees (decision 0148 item 8), before the drop and
+    // cancelling nothing. What the session showed of X and Y as it dropped is not measured, since
+    // it did not drop.
+    let model = QfexModel {
+        position_on_place_on: Some(1),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-position-before-drop").await;
+    assert_stopped(&d, places::Stop::ReadDisagrees);
+    let two = d.two();
+    assert_eq!(two.before_drop, Some([true, true]), "{two:?}");
+    assert!(two.before_drop_disagrees, "{two:?}");
+    assert_eq!(two.ended_by, Some(stage::GRACEFUL));
+    assert_eq!(d.count("cancel_order"), 0);
+    let what = d.what();
+    assert!(!what.iter().any(|w| w.contains(" drop ")), "{what:?}");
+    let (report, json) = d.outputs();
+    let not = "not measured: the session did not reach its drop";
+    let said = format!(
+        "- A CANCELLED of X before the drop: {not}; Y open as the connection dropped: {not}"
+    );
+    assert!(report.contains(&said), "{report}");
+    let two = &json["drop_tests"][0]["session_two"];
+    assert_eq!(
+        (&two["x_cancelled_before_drop"], &two["y_open_at_drop"]),
+        (&Value::Null, &Value::Null),
+        "{two}"
+    );
+    // A session that dropped measures both.
+    let d = dropped(QfexModel::default(), "drop-two-measured-at-drop").await;
+    let (report, json) = d.outputs();
+    let said = "- A CANCELLED of X before the drop: no; Y open as the connection dropped: yes";
+    assert!(report.contains(said), "{report}");
+    let two = &json["drop_tests"][0]["session_two"];
+    assert_eq!(
+        (&two["x_cancelled_before_drop"], &two["y_open_at_drop"]),
+        (&Value::Bool(false), &Value::Bool(true)),
+        "{two}"
+    );
+}
+
+/// A run on `model` whose verdict stops `judged` and whose read of every named account after the
+/// drop outranks it with `stop` ([`stage`]'s `outranks`): the run stops `stop`, after drop
+/// session two, its report saying the position is the owner's when `stop` is `NotFlat`.
+async fn outranked(model: QfexModel, what: &str, judged: places::Stop, stop: places::Stop) {
+    let d = dropped(model, what).await;
+    assert_eq!(d.verdict().stop(), Some(judged), "{:?}", d.verdict());
+    assert_stopped(&d, stop);
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    let after = format!("{} after drop session two", stop.name());
+    assert!(stopped.starts_with(&after), "{stopped}");
+    if stop == places::Stop::NotFlat {
+        let (report, _) = d.outputs();
+        assert!(report.contains(places::OWNERS_POSITION), "{report}");
+    }
+}
+
+#[tokio::test]
+async fn an_order_not_ours_the_reads_after_a_failed_drop_test_list_outranks_drop_failed() {
+    // PR #273's second review: the read of every named account after the drop outranks a
+    // verdict's stop that comes after its own in the verdict's order. An order not ours it lists
+    // outranks a test that only did not pass (Y not on historic-orders).
+    let model = QfexModel {
+        historic_omits_last: true,
+        after_drop_historic: Some(model::AfterHistoric::Foreign),
+        ..QfexModel::default()
+    };
+    let (judged, stop) = (places::Stop::DropFailed, places::Stop::ReadDisagrees);
+    outranked(model, "drop-two-rank-foreign", judged, stop).await;
+}
+
+#[tokio::test]
+async fn a_position_the_reads_after_the_drop_show_outranks_an_arm_cancel_unreported() {
+    // A position the read of every named account after the drop shows outranks an arm-time
+    // cancel QFEX did not report, the position then the owner's (0151 item 9).
+    let model = QfexModel {
+        arm_cancels_open: model::ArmCancels::Silent,
+        after_drop_historic: Some(model::AfterHistoric::Position),
+        ..QfexModel::default()
+    };
+    let (judged, stop) = (places::Stop::ArmCancelUnreported, places::Stop::NotFlat);
+    outranked(model, "drop-two-rank-silent", judged, stop).await;
+}
+
+#[tokio::test]
+async fn a_position_the_reads_after_the_drop_show_outranks_an_order_not_ours_after_it() {
+    // PR #273's second review, its P3 on the stops' order: a position the read of every named
+    // account after the drop shows outranks an order not ours the reads after the drop listed,
+    // as NotFlat comes before ReadDisagrees in the verdict's own order (0151 item 9).
+    let model = QfexModel {
+        foreign_on_drop: true,
+        after_drop_historic: Some(model::AfterHistoric::Position),
+        ..QfexModel::default()
+    };
+    let (judged, stop) = (places::Stop::ReadDisagrees, places::Stop::NotFlat);
+    outranked(model, "drop-two-rank-not-flat", judged, stop).await;
+}
+
+#[tokio::test]
+async fn a_fill_a_trades_page_names_before_a_refusal_is_said_the_owner_s_position() {
+    // PR #273's second review: on pages of one, X fills as a maker as its trades are first asked
+    // after the drop, that page naming it, and the next page is refused by a provider rate
+    // refusal. The refusal is the run's stop (decision 0148 item 8), but the fill is still the
+    // owner's position (0151 item 9), and the report says so beside the stop.
+    let model = QfexModel {
+        fill_on_trades_page: Some(1),
+        rate_limit: Some(model::Limited::TradesPage(2)),
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-two-fill-then-refused", |argv| {
+        set(argv, "--page-size", "1")
+    })
+    .await;
+    let on = places::RefusedOn::ReadSocket;
+    assert_stopped(&d, places::Stop::RateRefused { on });
+    let verdict = d.verdict();
+    let x = verdict::Which::X;
+    assert!(
+        verdict.failures.contains(&verdict::Failure::Traded(x)),
+        "{verdict:?}"
+    );
+    let (report, _) = d.outputs();
+    assert!(report.contains(places::OWNERS_POSITION_BESIDE), "{report}");
+    assert!(!report.contains(places::OWNERS_POSITION), "{report}");
+}
+
+#[tokio::test]
+async fn a_refusal_after_the_trades_were_read_whole_leaves_them_read_whole() {
+    // PR #273's second review: X's and Y's trades after the drop are read whole, then the first
+    // GET /user/historic-orders is answered HTTP 429. The refusal is a failure, and the run's
+    // stop, of its own; it does not make the trades not read whole.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::HistoricAfterDrop),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-two-historic-refused").await;
+    let on = places::RefusedOn::Rest;
+    assert_stopped(&d, places::Stop::RateRefused { on });
+    let after = d.two().after.as_ref().expect("X and Y were read");
+    assert!(after.trades_whole && !after.historic_whole, "{after:?}");
+    let verdict = d.verdict();
+    use verdict::Failure::{HistoricNotRead, RateRefused, TradesNotRead};
+    assert_eq!(
+        verdict.failures,
+        [RateRefused, HistoricNotRead],
+        "{verdict:?}"
+    );
+    assert!(!verdict.failures.contains(&TradesNotRead));
+}
+
+#[tokio::test]
+async fn x_s_status_read_whole_after_drop_session_one_and_not_listed_is_said_not_listed() {
+    // PR #273's second review: X's GET /user/historic-orders after drop session one is read
+    // whole and names no terminal status of X, and an order not ours then stops the run before
+    // drop session two. The report says X's status was not listed, apart from Y's, never read.
+    let model = QfexModel {
+        foreign_after_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-one-x-not-listed").await;
+    assert_stopped(&d, places::Stop::ReadDisagrees);
+    let run = d.drop_run();
+    assert!(run.two.is_none(), "{run:?}");
+    let after = run.after.as_ref().expect("X was read");
+    assert_eq!(
+        (after.error.as_ref(), after.terminal_status.as_ref()),
+        (None, None)
+    );
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains("- terminal_status on GET /user/historic-orders: X not listed; Y not read"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn the_other_accounts_cleanness_is_not_known_when_a_read_of_one_failed() {
+    // PR #273's second review: the subaccount's GET /user/positions fails after drop session one
+    // and again before drop session two, so the run stops LeftResting, every read of it made
+    // having been clean. Whether it stayed clean is not known, not yes.
+    let model = QfexModel {
+        rest_fails: vec![2, 4],
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-others-unread").await;
+    assert_marked(&d, places::Stop::LeftResting);
+    let run = d.drop_run();
+    assert_eq!(run.others_clean, places::OthersClean::NotKnown, "{run:?}");
+    let (report, json) = d.outputs();
+    let said = "- Whether the other named accounts stayed clean: not known: every read of another \
+                named account made was clean, but one could not be made";
+    assert!(report.contains(said), "{report}");
+    assert_eq!(json["drop_tests"][0]["others_clean"], "not known");
 }
