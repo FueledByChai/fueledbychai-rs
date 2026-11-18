@@ -522,18 +522,44 @@ fn a_reply_the_codec_refuses_fails_naming_its_position_and_kind_never_its_bytes(
     );
 }
 
+/// Holds `setup`'s Debug to showing its bootstrap's replies as `kinds` and nothing more of
+/// them: the bootstrap's own Debug is exactly those kinds, and the Setup's Debug is the same
+/// Setup's with no bootstrap, but for that one field. So no byte of a reply (the login's body,
+/// [`LOGIN`]'s `900`, or the token the acknowledgement echoes) reaches it, whatever the rest
+/// of the Setup shows: its `venue_order_ids` is shown as an address, which changes from run
+/// to run and once held `900` (FBC-4qot), and both formats here show the same one.
+fn shows_replies_by_kind_only(mut setup: Setup, kinds: &str) {
+    let shown = format!("{setup:?}");
+    let bootstrap = format!("{:?}", setup.bootstrap);
+    assert_eq!(
+        bootstrap,
+        format!("Some(Bootstrap {{ replies: [{kinds}] }})")
+    );
+    setup.bootstrap = None;
+    let without = format!("{setup:?}");
+    assert_eq!(without.matches("bootstrap: None").count(), 1, "{without}");
+    let with = without.replacen("bootstrap: None", &format!("bootstrap: {bootstrap}"), 1);
+    assert_eq!(shown, with);
+    assert!(!shown.contains(TOY_TOKEN), "{shown}");
+}
+
 #[test]
 fn a_bootstrap_shows_its_replies_by_kind_only() {
-    let setup = by_login();
-    let shown = format!("{setup:?}");
-    assert!(
-        shown.contains("replies: [HTTP response, text frame]"),
-        "{shown}"
-    );
-    assert!(!shown.contains(TOY_TOKEN), "{shown}");
-    assert!(!shown.contains("900"), "{shown}");
+    shows_replies_by_kind_only(by_login(), "HTTP response, text frame");
     let binary = format!("{:?}", BootReply::Binary(vec![1]));
     assert_eq!(binary, "binary frame");
+}
+
+#[test]
+fn a_setup_showing_900_outside_its_bootstrap_still_shows_its_replies_by_kind_only() {
+    // FBC-4qot: the stream number stands for an address holding 900 (CI's 0x626bcd390010),
+    // which a test cannot choose; a check that looked for 900 in the whole Setup failed here.
+    let setup = Setup {
+        exec_stream: StreamId(900),
+        ..by_login()
+    };
+    assert!(format!("{setup:?}").contains("StreamId(900)"));
+    shows_replies_by_kind_only(setup, "HTTP response, text frame");
 }
 
 #[test]
