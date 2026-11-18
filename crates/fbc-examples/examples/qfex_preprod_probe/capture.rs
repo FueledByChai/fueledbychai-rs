@@ -105,6 +105,16 @@ pub struct AccountRead {
     /// The `open_orders` GET /user/positions counts on symbols other than the admitted order's,
     /// when the page listed it ([`AccountRead::of`]): none otherwise.
     pub rest_open_elsewhere: u64,
+    /// How many of the page's orders are none of the orders the read knows
+    /// ([`AllowedOrder::unknown`]): the reads after a drop session know the drop test's orders on
+    /// their account, X and then Y, so one of these is an order the streams did not show
+    /// (decision 0148 item 8, FBC-77r8's review). Every other read knows none, so it counts every
+    /// order its page lists, and judges them by [`AccountRead::refusal`] alone. It counts the
+    /// one page the read makes: an order on a later page of a full one, or one no page lists and
+    /// REST's `open_orders` alone counts (a stop order), is not counted, since that count does
+    /// not tell it from ours. A read after a drop session then shows it as an order resting
+    /// ([`Stop::LeftResting`](crate::places::Stop::LeftResting), marked), not as one unknown.
+    pub page_unknown: usize,
 }
 
 impl AccountRead {
@@ -218,6 +228,14 @@ impl AllowedOrder {
         allowed
             .filter(|a| a.account == account)
             .is_some_and(listing)
+    }
+
+    /// How many of `orders`, a page of `account`'s, are named by none of `known`
+    /// ([`AllowedOrder::names`]) that is on `account` ([`AccountRead::page_unknown`]).
+    pub fn unknown(known: &[&AllowedOrder], account: Armed, orders: &[PageOrder]) -> usize {
+        let mine = || known.iter().filter(|a| a.account == account);
+        let named = |o: &&PageOrder| mine().any(|a| a.names(&o.order, &o.client));
+        orders.iter().filter(|o| !named(o)).count()
     }
 
     /// How many of `orders`, a page of `account`'s, are it ([`AccountRead::page_allowed`]): none

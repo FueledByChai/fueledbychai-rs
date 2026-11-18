@@ -934,7 +934,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     refusal (one kept whole included) or a Ctrl-C during them a stop, a trade naming X in them
     `NotFlat` (a fill seen with no session open, 0151 item 9), and X's trades or historic-orders not
     read whole `LeftResting`, X left unjudged, then a failure of drop session one that was no stop,
-    kept as the session's error, with `LeftResting` marked when an order of ours rests. Drop session
+    kept as the session's error, with `ReadDisagrees` marked for an order none of ours or a TWAP,
+    else `LeftResting` when an order of ours rests or X's account could not be read. Drop session
     two (FBC-77r8): every named account read again, admitting X alone (`Run::read_before_two`, a
     refusal kept whole on its sockets a stop); a session on the same `Link` and registry, seeded
     nothing and not Started again (its market armed from drop session one), whose handler watches
@@ -942,9 +943,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     (`Run::place_resting`, held to `market::caps_admit` at its own touch); Y's ACK or its deadline;
     the read before the drop, one never-arming read beside the session, a `CANCELLED` naming X heard
     by its end recorded as the arm's, reported (`tee::Kept::cancelled_of_from`), and a stop or a
-    press met as its socket closes taken before the drop; then the abrupt drop, the session's run
-    dropped unpolled and its connection with it, no WebSocket close (`stage::DROPPED`), the capture
-    taking the session's end as its close (`capture.rs`), with what the session showed as it dropped
+    press met as its socket closes taken before the drop; then that read not made a stop,
+    `LeftResting`, and that read showing an order or a TWAP neither X nor Y (`verdict::others`) or
+    a position the registry does not hold a stop, `ReadDisagrees` (0148 item 8), each before the
+    drop and cancelling nothing; then the abrupt drop, the session's run dropped unpolled and its
+    connection with it, no WebSocket close (`stage::DROPPED`), the capture taking the session's
+    end as its close (`capture.rs`), with what the session showed as it dropped
     (`Run::at_drop`: a `CANCELLED` of X heard, which leaves the drop's reach over X not measured,
     and Y still open in the registry with no `CANCELLED` of it, which the verdict needs,
     `YEndedBeforeDrop` otherwise, and Y listed by the read before the drop, made after Y's ACK,
@@ -957,7 +961,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     both (`Run::read_orders`, the member names a trades row carries kept as names alone), the
     verdict (`verdict::DropVerdict`, per account, in memory, never
     carried to another account or run; a row since X's send naming another order or none fails
-    it, and X's absence, before the drop or after it, counts as the arm's or the drop's cancel
+    it, and so does an order or a TWAP neither X nor Y on any read after the drop
+    (`verdict::Failure::OtherOrder`, `ReadDisagrees`); a fill or a status a page showed counts
+    though a later page failed (`verdict::Facts::traded_seen`, `terminal_seen`); and X's absence,
+    before the drop or after it, counts as the arm's or the drop's cancel
     only as `places::close_verdict` counts it, the trades read whole, no row naming X or another
     order or none, the position flat, and otherwise is not measured, its reason given,
     `verdict::Unmeasured`, 0132 item 4), then the read of every named account. From the first arm to
@@ -973,15 +980,22 @@ holds two of them for one pull request. The rules after the three roles bind all
     owner's hand cancel: a stop of either session; `NotFlat` on a position after a session or a
     trade naming X after drop session one; `DropFailed` for a trade naming another order or none
     after drop session one, Y never placed; `LeftResting` for X's trades or historic-orders not read
-    whole after drop session one; a failure of drop session one that is no stop, with `LeftResting`
-    added when an order of ours rests; a stop of the read before drop session two; a failure of drop
-    session two that is no stop, with X's trades, and Y's once submitted, read after the account
-    reads, and `LeftResting` or `NotFlat` added when those reads show an order resting, a position
-    or a trade naming X or Y (`stage::read_stop`); the verdict's (`DropFailed`,
+    whole after drop session one; a failure of drop session one that is no stop, with
+    `ReadDisagrees` added when its reads show an order none of ours or a TWAP, else `LeftResting`
+    when an order of ours rests or X's account could not be read; a stop of the read before drop
+    session two; a failure of drop session two that is no stop, with X's trades, and Y's once
+    submitted, read after the account reads, and `NotFlat`, `ReadDisagrees` or `LeftResting` added
+    when those reads show a position or a trade naming X or Y, an order none of the drop test's or
+    a TWAP, or an order resting (`stage::after_stop`, after `stage::read_stop`'s refusal and
+    Ctrl-C), or else `LeftResting` when X's account was not read; the verdict's (`DropFailed`,
     `ArmCancelUnreported` recorded and stopped on after the drop, `UnexpectedFill` for a trades row
-    naming X or Y, the run not flat and the position the owner's, 0151 item 9, or a provider
-    refusal); or `LeftResting` after drop session two. A failed drop test is a stop, so nothing more
-    is placed on its account or any other. With none, the run ends after the last account's drop
+    naming X or Y, the run not flat and the position the owner's, 0151 item 9, said so beside a
+    provider refusal that came first, `ReadDisagrees` for an order or a TWAP not ours after the
+    drop, or a provider refusal), but the read of every named account after the drop outranking a
+    stop after its own in the verdict's order (`stage::outranks`: `NotFlat` over `ReadDisagrees`,
+    `ArmCancelUnreported` and `DropFailed`, `ReadDisagrees` over the last two); or `ReadDisagrees`
+    or `LeftResting` after drop session two. A failed drop test is a stop, so nothing more is
+    placed on its account or any other. With none, the run ends after the last account's drop
     test, its line naming FBC-su9i, which builds stage two. The report and the evidence (`"ticket"`
     FBC-9sk2) give each named account's drop test (what answered each arm, whether enabling cancels
     open orders and whether QFEX reports it, the verdict, the drop's reach over X, whether a
@@ -991,13 +1005,16 @@ holds two of them for one pull request. The rules after the three roles bind all
     listing it; X absent counted cancelled only after a graceful close with no stop that cancels
     before it, X resting as it was sent, X's account flat and X's trades since its send read whole
     with no row since then, 0132 item 4, and otherwise not measured, its reason given
-    (`places::close_verdict`); whether the other named accounts stayed clean, each order's
+    (`places::close_verdict`); whether the other named accounts stayed clean
+    (`places::OthersClean`, not known when a read of one could not be made), each order's
     historic-orders `terminal_status`, the members a trades row carries, what followed; then each
     session: each frame's client-id echo as a verdict, whether `add_order` went out as encoded,
-    the stop's cancels, each comparison, the reads before and after the drop), the place
-    registries, each
-    session's and read socket's refusals (`refusals.rs`, a session named by `SessionRun::label` on
-    each named account, counted together, the reads after the drop under `AFTER_DROP_TWO`) and its
+    the stop's cancels, each comparison, the reads before and after the drop, what the session
+    showed of X and Y as it dropped, not measured when it did not reach its drop, and whether X
+    rested when the run ended, from the read of X's account after drop session two once that
+    session was built: resting, absent, or not known), the place registries, each session's and
+    read socket's refusals (`refusals.rs`, a session named by `SessionRun::label` on each named
+    account, counted together, the reads after the drop under `AFTER_DROP_TWO`) and its
     resync's full pages, read on the traded spec (`pages::rows_on`); its slice is
     `drop-production/`, both sessions of each account's drop test, scrubbed by `Scrub::Places`, with
     a README of its own. Held in `tests/qfex_preprod_probe/place_stages.rs` and `compare_reads.rs`,
@@ -1022,10 +1039,16 @@ holds two of them for one pull request. The rules after the three roles bind all
     `crossed_on_place` (a crossed touch pushed on the MDS), `touch_moves_at_arm` (the touch moved
     at a later arm), `stop_order_after_close` (an open order REST counts and no page lists, once
     a session on an account the model placed nothing on ended), `fill_on_trades_page` (X filled as
-    a later `get_user_trades` page is asked) and `Limited::RestAfterDrop`, all
-    declared by path; three paths no flag or answer reaches, X spent from its list, X not priced
-    and the journal past its soft limit, are a test's `probe_args::TestHooks`, compiled into the
-    test binary alone. The
+    a later `get_user_trades` page is asked), `Limited::RestAfterDrop`, `Limited::TradesPage` (a
+    later `get_user_trades` page refused), `Limited::HistoricAfterDrop` (the first historic-orders
+    read after a drop refused), `foreign_order_on` (an order no run placed beside a later place),
+    `position_on_place_on` (a position moved with a later place), `foreign_on_drop` (one left as a
+    connection drops), `twap_after_close` (a TWAP listed once a connection ended) and
+    `after_drop_historic` (a position, an order not ours or a TWAP once the first historic-orders
+    read after a drop is answered), all declared by path; four paths no flag or answer reaches, X
+    spent from its list, X not priced, a session failing after its order's answer and the journal
+    past its soft limit, are a test's `probe_args::TestHooks`, compiled into the test binary
+    alone. The
     probe's credentials come from the environment through `src/auth_qfex.rs`, a review path,
     which also hands each signed read to the connector; the probe reuses
     `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs` (the caps'

@@ -412,6 +412,10 @@ pub struct TestHooks {
     /// X not priced once the market armed, so drop session one fails with no stop
     /// (`stage::Halt::Error`), its reads after it made as after any session.
     pub x_unpriced: bool,
+    /// The drop test's `n`th order, from 0 (X, then Y), answered, and then its session fails
+    /// with no stop (`stage::Halt::Error`), that order left resting: a failure after a place,
+    /// which no answer of the QFEX model makes (FBC-77r8's review).
+    pub fail_after_place: Option<usize>,
 }
 
 /// What `--reconciled` declares the owner did by hand after an earlier place-stage run's stop

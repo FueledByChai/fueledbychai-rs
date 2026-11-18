@@ -17,34 +17,39 @@
 //!   neither X nor Y or the wait ends. A read still running at that end sends nothing more
 //!   ([`Reader::until`]) and is not judged ([`Shown::Unfinished`]), though the answer to what it
 //!   already sent is still read, so a provider rate refusal in it is heard. A provider rate
-//!   refusal ends them at once (decision 0148 item 8).
-//! - **The verdict** ([`DropVerdict::judge`]): the drop test passes only when Y rested before
-//!   the drop, was still open as the connection dropped and was listed by the read before the
-//!   drop (made after Y's `ACK`, so a `CANCELLED` of Y still on its way is no pass), the last
-//!   read after it lists neither X nor Y and shows the position flat, every
-//!   `get_user_trades` page since X's send was read and no row there names X, Y, another order or
-//!   none (nothing else trades on the account, decision 0132 item 4), and `GET
-//!   /user/historic-orders` lists both (0151 item 13), and no provider rate refusal cut its reads
-//!   short (decision 0148 item 8). Beside it, the drop's reach over X, an order of an earlier
-//!   connection: measured only when the read before the drop listed X and no `CANCELLED` of X
-//!   came in drop session two before the drop, so a cancel the arm or QFEX made is never
-//!   credited to the drop, and otherwise recorded as not measured, never failed; and what the
-//!   arm did to X: not measured when X was not open as drop session two armed (whatever ended
-//!   it: the report gives whether drop session one's graceful close did,
-//!   [`crate::places::close_verdict`]), and otherwise reported cancelled (a `CANCELLED` of X in
-//!   the arm's window, which ends with the read before the drop), survived, or cancelled with no
+//!   refusal ends them at once (decision 0148 item 8). Whether any read made lists an order or
+//!   a TWAP that is neither X nor Y is kept ([`AfterDrop::others`], [`others`]).
+//! - **The verdict** ([`DropVerdict::judge`]): the drop test passes only when Y rested before the
+//!   drop, was still open as the connection dropped and was listed by the read before the drop
+//!   (made after Y's `ACK`, so a `CANCELLED` of Y still on its way is no pass), the last read after
+//!   it lists neither X nor Y and shows the position flat, every `get_user_trades` page since X's
+//!   send was read and no row there names X, Y, another order or none (nothing else trades on the
+//!   account, decision 0132 item 4), no read after it lists an order or a TWAP that is neither, and
+//!   `GET /user/historic-orders` lists both (0151 item 13), and no provider rate refusal cut its
+//!   reads short (decision 0148 item 8). A row a page read showed counts whether or not every page
+//!   was read: a fill or a status a page showed is not erased by a later page that failed
+//!   ([`Facts::traded_seen`], [`Facts::terminal_seen`]). Beside it, the drop's reach over X, an
+//!   order of an earlier connection: measured only when the read before the drop listed X and no
+//!   `CANCELLED` of X came in drop session two before the drop, so a cancel the arm or QFEX made is
+//!   never credited to the drop, and otherwise recorded as not measured, never failed; and what the
+//!   arm did to X: not measured when X was not open as drop session two armed (whatever ended it:
+//!   the report gives whether drop session one's graceful close did,
+//!   [`crate::places::close_verdict`]), and otherwise reported cancelled (a `CANCELLED` of X in the
+//!   arm's window, which ends with the read before the drop), survived, or cancelled with no
 //!   report. X's absence counts as a cancel, the drop's or the arm's, only as
-//!   [`crate::places::close_verdict`] counts it after drop session one (decision 0132 item 4):
-//!   the trades since X's send read whole, no row naming X, none naming Y, another order or
-//!   none, and the position flat after the drop; otherwise it is not measured, its reason given
+//!   [`crate::places::close_verdict`] counts it after drop session one (decision 0132 item 4): the
+//!   trades since X's send read whole, no row naming X, none naming Y, another order or none, and
+//!   the position flat after the drop; otherwise it is not measured, its reason given
 //!   ([`Unmeasured`]).
 //! - **Its stop** ([`DropVerdict::stop`]): a provider rate refusal in the reads after the drop,
 //!   of the trades or of historic-orders stops the run as the refusal it is (decision 0148 item
 //!   8), as the reads after drop session one do; then a fill of X or Y a trades row shows stops
 //!   the run not flat, the position the owner's (0151 item 9), and so does a position the last
-//!   read shows; then an arm-time cancel QFEX did not report (decision 0132 item 4: recorded, and
-//!   stopped on after the drop); then a failed test (decision 0132 item 7). A failed drop test
-//!   places nothing more on its account, since the run stops.
+//!   read shows; then an order or a TWAP not ours a read after the drop listed
+//!   ([`Stop::ReadDisagrees`], decision 0148 item 8); then an arm-time cancel QFEX did not report
+//!   (decision 0132 item 4: recorded, and stopped on after the drop); then a failed test
+//!   (decision 0132 item 7). A failed drop test places nothing more on its account, since the run
+//!   stops.
 
 use std::time::Duration;
 
@@ -88,10 +93,12 @@ impl DropOrder {
     /// the read decodes it under our namespace. Either one is enough, so an order listed is
     /// never taken for absent.
     pub fn listed_in(&self, read: &compare::Read) -> bool {
-        let by = |l: &compare::Listed| {
-            self.venue.as_ref() == Some(&l.order) || l.client == CidMatch::Ours(self.cid)
-        };
-        read.listed.iter().any(by)
+        read.listed.iter().any(|l| self.names(l))
+    }
+
+    /// Whether `listed`, one order a read listed, is it: by its venue id, or by its client id.
+    pub fn names(&self, listed: &compare::Listed) -> bool {
+        self.venue.as_ref() == Some(&listed.order) || listed.client == CidMatch::Ours(self.cid)
     }
 
     /// Whether the `get_user_trades` row `row` names it: by its client id's text, or by its
@@ -119,6 +126,13 @@ pub fn status_name(status: &str) -> String {
         true => status.to_owned(),
         false => "(not a status name)".to_owned(),
     }
+}
+
+/// How many orders and TWAPs `read` lists that are neither `x` nor `y`: what the streams did not
+/// show (decision 0148 item 8), as [`compare::judge`] counts an order not ours.
+pub fn others(read: &compare::Read, x: &DropOrder, y: &DropOrder) -> usize {
+    let theirs = read.listed.iter().filter(|l| !x.names(l) && !y.names(l));
+    theirs.count() + read.twaps
 }
 
 /// What one read after the drop showed: whether it listed X and Y, and whether the REST position
@@ -173,6 +187,9 @@ pub struct AfterDrop {
     /// From their start to the end of the first read listing neither X nor Y.
     pub absent_after: Option<Duration>,
     pub refused: Option<RefusedOn>,
+    /// Whether a read made, judged or not, listed an order or a TWAP that is neither X nor Y
+    /// ([`others`]): something the streams did not show, a stop (decision 0148 item 8).
+    pub others: bool,
 }
 
 /// The reads after the drop: `reader`'s reads at `cadence` (one at once, then each one interval
@@ -211,6 +228,11 @@ pub async fn until_absent<R: Reader>(
         // A read finished past the wait is not judged, so none is taken as listing neither after
         // it (0109, 0151 item 4); a provider rate refusal it heard still ends them.
         let late = Instant::now() > end;
+        // An order or a TWAP neither X nor Y, listed by a read finished late too: what a read
+        // showed is not erased by when it ended.
+        if let Attempt::Read(read) = &attempt {
+            after.others |= others(read, x, y) > 0;
+        }
         let shown = match attempt {
             Attempt::Cut => Shown::Unfinished,
             Attempt::Read(_) if late => Shown::Unfinished,
@@ -286,6 +308,10 @@ pub struct Facts {
     /// The `get_user_trades` rows since X's send naming X and naming Y; `None` when the trades
     /// were not read whole.
     pub traded: Option<[usize; 2]>,
+    /// The rows naming X and naming Y on the pages read, whole or not: a fill a page showed,
+    /// which a later page that failed does not erase (0151 item 9). Read only when
+    /// [`Facts::traded`] is `None`.
+    pub traded_seen: [usize; 2],
     /// The `get_user_trades` rows since X's send naming neither X nor Y, another order or none,
     /// on the pages read, whole or not: something else traded on the account (decision 0132
     /// item 4).
@@ -293,9 +319,24 @@ pub struct Facts {
     /// X's and Y's `terminal_status` on `GET /user/historic-orders`, each when a row names it;
     /// `None` when the pages were not read whole.
     pub historic: Option<[Option<String>; 2]>,
+    /// Each one's status on the pages read, whole or not: a row naming it shows it terminal
+    /// (0151 item 5) whether or not a later page failed. Read only when [`Facts::historic`] is
+    /// `None`.
+    pub terminal_seen: [Option<String>; 2],
+    /// Whether a read after the drop listed an order or a TWAP that is neither X nor Y
+    /// ([`AfterDrop::others`]).
+    pub others_after: bool,
     /// The provider rate refusal that ended the reads after the drop ([`AfterDrop::refused`]) or
     /// the reads of the trades or of historic-orders, if one did (decision 0148 item 8).
     pub refused: Option<RefusedOn>,
+}
+
+impl Facts {
+    /// The rows naming X and naming Y on every page read, whole or not ([`Facts::traded`], else
+    /// [`Facts::traded_seen`]).
+    fn naming(&self) -> [usize; 2] {
+        self.traded.unwrap_or(self.traded_seen)
+    }
 }
 
 /// What drop session two's arm did to X (decision 0132 item 4).
@@ -396,10 +437,11 @@ impl Unmeasured {
 /// X's after drop session one: a row naming X, then any other row, then the position, then the
 /// trades read whole.
 fn x_absence(facts: &Facts) -> Result<(), Unmeasured> {
-    if facts.traded.is_some_and(|[x, _]| x > 0) {
+    let [x, y] = facts.naming();
+    if x > 0 {
         return Err(Unmeasured::Traded);
     }
-    if facts.other_trades > 0 || facts.traded.is_some_and(|[_, y]| y > 0) {
+    if facts.other_trades > 0 || y > 0 {
         return Err(Unmeasured::OtherTrade);
     }
     match facts.after {
@@ -477,6 +519,10 @@ pub enum Failure {
     /// A `get_user_trades` row since X's send names another order or none: something else
     /// traded on the account (decision 0132 item 4).
     OtherTrade,
+    /// A read after the drop listed an order or a TWAP that is neither X nor Y: something else
+    /// trades on the account (decision 0132 item 4), which the streams did not show (decision
+    /// 0148 item 8).
+    OtherOrder,
     /// `GET /user/historic-orders` was not read whole.
     HistoricNotRead,
     /// No `GET /user/historic-orders` row names it (0151 item 13).
@@ -509,6 +555,9 @@ impl Failure {
             Failure::OtherTrade => "a get_user_trades row since X's send names another order or \
                                     none: something else traded on the account (decision 0132 \
                                     item 4)"
+                .to_owned(),
+            Failure::OtherOrder => "an order or a TWAP not ours listed by a read after the drop: \
+                                    something else trades on the account (decision 0132 item 4)"
                 .to_owned(),
             Failure::HistoricNotRead => "GET /user/historic-orders was not read whole".to_owned(),
             Failure::NotTerminal(o) => {
@@ -561,15 +610,15 @@ impl DropVerdict {
                 failures.extend((!last.flat).then_some(Failure::NotFlat));
             }
         }
-        match facts.traded {
-            None => failures.push(Failure::TradesNotRead),
-            Some([x, y]) => {
-                failures.extend((x > 0).then_some(Failure::Traded(Which::X)));
-                failures.extend((y > 0).then_some(Failure::Traded(Which::Y)));
-            }
-        }
+        // A row a page read names is a fill whether or not every page was read (0151 item 9).
+        failures.extend(facts.traded.is_none().then_some(Failure::TradesNotRead));
+        let [x, y] = facts.naming();
+        failures.extend((x > 0).then_some(Failure::Traded(Which::X)));
+        failures.extend((y > 0).then_some(Failure::Traded(Which::Y)));
         failures.extend((facts.other_trades > 0).then_some(Failure::OtherTrade));
-        let terminal = facts.historic.clone().unwrap_or_default();
+        failures.extend(facts.others_after.then_some(Failure::OtherOrder));
+        // And a row naming an order shows it terminal whether or not every page was read.
+        let terminal = (facts.historic.clone()).unwrap_or_else(|| facts.terminal_seen.clone());
         match &facts.historic {
             None => failures.push(Failure::HistoricNotRead),
             Some([x, y]) => {
@@ -620,10 +669,11 @@ impl DropVerdict {
     /// The stop it makes, the first that applies: a provider rate refusal in its reads
     /// ([`Stop::RateRefused`], decision 0148 item 8); a fill of X or Y shown by a trades row
     /// ([`Stop::UnexpectedFill`]) or a position the last read showed ([`Stop::NotFlat`]), either
-    /// leaving the run not flat with the position the owner's (0151 item 9); an arm-time cancel
-    /// QFEX did not report ([`Stop::ArmCancelUnreported`], decision 0132 item 4); then a test
-    /// that did not pass ([`Stop::DropFailed`], decision 0132 item 7). None when it passed with
-    /// none of them.
+    /// leaving the run not flat with the position the owner's (0151 item 9); an order or a TWAP
+    /// not ours a read after the drop listed ([`Stop::ReadDisagrees`], decision 0148 item 8); an
+    /// arm-time cancel QFEX did not report ([`Stop::ArmCancelUnreported`], decision 0132 item
+    /// 4); then a test that did not pass ([`Stop::DropFailed`], decision 0132 item 7). None when
+    /// it passed with none of them.
     pub fn stop(&self) -> Option<Stop> {
         if let Some(on) = self.refused {
             return Some(Stop::RateRefused { on });
@@ -634,6 +684,9 @@ impl DropVerdict {
         }
         if has(Failure::NotFlat) {
             return Some(Stop::NotFlat);
+        }
+        if has(Failure::OtherOrder) {
+            return Some(Stop::ReadDisagrees);
         }
         if self.arm == ArmCancel::Unreported {
             return Some(Stop::ArmCancelUnreported);
@@ -817,6 +870,7 @@ mod tests {
             other_trades: 0,
             historic: Some([Some("CANCELLED".to_owned()), Some("CANCELLED".to_owned())]),
             refused: None,
+            ..Facts::default()
         }
     }
 
@@ -1559,5 +1613,131 @@ mod tests {
         let after = until_absent(&mut reader, (&x, &y), CADENCE).await;
         assert_eq!(after.reads.len(), 2, "{after:?}");
         assert_eq!(start.elapsed(), Duration::from_millis(4_530));
+    }
+
+    #[test]
+    fn an_order_or_a_twap_neither_x_nor_y_is_counted_by_either_of_its_ids() {
+        // FBC-77r8's review (thread 4611183918): what a read lists that is neither X nor Y, by
+        // venue id or by client id, and every TWAP, is what the streams did not show.
+        let (x, y) = orders(None);
+        let ours = Read {
+            listed: vec![
+                listed(1, CidMatch::Unparseable),
+                listed(7, CidMatch::Ours(cid(2))),
+            ],
+            twaps: 0,
+            position: Decimal::ZERO,
+        };
+        assert_eq!(others(&ours, &x, &y), 0);
+        let theirs = Read {
+            listed: vec![
+                listed(1, CidMatch::Ours(cid(1))),
+                listed(9, CidMatch::Foreign(Namespace::new(3))),
+                listed(8, CidMatch::Ours(cid(3))),
+            ],
+            twaps: 1,
+            ..ours.clone()
+        };
+        assert_eq!(others(&theirs, &x, &y), 3);
+        let twap = Read { twaps: 1, ..ours };
+        assert_eq!(others(&twap, &x, &y), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_after_the_drop_listing_another_order_or_a_twap_is_kept_absent_or_not() {
+        // The first read lists X beside a TWAP, the second neither X nor Y: the reads end there,
+        // and the TWAP the first showed is kept.
+        let (x, y) = orders(Some(2));
+        let twap = Attempt::Read(Read {
+            listed: vec![listed(1, CidMatch::Unparseable)],
+            twaps: 1,
+            position: Decimal::ZERO,
+        });
+        let mut reader = played(vec![twap, read(&[], "0")]);
+        let after = until_absent(&mut reader, (&x, &y), CADENCE).await;
+        assert!(after.others && after.absent_after.is_some(), "{after:?}");
+        let mut reader = played(vec![read(&[1], "0"), read(&[], "0")]);
+        let after = until_absent(&mut reader, (&x, &y), CADENCE).await;
+        assert!(!after.others, "{after:?}");
+        let mut reader = played(vec![read(&[9], "0")]);
+        let after = until_absent(&mut reader, (&x, &y), CADENCE).await;
+        assert!(after.others && after.absent_after.is_some(), "{after:?}");
+    }
+
+    #[test]
+    fn a_row_a_page_showed_is_kept_when_a_later_page_failed() {
+        // FBC-77r8's review (thread 4611183910): a trades page named X, then a later page failed
+        // with no provider rate refusal. The fill stays a failure and the verdict's stop is
+        // UnexpectedFill, not DropFailed; a historic-orders row naming X shows it terminal though
+        // a later page failed, so the drop's reach over X is still shown when nothing else rules
+        // it out.
+        let unread = Facts {
+            traded: None,
+            traded_seen: [1, 0],
+            ..passing()
+        };
+        let verdict = DropVerdict::judge(&unread);
+        assert_eq!(
+            verdict.failures,
+            [Failure::TradesNotRead, Failure::Traded(Which::X)]
+        );
+        assert_eq!(verdict.reach, Reach::Unmeasured(Unmeasured::Traded));
+        assert_eq!(verdict.stop(), Some(Stop::UnexpectedFill));
+        let y = Facts {
+            traded_seen: [0, 1],
+            ..unread.clone()
+        };
+        assert_eq!(DropVerdict::judge(&y).stop(), Some(Stop::UnexpectedFill));
+        // Read whole, the whole read's counts are judged, not the part seen.
+        let whole = Facts {
+            traded: Some([0, 0]),
+            ..unread
+        };
+        assert!(DropVerdict::judge(&whole).passed);
+        let cancelled = Some("CANCELLED".to_owned());
+        let historic = Facts {
+            historic: None,
+            terminal_seen: [cancelled.clone(), None],
+            ..passing()
+        };
+        let verdict = DropVerdict::judge(&historic);
+        assert_eq!(verdict.failures, [Failure::HistoricNotRead]);
+        assert_eq!(verdict.terminal, [cancelled, None]);
+        assert_eq!(verdict.reach, Reach::Cancelled);
+        assert_eq!(verdict.stop(), Some(Stop::DropFailed));
+    }
+
+    #[test]
+    fn another_order_or_a_twap_after_the_drop_fails_the_test_read_disagrees() {
+        // FBC-77r8's review: an order or a TWAP neither X nor Y after the drop fails the test and
+        // stops the run ReadDisagrees (decision 0148 item 8), after a fill or a position and
+        // before an arm-time cancel QFEX did not report.
+        let others = Facts {
+            others_after: true,
+            ..passing()
+        };
+        let verdict = DropVerdict::judge(&others);
+        assert_eq!(verdict.failures, [Failure::OtherOrder]);
+        assert_eq!(verdict.stop(), Some(Stop::ReadDisagrees));
+        let unreported = Facts {
+            x_before_drop: Some(false),
+            ..others.clone()
+        };
+        let verdict = DropVerdict::judge(&unreported);
+        assert_eq!(verdict.arm, ArmCancel::Unreported);
+        assert_eq!(verdict.stop(), Some(Stop::ReadDisagrees));
+        let filled = Facts {
+            traded: Some([0, 1]),
+            ..others
+        };
+        assert_eq!(
+            DropVerdict::judge(&filled).stop(),
+            Some(Stop::UnexpectedFill)
+        );
+        assert_eq!(
+            Failure::OtherOrder.says(),
+            "an order or a TWAP not ours listed by a read after the drop: something else trades \
+             on the account (decision 0132 item 4)"
+        );
     }
 }

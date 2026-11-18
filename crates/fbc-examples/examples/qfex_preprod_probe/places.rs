@@ -1079,11 +1079,17 @@ pub struct TwoRun {
     pub x_cancelled_before_drop: bool,
     /// Whether Y was still open in the registry as the connection dropped, with no `CANCELLED`
     /// of it heard in the session: the drop then had Y of its own to cancel (0151 item 13).
+    /// Both are measured only once the session reached its drop: before it, each stays false,
+    /// which the report and the evidence say is not measured.
     pub y_open_at_drop: bool,
     pub y: XRun,
     /// What the read before the drop listed, X then Y, on a socket that never arms; `None` when
     /// it was not made.
     pub before_drop: Option<[bool; 2]>,
+    /// Whether that read showed what the streams did not: an order or a TWAP that is neither X
+    /// nor Y, or a position the registry does not hold, a stop before the drop (decision 0148
+    /// item 8, FBC-77r8's review).
+    pub before_drop_disagrees: bool,
     /// The stop's cancels, when a stop that cancels in a drop session came (0151 item 2).
     pub cancels: Option<Cancels>,
     /// Each comparison of the streams with the reads: after the stop's cancels alone.
@@ -1101,6 +1107,12 @@ pub struct TwoRun {
     pub resting: bool,
     /// Whether the account was read after the session.
     pub read: bool,
+    /// Whether that read of X's account listed X, by its venue id once known: X resting when the
+    /// run ended, for the owner's hand cancel (decision 0132 item 7).
+    pub x_resting: bool,
+    /// Whether X's account was read after the session on a page that listed X or was its last,
+    /// so [`TwoRun::x_resting`] is known.
+    pub x_read: bool,
     /// Why the session could not run its course, when that was no stop: never an id or value.
     pub error: Option<String>,
     /// How QFEX gave back our client id on the session, frame by frame ([`DropRun::echoes`]).
@@ -1162,10 +1174,50 @@ pub struct DropRun {
     /// 0151 item 13).
     pub verdict: Option<crate::verdict::DropVerdict>,
     /// Whether every read of the other named accounts during this drop test was clean (no open
-    /// order, no TWAP, flat); `None` when the configuration names no other account.
-    pub others_clean: Option<bool>,
+    /// order, no TWAP, flat), as [`OthersClean`] says.
+    pub others_clean: OthersClean,
     /// The run's stop, by name, when one came during this drop test: nothing more is placed.
     pub stop: Option<&'static str>,
+}
+
+/// Whether the other named accounts stayed clean through a drop test (FBC-77r8), from the reads
+/// of them made and those that could not be.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum OthersClean {
+    /// The configuration names no other account.
+    #[default]
+    NoneNamed,
+    /// Every read of them was made, and each was clean.
+    Clean,
+    /// A read of one was not clean.
+    NotClean,
+    /// Every read made was clean, but a read of one could not be made, so whether they stayed
+    /// clean is not known (FBC-77r8's review).
+    NotKnown,
+}
+
+impl OthersClean {
+    /// It, from `clean`, whether every read made was clean (`None` when no other account is
+    /// named, as `stage::others_clean` gives it), and whether a read of one could not be made.
+    pub fn of(clean: Option<bool>, unread: bool) -> OthersClean {
+        match (clean, unread) {
+            (None, _) => OthersClean::NoneNamed,
+            (Some(false), _) => OthersClean::NotClean,
+            (Some(true), true) => OthersClean::NotKnown,
+            (Some(true), false) => OthersClean::Clean,
+        }
+    }
+
+    /// As the evidence keeps it: `true` or `false`, `null` when no other account is named, and
+    /// `"not known"`.
+    fn to_json(self) -> Value {
+        match self {
+            OthersClean::NoneNamed => Value::Null,
+            OthersClean::Clean => Value::Bool(true),
+            OthersClean::NotClean => Value::Bool(false),
+            OthersClean::NotKnown => Value::String("not known".to_owned()),
+        }
+    }
 }
 
 /// Why the graceful close's cancel of X was not measured ([`close_verdict`]).
@@ -1361,6 +1413,12 @@ pub const LAST_ACCOUNT: &str = "the run's end: stage two is not built yet (FBC-s
 pub const OWNERS_POSITION: &str = "the run stops not flat, and the position is the owner's \
      (0151 item 9)";
 
+/// What the report says of a fill a trades row after the drop names when the run stopped on a
+/// stop before it in the verdict's order, a provider rate refusal (0151 item 9, decision 0148
+/// item 8).
+pub const OWNERS_POSITION_BESIDE: &str = "a get_user_trades row names X or Y, so the position \
+     is the owner's (0151 item 9), though the run stopped first on the stop below";
+
 fn yn(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
@@ -1394,23 +1452,47 @@ pub fn drop_markdown(s: &mut String, run: &DropRun, last: bool) {
         || "not measured: the drop test ended before its drop".to_owned(),
         |v| v.reach.says(),
     );
+    // A trades row naming X or Y is a fill of ours whatever stop came first (0151 item 9), so
+    // the position is said to be the owner's from the verdict's failures, not from the stop's
+    // name alone (FBC-77r8's review).
+    let traded = run.verdict.as_ref().is_some_and(|v| {
+        (v.failures.iter()).any(|f| matches!(f, crate::verdict::Failure::Traded(_)))
+    });
     let fill = match run.stop {
         Some("UnexpectedFill" | "NotFlat") if run.verdict.is_some() => {
             format!("; {OWNERS_POSITION}")
         }
+        _ if traded => format!("; {OWNERS_POSITION_BESIDE}"),
         _ => String::new(),
     };
     let others = match run.others_clean {
-        None => "no other account is named",
-        Some(true) => "yes: every read of every other named account was clean",
-        Some(false) => "no: a read of another named account was not clean (the reads below)",
+        OthersClean::NoneNamed => "no other account is named",
+        OthersClean::Clean => "yes: every read of every other named account was clean",
+        OthersClean::NotClean => {
+            "no: a read of another named account was not clean (the reads below)"
+        }
+        OthersClean::NotKnown => {
+            "not known: every read of another named account made was clean, but one could not \
+             be made (the errors below)"
+        }
     };
+    // A status any read showed; otherwise "not listed" only when the last read of
+    // historic-orders that could list it was read whole, and "not read" when it was not, or
+    // none was made (FBC-77r8's review): Y only after drop session two, X after either session.
     let terminal = |n: usize| {
         let after = two.and_then(|t| t.after.as_ref());
         let status = after.and_then(|a| a.terminal.get(n).cloned().flatten());
         let one = run.after.as_ref().and_then(|a| a.terminal_status.clone());
         let status = if n == 0 { status.or(one) } else { status };
-        status.unwrap_or_else(|| "not listed".to_owned())
+        let whole = match (after, n) {
+            (Some(a), _) => a.historic_whole,
+            (None, 0) => run.after.as_ref().is_some_and(|a| a.error.is_none()),
+            (None, _) => false,
+        };
+        status.unwrap_or_else(|| match whole {
+            true => "not listed".to_owned(),
+            false => "not read".to_owned(),
+        })
     };
     let mut fields: Vec<&str> = Vec::new();
     let read = run.after.iter().flat_map(|a| a.fields.iter());
@@ -1594,24 +1676,42 @@ fn one_markdown(s: &mut String, run: &DropRun) {
         cancels_said(run.cancels.as_ref()),
         run.ended_by.unwrap_or("it did not open"),
         close_said(run),
-        match (run.x_resting, run.x.submitted, run.x_read) {
-            (true, _, _) if run.two.is_some() => {
-                "no: X rested after drop session one, and drop session two's drop followed, \
-                 whose reads show it (below)"
-            }
-            (true, _, _) => HAND_CANCEL,
-            (false, false, _) => "no: X was not placed",
-            (false, true, true) => "no",
-            (false, true, false) => {
-                "not known: the account was not read after the session; read it on QFEX's \
-                 site before the next run"
-            }
-        },
+        x_at_end(run),
         echoes_said(&run.echoes),
         run.as_encoded.map_or("none sent", yn),
         run.error.as_deref().unwrap_or("none"),
     );
     compared_markdown(s, &run.compared);
+}
+
+/// Whether X rested when the run ended, as the report says it: from the read of X's account
+/// after drop session two once that session was built, and otherwise after drop session one;
+/// never from a session having been built (FBC-77r8's review).
+fn x_at_end(run: &DropRun) -> String {
+    if let Some(two) = &run.two {
+        return match (two.x_resting, two.x_read) {
+            (true, _) => format!(
+                "yes, shown by the read of X's account after drop session two: {HAND_CANCEL}"
+            ),
+            (false, true) => {
+                "no: the read of X's account after drop session two no longer listed it".to_owned()
+            }
+            (false, false) => "not known: X's account was not read after drop session two, or \
+                               its page was full and did not list X; read it on QFEX's site \
+                               before the next run"
+                .to_owned(),
+        };
+    }
+    match (run.x_resting, run.x.submitted, run.x_read) {
+        (true, _, _) => HAND_CANCEL,
+        (false, false, _) => "no: X was not placed",
+        (false, true, true) => "no",
+        (false, true, false) => {
+            "not known: the account was not read after the session; read it on QFEX's site \
+             before the next run"
+        }
+    }
+    .to_owned()
 }
 
 /// The report's section on drop session two (FBC-77r8).
@@ -1622,7 +1722,17 @@ fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
         None => "not read",
     };
     let before_drop = match two.before_drop {
-        Some([x, y]) => format!("X listed {}; Y listed {}", yn(x), yn(y)),
+        Some([x, y]) => format!(
+            "X listed {}; Y listed {}{}",
+            yn(x),
+            yn(y),
+            match two.before_drop_disagrees {
+                true =>
+                    "; it showed an order, a TWAP or a position the streams did not, a stop \
+                         before the drop (decision 0148 item 8)",
+                false => "",
+            }
+        ),
         None => "not made".to_owned(),
     };
     let after_drop = match &two.after_drop {
@@ -1659,6 +1769,13 @@ fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
                 .as_ref()
                 .map_or(String::new(), |e| format!("; not read whole: {e}"))
         ),
+    };
+    // What the session showed of X and Y as it dropped, measured only once it reached its drop
+    // (FBC-77r8's review).
+    let dropped = two.ended_by == Some(crate::stage::DROPPED);
+    let at_drop = |b: bool| match dropped {
+        true => yn(b),
+        false => "not measured: the session did not reach its drop",
     };
     let resting = match (two.resting, two.read) {
         (true, _) => HAND_CANCEL_ORDERS,
@@ -1697,8 +1814,8 @@ fn two_markdown(s: &mut String, run: &DropRun, two: &TwoRun) {
         yn(two.resynced),
         yn(two.x_cancel_reported),
         placed_said(&two.y),
-        yn(two.x_cancelled_before_drop),
-        yn(two.y_open_at_drop),
+        at_drop(two.x_cancelled_before_drop),
+        at_drop(two.y_open_at_drop),
         cancels_said(two.cancels.as_ref()),
         two.ended_by.unwrap_or("it did not open"),
         echoes_said(&two.echoes),
@@ -1760,7 +1877,7 @@ pub fn drop_to_json(run: &DropRun) -> Value {
     let two = run.two.as_ref().map(two_to_json);
     let verdict = run.verdict.as_ref().map(verdict_to_json);
     json!({"account": run.account, "session_one": one, "x_before_two": run.x_before_two,
-        "session_two": two, "verdict": verdict, "others_clean": run.others_clean,
+        "session_two": two, "verdict": verdict, "others_clean": run.others_clean.to_json(),
         "stop": run.stop})
 }
 
@@ -1768,12 +1885,15 @@ pub fn drop_to_json(run: &DropRun) -> Value {
 fn two_to_json(two: &TwoRun) -> Value {
     let ms = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
     let compared: Vec<Value> = two.compared.iter().map(compared_json).collect();
+    // Measured only once the session reached its drop: `null` otherwise.
+    let dropped = two.ended_by == Some(crate::stage::DROPPED);
     let after_drop = two.after_drop.as_ref().map(|a| {
         let reads: Vec<Value> = (a.reads.iter())
             .map(|(at, shown)| json!({"began_ms": ms(*at), "shown": format!("{shown:?}")}))
             .collect();
         json!({"reads": reads, "absent_after_ms": a.absent_after.map(ms),
-            "refused": a.refused.map(|on| Stop::RateRefused { on }.name())})
+            "refused": a.refused.map(|on| Stop::RateRefused { on }.name()),
+            "others": a.others})
     });
     let after = two.after.as_ref().map(|a| {
         json!({"trades": a.trades, "naming": a.naming, "terminal_status": a.terminal,
@@ -1782,12 +1902,14 @@ fn two_to_json(two: &TwoRun) -> Value {
     });
     json!({"authenticated": two.authenticated, "arm": two.arm, "resynced": two.resynced,
         "x_cancel_reported": two.x_cancel_reported,
-        "x_cancelled_before_drop": two.x_cancelled_before_drop,
-        "y_open_at_drop": two.y_open_at_drop, "y": placed_json(&two.y),
+        "x_cancelled_before_drop": dropped.then_some(two.x_cancelled_before_drop),
+        "y_open_at_drop": dropped.then_some(two.y_open_at_drop), "y": placed_json(&two.y),
         "before_drop": two.before_drop.map(|[x, y]| json!({"x_listed": x, "y_listed": y})),
+        "before_drop_disagrees": two.before_drop_disagrees,
         "cancels": cancels_json(two.cancels.as_ref()), "compared": compared,
         "ended_by": two.ended_by, "after_drop": after_drop, "after": after,
         "resting": two.resting, "read_after": two.read,
+        "x_resting": two.x_resting, "x_read_after": two.x_read,
         "hand_cancel": two.resting.then_some(HAND_CANCEL_ORDERS),
         "echoes": two.echoes, "add_order_as_encoded": two.as_encoded, "error": two.error})
 }

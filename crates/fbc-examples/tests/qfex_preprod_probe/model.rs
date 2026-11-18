@@ -69,7 +69,11 @@
 //!   [`QfexModel::fill_on_drop`], [`QfexModel::trade_on_drop`],
 //!   [`QfexModel::historic_omits_last`],
 //!   [`QfexModel::historic_fails`] and
-//!   [`QfexModel::touch_moves_at_arm`].
+//!   [`QfexModel::touch_moves_at_arm`]; and, for FBC-77r8's review,
+//!   [`QfexModel::foreign_order_on`], [`QfexModel::position_on_place_on`],
+//!   [`QfexModel::foreign_on_drop`], [`QfexModel::twap_after_close`],
+//!   [`QfexModel::after_drop_historic`] ([`AfterHistoric`]), [`Limited::TradesPage`] and
+//!   [`Limited::HistoricAfterDrop`].
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -192,6 +196,21 @@ pub enum OnAck {
     MakerFill,
 }
 
+/// What the model changes on an account as its first `GET /user/historic-orders` after an armed
+/// connection's drop is answered ([`QfexModel::after_drop_historic`]): after the reads after the
+/// drop, and before the read of every named account after them (FBC-77r8's review).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AfterHistoric {
+    /// Its position on [`SYMBOL`] moves, with no order or fill of the model's, as a hand trade's
+    /// would.
+    Position,
+    /// It holds an open order no run placed, under [`STRAY_CID`], which its pages list and no
+    /// frame names.
+    Foreign,
+    /// Its read sockets' pages list one TWAP.
+    Twap,
+}
+
 /// Which open orders an armed connection's end cancels ([`QfexModel::cod_reach`]).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum Reach {
@@ -254,6 +273,13 @@ pub enum Limited {
     /// The first `get_user_trades` page on a read socket, answered a `RateLimited` err echoing
     /// it.
     Trades,
+    /// The `n`th `get_user_trades` page of the run, from 0, as
+    /// [`QfexModel::fill_on_trades_page`] counts them, answered a `RateLimited` err echoing it
+    /// (FBC-77r8's review).
+    TradesPage(usize),
+    /// The first `GET /user/historic-orders` once an armed connection dropped, with no close,
+    /// answered HTTP 429 (FBC-77r8's review).
+    HistoricAfterDrop,
 }
 
 /// What an account's reads answer while [`QfexModel::rest_lag`] holds them back: its open orders
@@ -476,6 +502,24 @@ pub struct QfexModel {
     /// With the first `add_order`, its account also holds an open order it did not place, under
     /// [`STRAY_CID`], which its pages list and no frame names, as another trader's would.
     pub foreign_order: bool,
+    /// With the `n`th `add_order` of the run, from 0, its account also holds such an order
+    /// (FBC-77r8's review: `n` 1, beside Y, so the read before the drop lists it).
+    pub foreign_order_on: Option<usize>,
+    /// With the `n`th `add_order` of the run, from 0, its account's positions show a position on
+    /// [`SYMBOL`] that no order or fill of the model made, and no frame says so (FBC-77r8's
+    /// review: `n` 1, beside Y, so the read before the drop shows it).
+    pub position_on_place_on: Option<usize>,
+    /// As an armed connection's drop is settled, after its cancel-on-disconnect, its account
+    /// holds such an order, so the reads after the drop list it (FBC-77r8's review).
+    pub foreign_on_drop: bool,
+    /// Once an armed connection ended, its account's read sockets' pages list one TWAP
+    /// (FBC-77r8's review).
+    pub twap_after_close: bool,
+    /// What the first `GET /user/historic-orders` after an armed connection's drop changes on
+    /// its account, once answered ([`AfterHistoric`]; FBC-77r8's review).
+    pub after_drop_historic: Option<AfterHistoric>,
+    /// The accounts whose read sockets' pages list a TWAP.
+    pub(super) twaps: Vec<Option<String>>,
     /// As it reads the first `add_order`, before answering it, the model holds this limiter's
     /// every frame budget for the time given, as a provider refusal echoing nothing would: the
     /// run's shared limiter, under the run's provider user.
@@ -655,6 +699,12 @@ impl Default for QfexModel {
             position_after_close: false,
             position_on_place: false,
             foreign_after_close: false,
+            foreign_order_on: None,
+            position_on_place_on: None,
+            foreign_on_drop: false,
+            twap_after_close: false,
+            after_drop_historic: None,
+            twaps: Vec::new(),
             foreign_order: false,
             hold_on_place: None,
             auth_fails: false,
@@ -762,8 +812,55 @@ impl QfexModel {
             _ if std::mem::take(&mut self.historic_fails) => {
                 status(500, r#"{"error":"synthetic failure"}"#)
             }
-            _ => ok(&self.historic(account)),
+            _ if self.rate_limit == Some(Limited::HistoricAfterDrop) && self.dropped() => {
+                self.rate_limit = None;
+                status(429, r#"{"error":"Too Many Requests"}"#)
+            }
+            _ => {
+                let body = self.historic(account.clone());
+                let dropped = self.dropped();
+                if let Some(change) = self.after_drop_historic.take_if(|_| dropped) {
+                    self.after_historic(account, change);
+                }
+                ok(&body)
+            }
         }
+    }
+
+    /// Makes `change` on `account` ([`QfexModel::after_drop_historic`]).
+    fn after_historic(&mut self, account: Option<String>, change: AfterHistoric) {
+        match change {
+            AfterHistoric::Position => {
+                self.before_change(&account);
+                if !self.moved.contains(&account) {
+                    self.moved.push(account);
+                }
+            }
+            AfterHistoric::Foreign => {
+                self.foreign_beside(&account, "33333333-3333-4333-8333-333333333333");
+            }
+            AfterHistoric::Twap => self.twaps.push(account),
+        }
+    }
+
+    /// Rests an open order no run placed on `account`, under [`STRAY_CID`] and the venue id
+    /// `id`, shaped as the account's first order: none when the account has none, or when `id`
+    /// is held already.
+    fn foreign_beside(&mut self, account: &Option<String>, id: &str) {
+        let first = self.orders.iter().find(|o| o.account == *account).cloned();
+        let foreign = first.map(|first| Order {
+            id: id.to_owned(),
+            cid: STRAY_CID.to_owned(),
+            filled: Decimal::ZERO,
+            state: State::Open,
+            ..first
+        });
+        let new = |f: &Order| self.orders.iter().all(|o| o.id != f.id);
+        let foreign = foreign.filter(new);
+        if foreign.is_some() {
+            self.before_change(account);
+        }
+        self.orders.extend(foreign);
     }
 
     /// `account`'s ended orders, as `GET /user/historic-orders` lists them.
@@ -968,6 +1065,14 @@ impl QfexModel {
             "get_user_trades" if self.trades_err => Ok(vec![Frame::text(format!(
                 r#"{{"type":"Err","error_code":"InvalidRequest","message":"synthetic","incoming_message":{text}}}"#
             ))]),
+            "get_user_trades"
+                if self.rate_limit == Some(Limited::TradesPage(self.trades_asked)) =>
+            {
+                self.rate_limit = None;
+                self.trades_asked += 1;
+                let echo = serde_json::json!({"type": "get_user_trades", "params": v["params"]});
+                Ok(vec![Frame::text(limited(&echo.to_string(), 1))])
+            }
             "get_user_trades" if self.rate_limit == Some(Limited::Trades) => {
                 self.rate_limit = None;
                 let echo = serde_json::json!({"type": "get_user_trades", "params": v["params"]});
@@ -1200,6 +1305,12 @@ impl QfexModel {
         if self.position_after_close && !self.moved.contains(&account) {
             self.moved.push(account.clone());
         }
+        if self.foreign_on_drop && !graceful {
+            self.foreign_beside(&account, "99999999-9999-4999-8999-999999999999");
+        }
+        if self.twap_after_close && !self.twaps.contains(&account) {
+            self.twaps.push(account.clone());
+        }
         if self.foreign_after_close {
             let first = self.orders.iter().find(|o| o.account == account).cloned();
             let foreign = first.map(|first| Order {
@@ -1315,6 +1426,13 @@ impl QfexModel {
                 };
                 self.orders.push(foreign);
             }
+        }
+        let moved = self.position_on_place_on == Some(self.places - 1);
+        if moved && !self.moved.contains(&account) {
+            self.moved.push(account.clone());
+        }
+        if self.foreign_order_on == Some(self.places - 1) {
+            self.foreign_beside(&account, "88888888-8888-4888-8888-888888888888");
         }
         if let Some(after) = self.part_fill_after.filter(|_| first) {
             let filled = self.fill_part(&order.id, order.quantity / Decimal::TWO);
@@ -1606,7 +1724,11 @@ impl QfexModel {
                 row["client_order_id"] = Value::String(String::new());
             }
         }
-        serde_json::json!({"all_orders_response": {"orders": rows, "twaps": []}}).to_string()
+        let twaps = match !session && self.twaps.contains(&account) {
+            true => vec![serde_json::json!({"symbol": SYMBOL, "status": "ACTIVE"})],
+            false => Vec::new(),
+        };
+        serde_json::json!({"all_orders_response": {"orders": rows, "twaps": twaps}}).to_string()
     }
 
     /// The `get_user_trades` page `v` asks of `conn`'s account: its fills from `start_ts`.
