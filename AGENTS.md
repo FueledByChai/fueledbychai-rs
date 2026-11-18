@@ -946,11 +946,15 @@ holds two of them for one pull request. The rules after the three roles bind all
     session one (what answered the arm, whether the graceful close cancelled X, measured on a
     read of X's own account alone, X found there by its venue id once known whatever client id
     its row carries (`AllowedOrder::names`, apart from the stricter `AllowedOrder::matches` a
-    read before a session admits by), and unmeasured on a full page not listing it, each frame's
-    client-id echo as a verdict, whether `add_order` went out as encoded, the stop's cancels, each
-    comparison, X's reads), the place registries, each session's and read socket's refusals
-    (`refusals.rs`, a session named by `SessionRun::label`) and its resync's full pages, read on
-    the traded spec (`pages::rows_on`); its slice is `drop-production/`, scrubbed by
+    read before a session admits by), and unmeasured on a full page not listing it; X absent
+    counted cancelled only after a graceful close with no stop that cancels before it, X
+    resting as it was sent, X's account flat and X's trades since its send read whole with no
+    row since then, 0132 item 4, and otherwise not measured, its reason given
+    (`places::close_verdict`); each frame's client-id echo as a verdict, whether `add_order`
+    went out as encoded, the stop's cancels, each comparison, X's reads), the place registries,
+    each session's and read socket's refusals (`refusals.rs`, a session named by
+    `SessionRun::label`) and its resync's full pages, read on the traded spec
+    (`pages::rows_on`); its slice is `drop-production/`, scrubbed by
     `Scrub::Places`, with a README of its own.
     Held in `tests/qfex_preprod_probe/place_stages.rs` and `compare_reads.rs`, against a QFEX
     model in `tests/qfex_preprod_probe/model.rs` on the conformance stub's serving scripts
@@ -961,7 +965,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     `rest_fails`, `cancel_delay`, `close_on_place`, `arm_err`, `foreign_order`,
     `position_on_place`, `position_after_close`, `hold_on_place`, `cancel_place`,
     `venue_cancel`, `close_on_cancel`, `stray_after`, `part_fill_after`, `close_after`,
-    `fill_on_trades`, `touch_moves` and `hold_trades`, all declared by path; two
+    `fill_on_trades`, `fill_after_close`, `part_fill_after_close`, `trade_after_close`,
+    `trades_err`, `historic_fails`, `touch_moves` and `hold_trades`, all declared by path; two
     paths no flag or answer reaches, X spent from its list and the journal past its soft limit,
     are a test's `probe_args::TestHooks`, compiled into the test binary alone. The
     probe's credentials come from the environment through `src/auth_qfex.rs`, a review path,

@@ -5021,6 +5021,473 @@ async fn a_close_is_measured_only_on_a_read_of_xs_own_account() {
     );
 }
 
+#[tokio::test]
+async fn x_filled_after_the_close_is_not_counted_as_cancelled_by_it() {
+    // PR #272's thread 4608720833. X rests as the graceful close is sent and fills whole once
+    // the model has settled the close, before the after-session read of its account: the page
+    // no longer lists X, and a get_user_trades row names it. X's absence is a fill's, not the
+    // close's cancel (decision 0132 item 4), so it is not measured, and the trade stops the run
+    // not flat (0151 item 9).
+    let model = QfexModel {
+        fill_after_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-fill-after-close").await;
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(run.x_read && !run.x_resting, "{run:?}");
+    let after = run.after.as_ref().unwrap();
+    assert_eq!((after.trades_naming_x, after.error.as_ref()), (1, None));
+    assert!(after.trades_read, "{after:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::XTraded);
+    assert_stopped(&d, places::Stop::NotFlat);
+}
+
+#[tokio::test]
+async fn x_gone_with_its_trades_unread_is_not_counted_as_cancelled_by_the_close() {
+    // A sibling of PR #272's thread 4608720833. The graceful close cancels X, so the read after
+    // it no longer lists X, but every get_user_trades page is answered an InvalidRequest err,
+    // which is no rate refusal: nothing rules out a fill of X, so whether the close cancelled
+    // it is not measured (decision 0132 item 4).
+    let model = QfexModel {
+        cod_on_close: true,
+        trades_err: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-close-trades-unread").await;
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(run.x_read && !run.x_resting, "{run:?}");
+    let after = run.after.as_ref().unwrap();
+    assert!(
+        after.error.is_some() && after.trades_naming_x == 0,
+        "{after:?}"
+    );
+    assert!(!after.trades_read, "{after:?}");
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::TradesUnread);
+    let (report, json) = d.outputs();
+    assert_eq!(json["drop_session_one"]["after"]["trades_read"], false);
+    assert!(
+        report.contains("0 trade rows since X's send, not read whole, 0 naming X"),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn x_part_filled_after_the_close_then_gone_is_not_counted_as_cancelled_by_it() {
+    // A sibling of PR #272's thread 4608720833. Half of X fills once the model has settled the
+    // graceful close, and the close then cancels the rest: the read after it no longer lists X,
+    // and a get_user_trades row names it. Decision 0132 item 4 counts X cancelled only with no
+    // row naming it, so a part fill leaves the close not measured too, and stops the run not
+    // flat (0151 item 9).
+    let model = QfexModel {
+        part_fill_after_close: true,
+        cod_on_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-part-fill-after-close").await;
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+    assert!(run.x_read && !run.x_resting, "{run:?}");
+    let after = run.after.as_ref().unwrap();
+    assert_eq!((after.trades_naming_x, after.error.as_ref()), (1, None));
+    assert_eq!(after.terminal_status.as_deref(), Some("CANCELLED"));
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::XTraded);
+    assert_stopped(&d, places::Stop::NotFlat);
+}
+
+#[tokio::test]
+async fn x_gone_with_its_trades_read_whole_and_naming_it_in_no_row_was_cancelled_by_the_close() {
+    // PR #272's thread 4608720833, the measurement it keeps: X rested as the graceful close was
+    // sent, the read after it no longer lists X, and every get_user_trades page since X's send
+    // was read, none naming X, so the close cancelled X (decision 0132 item 4).
+    let model = QfexModel {
+        cod_on_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-close-trades-read").await;
+    let run = d.drop_run();
+    let after = run.after.as_ref().unwrap();
+    assert_eq!((after.trades_naming_x, after.error.as_ref()), (0, None));
+    assert!(after.trades_read, "{after:?}");
+    assert_eq!(run.close_cancelled_x, Some(true), "{run:?}");
+    assert_eq!(run.close_not_measured, None, "{run:?}");
+    let (report, json) = d.outputs();
+    assert_eq!(json["drop_session_one"]["close_cancelled_x"], true);
+    assert_eq!(json["drop_session_one"]["close_not_measured"], Value::Null);
+    assert_eq!(json["drop_session_one"]["after"]["trades_read"], true);
+    assert!(
+        report.contains(
+            "Whether the graceful close cancelled X: yes: X rested before it, no cancel of ours \
+             was sent, and the read after it no longer listed X, with X's account flat after it \
+             and X's trades since its send read whole, no row since then on the account \
+             (decision 0132 item 4)"
+        ),
+        "{report}"
+    );
+}
+
+#[tokio::test]
+async fn x_still_listed_after_the_close_was_not_cancelled_by_it_whatever_its_trades_read() {
+    // A sibling of PR #272's thread 4608720833. The read after the graceful close still lists
+    // X: the close did not cancel it, whether or not its trades could be read.
+    for (trades_err, what) in [(false, "drop-close-keeps-read"), (true, "drop-close-keeps")] {
+        let model = QfexModel {
+            trades_err,
+            ..QfexModel::default()
+        };
+        let d = dropped(model, what).await;
+        let run = d.drop_run();
+        assert!(
+            run.x.rested_at_close && run.x_read && run.x_resting,
+            "{run:?}"
+        );
+        assert_eq!(run.after.as_ref().unwrap().error.is_some(), trades_err);
+        assert_eq!(run.close_cancelled_x, Some(false), "{run:?}");
+        assert_eq!(run.close_not_measured, None, "{run:?}");
+        let (report, json) = d.outputs();
+        assert_eq!(json["drop_session_one"]["close_cancelled_x"], false);
+        assert_eq!(json["drop_session_one"]["close_not_measured"], Value::Null);
+        assert!(
+            report.contains(
+                "Whether the graceful close cancelled X: no: X rested before it and still did \
+                 after it"
+            ),
+            "{report}"
+        );
+        assert_stopped(&d, places::Stop::LeftResting);
+    }
+}
+
+#[tokio::test]
+async fn x_gone_with_its_account_not_flat_is_not_counted_as_cancelled_by_the_close() {
+    // A sibling of PR #272's thread 4608720833. The graceful close cancels X, and X's account
+    // then shows a position no fill of ours made, with no trade row: something traded there,
+    // which decision 0132 item 4 rules out, so the cause of X's absence is unknown and the
+    // close is not measured; the position stops the run not flat.
+    let model = QfexModel {
+        cod_on_close: true,
+        position_after_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-close-not-flat").await;
+    let run = d.drop_run();
+    assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(run.x_read && !run.x_resting, "{run:?}");
+    let after = run.after.as_ref().unwrap();
+    assert_eq!((after.trades, after.error.as_ref()), (0, None), "{after:?}");
+    assert!(after.trades_read, "{after:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::XNotFlat);
+    assert_stopped(&d, places::Stop::NotFlat);
+}
+
+#[tokio::test]
+async fn x_gone_after_a_trade_naming_another_order_or_none_is_not_counted_cancelled() {
+    // A sibling of PR #272's thread 4608720833. The graceful close cancels X, and as it is
+    // settled a trade of an order the model never had comes on X's account: its row names
+    // another order, or none, which a row of X's own fill could be. Either way something traded
+    // since X's send, so the close is not measured (decision 0132 item 4), and the position it
+    // left stops the run not flat.
+    for (stray, what) in [
+        (model::StrayTrade::Other, "drop-close-other-trade"),
+        (model::StrayTrade::Unnamed, "drop-close-unnamed-trade"),
+    ] {
+        let model = QfexModel {
+            cod_on_close: true,
+            trade_after_close: Some(stray),
+            ..QfexModel::default()
+        };
+        let d = dropped(model, what).await;
+        let run = d.drop_run();
+        assert!(run.x.rested_at_close && run.cancels.is_none(), "{run:?}");
+        assert!(run.x_read && !run.x_resting, "{run:?}");
+        let after = run.after.as_ref().unwrap();
+        assert_eq!((after.trades, after.trades_naming_x), (1, 0), "{after:?}");
+        assert!(after.trades_read && after.error.is_none(), "{after:?}");
+        assert_eq!(after.terminal_status.as_deref(), Some("CANCELLED"));
+        assert_eq!(run.close_cancelled_x, None, "{run:?}");
+        assert_not_measured(&d, places::CloseUnmeasured::OtherTrade);
+        assert_stopped(&d, places::Stop::NotFlat);
+    }
+}
+
+#[tokio::test]
+async fn a_close_whose_historic_orders_read_fails_still_counts_x_cancelled() {
+    // A sibling of PR #272's thread 4608720833. The graceful close cancels X, X's trades since
+    // its send are read whole with no row, and GET /user/historic-orders then fails HTTP 500.
+    // 0132 item 4's two reads show the close cancelled X, and 0151 item 13's historic-orders
+    // condition is the drop test's pass, not this measurement, so it is still counted; the
+    // report says which read failed, and that X's status there is not known.
+    let model = QfexModel {
+        cod_on_close: true,
+        historic_fails: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-close-historic-fails").await;
+    let run = d.drop_run();
+    let after = run.after.as_ref().unwrap();
+    assert!(after.trades_read && after.trades == 0, "{after:?}");
+    assert_eq!(after.terminal_status, None, "{after:?}");
+    let error = after.error.as_deref().unwrap_or_default();
+    assert!(
+        error.starts_with("GET /user/historic-orders: "),
+        "{after:?}"
+    );
+    assert_eq!(run.close_cancelled_x, Some(true), "{run:?}");
+    assert_eq!(run.close_not_measured, None, "{run:?}");
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let (report, json) = d.outputs();
+    assert_eq!(json["drop_session_one"]["close_cancelled_x"], true);
+    assert_eq!(json["drop_session_one"]["after"]["trades_read"], true);
+    let said = format!(
+        "0 trade rows since X's send, read whole, 0 naming X; X on GET /user/historic-orders: \
+         not known; a read failed: {error}"
+    );
+    assert!(report.contains(&said), "{report}");
+    assert!(!report.contains("not read whole"), "{report}");
+}
+
+#[tokio::test]
+async fn x_gone_with_a_rate_refusal_on_its_trades_is_not_measured_and_stops_the_run() {
+    // A sibling of PR #272's thread 4608720833. The graceful close cancels X, and X's first
+    // get_user_trades page is answered a RateLimited err: the trades are not read, so the close
+    // is not measured, and the refusal is the run's stop, marked (decision 0148 item 8).
+    let model = QfexModel {
+        cod_on_close: true,
+        rate_limit: Some(model::Limited::Trades),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "drop-close-trades-refused").await;
+    let run = d.drop_run();
+    assert!(run.x_read && !run.x_resting, "{run:?}");
+    let after = run.after.as_ref().unwrap();
+    assert!(!after.trades_read && after.error.is_some(), "{after:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::TradesUnread);
+    let on = places::RefusedOn::ReadSocket;
+    assert_stopped(&d, places::Stop::RateRefused { on });
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(said.contains("reading X after drop session one"), "{said}");
+}
+
+#[tokio::test]
+async fn a_connection_that_ends_first_is_not_measured_as_a_close_sent() {
+    // A sibling of PR #272's thread 4608720833. The server closes the session's connection as
+    // it reads X, which rests: no close was sent, so the reason is the connection's end, not
+    // that X did not rest.
+    let model = QfexModel {
+        close_on_place: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-ended-reason", patient_rpc).await;
+    let run = d.drop_run();
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED), "{run:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::NotClosed);
+    // And one that ends as a stop's cancels wait, held: still the connection's end.
+    let model = QfexModel {
+        close_on_cancel: true,
+        ..QfexModel::default()
+    };
+    let d = pressed_drop(
+        model,
+        "drop-ended-in-cancels-reason",
+        patient_rpc,
+        &[" add_order"],
+    )
+    .await;
+    let run = d.drop_run();
+    assert_eq!(run.ended_by, Some(stage::CONNECTION_ENDED), "{run:?}");
+    assert!(run.cancels.as_ref().is_some_and(|c| c.held), "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::NotClosed);
+}
+
+#[tokio::test]
+async fn held_stop_cancels_before_a_graceful_close_are_the_reason_it_is_not_measured() {
+    // A sibling of PR #272's thread 4608720833. The owner's Ctrl-C, whose cancel of X QFEX
+    // answers with a RateLimited err: the cancels are held and the session ends by a graceful
+    // close. A stop that cancels came, though none was seen to end X, so that is the reason.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::Cancel),
+        ..QfexModel::default()
+    };
+    let d = pressed_drop(model, "drop-held-reason", |a| a, &[" add_order"]).await;
+    let run = d.drop_run();
+    assert_eq!(run.ended_by, Some(stage::GRACEFUL));
+    assert!(run.cancels.as_ref().is_some_and(|c| c.held), "{run:?}");
+    assert_eq!(run.close_cancelled_x, None, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::CancelStop);
+    // Said as a stop that came, not as a cancel sent, which none may have been.
+    let (report, _) = d.outputs();
+    let said = "not measured: a stop that cancels came before the close (0151 item 2), its \
+                cancels sent, held or refused";
+    assert!(report.contains(said), "{report}");
+}
+
+#[tokio::test]
+async fn a_close_with_no_room_is_not_measured_for_its_room() {
+    // A sibling of PR #272's thread 4608720833, on the run of
+    // a_close_with_no_room_in_the_shared_budget_is_not_counted_graceful: the close was sent
+    // with no room, so it may not have been graceful, and that is the reason given, not the
+    // connection's end, which did not come first.
+    let rate_user = user();
+    let limiter = shared_limiter(rate_user);
+    let model = QfexModel {
+        hold_on_place: Some((limiter, Duration::from_secs(3600))),
+        ..QfexModel::default()
+    };
+    let (dir, removed) = temp_dir("drop-no-room-reason");
+    let venue = Venue::start(model).await;
+    let asked = set(drop_argv(&dir, &venue), "--agree-wait-ms", "1000");
+    let (mut opts, places) = parsed(&asked).unwrap();
+    opts.rate_user = rate_user;
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let ran = stage::run_places(&opts, &places, &lookup, out).await;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    let run = d.drop_run();
+    assert_eq!(run.ended_by, Some(stage::NO_ROOM_TO_CLOSE), "{}", d.printed);
+    assert!(run.x.rested_at_close, "{run:?}");
+    assert_not_measured(&d, places::CloseUnmeasured::NoRoomToClose);
+}
+
+/// Asserts `d`'s graceful close was not measured as cancelling X for `why`, as its report and
+/// its evidence say it.
+fn assert_not_measured(d: &Dropped, why: places::CloseUnmeasured) {
+    assert_eq!(d.drop_run().close_not_measured, Some(why));
+    let (report, json) = d.outputs();
+    assert_eq!(json["drop_session_one"]["close_cancelled_x"], Value::Null);
+    assert_eq!(json["drop_session_one"]["close_not_measured"], why.says());
+    let said = format!(
+        "Whether the graceful close cancelled X: not measured: {}",
+        why.says()
+    );
+    assert!(report.contains(&said), "{report}");
+}
+
+#[test]
+fn a_close_is_judged_cancelling_x_only_on_xs_absence_and_its_trades_read_whole() {
+    // PR #272's thread 4608720833, each of close_verdict's reasons on a run built by hand.
+    use places::{CloseUnmeasured as U, XAccountRead, close_verdict};
+    let rested = places::DropRun {
+        x: places::XRun {
+            rested_at_close: true,
+            ..places::XRun::default()
+        },
+        ended_by: Some(stage::GRACEFUL),
+        after: Some(places::XAfter {
+            trades_read: true,
+            ..places::XAfter::default()
+        }),
+        ..places::DropRun::default()
+    };
+    let gone = XAccountRead {
+        read: true,
+        listed: false,
+        flat: true,
+    };
+    let listed = XAccountRead {
+        listed: true,
+        ..gone
+    };
+    let moved = XAccountRead {
+        flat: false,
+        ..gone
+    };
+    assert_eq!(close_verdict(&rested, gone), Ok(true));
+    assert_eq!(close_verdict(&rested, listed), Ok(false));
+    let unread = XAccountRead {
+        read: false,
+        ..gone
+    };
+    assert_eq!(close_verdict(&rested, unread), Err(U::XUnread));
+    // How the session ended comes first: no close sent, a close with no room, or none reached,
+    // whether or not X rested and a stop that cancels came.
+    for (ended, why) in [
+        (Some(stage::CONNECTION_ENDED), U::NotClosed),
+        (Some(stage::NO_ROOM_TO_CLOSE), U::NoRoomToClose),
+        (None, U::NoClose),
+    ] {
+        let mut run = rested.clone();
+        run.ended_by = ended;
+        assert_eq!(close_verdict(&run, gone), Err(why));
+        run.x.rested_at_close = false;
+        run.cancels = Some(places::Cancels::default());
+        assert_eq!(close_verdict(&run, gone), Err(why));
+    }
+    // A stop that cancels, its cancels held and none sent included, then X not resting.
+    let mut run = rested.clone();
+    run.cancels = Some(places::Cancels {
+        sent: 0,
+        held: true,
+        ..places::Cancels::default()
+    });
+    assert_eq!(close_verdict(&run, gone), Err(U::CancelStop));
+    run.x.rested_at_close = false;
+    assert_eq!(close_verdict(&run, gone), Err(U::CancelStop));
+    run.cancels = None;
+    assert_eq!(close_verdict(&run, gone), Err(U::NotRested));
+    // X absent: its trades not read whole, or not read at all, a row naming X, even one read
+    // before the read failed, another row since its send, or its account not flat, leave the
+    // close not measured; X listed was not cancelled by it, whatever its trades and position.
+    let mut run = rested.clone();
+    run.after.as_mut().unwrap().trades_read = false;
+    assert_eq!(close_verdict(&run, gone), Err(U::TradesUnread));
+    assert_eq!(close_verdict(&run, listed), Ok(false));
+    run.after = None;
+    assert_eq!(close_verdict(&run, gone), Err(U::TradesUnread));
+    assert_eq!(close_verdict(&run, moved), Err(U::XNotFlat));
+    let mut run = rested.clone();
+    let after = run.after.as_mut().unwrap();
+    (after.trades, after.trades_naming_x) = (1, 1);
+    assert_eq!(close_verdict(&run, gone), Err(U::XTraded));
+    assert_eq!(close_verdict(&run, moved), Err(U::XTraded));
+    assert_eq!(close_verdict(&run, listed), Ok(false));
+    run.after.as_mut().unwrap().trades_read = false;
+    assert_eq!(close_verdict(&run, gone), Err(U::XTraded));
+    // A row naming another order or none, whether or not the trades were read whole.
+    let mut run = rested.clone();
+    run.after.as_mut().unwrap().trades = 1;
+    assert_eq!(close_verdict(&run, gone), Err(U::OtherTrade));
+    assert_eq!(close_verdict(&run, moved), Err(U::OtherTrade));
+    assert_eq!(close_verdict(&run, listed), Ok(false));
+    run.after.as_mut().unwrap().trades_read = false;
+    assert_eq!(close_verdict(&run, gone), Err(U::OtherTrade));
+    // X's account not flat with no row since X's send: a trade the rows do not show.
+    assert_eq!(close_verdict(&rested, moved), Err(U::XNotFlat));
+    let mut run = rested.clone();
+    run.after.as_mut().unwrap().trades_read = false;
+    assert_eq!(close_verdict(&run, moved), Err(U::XNotFlat));
+    assert_eq!(
+        close_verdict(
+            &rested,
+            XAccountRead {
+                listed: true,
+                ..moved
+            }
+        ),
+        Ok(false)
+    );
+}
+
 /// Asserts `d` stopped on a read socket, met `when`, as [`assert_stopped`] asserts a stop but
 /// for the reads after the session, which the caller asserts, its socket labelled `label`
 /// showing one refusal in a frame kept whole and none in clear, and no cancel sent.
