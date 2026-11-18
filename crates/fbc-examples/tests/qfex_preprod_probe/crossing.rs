@@ -1735,6 +1735,7 @@ fn stage_twos_report_and_evidence_say_each_crossing_with_no_id_or_value() {
         blocked,
         ended,
         presses: 1,
+        ..places::Cancels::default()
     };
     let compared = compare::Compared {
         step: "the crossing post-only",

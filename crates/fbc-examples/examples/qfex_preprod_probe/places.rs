@@ -1003,6 +1003,12 @@ pub struct Cancels {
     pub ended: bool,
     /// The owner's presses taken while they ran, each recorded, none ending them early.
     pub presses: u32,
+    /// The stop the tee or the session's handler had raised when they took the owner's first
+    /// press, if any: the session's stop, which came before the press (decision 0148 item 8).
+    pub stop_at_press: Option<Stop>,
+    /// Whether the connection's end cut them short, before every order they named was seen to
+    /// end: they are held, and the market is disarmed as its registry serves no more sessions.
+    pub cut_short: bool,
 }
 
 impl Cancels {
@@ -1619,16 +1625,20 @@ fn cancels_said(cancels: Option<&Cancels>) -> String {
              recorded; then the market disarmed and a graceful close (0151 items 2 and 11)",
             c.sent,
             if c.sent == 1 { "" } else { "s" },
-            match (c.held, c.ended) {
-                (true, _) => "held or refused, so not every order was seen to end",
-                (false, true) => "every order they named was seen to end",
-                (false, false) => "not every order they named was seen to end in time",
+            match (c.cut_short, c.held, c.ended) {
+                (true, _, _) => CUT_SHORT,
+                (false, true, _) => "held or refused, so not every order was seen to end",
+                (false, false, true) => "every order they named was seen to end",
+                (false, false, false) => "not every order they named was seen to end in time",
             },
             c.presses,
             if c.presses == 1 { "" } else { "es" }
         ),
     }
 }
+
+/// What a stop's cancels the connection's end cut short did, as the report says it.
+pub const CUT_SHORT: &str = "cut short by the connection's end, so not every order was seen to end";
 
 /// An order's request, as the report says it: whether it was handed to the session, shown
 /// resting, echoed byte for byte, its outcome and its time to its ACK.
@@ -1889,7 +1899,7 @@ pub fn compared_json(c: &crate::compare::Compared) -> Value {
 pub fn cancels_json(c: Option<&Cancels>) -> Value {
     json!(
         c.map(|c| json!({"sent": c.sent, "held": c.held, "ended": c.ended,
-        "presses": c.presses}))
+        "presses": c.presses, "cut_short": c.cut_short}))
     )
 }
 
