@@ -820,6 +820,60 @@ fn the_models_knobs_send_their_frames_after_the_first_ack() {
 }
 
 #[test]
+fn the_models_stray_and_cid_knobs_hold_the_read_pages_until_the_placing_connection_ends() {
+    // CI run 44211090021 on PR #272: neither knob changes what a read shows, so a read socket's
+    // page waits from the first add_order until the end of the connection it came on is seen;
+    // the session's own pages, and every page before the place, are answered at once.
+    let page = r#"{"type":"get_user_orders","params":{"limit":1000,"offset":0}}"#;
+    let subscribe = r#"{"type":"subscribe","params":{"channels":["orders"]}}"#;
+    for knob in ["stray_order", "cid_absent_update"] {
+        let mut model = QfexModel {
+            stray_order: knob == "stray_order",
+            cid_absent_update: knob == "cid_absent_update",
+            ..QfexModel::default()
+        };
+        model.trade(0, &Frame::text(subscribe)).unwrap();
+        assert_eq!(
+            model.trade(1, &Frame::text(page)).unwrap().len(),
+            1,
+            "{knob}"
+        );
+        model.trade(0, &Frame::text(ADD)).unwrap();
+        assert!(model.knob_frames_unread(), "{knob}");
+        assert!(
+            model.trade(1, &Frame::text(page)).unwrap().is_empty(),
+            "{knob}"
+        );
+        assert!(
+            model.trade(2, &Frame::text(page)).unwrap().is_empty(),
+            "{knob}"
+        );
+        assert_eq!(model.held_pages.len(), 2, "{knob}");
+        assert_eq!(
+            model.trade(0, &Frame::text(page)).unwrap().len(),
+            1,
+            "{knob}"
+        );
+        // The placing connection's end seen, a page is answered at once again.
+        model.conns.get_mut(&0).unwrap().settled = true;
+        assert!(!model.knob_frames_unread(), "{knob}");
+        assert_eq!(
+            model.trade(1, &Frame::text(page)).unwrap().len(),
+            1,
+            "{knob}"
+        );
+    }
+    // Every other knob holds no page.
+    let mut model = QfexModel {
+        maker_fill: true,
+        ..QfexModel::default()
+    };
+    model.trade(0, &Frame::text(ADD)).unwrap();
+    assert!(!model.knob_frames_unread());
+    assert_eq!(model.trade(1, &Frame::text(page)).unwrap().len(), 1);
+}
+
+#[test]
 fn the_models_rate_limits_answer_a_place_or_a_cancel_once() {
     for (limited, want) in [
         (Limited::PlaceErr, "RateLimited"),
