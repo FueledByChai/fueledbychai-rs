@@ -47,7 +47,9 @@
 //!   [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`] and [`QfexModel::hold_trades`], and
 //!   on every read socket's pages [`QfexModel::newest_first`], after the first `add_order`
 //!   [`QfexModel::page_delay`] and, once an armed connection ended,
-//!   [`QfexModel::blank_cid_after_session`].
+//!   [`QfexModel::blank_cid_after_session`]. With [`QfexModel::stray_order`] or
+//!   [`QfexModel::cid_absent_update`], a read socket's page waits from the first `add_order`
+//!   until the end of the connection it came on is seen ([`QfexModel::knob_frames_unread`]).
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -327,7 +329,9 @@ pub struct QfexModel {
     pub ack_delay: Option<Duration>,
     pub rate_limit: Option<Limited>,
     /// After the first `ACK`: an `order_response` naming an order no run placed, with
-    /// [`STRAY_CID`] (decision 0151 item 13's stray order).
+    /// [`STRAY_CID`] (decision 0151 item 13's stray order). With it, as with
+    /// [`QfexModel::cid_absent_update`], the read sockets' pages wait for the end of the
+    /// placing connection ([`QfexModel::knob_frames_unread`]).
     pub stray_order: bool,
     /// After the first `ACK`: an `order_response` naming that order with no client id.
     pub cid_absent_update: bool,
@@ -412,6 +416,11 @@ pub struct QfexModel {
     pub mds_pusher: Option<Pusher>,
     /// The answers [`QfexModel::hold_trades`] held: each connection and frame.
     pub(super) held: Vec<(usize, Frame)>,
+    /// The connection the first `add_order` came on.
+    pub(super) placed_on: Option<usize>,
+    /// The read sockets' pages [`QfexModel::knob_frames_unread`] held: each connection and
+    /// frame.
+    pub(super) held_pages: Vec<(usize, Frame)>,
     pub(super) lagging: HashMap<Option<String>, Stale>,
     /// The accounts [`QfexModel::position_after_close`] moved.
     pub(super) moved: Vec<Option<String>>,
@@ -486,6 +495,8 @@ impl Default for QfexModel {
             stuck_trades: false,
             mds_pusher: None,
             held: Vec::new(),
+            placed_on: None,
+            held_pages: Vec::new(),
             lagging: HashMap::new(),
             moved: Vec::new(),
             places: 0,
@@ -702,6 +713,10 @@ impl QfexModel {
             "get_user_orders" => {
                 let session = self.conns.get(&conn).is_some_and(|c| c.session);
                 let page = Frame::text(self.orders_page(conn, &v));
+                if !session && self.knob_frames_unread() {
+                    self.held_pages.push((conn, page));
+                    return Ok(Vec::new());
+                }
                 match self.page_delay.filter(|_| !session && self.places > 0) {
                     Some(after) => {
                         self.later(conn, vec![page], after, false);
@@ -729,6 +744,42 @@ impl QfexModel {
     /// Whether an armed connection's end was seen.
     fn session_ended(&self) -> bool {
         self.conns.values().any(|c| c.armed && c.settled)
+    }
+
+    /// Whether a read socket's `get_user_orders` page waits: with [`QfexModel::stray_order`] or
+    /// [`QfexModel::cid_absent_update`], from the first `add_order` until the end of the
+    /// connection it came on is seen (its client's close frame read, or the connection ended).
+    /// Neither knob changes what a read shows, so nothing else orders a comparison's reads after
+    /// the knob's frame. The stub writing that frame does not put it on the session's socket:
+    /// the stub's socket does not set `TCP_NODELAY`, so the kernel can hold a frame written right
+    /// after the `ACK` until the client acknowledges the `ACK` (about 40 ms on Linux). The
+    /// session ends its connection only after drop session one's steps end, so a comparison
+    /// held this way ends by the stop the knob's frame raises or by the end of its wait, never
+    /// by agreeing before the session read that frame.
+    pub(super) fn knob_frames_unread(&self) -> bool {
+        let knob = self.stray_order || self.cid_absent_update;
+        knob && self.placed_on.is_some_and(|n| !self.conn_ended(n))
+    }
+
+    /// Whether the end of trade connection `n` was seen: its client's close frame read, or the
+    /// connection ended, as the stub's record shows, or its cancel-on-disconnect settled.
+    fn conn_ended(&self, n: usize) -> bool {
+        let settled = self.conns.get(&n).is_some_and(|c| c.settled);
+        let records = self.views.as_ref().map(|(trade, _)| trade.connections());
+        let record = records.and_then(|r| r.get(n).cloned());
+        settled || record.is_some_and(|r| r.client_closed || !r.open)
+    }
+
+    /// Answers each page [`QfexModel::knob_frames_unread`] held, in order, on its connection,
+    /// once none waits. A comparison that asked for them has ended by then, so a push to a
+    /// connection that is gone fails, and nothing reads that failure.
+    fn release_pages(&mut self) {
+        if self.held_pages.is_empty() || self.knob_frames_unread() || self.pusher.is_none() {
+            return;
+        }
+        for (conn, page) in std::mem::take(&mut self.held_pages) {
+            self.later(conn, vec![page], Duration::ZERO, false);
+        }
     }
 
     /// `conn`'s account.
@@ -784,6 +835,7 @@ impl QfexModel {
             let did = if cancels { "cancels" } else { "keeps" };
             self.event(format!("cod {n} {how} {did}"), None);
         }
+        self.release_pages();
     }
 
     /// Rests the order `v`, whose frame is `text`, on `conn`'s account and answers it, with the
@@ -791,6 +843,9 @@ impl QfexModel {
     fn add_order(&mut self, conn: usize, v: &Value, text: &str) -> Vec<Frame> {
         self.places += 1;
         let first = self.places == 1;
+        if first {
+            self.placed_on = Some(conn);
+        }
         if let Some((limiter, held)) = self.hold_on_place.as_ref().filter(|_| first) {
             let now = tokio::time::Instant::now();
             let on = fbc_core::ConnKey {
