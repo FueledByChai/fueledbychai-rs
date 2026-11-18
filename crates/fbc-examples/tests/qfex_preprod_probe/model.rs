@@ -116,10 +116,14 @@
 //!   socket's first page answered with a frame that is no page, or by a server close, and
 //!   [`QfexModel::rest_fails_after_drop_reads`], the read of the account after drop session two
 //!   answered HTTP 500, and [`QfexModel::rest_fails_after_historic`] (PR #278's review), the
-//!   first account's read before drop session two answered HTTP 500; and, for its restack onto FBC-77r8's review fixes,
-//!   [`QfexModel::twap_elsewhere_after_close`], a TWAP on every other account once an armed
-//!   connection ended, and [`QfexModel::page_after_ioc_end`], a read socket's first page once the
-//!   run's first limit IOC's connection ended, answered as [`PageFault`] says.
+//!   first account's read before drop session two answered HTTP 500; and, for its restack onto
+//!   FBC-77r8's review fixes, [`QfexModel::twap_elsewhere_after_close`], a TWAP on every other
+//!   account once an armed connection ended, and [`QfexModel::page_after_ioc_end`], a read
+//!   socket's first page once the run's first limit IOC's connection ended, answered as
+//!   [`PageFault`] says. FBC-8mwz's, once an armed connection dropped:
+//!   [`QfexModel::silent_sub_after_drop_reads`], the subaccount's read after drop session two
+//!   left unanswered, and [`QfexModel::stop_order_after_drop_reads`], an open order no page
+//!   lists counted by its REST positions.
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -794,6 +798,18 @@ pub struct QfexModel {
     /// which follows the reads of X's trades and historic orders after drop session one, however
     /// many reads the comparison after X's place made.
     pub rest_fails_after_historic: bool,
+    /// Once an armed connection dropped abruptly, the first authentication naming a subaccount
+    /// after a `GET /user/historic-orders` left unanswered (FBC-8mwz): the subaccount's read after
+    /// the primary account's drop session two, which follows the reads of X's and Y's trades and
+    /// historic orders after the drop on the primary account, waits out `--read-wait-ms` and
+    /// fails. Every later authentication is answered.
+    pub silent_sub_after_drop_reads: bool,
+    /// Once an armed connection dropped abruptly and a `GET /user/historic-orders` came, every
+    /// subaccount's `GET /user/positions` counts one open order on [`SYMBOL`] that no page lists,
+    /// as a stop order would (FBC-8mwz): the subaccount's read after the primary account's drop
+    /// session two, which follows the reads of X's and Y's trades and historic orders after the
+    /// drop on the primary account, shows an order resting.
+    pub stop_order_after_drop_reads: bool,
     /// The first `cancel_order`'s answer is pushed this long after it, instead of at once.
     pub cancel_delay: Option<Duration>,
     /// Once an armed connection ended, its account's positions show a position on [`SYMBOL`]
@@ -1000,7 +1016,8 @@ pub struct QfexModel {
     pub(super) drops: usize,
     pub(super) rest_after: usize,
     /// Whether a `GET /user/historic-orders` came once an armed connection dropped abruptly
-    /// ([`QfexModel::rest_fails_after_drop_reads`]).
+    /// ([`QfexModel::rest_fails_after_drop_reads`], [`QfexModel::silent_sub_after_drop_reads`],
+    /// [`QfexModel::stop_order_after_drop_reads`]).
     pub(super) historic_after_drop: bool,
     /// Whether a `GET /user/historic-orders` came ([`QfexModel::rest_fails_after_historic`]).
     pub(super) historic_asked: bool,
@@ -1103,6 +1120,8 @@ impl Default for QfexModel {
             page_after_ioc_end: None,
             rest_fails_after_drop_reads: false,
             rest_fails_after_historic: false,
+            silent_sub_after_drop_reads: false,
+            stop_order_after_drop_reads: false,
             historic_after_drop: false,
             historic_asked: false,
             cancel_delay: None,
@@ -1252,6 +1271,13 @@ impl QfexModel {
                 if self.rest_fails_after_historic && self.historic_asked {
                     self.rest_fails_after_historic = false;
                     return status(500, r#"{"error":"synthetic failure"}"#);
+                }
+                let sub = account.is_some();
+                if sub && self.stop_order_after_drop_reads && self.historic_after_drop {
+                    return ok(&serde_json::json!({"balance": {}, "positions": [
+                        {"symbol": SYMBOL, "position": 0, "open_orders": 1}
+                    ]})
+                    .to_string());
                 }
                 ok(&self.positions_of(account))
             }
@@ -1468,6 +1494,11 @@ impl QfexModel {
                 }
                 let crossed = self.silent_after_cross.is_some_and(|n| self.crossings > n);
                 if crossed && v["params"]["account_id"].as_str().is_none() {
+                    return Ok(Vec::new());
+                }
+                let sub = v["params"]["account_id"].as_str().is_some();
+                if sub && self.historic_after_drop && self.silent_sub_after_drop_reads {
+                    self.silent_sub_after_drop_reads = false;
                     return Ok(Vec::new());
                 }
                 if self.places > 0 && self.rate_limit == Some(Limited::ReadAuth(n)) {

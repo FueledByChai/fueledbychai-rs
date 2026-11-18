@@ -8239,21 +8239,140 @@ fn the_reads_after_drop_session_two_stop_on_the_first_that_applies() {
     });
     let after = "after drop session two";
     let during = "during the reads after drop session two";
+    // A named account not read is ranked last (FBC-8mwz): every case before it outranks it.
+    let not_read = stage::NOT_READ_AFTER_TWO;
     let cases = [
         (
-            (refused, true, true, true),
+            (refused, true, true, true, true),
             refused.map(|s| (s, "in the reads after drop session two")),
         ),
-        ((None, true, true, true), Some((Stop::Interrupted, during))),
-        ((None, false, true, true), Some((Stop::NotFlat, after))),
-        ((None, false, false, true), Some((Stop::LeftResting, after))),
-        ((None, false, false, false), None),
+        (
+            (None, true, true, true, true),
+            Some((Stop::Interrupted, during)),
+        ),
+        (
+            (None, false, true, true, true),
+            Some((Stop::NotFlat, after)),
+        ),
+        (
+            (None, false, false, true, true),
+            Some((Stop::LeftResting, after)),
+        ),
+        (
+            (None, false, false, true, false),
+            Some((Stop::LeftResting, after)),
+        ),
+        (
+            (None, false, false, false, true),
+            Some((Stop::LeftResting, not_read)),
+        ),
+        ((None, false, false, false, false), None),
     ];
-    for ((refused, pressed, not_flat, resting), want) in cases {
-        let got = stage::read_stop(refused, pressed, not_flat, resting);
-        assert_eq!(got, want, "{refused:?} {pressed} {not_flat} {resting}");
+    for ((refused, pressed, not_flat, resting, unread), want) in cases {
+        let got = stage::read_stop(refused, pressed, not_flat, resting, unread);
+        assert_eq!(
+            got, want,
+            "{refused:?} {pressed} {not_flat} {resting} {unread}"
+        );
         // Each is marked (0151 item 6).
         assert!(got.is_none_or(|(stop, _)| stop.marks()));
+    }
+    assert_eq!(
+        not_read,
+        "after drop session two, a named account not read after it"
+    );
+}
+
+#[test]
+fn the_stop_after_drop_session_two_ranks_an_account_not_read_last() {
+    // FBC-8mwz: stage::after_stop ranks a named account not read, `unread`, after a position not
+    // flat, an order or a TWAP not ours and an order of ours resting, and takes none when the
+    // caller passes `unread` false, as it does after a failed drop session two (FBC-gisx).
+    use places::Stop;
+    use stage::AfterReads;
+    let after = "after drop session two";
+    let refused = Some(Stop::RateRefused {
+        on: places::RefusedOn::Rest,
+    });
+    let unexpected = AfterReads {
+        unexpected: true,
+        unread: true,
+        ..AfterReads::default()
+    };
+    let resting = AfterReads {
+        resting: true,
+        unread: true,
+        ..AfterReads::default()
+    };
+    let unread = AfterReads {
+        unread: true,
+        ..AfterReads::default()
+    };
+    let not_flat = AfterReads {
+        not_flat: true,
+        ..unexpected
+    };
+    let pressed = AfterReads {
+        pressed: true,
+        ..not_flat
+    };
+    let refusal = AfterReads { refused, ..pressed };
+    let cases = [
+        (
+            (unexpected, false, true),
+            Some((Stop::ReadDisagrees, after)),
+        ),
+        ((resting, false, true), Some((Stop::LeftResting, after))),
+        (
+            (unread, false, true),
+            Some((Stop::LeftResting, stage::NOT_READ_AFTER_TWO)),
+        ),
+        ((unread, false, false), None),
+        (
+            (AfterReads::default(), false, true),
+            Some((Stop::LeftResting, stage::NOT_READ_AFTER_TWO)),
+        ),
+        ((AfterReads::default(), false, false), None),
+        ((not_flat, false, true), Some((Stop::NotFlat, after))),
+        (
+            (pressed, false, true),
+            Some((Stop::Interrupted, "during the reads after drop session two")),
+        ),
+        (
+            (unread, true, true),
+            Some((Stop::Interrupted, "during the reads after drop session two")),
+        ),
+        (
+            (refusal, false, true),
+            refused.map(|s| (s, "in the reads after drop session two")),
+        ),
+    ];
+    for ((reads, pressed, unread), want) in cases {
+        let got = stage::after_stop(&reads, pressed, unread);
+        assert_eq!(got, want, "{reads:?} {pressed} {unread}");
+    }
+}
+
+#[test]
+fn a_left_resting_after_drop_session_two_is_said_counted_only_when_no_read_listed_one() {
+    // FBC-8mwz: a LeftResting after a drop session two that reached its end, no read listing an
+    // order resting, is a named account not read, said in the owner's words, counted resting
+    // (the ruling under 0151 item 6 on FBC-gisx); one a read listed, and every other stop, is
+    // said as itself.
+    use places::Stop;
+    let cases = [
+        ((Stop::LeftResting, false), Some(places::COUNTED_UNREAD)),
+        ((Stop::LeftResting, true), None),
+        ((Stop::ReadDisagrees, false), None),
+        ((Stop::NotFlat, false), None),
+        ((Stop::Interrupted, true), None),
+    ];
+    for ((stop, resting), want) in cases {
+        assert_eq!(
+            stage::drop_two_says(stop, resting),
+            want,
+            "{stop:?} {resting}"
+        );
     }
 }
 
@@ -15301,8 +15420,9 @@ async fn x_s_account_unread_after_a_drop_session_two_that_reached_its_verdict_co
     // drop showing X and Y end, then the read of X's account after the session fails with no
     // provider rate refusal, its GET /user/positions answered HTTP 500 (the first after the
     // historic-orders read after the drop). The verdict showed X's and Y's ends, so neither is
-    // counted resting: no hand cancel, no stop, and the run goes on to the crossing session's
-    // reads, which read every account again.
+    // counted resting: no hand cancel. FBC-8mwz: the account not read is still a stop,
+    // LeftResting, marked, said in the owner's words (counted resting, never seen resting), so
+    // the run does not go on to the crossing session (decision 0132 item 7).
     let model = QfexModel {
         rest_fails_after_drop_reads: true,
         ..QfexModel::default()
@@ -15319,14 +15439,149 @@ async fn x_s_account_unread_after_a_drop_session_two_that_reached_its_verdict_co
     assert_eq!(two.unread, None, "{two:?}");
     assert!(!two.read && !two.resting, "{two:?}");
     assert!(!d.printed.contains("RESTING "), "{}", d.printed);
-    assert_eq!(d.ev.stop, None, "{}", d.printed);
-    assert!(d.marker().is_none());
-    d.at("READ before the crossing session: primary (cross)");
+    assert_marked(&d, places::Stop::LeftResting);
+    let line = format!(
+        "LeftResting {}: {}; no further session runs",
+        stage::NOT_READ_AFTER_TWO,
+        places::COUNTED_UNREAD
+    );
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some(line.as_str()),
+        "{}",
+        d.printed
+    );
+    assert!(!d.printed.contains("READ before the crossing session"));
+    assert!(!d.printed.contains("REGISTRY cross"), "{}", d.printed);
     let (_, json) = d.outputs();
     let two = &json["drop_tests"][0]["session_two"];
     assert_eq!(two["read_after_failed"], Value::Null);
     assert_eq!(two["counted_resting"], Value::Null);
     assert_eq!(two["hand_cancel"], Value::Null);
+}
+
+#[tokio::test]
+async fn a_named_account_not_read_after_drop_session_two_stops_the_run_marked() {
+    // FBC-8mwz: every ACK echoes its client id upper-cased, so the run's exact-echo gate stays
+    // shut and, with every drop test passing, the run would end NoEcho, which writes no marker.
+    // The primary account's drop test passes, its verdict judged on the reads after the drop, and
+    // then the subaccount's read after drop session two is left unanswered (its authentication,
+    // the first naming a subaccount after the historic-orders read after the drop), so it fails
+    // at --read-wait-ms. A named account, not X's, that could not be read after the session is a
+    // stop: LeftResting, marked (0151 item 6), its line naming an account not read and saying
+    // the owner's words, counted resting, not seen resting (the ruling under 0151 item 6 on
+    // FBC-gisx). The subaccount's drop test never runs, and the run does not end NoEcho.
+    let model = QfexModel {
+        ack_echo: model::Echo::Upper,
+        silent_sub_after_drop_reads: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-two-sub-unread", |argv| {
+        set(argv, "--read-wait-ms", "3000")
+    })
+    .await;
+    assert!(d.verdict().passed, "{:?}", d.verdict());
+    assert_stopped(&d, places::Stop::LeftResting);
+    assert_eq!(d.ev.drops.len(), 1, "{}", d.printed);
+    let line = format!(
+        "LeftResting {}: {}; no further session runs",
+        stage::NOT_READ_AFTER_TWO,
+        places::COUNTED_UNREAD
+    );
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some(line.as_str()),
+        "{}",
+        d.printed
+    );
+    assert!(
+        d.printed.contains(&format!("STOPPED {line}")),
+        "{}",
+        d.printed
+    );
+    // The gate is never judged, so the run does not end NoEcho.
+    assert!(!d.printed.contains("STOPPED NoEcho"), "{}", d.printed);
+    assert!(!d.printed.contains("GATE "), "{}", d.printed);
+    assert!(!line.contains(places::Stop::LeftResting.says()), "{line}");
+    // The subaccount's read after drop session two is the one that failed: X's account was read,
+    // so nothing of the drop test is counted resting and no hand cancel is asked for.
+    let failed = "subaccount could not be read";
+    assert!(
+        d.ev.errors.iter().any(|e| e.starts_with(failed)),
+        "{:?}",
+        d.ev.errors
+    );
+    assert_eq!(d.ev.last_unread, ["subaccount"], "{}", d.printed);
+    let two = d.two();
+    assert!(two.read && two.unread.is_none() && !two.resting, "{two:?}");
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    // X and Y alone, on drop session one and two of the primary account.
+    assert_eq!(d.ev.sessions.len(), 2);
+    assert_eq!(d.count("add_order"), 2);
+    let (report, json) = d.outputs();
+    assert!(report.contains(&line), "{report}");
+    assert_eq!(json["stopped"], line.as_str());
+}
+
+#[tokio::test]
+async fn an_order_a_read_lists_after_drop_session_two_is_said_seen_resting_with_an_account_unread()
+{
+    // FBC-8mwz's review: the primary account's drop test passes, its verdict judged on the reads
+    // after the drop. Then the reads after drop session two read every named account: the
+    // primary account's GET /user/positions is answered HTTP 500 (the first after the
+    // historic-orders read after the drop), so it is not read, and the subaccount's counts one
+    // open order that no page lists, as a stop order would, so an order rests. The order a read
+    // showed outranks the account not read, and it was seen resting: the stop is LeftResting
+    // after drop session two, marked, said as Stop::says, never in the owner's words for an
+    // order counted resting (the ruling under 0151 item 6 on FBC-gisx).
+    let model = QfexModel {
+        rest_fails_after_drop_reads: true,
+        stop_order_after_drop_reads: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(model, "drop-two-seen-resting-unread", |a| a).await;
+    assert!(d.verdict().passed, "{:?}", d.verdict());
+    assert_marked(&d, places::Stop::LeftResting);
+    let line = format!(
+        "LeftResting after drop session two: {}; no further session runs",
+        places::Stop::LeftResting.says()
+    );
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some(line.as_str()),
+        "{}",
+        d.printed
+    );
+    assert!(
+        d.printed.contains(&format!("STOPPED {line}")),
+        "{}",
+        d.printed
+    );
+    assert!(!line.contains(places::COUNTED_UNREAD), "{line}");
+    assert!(!line.contains(stage::NOT_READ_AFTER_TWO), "{line}");
+    // The primary account was the one not read; the subaccount's order was seen resting.
+    let failed = "primary (drop) could not be read: GET /user/positions";
+    assert!(
+        d.ev.errors.iter().any(|e| e.starts_with(failed)),
+        "{:?}",
+        d.ev.errors
+    );
+    let two = d.two();
+    assert!(!two.read && two.resting && two.unread.is_none(), "{two:?}");
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL_ORDERS)),
+        "{}",
+        d.printed
+    );
+    // The subaccount's drop test never runs: X and Y alone, on the primary account.
+    assert_eq!(d.ev.drops.len(), 1, "{}", d.printed);
+    assert_eq!(d.ev.sessions.len(), 2);
+    assert_eq!(d.count("add_order"), 2);
+    assert!(!d.printed.contains("REGISTRY cross"), "{}", d.printed);
+    let (report, json) = d.outputs();
+    assert!(report.contains(&line), "{report}");
+    assert_eq!(json["stopped"], line.as_str());
 }
 
 // ----- FBC-gisx's restack onto FBC-77r8's review fixes (PR #273) -------------------------------
@@ -16002,4 +16257,142 @@ async fn a_press_as_the_last_read_after_a_failed_drop_session_two_ends_outranks_
     assert_eq!(two["counted_resting"], "X");
     assert_eq!(two["hand_cancel"], places::HAND_CANCEL_X_UNREAD);
     assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+}
+
+// ----- FBC-8mwz's restack onto PR #274's and PR #277's review fixes ---------------------------
+
+/// The whole stop line of a press of Ctrl-C taken by the reads after drop session two.
+fn interrupted_after_two() -> String {
+    format!(
+        "Interrupted during the reads after drop session two: {}; no further session runs",
+        places::Stop::Interrupted.says()
+    )
+}
+
+#[tokio::test]
+async fn a_press_as_the_last_read_after_drop_session_two_ends_outranks_an_account_not_read() {
+    // FBC-su9i's review fix to the reads after a session (a press made as the last read ends is
+    // taken), on FBC-8mwz's own path: the primary account's drop test passes, its verdict judged,
+    // and the read of the primary account after drop session two fails with no provider rate
+    // refusal (its GET /user/positions answered HTTP 500, the first after the historic-orders
+    // read after the drop), which alone would stop the run LeftResting as an account not read.
+    // The owner presses Ctrl-C as the last named account's read after the session, the
+    // subaccount's, prints its line, in the poll that ends that read. The press is taken by those
+    // reads, and it is the run's stop, Interrupted, marked, ahead of the account not read.
+    let model = QfexModel {
+        rest_fails_after_drop_reads: true,
+        ..QfexModel::default()
+    };
+    let at = "READ after drop session two: subaccount";
+    let d = pressed_at_as(model, "drop-two-press-last-unread", user(), |a| a, at).await;
+    assert!(d.verdict().passed, "{:?}", d.verdict());
+    assert_stopped(&d, places::Stop::Interrupted);
+    let line = interrupted_after_two();
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some(line.as_str()),
+        "{}",
+        d.printed
+    );
+    assert!(
+        d.printed.contains(&format!("STOPPED {line}")),
+        "{}",
+        d.printed
+    );
+    assert!(!line.contains(places::COUNTED_UNREAD), "{line}");
+    assert!(!line.contains(stage::NOT_READ_AFTER_TWO), "{line}");
+    // The primary account is the one not read; the press came after its read failed.
+    let failed = "primary (drop) could not be read: GET /user/positions";
+    assert!(
+        d.ev.errors.iter().any(|e| e.starts_with(failed)),
+        "{:?}",
+        d.ev.errors
+    );
+    let two = d.two();
+    assert!(!two.read && !two.resting && two.unread.is_none(), "{two:?}");
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    // X and Y alone, and nothing cancelled: no session was open when the press came.
+    assert_eq!(d.ev.drops.len(), 1, "{}", d.printed);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (2, 0));
+    let (report, json) = d.outputs();
+    assert!(report.contains(&line), "{report}");
+    assert_eq!(json["stopped"], line.as_str());
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+}
+
+#[tokio::test]
+async fn a_press_during_an_unanswered_read_after_drop_session_two_outranks_the_account_not_read() {
+    // FBC-su9i's review family (a press taken by a wait is the run's Interrupted stop unless a
+    // stop came first), on FBC-8mwz's own path: the primary account's drop test passes, and the
+    // owner presses Ctrl-C as the primary account's read after drop session two prints its line.
+    // The subaccount's read after it is then left unanswered (silent_sub_after_drop_reads) and
+    // fails at --read-wait-ms. The press, taken by those reads, is the run's stop, Interrupted,
+    // marked, ranked above the account not read, which came after it.
+    let model = QfexModel {
+        ack_echo: model::Echo::Upper,
+        silent_sub_after_drop_reads: true,
+        ..QfexModel::default()
+    };
+    let at = "READ after drop session two: primary (drop)";
+    let wait = |argv| set(argv, "--read-wait-ms", "3000");
+    let d = pressed_at_as(model, "drop-two-press-sub-unread", user(), wait, at).await;
+    assert!(d.verdict().passed, "{:?}", d.verdict());
+    assert_stopped(&d, places::Stop::Interrupted);
+    let line = interrupted_after_two();
+    assert_eq!(
+        d.ev.stopped.as_deref(),
+        Some(line.as_str()),
+        "{}",
+        d.printed
+    );
+    assert!(!line.contains(places::COUNTED_UNREAD), "{line}");
+    assert!(!d.printed.contains("STOPPED NoEcho"), "{}", d.printed);
+    // The subaccount's read is the one that failed, after the press.
+    let failed = "subaccount could not be read";
+    assert!(
+        d.ev.errors.iter().any(|e| e.starts_with(failed)),
+        "{:?}",
+        d.ev.errors
+    );
+    assert_eq!(d.ev.last_unread, ["subaccount"], "{}", d.printed);
+    assert!(d.two().read, "{:?}", d.two());
+    assert_eq!(d.ev.drops.len(), 1, "{}", d.printed);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (2, 0));
+    let (_, json) = d.outputs();
+    assert_eq!(json["stopped"], line.as_str());
+}
+
+#[tokio::test]
+async fn a_verdicts_stop_before_an_account_not_read_after_drop_session_two_is_kept() {
+    // FBC-su9i's review family (a stop raised before is kept), on FBC-8mwz's own path: the drop
+    // test fails, Y never shown ended on historic-orders (historic_omits_last), so the verdict's
+    // stop is DropFailed. The subaccount's read after drop session two is then left unanswered
+    // and fails at --read-wait-ms. The verdict's stop came first and is kept: the account not
+    // read, LeftResting, does not outrank it (stage::outranks), and the run stops DropFailed,
+    // marked, its line naming no account not read.
+    let model = QfexModel {
+        historic_omits_last: true,
+        silent_sub_after_drop_reads: true,
+        ..QfexModel::default()
+    };
+    let wait = |argv| set(argv, "--read-wait-ms", "3000");
+    let d = dropped_with(model, "drop-two-failed-sub-unread", wait).await;
+    let judged = places::Stop::DropFailed;
+    assert_eq!(d.verdict().stop(), Some(judged), "{:?}", d.verdict());
+    assert_stopped(&d, judged);
+    let stopped = d.ev.stopped.as_deref().unwrap_or_default();
+    assert!(
+        stopped.starts_with("DropFailed after the drop"),
+        "{stopped}"
+    );
+    assert!(!stopped.contains(stage::NOT_READ_AFTER_TWO), "{stopped}");
+    assert!(!stopped.contains(places::COUNTED_UNREAD), "{stopped}");
+    let failed = "subaccount could not be read";
+    assert!(
+        d.ev.errors.iter().any(|e| e.starts_with(failed)),
+        "{:?}",
+        d.ev.errors
+    );
+    assert_eq!(d.ev.last_unread, ["subaccount"], "{}", d.printed);
+    assert_eq!(d.ev.drops.len(), 1, "{}", d.printed);
 }
