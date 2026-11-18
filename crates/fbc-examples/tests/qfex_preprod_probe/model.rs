@@ -127,7 +127,12 @@
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
-//!   reconnect), or, with [`QfexModel::mds_silent`], with nothing.
+//!   reconnect), or, with [`QfexModel::mds_silent`], with nothing. With
+//!   [`QfexModel::mds_pings`] (FBC-kllr), reached through a relay of its own
+//!   ([`super::mds_pings`]) that pings each connection, streams the touch before each ping and
+//!   closes a connection whose pings go unanswered too long.
+//! - **A held read** ([`QfexModel::hold_page`], FBC-kllr): the next read socket's page held
+//!   until the test releases it, so a test can hold the run between two sessions.
 //!
 //! Every symbol, key, id and value is made up.
 
@@ -609,6 +614,15 @@ pub struct QfexModel {
     pub touch: Touch,
     pub mds_err: bool,
     pub mds_silent: bool,
+    /// When set, the MDS is reached through a relay that pings each connection, closes one whose
+    /// pings go unanswered too long, and streams the touch before each ping
+    /// ([`super::mds_pings`], FBC-kllr); unset, the MDS stub is reached directly.
+    pub mds_pings: Option<super::mds_pings::Pings>,
+    /// Set, the next read socket's `get_user_orders` page is held unanswered, logged as `trade
+    /// <n> page held`, until the test releases it ([`Venue::release_held`]), and the knob clears:
+    /// a test sets it as the probe prints a line, so the read after that line holds the run there
+    /// (FBC-kllr: a gap between two sessions made as long as the test moves the clock).
+    pub hold_page: bool,
     pub log: Vec<Event>,
     /// What the probe printed, to stamp each event with whether `CAPS` came first.
     pub printed: Printed,
@@ -1059,6 +1073,8 @@ impl Default for QfexModel {
             touch: Touch::fresh(),
             mds_err: false,
             mds_silent: false,
+            mds_pings: None,
+            hold_page: false,
             log: Vec::new(),
             printed: Printed::default(),
             views: None,
@@ -1602,6 +1618,11 @@ impl QfexModel {
                 }
                 if !session && self.knob_frames_unread() {
                     self.held_pages.push((conn, page));
+                    return Ok(Vec::new());
+                }
+                if !session && std::mem::take(&mut self.hold_page) {
+                    self.event(format!("trade {conn} page held"), None);
+                    self.held.push((conn, page));
                     return Ok(Vec::new());
                 }
                 match self.page_delay.filter(|_| !session && self.places > 0) {
@@ -2912,10 +2933,12 @@ impl std::io::Write for Printed {
     }
 }
 
-/// The model, running: its trade and REST stub and its MDS stub, each on a serving script.
+/// The model, running: its trade and REST stub and its MDS stub, each on a serving script, and,
+/// with [`QfexModel::mds_pings`], the relay the MDS is reached through.
 pub struct Venue {
     pub trade: StubServer,
     pub mds: StubServer,
+    pub relay: Option<super::mds_pings::Relay>,
     pub model: Arc<Mutex<QfexModel>>,
 }
 
@@ -2949,7 +2972,42 @@ impl Venue {
         model.lock().unwrap().mds_pusher = Some(push);
         let mds = StubServer::start(script, HttpRouter::new()).await.unwrap();
         model.lock().unwrap().views = Some((trade.connections_view(), mds.connections_view()));
-        Venue { trade, mds, model }
+        let pings = model.lock().unwrap().mds_pings;
+        let relay = match pings {
+            Some(pings) => {
+                let upstream = mds.ws_url("").trim_start_matches("ws://").parse().unwrap();
+                let m = Arc::clone(&model);
+                let touch = move || m.lock().unwrap().touch.frame(SYMBOL);
+                Some(super::mds_pings::Relay::start(upstream, pings, touch).await)
+            }
+            None => None,
+        };
+        Venue {
+            trade,
+            mds,
+            relay,
+            model,
+        }
+    }
+
+    /// The MDS origin the probe connects to: the relay's with [`QfexModel::mds_pings`], the MDS
+    /// stub's otherwise.
+    pub fn mds_url(&self) -> String {
+        match &self.relay {
+            Some(relay) => relay.url(),
+            None => self.mds.ws_url(""),
+        }
+    }
+
+    /// What the relay sent and heard on each MDS connection ([`super::mds_pings::Pinged`]): none
+    /// without one.
+    pub fn pinged(&self) -> Vec<super::mds_pings::Pinged> {
+        (self.relay.as_ref()).map_or_else(Vec::new, super::mds_pings::Relay::pinged)
+    }
+
+    /// Whether an answer [`QfexModel::hold_page`] or another knob held waits to be released.
+    pub fn holding(&self) -> bool {
+        !self.model.lock().unwrap().held.is_empty()
     }
 
     /// Every request and connection the model saw, in order.
@@ -2958,9 +3016,9 @@ impl Venue {
     }
 
     /// Sends each answer [`QfexModel::hold_trades`], [`QfexModel::resync_page_held`],
-    /// [`QfexModel::hold_cancel`] and [`QfexModel::hold_ioc_sell`] held, in order, on its
-    /// connection, then closes each connection whose close [`QfexModel::hold_cancel`] or
-    /// [`QfexModel::hold_ioc_sell`] held.
+    /// [`QfexModel::hold_page`], [`QfexModel::hold_cancel`] and [`QfexModel::hold_ioc_sell`] held,
+    /// in order, on its connection, then closes each connection whose close
+    /// [`QfexModel::hold_cancel`] or [`QfexModel::hold_ioc_sell`] held.
     pub async fn release_held(&self) {
         let (held, closes, pusher) = {
             let mut model = self.model.lock().unwrap();
