@@ -1615,7 +1615,9 @@ pub const COUNTED_BY_REGISTRY: &str = "an order of ours the session's registry s
 
 /// What a stage-two session's [`Stop::LeftResting`] says of a named account that could not be
 /// read after the session, when no read listed an order of ours and its registry counts none
-/// resting, in place of [`Stop::says`]'s (`stage::stage_counted_says`, FBC-gisx).
+/// resting, in place of [`Stop::says`]'s (`stage::stage_counted_says`, FBC-gisx); and what one
+/// after a drop session two that reached its end says when no read listed an order resting
+/// (`stage::drop_two_says`, `stage::NOT_READ_AFTER_TWO`, FBC-8mwz).
 pub const COUNTED_UNREAD: &str = "a named account that could not be read after a session, so \
      nothing showed the end of an order of ours that may rest there: counted resting, not seen \
      resting (decision 0005, the owner's ruling under 0151 item 6)";

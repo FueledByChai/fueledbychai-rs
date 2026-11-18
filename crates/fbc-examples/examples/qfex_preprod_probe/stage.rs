@@ -2908,8 +2908,10 @@ impl Run<'_> {
         // account not read, the orders sent whose end the streams did not show counted resting,
         // so an order still resting, or counted resting, is marked for the hand cancel the report
         // asks for (0151 items 6 and 9); the verdict's stop (decision 0132 item 7, 0151 items 9
-        // and 13); then the reads' stop.
-        let read_stop = after_stop(&after, pressed);
+        // and 13); then the reads' stop, a named account not read among them (FBC-8mwz). After a
+        // failure, an account not read counts only the orders whose end nothing showed, as above
+        // (FBC-gisx), so the reads' stop there takes no account not read.
+        let read_stop = after_stop(&after, pressed, false);
         if let Some(said) = said {
             return Err(said);
         }
@@ -2937,6 +2939,9 @@ impl Run<'_> {
         }
         let judged = verdict.as_ref().and_then(crate::verdict::DropVerdict::stop);
         self.drop_run().verdict = verdict;
+        // A named account, X's or another, that could not be read after the session is a stop
+        // too, after every other the reads show (FBC-8mwz; decision 0132 item 7).
+        let read_stop = after_stop(&after, pressed, after.unread);
         // What the reads after the session show of the account, a position not flat or an order
         // or a TWAP the streams did not show, outranks a verdict's stop that comes after it in
         // the verdict's own order ([`outranks`]): the position is then the owner's (0151 item
@@ -2944,8 +2949,11 @@ impl Run<'_> {
         if let Some(stop) = judged.filter(|j| !outranks(read_stop.map(|(s, _)| s), *j)) {
             return Err(self.halt(stop, "after the drop"));
         }
+        // A LeftResting no read listing an order made is a named account not read: said in the
+        // owner's words, counted resting, never seen resting (the ruling under 0151 item 6 on
+        // FBC-gisx); one a read listed is said as seen resting ([`drop_two_says`]).
         match read_stop {
-            Some((stop, when)) => Err(self.halt(stop, when)),
+            Some((stop, when)) => Err(self.halt_as(stop, when, drop_two_says(stop, after.resting))),
             None => Ok(()),
         }
     }
@@ -6632,17 +6640,29 @@ fn ended_on(link: &Link, cid: fbc_core::ClientOrderId) -> bool {
     (link.registry().get(cid)).is_some_and(|r| r.state().is_terminal())
 }
 
+/// What the reads' stop after a drop session two that reached its end says in place of
+/// [`Stop::says`]'s (FBC-8mwz): a [`Stop::LeftResting`] when no read listed an order resting,
+/// `resting` false, is a named account not read, said as [`places::COUNTED_UNREAD`], counted
+/// resting, not seen resting (the ruling under 0151 item 6 on FBC-gisx). One a read listed, and
+/// every other stop, is said as itself: `None`.
+pub fn drop_two_says(stop: Stop, resting: bool) -> Option<&'static str> {
+    (stop == Stop::LeftResting && !resting).then_some(places::COUNTED_UNREAD)
+}
+
 /// The stop the reads after drop session two make, given `after` and whether the owner pressed
 /// Ctrl-C during the reads after the drop, or during X's and Y's trades read after a failure
 /// (`pressed`): [`read_stop`]'s, with [`Stop::ReadDisagrees`] for an order none of ours or a
-/// TWAP after a position not flat and before an order of ours resting.
-fn after_stop(after: &AfterReads, pressed: bool) -> Option<(Stop, &'static str)> {
+/// TWAP after a position not flat and before an order of ours resting, and a named account not
+/// read, `unread`, last (FBC-8mwz). The caller passes `unread` false after a failed drop session
+/// two, where an account not read counts only the orders whose end nothing showed (FBC-gisx).
+pub fn after_stop(after: &AfterReads, pressed: bool, unread: bool) -> Option<(Stop, &'static str)> {
     let pressed = pressed || after.pressed;
     // After a position not flat and before an order of ours still resting: an order or a TWAP
     // the streams did not show (decision 0148 item 8).
-    let shown = read_stop(after.refused, pressed, after.not_flat, false);
+    let shown = read_stop(after.refused, pressed, after.not_flat, false, false);
     let unexpected = (after.unexpected).then_some((Stop::ReadDisagrees, "after drop session two"));
-    (shown.or(unexpected)).or_else(|| read_stop(None, false, false, after.resting))
+    let rest = || read_stop(None, false, false, after.resting, unread);
+    (shown.or(unexpected)).or_else(rest)
 }
 
 /// Whether `read`, the stop the reads after drop session two make, outranks `judged`, the
@@ -6662,24 +6682,34 @@ fn outranks(read: Option<Stop>, judged: Stop) -> bool {
 /// The stop the reads after drop session two make, and when it was met, the first that applies:
 /// the provider rate refusal they met, `refused`; the owner's Ctrl-C during them, `pressed`; a
 /// position not flat; an order of ours still resting, for the owner's hand cancel (decision
-/// 0132 item 7). Each is marked (0151 item 6). None when they show none of them.
+/// 0132 item 7); then a named account that could not be read, `unread` (FBC-8mwz): nobody
+/// looked at it after the session, so an order of ours may still rest there unjudged, as
+/// [`stage_read_stop`] takes one after a stage-two session (`LeftResting`; an account that
+/// cannot be read stops the probe, decision 0132 item 7). Each is marked (0151 item 6), so the
+/// next run must reconcile. None when they show none of them.
 pub fn read_stop(
     refused: Option<Stop>,
     pressed: bool,
     not_flat: bool,
     resting: bool,
+    unread: bool,
 ) -> Option<(Stop, &'static str)> {
     const AFTER: &str = "after drop session two";
     if let Some(stop) = refused {
         return Some((stop, "in the reads after drop session two"));
     }
-    match (pressed, not_flat, resting) {
+    match (pressed, not_flat, resting, unread) {
         (true, ..) => Some((Stop::Interrupted, "during the reads after drop session two")),
-        (false, true, _) => Some((Stop::NotFlat, AFTER)),
-        (false, false, true) => Some((Stop::LeftResting, AFTER)),
-        (false, false, false) => None,
+        (false, true, ..) => Some((Stop::NotFlat, AFTER)),
+        (false, false, true, _) => Some((Stop::LeftResting, AFTER)),
+        (false, false, false, true) => Some((Stop::LeftResting, NOT_READ_AFTER_TWO)),
+        (false, false, false, false) => None,
     }
 }
+
+/// When the reads after drop session two could not read a named account ([`read_stop`],
+/// FBC-8mwz).
+pub const NOT_READ_AFTER_TWO: &str = "after drop session two, a named account not read after it";
 
 /// A comparison that made no read, since its socket could not be set up: `why` is not shown.
 fn unread(step: &'static str, _why: String) -> crate::compare::Compared {

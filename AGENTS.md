@@ -1029,7 +1029,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     named account after the drop outranking a stop after its own in the verdict's order
     (`stage::outranks`: `NotFlat` over `ReadDisagrees`, `ArmCancelUnreported` and `DropFailed`,
     `ReadDisagrees` over the last two); or `ReadDisagrees` or `LeftResting` after drop session
-    two. A failed drop test is a stop, so nothing more is placed on its account or any other; the
+    two, then, last, `LeftResting` for a named account, X's or another, not read after it
+    (FBC-8mwz, `stage::NOT_READ_AFTER_TWO`, said as `places::COUNTED_UNREAD`; decision 0132 item
+    7), where a failed drop session two stops only on the orders `places::Counted` counts. A
+    failed drop test is a stop, so nothing more is placed on its account or any other; the
     drop registry is disarmed once its second session
     ends, giving up its market lease. With none, stage two follows (FBC-su9i; `stage.rs`'s
     `Run::cross_tests`, `stage_two.rs`; decisions 0005, 0132 item 7, 0148 items 2, 6 and 8, 0151
@@ -1269,9 +1272,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     `touch_after` (the touch pushed again on the MDS later), `fill_other_on_place` (another order
     filled as a place arrives, the place left unanswered), `rest_lag_from` (`rest_lag` held to the
     changes from a given place on), `ioc_order_after` (a filled IOC's final `order_response` pushed
-    later), `ioc_acked` (every limit IOC it fills answered `ACK` first), `fill_in_resync` (an
-    arm's fills sent before its connection's next `get_user_orders` page), `resync_page_held` (that
-    page held for the test's release, `Venue::release_held`), the read sockets' pages held after a
+    later), `ioc_acked` (every limit IOC it fills answered `ACK` first), `fill_in_resync` (an arm's
+    fills sent before its connection's next `get_user_orders` page), `resync_page_held` (that page
+    held for the test's release, `Venue::release_held`), the read sockets' pages held after a
     `maker_fill` the reads lag until its connection's client writes again (`knob_frames_unread`),
     and `Limited::ReadSocketAfterIoc` and `ReadAuthEchoAfterIoc` (a refusal counted from the run's
     first limit IOC), and, for FBC-gisx, `page_after_session` (the first `get_user_orders` page a
@@ -1283,8 +1286,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     historic-orders read answered HTTP 500: the read before drop session two, however many reads
     the comparison after X's place made) and
     `twap_elsewhere_after_close` (once an armed connection ended, every other account's pages
-    listing one TWAP), all declared by path; eleven paths no flag or answer reaches, X spent from
-    its list, X not priced, Y not priced (FBC-gisx), a session failing after its order's answer,
+    listing one TWAP), and, for FBC-8mwz, `silent_sub_after_drop_reads` (once an armed connection
+    dropped and a historic-orders read came, the first authentication naming a subaccount left
+    unanswered, once) and `stop_order_after_drop_reads` (from then on, every subaccount's
+    `GET /user/positions` counting one open order no page lists), all declared by path; eleven paths
+    no flag or answer reaches, X spent from its list, X not priced, Y not priced (FBC-gisx), a
+    session failing after its order's answer,
     the journal past its soft limit, another order of ours held in a cross registry before a
     crossing order or a taker IOC, the account's flatten budget spent by its drop registry on the
     allowance its later registries are handed, the flatten's market Killed before the owner's
