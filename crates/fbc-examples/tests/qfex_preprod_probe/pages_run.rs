@@ -121,8 +121,40 @@ fn a_page_comes_to_its_names_and_counts_and_a_refusal_is_the_runs_stop() {
             full: true
         }
     );
-    assert_eq!(stop, None);
+    // A TWAP on a page is what the streams did not show: the run's stop (decision 0148 item 8;
+    // PR #284's review).
+    assert_eq!(stop, Some(places::Stop::ReadDisagrees));
     assert_eq!(came.says(), "listed P1; 0 orders not ours; 1 TWAP; full");
+    // A page listing ours alone stops nothing; one listing an order not ours stops the run.
+    let clean = PageAttempt::Read {
+        listed: vec![listed(vid(1), CidMatch::Unparseable)],
+        twaps: 0,
+        full: true,
+        kept: "synthetic".to_owned(),
+    };
+    assert_eq!(pager::came(&clean, &ours).1, None);
+    let other = PageAttempt::Read {
+        listed: vec![listed(vid(5), CidMatch::Foreign(Namespace::new(3)))],
+        twaps: 0,
+        full: true,
+        kept: "synthetic".to_owned(),
+    };
+    let (came, stop) = pager::came(&other, &ours);
+    assert_eq!(stop, Some(places::Stop::ReadDisagrees));
+    assert_eq!(
+        came.says(),
+        "listed none of ours; 1 order not ours; 0 TWAPs; full"
+    );
+    let unknown = PageAttempt::Read {
+        listed: vec![listed(vid(6), CidMatch::Unparseable)],
+        twaps: 0,
+        full: false,
+        kept: "synthetic".to_owned(),
+    };
+    assert_eq!(
+        pager::came(&unknown, &ours).1,
+        Some(places::Stop::ReadDisagrees)
+    );
     let (came, stop) = pager::came(&PageAttempt::Refused, &ours);
     assert_eq!(came, Came::Refused);
     let pager = places::RefusedOn::Pager;

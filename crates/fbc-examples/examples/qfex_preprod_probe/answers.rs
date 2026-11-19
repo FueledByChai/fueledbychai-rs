@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 use crate::capture::{AccountRead, Evidence, SessionRun};
 use crate::compare::{Compared, Ended};
 use crate::pager::{Came, PagesRun};
-use crate::places::{DropRun, Sides, TradeIds, XAfter};
+use crate::places::{DropRun, Sides, TradeIds, Traded, XAfter};
 use crate::stage_two::{CrossRun, StageTwo};
 
 /// What an item read from the whole run's frames says first.
@@ -246,10 +246,16 @@ fn historic(of: &Of<'_>) -> String {
         each.push(format!("the taker IOC {status}"));
         let flattens = traded.terminal.iter().skip(1);
         let listed = flattens.clone().filter(|t| t.is_some()).count();
+        // A flatten IOC not listed on pages not all read is not shown unlisted (PR #284's
+        // review).
         if traded.terminal.len() > 1 {
             each.push(format!(
-                "its flatten IOCs {listed} of {} listed",
-                traded.terminal.len() - 1
+                "its flatten IOCs {listed} of {} listed{}",
+                traded.terminal.len() - 1,
+                match traded.historic_whole {
+                    true => "",
+                    false => ", on GET /user/historic-orders pages not all read",
+                }
             ));
         }
     }
@@ -264,7 +270,7 @@ fn historic(of: &Of<'_>) -> String {
 
 /// What the account's trades reads kept: drop session one's, after the drop, and after the
 /// taker IOC session, as `(time kinds, trade ids, sides as a maker, sides as a taker, rows not
-/// ours, fields, whether any read was made)`.
+/// ours, fields, whether any page was read, and each read not read whole)`.
 struct Rows {
     kinds: Vec<&'static str>,
     ids: TradeIds,
@@ -272,8 +278,39 @@ struct Rows {
     taker: Sides,
     foreign: usize,
     fields: Vec<String>,
+    /// Whether any read of the account read a `get_user_trades` page.
     read: bool,
+    /// Each read whose pages were not all read, to a short page, by when it was made and why:
+    /// what it shows is of the pages read alone, never of the whole history (PR #284's review).
+    unwhole: Vec<String>,
 }
+
+/// One trades read of the account, as [`rows`] adds it up: when it was made, whether every page
+/// was read to a short one (`whole`), the rows it read, and why it could not be made whole.
+struct History<'a> {
+    when: &'static str,
+    whole: bool,
+    trades: usize,
+    error: Option<&'a str>,
+}
+
+impl History<'_> {
+    /// Whether it read any page: a read not whole that read one read a full page, so a row.
+    fn paged(&self) -> bool {
+        self.whole || self.trades > 0
+    }
+
+    /// Why it is not whole, by when it was made: its error, or none given.
+    fn unwhole(&self) -> Option<String> {
+        let why = self.error.unwrap_or("its pages were not all read");
+        (!self.whole).then(|| format!("{}: {why}", self.when))
+    }
+}
+
+/// When each trades read of the account was made, as [`Rows::unwhole`] names it.
+const AFTER_ONE: &str = "after drop session one";
+const AFTER_DROP: &str = "after the drop";
+const AFTER_TAKE: &str = "after the taker IOC session";
 
 fn rows(of: &Of<'_>) -> Rows {
     let mut rows = Rows {
@@ -284,8 +321,17 @@ fn rows(of: &Of<'_>) -> Rows {
         foreign: 0,
         fields: Vec::new(),
         read: false,
+        unwhole: Vec::new(),
     };
-    let mut add = |kinds: &[&'static str], ids: TradeIds, foreign: usize, fields: &[String]| {
+    let mut add = |kinds: &[&'static str],
+                   ids: TradeIds,
+                   foreign: usize,
+                   fields: &[String],
+                   history: History<'_>| {
+        rows.unwhole.extend(history.unwhole());
+        if !history.paged() {
+            return;
+        }
         for kind in kinds {
             if !rows.kinds.contains(kind) {
                 rows.kinds.push(kind);
@@ -308,25 +354,85 @@ fn rows(of: &Of<'_>) -> Rows {
             sides,
             foreign,
             fields,
+            trades,
+            trades_read,
+            error,
             ..
         }) = &d.after
         {
-            add(time_kinds, *trade_ids, *foreign, fields);
+            let history = History {
+                when: AFTER_ONE,
+                whole: *trades_read,
+                trades: *trades,
+                error: error.as_deref(),
+            };
+            add(time_kinds, *trade_ids, *foreign, fields, history);
             maker = plus(maker, *sides);
         }
         if let Some(t) = d.two.as_ref().and_then(|t| t.after.as_ref()) {
-            add(&t.time_kinds, t.trade_ids, t.foreign, &t.fields);
+            add(
+                &t.time_kinds,
+                t.trade_ids,
+                t.foreign,
+                &t.fields,
+                traded(AFTER_DROP, t),
+            );
             maker = plus(maker, t.sides);
         }
     }
     let mut taker = Sides::default();
     if let Some(t) = of.take.and_then(|t| t.traded.as_ref()) {
-        add(&t.time_kinds, t.trade_ids, t.foreign, &t.fields);
+        add(
+            &t.time_kinds,
+            t.trade_ids,
+            t.foreign,
+            &t.fields,
+            traded(AFTER_TAKE, t),
+        );
         taker = t.sides;
     }
     rows.maker = maker;
     rows.taker = taker;
     rows
+}
+
+/// A [`Traded`] read, made `when`, as a [`History`].
+fn traded<'a>(when: &'static str, t: &'a Traded) -> History<'a> {
+    History {
+        when,
+        whole: t.trades_whole,
+        trades: t.trades,
+        error: t.error.as_deref(),
+    }
+}
+
+impl Rows {
+    /// What an item read from the rows says when no read of the account read a page: no read
+    /// made, or those made, each with why, none reading a page.
+    fn not_read(&self) -> Option<String> {
+        if self.read {
+            return None;
+        }
+        Some(match self.unwhole.is_empty() {
+            true => "not measured: no get_user_trades read was made on this account".to_owned(),
+            false => format!(
+                "not measured: no get_user_trades page was read on this account ({})",
+                self.unwhole.join("; ")
+            ),
+        })
+    }
+
+    /// What an item read from the rows adds when a read of the account was not read whole: what
+    /// it says is of the pages read alone. Empty when every read was whole.
+    fn partly(&self) -> String {
+        match self.unwhole.is_empty() {
+            true => String::new(),
+            false => format!(
+                "; of the pages read alone, since a get_user_trades read was not read whole ({})",
+                self.unwhole.join("; ")
+            ),
+        }
+    }
 }
 
 /// Two counts of sides added up.
@@ -341,8 +447,8 @@ fn plus(a: Sides, b: Sides) -> Sides {
 /// The kind of a trade's `timestamp`, and whether its `trade_id` is the fills channel's.
 fn trade_time(of: &Of<'_>) -> String {
     let rows = rows(of);
-    if !rows.read {
-        return "not measured: no get_user_trades read was made on this account".to_owned();
+    if let Some(not_read) = rows.not_read() {
+        return not_read;
     }
     let kinds = match rows.kinds.is_empty() {
         true => "not measured: no get_user_trades row naming an order of ours was read".to_owned(),
@@ -351,7 +457,11 @@ fn trade_time(of: &Of<'_>) -> String {
             rows.kinds.join(", and ")
         ),
     };
-    format!("the timestamp: {kinds}; the trade_id: {}", rows.ids.says())
+    format!(
+        "the timestamp: {kinds}; the trade_id: {}{}",
+        rows.ids.says(),
+        rows.partly()
+    )
 }
 
 /// How one role's rows stated our side, as [`sides`] says it.
@@ -368,8 +478,8 @@ fn stated(sides: &Sides) -> String {
 /// only on a row of an order of ours that was the maker, since on a taker's row the two are one.
 fn sides(of: &Of<'_>) -> String {
     let rows = rows(of);
-    if !rows.read {
-        return "not measured: no get_user_trades read was made on this account".to_owned();
+    if let Some(not_read) = rows.not_read() {
+        return not_read;
     }
     let carried: Vec<&str> = (rows.fields.iter())
         .filter(|f| f.contains("side"))
@@ -408,7 +518,7 @@ fn sides(of: &Of<'_>) -> String {
             stated(&maker)
         ),
     };
-    format!("carried: {carried}; side is {whose}")
+    format!("carried: {carried}; side is {whose}{}", rows.partly())
 }
 
 fn s(n: usize) -> &'static str {
@@ -429,11 +539,18 @@ fn pages(run: Option<&PagesRun>) -> String {
     let full = (read.iter())
         .filter(|p| matches!(p.came, Came::Read { full: true, .. }))
         .count();
-    // A page listing one of ours the streams did not show open as it was asked.
+    // A page listing one of ours the streams did not show open as it was asked: a no only of
+    // the pages read, and not measured when none was (PR #284's review).
     let ended = read.iter().any(|p| match &p.came {
         Came::Read { ours, .. } => ours.iter().any(|o| !p.open.contains(o)),
         _ => false,
     });
+    let ended = match (ended, read.len()) {
+        (true, _) => "yes".to_owned(),
+        (false, 0) => "not measured: no page was read".to_owned(),
+        (false, n) if n == run.pages.len() => "no".to_owned(),
+        (false, n) => format!("none on the {n} page{} read", s(n)),
+    };
     format!(
         "{} page{} asked at a page size of {}, {} read, {full} of them full; the order QFEX's \
          pages list ours in: {}; a page listing an order of ours the streams did not show open: \
@@ -443,7 +560,7 @@ fn pages(run: Option<&PagesRun>) -> String {
         crate::pager::PAGE_SIZE,
         read.len(),
         crate::pager::order_shown(&run.pages).unwrap_or("not shown"),
-        crate::places::yn(ended),
+        ended,
         run.walk.map_or("not begun", crate::pager::WalkEnd::says)
     )
 }
@@ -526,13 +643,23 @@ fn frame_order(take: Option<&CrossRun>) -> String {
     }
 }
 
-/// Each session's resync: the orders its pages listed against REST's `open_orders`.
+/// Each session's resync: the orders its pages listed against REST's `open_orders`, compared
+/// only when every page it asked for was answered, so pages not all read never read as
+/// agreeing or differing (PR #284's review).
 fn resyncs(of: &Of<'_>) -> String {
     let each: Vec<String> = (of.sessions.iter())
         .filter(|run| run.pages.read > 0 || run.resync_open_orders.is_some())
         .map(|run| {
             let listed = run.pages.orders;
+            let (asked, read) = (run.pages.asked, run.pages.read);
             let said = match run.resync_open_orders {
+                Some(open) if asked == 0 => {
+                    format!("{open}: not compared, since no page it asked for was journaled")
+                }
+                Some(open) if read < asked => format!(
+                    "{open}: not compared, since {read} of the {asked} pages it asked for were \
+                     answered"
+                ),
                 Some(open) if open == listed => format!("{open}: they agree"),
                 Some(open) => format!("{open}: they differ"),
                 None => "not journaled".to_owned(),
@@ -551,11 +678,27 @@ fn resyncs(of: &Of<'_>) -> String {
     }
 }
 
-/// Each session's resync's full pages.
+/// Each session's resync's full pages, of the pages answered alone when not every page asked
+/// for was (PR #284's review).
 fn full_pages(of: &Of<'_>) -> String {
     let each: Vec<String> = (of.sessions.iter())
         .filter(|run| run.pages.asked > 0)
-        .map(|run| format!("{}: {}", run.label(), run.pages.listed()))
+        .map(|run| {
+            let (asked, read) = (run.pages.asked, run.pages.read);
+            match (read < asked, run.pages.full.is_empty()) {
+                (false, _) => format!("{}: {}", run.label(), run.pages.listed()),
+                (true, true) => format!(
+                    "{}: not measured: none among the {read} of the {asked} pages it asked for \
+                     that were answered",
+                    run.label()
+                ),
+                (true, false) => format!(
+                    "{}: {}, of the {read} of the {asked} pages it asked for that were answered",
+                    run.label(),
+                    run.pages.listed()
+                ),
+            }
+        })
         .collect();
     match each.is_empty() {
         true => "not measured: no resync on this account asked for a page".to_owned(),
@@ -563,16 +706,26 @@ fn full_pages(of: &Of<'_>) -> String {
     }
 }
 
-/// The trades rows naming none of the orders read for.
+/// The trades rows naming none of the orders read for: none only when every read of the
+/// account read its pages whole, so a history not read whole never reads as none (PR #284's
+/// review).
 fn foreign(of: &Of<'_>) -> String {
     let rows = rows(of);
-    match (rows.read, rows.foreign) {
-        (false, _) => "not measured: no get_user_trades read was made on this account".to_owned(),
-        (true, 0) => "none".to_owned(),
-        (true, n) => format!(
+    if let Some(not_read) = rows.not_read() {
+        return not_read;
+    }
+    match (rows.foreign, rows.unwhole.is_empty()) {
+        (0, true) => "none".to_owned(),
+        (0, false) => format!(
+            "not measured: none on the pages read, but a get_user_trades read was not read whole \
+             ({})",
+            rows.unwhole.join("; ")
+        ),
+        (n, _) => format!(
             "{n} row{}: an order of another's, or one this run did not name, traded on the \
-             account (none is pushed as a fill)",
-            s(n)
+             account (none is pushed as a fill){}",
+            s(n),
+            rows.partly()
         ),
     }
 }

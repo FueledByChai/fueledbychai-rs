@@ -535,6 +535,11 @@ pub struct TestHooks {
     /// The flatten's client id refused before each flatten IOC (FBC-ou9g): a refusal of the run's
     /// mint no answer of the QFEX model reaches.
     pub refuse_mint_in_flatten: bool,
+    /// Every Stop cancel of a session outside the drop test (crossing, taker IOC or stage three)
+    /// refused locally, as a failed submit, before it is handed to the session (FBC-3xzn): 0151
+    /// item 11's local cause, which no answer of the QFEX model reaches, since a cancel is
+    /// refused locally only for an order whose venue id is not known.
+    pub refuse_stop_cancels: bool,
 }
 
 /// Where [`TestHooks::kill_in_flatten`] Kills the flatten's market.

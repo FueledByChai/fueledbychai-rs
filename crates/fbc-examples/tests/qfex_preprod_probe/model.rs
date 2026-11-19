@@ -56,7 +56,9 @@
 //!   trade-socket authentication, [`QfexModel::touch_moves`]; on every read socket,
 //!   [`QfexModel::auth_fails`], [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`],
 //!   [`QfexModel::trades_err`] and [`QfexModel::hold_trades`], and on every read socket's pages
-//!   [`QfexModel::page_order`], after the first `add_order` [`QfexModel::page_delay`] and,
+//!   [`QfexModel::page_order`], on a given page at a limit of 1
+//!   [`QfexModel::stray_on_pager_page`] ([`PagerStray`]; PR #284's review), after the first
+//!   `add_order` [`QfexModel::page_delay`] and,
 //!   once an armed connection ended, [`QfexModel::blank_cid_after_session`] and, on its
 //!   positions, [`QfexModel::stop_order_after_close`]; on one authentication,
 //!   [`QfexModel::silent_auth`] (FBC-77r8). With [`QfexModel::stray_order`] or
@@ -127,8 +129,9 @@
 //!   page or on every `GET /user/historic-orders` page: [`QfexModel::endless`] ([`Endless`]),
 //!   each page full, of rows made up from the offset and limit it asks for, without end.
 //!   FBC-4plj's, on the run's `n`th `get_user_trades` page: [`QfexModel::trades_err_page`], an
-//!   `InvalidRequest` err echoing it, and [`QfexModel::hold_trades_page`], held for the test to
-//!   release.
+//!   `InvalidRequest` err echoing it, [`QfexModel::hold_trades_page`], held for the test to
+//!   release, and, for PR #284's review, [`QfexModel::netting_on_trades_page`], two trades of an
+//!   order the model never had made as it is asked.
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -501,6 +504,16 @@ pub enum Limited {
     /// 0, answered a `RateLimited` err echoing it: stage three's pager's `n`th page, when the
     /// run's `--page-size` is not 1 (FBC-4plj).
     PagerPage(usize),
+}
+
+/// What [`QfexModel::stray_on_pager_page`] lists on its page in place of the account's orders
+/// (PR #284's review).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PagerStray {
+    /// One open order no run placed, under [`STRAY_CID`], as another trader's would be.
+    Order,
+    /// A TWAP, beside the account's orders.
+    Twap,
 }
 
 /// The order a read socket's `get_user_orders` pages list an account's open orders in
@@ -985,6 +998,11 @@ pub struct QfexModel {
     /// The order a read socket's pages list an account's open orders in: oldest first by
     /// default (FBC-4plj's knob, which stage three's pager reads at a page size of 1).
     pub page_order: PageOrder,
+    /// The `n`th `get_user_orders` page of the run asked at a limit of 1 on a read socket, from
+    /// 0 (stage three's pager's `n`th page), lists what [`PagerStray`] names, in that answer
+    /// alone: the account holds no such order, so no other read or frame shows it, as one gone
+    /// before the next comparison would be (PR #284's review).
+    pub stray_on_pager_page: Option<(usize, PagerStray)>,
     /// How many `get_user_orders` pages a read socket has asked for at a limit of 1, as
     /// [`Limited::PagerPage`] counts them.
     pub(super) pager_pages: usize,
@@ -1021,6 +1039,11 @@ pub struct QfexModel {
     /// the test releases it ([`Venue::release_held`]), its hold logged `trades page held`
     /// (FBC-4plj: the owner's Ctrl-C during the taker IOC's trades read).
     pub hold_trades_page: Option<usize>,
+    /// As the `n`th `get_user_trades` page of the run is asked, from 0, counted so, two trades
+    /// on its account of an order the model never had, one each way, so its position does not
+    /// move: rows naming another order, or none, as [`StrayTrade`] says, which only a trades
+    /// read shows (PR #284's review: `n` 2 on one named account, the taker IOC's trades read).
+    pub netting_on_trades_page: Option<(usize, StrayTrade)>,
     /// Once an armed connection closed gracefully, as the model settles that close, a trade on
     /// that connection's account of an order the model never had, the size of the account's
     /// first order, which moves its position: a trade after X's send naming another order, or
@@ -1227,6 +1250,7 @@ impl Default for QfexModel {
             touch_moves: None,
             blank_cid_after_session: false,
             page_order: PageOrder::OldestFirst,
+            stray_on_pager_page: None,
             pager_pages: 0,
             page_delay: None,
             stuck_trades: false,
@@ -1236,6 +1260,7 @@ impl Default for QfexModel {
             part_fill_after_close: false,
             trades_err: false,
             trades_err_page: None,
+            netting_on_trades_page: None,
             hold_trades_page: None,
             trade_after_close: None,
             netting_after_close: None,
@@ -1731,6 +1756,11 @@ impl QfexModel {
                 if std::mem::take(&mut self.fill_on_trades) || later {
                     let id = self.orders.first().map(|o| o.id.clone());
                     self.fill(&id.expect("an order to fill"));
+                }
+                let netting = self.netting_on_trades_page.filter(|(at, _)| *at == asked);
+                if let Some((_, stray)) = netting {
+                    let account = self.account_of(conn);
+                    self.netting_trades(account, stray);
                 }
                 Ok(vec![Frame::text(self.trades_page(conn, &v))])
             }
@@ -2734,9 +2764,11 @@ impl QfexModel {
             let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
             return limited(&echo.to_string(), 3).replace("exceeded,", "exceeded\\u002c");
         }
+        let mut stray = None;
         if !session && v["params"]["limit"] == 1 {
             let n = self.pager_pages;
             self.pager_pages += 1;
+            stray = (self.stray_on_pager_page).and_then(|(at, what)| (at == n).then_some(what));
             if self.rate_limit == Some(Limited::PagerPage(n)) {
                 self.rate_limit = None;
                 let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
@@ -2784,10 +2816,22 @@ impl QfexModel {
             }
         }
         let beside = (self.twap_beside.as_ref()).is_some_and(|on| *on != account);
-        let twaps = match !session && (self.twaps.contains(&account) || beside) {
+        let twap = beside || stray == Some(PagerStray::Twap);
+        let twaps = match !session && (self.twaps.contains(&account) || twap) {
             true => vec![serde_json::json!({"symbol": SYMBOL, "status": "ACTIVE"})],
             false => Vec::new(),
         };
+        if stray == Some(PagerStray::Order) {
+            let first = self.orders.iter().find(|o| o.account == account).cloned();
+            let foreign = first.map(|first| Order {
+                id: "77777777-7777-4777-8777-777777777777".to_owned(),
+                cid: STRAY_CID.to_owned(),
+                filled: Decimal::ZERO,
+                state: State::Open,
+                ..first
+            });
+            rows = foreign.iter().map(row).collect();
+        }
         serde_json::json!({"all_orders_response": {"orders": rows, "twaps": twaps}}).to_string()
     }
 

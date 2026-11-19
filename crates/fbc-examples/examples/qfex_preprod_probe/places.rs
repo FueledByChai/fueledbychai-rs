@@ -156,6 +156,10 @@ pub enum Stop {
     /// A flatten that leaves the position not flat, and why (decision 0148 items 5, 8 and 9,
     /// 0151 item 9; FBC-ou9g): the position is the owner's.
     Flatten(Flattening),
+    /// A session outside the drop test whose Stop's cancels were refused locally or met by a
+    /// provider rate refusal ([`Cancels::blocked`]), with no stop before them: held Stop cancels
+    /// end with the run stopping (0151 item 11; FBC-3xzn). It says nothing of an order resting.
+    CancelsBlocked,
 }
 
 /// Why a flatten stopped not flat (decision 0148 items 5 and 8; [`Stop::Flatten`]).
@@ -210,7 +214,7 @@ pub enum RefusedOn {
 
 impl Stop {
     /// Every stop, in the order the report lists them.
-    pub const ALL: [Stop; 32] = [
+    pub const ALL: [Stop; 33] = [
         Stop::NotOurCid,
         Stop::StrayOrder,
         Stop::ReplayRefused(Replay::Untimed),
@@ -251,6 +255,7 @@ impl Stop {
         Stop::Flatten(Flattening::Unsettled),
         Stop::Flatten(Flattening::NotEnded),
         Stop::Flatten(Flattening::NoTouch),
+        Stop::CancelsBlocked,
     ];
 
     /// Its name, as the report, the evidence and the marker give it.
@@ -292,6 +297,7 @@ impl Stop {
                 Flattening::NotEnded => "Flatten(NotEnded)",
                 Flattening::NoTouch => "Flatten(NoTouch)",
             },
+            Stop::CancelsBlocked => "CancelsBlocked",
         }
     }
 
@@ -436,6 +442,11 @@ impl Stop {
                      was sent: not flat, the position the owner's (decision 0148 items 5 and 9)"
                 }
             },
+            Stop::CancelsBlocked => {
+                "a session's Stop cancels refused locally or met by a provider rate refusal, \
+                 with no stop before them: held Stop cancels end with the run stopping (0151 item \
+                 11). It says nothing of an order resting, which only a read listing one shows"
+            }
         }
     }
 

@@ -232,9 +232,11 @@
 //!   size of 1, every frame charged to the shared limiter first (`compare::Socket::page`); each
 //!   is recorded with its size and offset, which of ours the streams showed open as it was asked
 //!   and what it listed by name ([`Run::page_now`]). A provider rate refusal on the pager is the
-//!   run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`], marked; a page that could
-//!   not be made otherwise is recorded and stops nothing. A maker fill of a stage-three order is
-//!   flattened while the session is open, then stops the run (the flatten, below). Then the
+//!   run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`], marked, and so is a page
+//!   listing an order that is none of P1 to P3, or a TWAP, [`Stop::ReadDisagrees`] (decision
+//!   0148 item 8); a page that could not be made otherwise is recorded and stops nothing. A
+//!   maker fill of a stage-three order is flattened while the session is open, then stops the
+//!   run (the flatten, below). Then the
 //!   session's Stop and the read of every named account, as after a crossing session; the
 //!   session's frames and the pager's pages go in the `pages-production/` slice
 //!   ([`PAGES_SLICE`]). With no stop the run ends after the last account's stage three
@@ -247,9 +249,11 @@
 //!   every stop and once it ran its course (decision 0132 item 7, 0148 item 8), meets its span
 //!   bound one `--rpc-timeout-ms` early ([`cancels_begin`]), and, its cancels refused locally or
 //!   met by a provider rate refusal ([`Cancels::blocked`]), ends by the abrupt drop once its
-//!   account's drop test passed in the run, and by a graceful close otherwise (0151 item 11). A
-//!   graceful close waits for the shared budget's room when a provider rate refusal holds it, and
-//!   a Ctrl-C, or a stop that cancels under the policy, taken while it waits with no cancels run
+//!   account's drop test passed in the run, and by a graceful close otherwise; either way, with
+//!   no stop before them, those cancels stop the run, [`Stop::CancelsBlocked`], marked, the reads
+//!   after the session still made ([`stage_session_stop`]; 0151 item 11, FBC-3xzn). A graceful
+//!   close waits for the shared budget's room when a provider rate refusal holds it, and a
+//!   Ctrl-C, or a stop that cancels under the policy, taken while it waits with no cancels run
 //!   yet, runs its cancels first, then the flatten of a fill of ours not yet flattened (0151 items
 //!   2, 9 and 11).
 //! - **The flatten** ([`Run::flatten`], FBC-ou9g; decisions 0012, 0063, 0148 items 5, 6, 8 and 9,
@@ -4405,7 +4409,16 @@ impl Run<'_> {
             c.refused_locally();
         }
         let mut rpcs = Vec::new();
+        // A test's Stop cancels of a session outside the drop test refused locally (FBC-3xzn).
+        #[cfg(test)]
+        let refuse = stop
+            && matches!(d.which, Which::Cross | Which::Take | Which::Pages)
+            && self.places.is_some_and(|p| p.test.refuse_stop_cancels);
         let submit = |cmd, rpcs: &mut Vec<fbc_core::RpcId>| {
+            #[cfg(test)]
+            if refuse {
+                return Err("a test's local refusal of a Stop cancel".to_owned());
+            }
             let mut link = d.link.borrow_mut();
             let auth = link
                 .reg()
@@ -5627,7 +5640,8 @@ impl Run<'_> {
     /// given to the journal before any market arms (decision 0139) and seeded flat (decision 0148
     /// item 3); then its session ([`Run::cross_session`]); then the read of every named account
     /// after it, the session's orders known as ours on its own account. Each way it ends the run
-    /// is a stop, marked: the session's stop, a failure that was no stop (with the stop the reads
+    /// is a stop, marked: the session's stop, or with none its Stop's cancels held as 0151 item
+    /// 11 names ([`stage_session_stop`]), a failure that was no stop (with the stop the reads
     /// after it show), then the reads' own ([`stage_after_stop`]): a provider rate refusal, the
     /// owner's Ctrl-C, a position not flat, an order or a TWAP not ours, or an order of ours still
     /// resting, listed by a read or counted resting by the registry, an `Unknown` order included,
@@ -5731,13 +5745,15 @@ impl Run<'_> {
         link.borrow_mut().reg().disarm(inst);
         placed.session_ended(&link.borrow(), which.name(), self.mono());
         self.ev.place_registries.push(placed);
-        // A registry's order that kept the session's order back is counted resting, never seen
-        // resting (the owner's ruling under 0151 item 6 on FBC-gisx; its review).
-        let blocked = self.stage_run(which).blocked.is_some();
-        let said = ran.map(|stop| {
-            let says = (stop == Stop::LeftResting && blocked).then_some(places::COUNTED_BLOCKED);
-            self.halt_as(stop, &format!("in {}", which.name()), says)
-        });
+        // The session's stop: its own, or, with none, its Stop's cancels held as 0151 item 11
+        // names, which stop the run in their own right (FBC-3xzn). A registry's order that kept
+        // the session's order back is counted resting, never seen resting (the owner's ruling
+        // under 0151 item 6 on FBC-gisx; its review).
+        let kept_back = self.stage_run(which).blocked.is_some();
+        let cancels = self.stage_run(which).cancels.clone();
+        let session = stage_session_stop(ran, kept_back, cancels.as_ref());
+        let said =
+            session.map(|(stop, says)| self.halt_as(stop, &format!("in {}", which.name()), says));
         // The session's orders, once placed (the crossing post-only or the taker IOC, then its
         // flatten IOCs), are ours on its own account, by their venue ids once the streams named
         // them: an order or a TWAP any read lists that is none of them is what the streams did
@@ -5827,8 +5843,11 @@ impl Run<'_> {
     /// `trade_id` is the fills channel's, which side field it carries, and any row naming an
     /// order the codec did not place; the historic orders give each order's `terminal_status`.
     /// A read that could not be made is recorded and stops nothing; a provider rate refusal in
-    /// it is the run's stop, marked, and so is the owner's Ctrl-C meanwhile. Nothing is read
-    /// when no taker IOC was handed to the session.
+    /// it is the run's stop, marked, and so is the owner's Ctrl-C meanwhile, and then a row
+    /// naming none of `ours`, or none at all: a trade of an order the streams did not show,
+    /// [`Stop::ReadDisagrees`] (decision 0148 item 8; PR #284's review), each in that order, as
+    /// [`stage_read_stop`] ranks them. Nothing is read when no taker IOC was handed to the
+    /// session.
     async fn take_trades(&mut self, on: Armed, ours: &[&AllowedOrder]) -> Result<(), String> {
         let Some(since) = self.taker_secs.take().filter(|_| !ours.is_empty()) else {
             return Ok(());
@@ -5847,12 +5866,14 @@ impl Run<'_> {
             places::yn(traded.trades_whole),
             places::yn(traded.historic_whole)
         ));
+        let foreign = traded.foreign;
         self.stage_run(Which::Take).traded = Some(traded);
         let when = format!("reading the taker IOC's trades after {}", places::TAKE);
-        match (refused, pressed) {
-            (Some(stop), _) => Err(self.halt(stop, &when)),
-            (None, true) => Err(self.halt(Stop::Interrupted, &when)),
-            (None, false) => Ok(()),
+        match (refused, pressed, foreign) {
+            (Some(stop), ..) => Err(self.halt(stop, &when)),
+            (None, true, _) => Err(self.halt(Stop::Interrupted, &when)),
+            (None, false, 1..) => Err(self.halt(Stop::ReadDisagrees, TAKE_TRADES_OTHERS)),
+            (None, false, 0) => Ok(()),
         }
     }
 
@@ -6714,9 +6735,10 @@ impl Run<'_> {
     /// ([`crate::pager::PageRead`]): its size and offset, which of stage three's orders, `paged`,
     /// the streams showed open as it was asked, what it listed by name, and its frame for the
     /// slice; the pager's refusals kept as they go. A provider rate refusal on the pager is the
-    /// run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`] (decision 0148 item 8);
-    /// any other page that could not be made is recorded and stops nothing. Gives what it came
-    /// to.
+    /// run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`], and so is a page listing
+    /// an order that is none of `paged`, or a TWAP, [`Stop::ReadDisagrees`], each recorded first
+    /// (decision 0148 item 8); any other page that could not be made is recorded and stops
+    /// nothing. Gives what it came to.
     async fn page_now(
         &mut self,
         d: &DropCtx,
@@ -6779,7 +6801,15 @@ impl Run<'_> {
             let page = match page {
                 Ok(page) => page,
                 Err(halt) => {
-                    self.three_run().walk = Some(WalkEnd::NotRead);
+                    // The page itself, recorded, listed an order or a TWAP not ours: its stop.
+                    use crate::pager::Came;
+                    let came = self.three_run().pages.last().map(|p| p.came.clone());
+                    let disagreed = matches!(came, Some(Came::Read { others, twaps, .. }) if others + twaps > 0);
+                    let end = match disagreed {
+                        true => WalkEnd::Disagreed,
+                        false => WalkEnd::NotRead,
+                    };
+                    self.three_run().walk = Some(end);
                     return Err(halt);
                 }
             };
@@ -7115,6 +7145,38 @@ pub fn stage_counted_says(stop: Stop, listed: bool, counted: bool) -> Option<&'s
         _ => None,
     }
 }
+
+/// The stop a session outside the drop test ends the run with before the reads after it
+/// ([`Run::cross_test`]: the crossing session's, the taker IOC session's and stage three's
+/// alike), and what it says in place of [`Stop::says`], given `ran`, the stop its steps, its
+/// flatten, its Stop's cancels or its close raised, `kept_back`, whether the check before its
+/// order kept that order back, and `cancels`, its Stop's cancels when they ran. The first stop
+/// is the run's: `ran`, its [`Stop::LeftResting`] said as [`places::COUNTED_BLOCKED`] when the
+/// check kept its order back. With none, cancels refused locally or met by a provider rate
+/// refusal ([`Cancels::blocked`], 0151 item 11's two causes) stop the run in their own right,
+/// [`Stop::CancelsBlocked`] (0151 item 11; FBC-3xzn), which says nothing of an order resting
+/// (the owner's ruling under 0151 item 6). A provider rate refusal also raises
+/// [`Stop::RateRefused`] through the tee, which comes first as `ran`. `None` when neither came:
+/// the reads after the session decide ([`stage_after_stop`]).
+pub fn stage_session_stop(
+    ran: Option<Stop>,
+    kept_back: bool,
+    cancels: Option<&Cancels>,
+) -> Option<(Stop, Option<&'static str>)> {
+    match (ran, cancels.is_some_and(|c| c.blocked)) {
+        (Some(stop), _) => {
+            let says = (stop == Stop::LeftResting && kept_back).then_some(places::COUNTED_BLOCKED);
+            Some((stop, says))
+        }
+        (None, true) => Some((Stop::CancelsBlocked, None)),
+        (None, false) => None,
+    }
+}
+
+/// When the taker IOC's trades read after its session held a row naming none of its orders, or
+/// none at all (decision 0148 item 8; PR #284's review).
+pub const TAKE_TRADES_OTHERS: &str = "reading the taker IOC's trades after the taker IOC session, \
+     a get_user_trades row naming no order of ours";
 
 /// When the reads after a taker IOC session listed an order or a TWAP not ours.
 pub const TAKE_OTHERS: &str =

@@ -1342,6 +1342,76 @@ fn held_cancels_end_a_stage_session_by_a_drop_only_after_a_passed_drop_test() {
 }
 
 #[test]
+fn held_stop_cancels_stop_the_run_unless_a_stop_came_before_them() {
+    // 0151 item 11 (FBC-3xzn): a session outside the drop test whose Stop's cancels were refused
+    // locally or met by a provider rate refusal stops the run in its own right,
+    // CancelsBlocked, when no stop came before them; one that came first is the run's.
+    use places::{COUNTED_BLOCKED, Cancels, RefusedOn, Stop};
+    use stage::stage_session_stop;
+    let mut blocked = Cancels::default();
+    blocked.refused_locally();
+    // Answered other than accepted alone holds them but is neither of 0151 item 11's causes.
+    let held = Cancels {
+        sent: 1,
+        held: true,
+        ..Cancels::default()
+    };
+    let clean = Cancels {
+        sent: 1,
+        ended: true,
+        ..Cancels::default()
+    };
+    // Blocked with no earlier stop: CancelsBlocked, said as itself, whether or not the check
+    // before the session's order kept it back.
+    for kept_back in [false, true] {
+        assert_eq!(
+            stage_session_stop(None, kept_back, Some(&blocked)),
+            Some((Stop::CancelsBlocked, None))
+        );
+    }
+    // Blocked behind an earlier stop: the earlier one is the run's, said as before.
+    let session = RefusedOn::Session;
+    for earlier in [
+        Stop::Interrupted,
+        Stop::SpanBound,
+        Stop::RateRefused { on: session },
+        Stop::UnexpectedFill,
+        Stop::ReadDisagrees,
+    ] {
+        assert_eq!(
+            stage_session_stop(Some(earlier), false, Some(&blocked)),
+            Some((earlier, None)),
+            "{}",
+            earlier.name()
+        );
+    }
+    let resting = Some(Stop::LeftResting);
+    let counted = Some((Stop::LeftResting, Some(COUNTED_BLOCKED)));
+    assert_eq!(stage_session_stop(resting, true, Some(&blocked)), counted);
+    assert_eq!(stage_session_stop(resting, true, None), counted);
+    // Not blocked: no stop of its own, whatever else held them.
+    for cancels in [Some(&held), Some(&clean), None] {
+        assert_eq!(stage_session_stop(None, false, cancels), None);
+        let span = Some((Stop::SpanBound, None));
+        assert_eq!(
+            stage_session_stop(Some(Stop::SpanBound), false, cancels),
+            span
+        );
+    }
+    // It marks, cancels nothing in a drop session (no drop session raises it), and says nothing
+    // of an order resting.
+    let stop = Stop::CancelsBlocked;
+    assert!(stop.marks() && !stop.cancels_in_drop(false));
+    assert_eq!(Stop::named("CancelsBlocked"), Some(stop));
+    assert!(stop.says().contains("0151 item 11"), "{}", stop.says());
+    assert!(
+        stop.says().contains("says nothing of an order resting"),
+        "{}",
+        stop.says()
+    );
+}
+
+#[test]
 fn a_stop_cancels_blocked_only_when_refused_locally_or_rate_refused() {
     let accepted = SubmitOutcome::Accepted {
         ack: fbc_core::AckLevel::Final,
