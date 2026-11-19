@@ -15731,12 +15731,19 @@ async fn an_order_a_registry_holds_that_keeps_a_crossing_order_back_is_said_coun
 async fn an_account_the_read_before_drop_session_two_cannot_read_is_said_counted_not_seen() {
     // QFEX cancels X itself after its ACK, its CANCELLED naming our client id, so the streams
     // show X end in drop session one and the reads after it do not list X. Then the primary's
-    // GET /user/positions in the read before drop session two answers HTTP 500 (the fourth after
-    // X's place). The run stops LeftResting, marked, said as an account not read, counted
-    // resting, never as an order seen resting.
+    // GET /user/positions in the read before drop session two answers HTTP 500. The run stops
+    // LeftResting, marked, said as an account not read, counted resting, never as an order seen
+    // resting.
+    //
+    // PR #278's CI (run 44502099758): the 500 is keyed on the first GET /user/positions after
+    // the run's first GET /user/historic-orders, X's read after drop session one, never on a
+    // count from X's place. The CANCELLED follows X's ACK in one answer, so on Linux the kernel
+    // can hold it about 40 ms while REST already shows X ended: the comparison after X's place
+    // then makes a second read, and a count would land on the subaccount's read after drop
+    // session one, which stops nothing.
     let model = QfexModel {
         venue_cancel: true,
-        rest_fails: vec![3],
+        rest_fails_after_historic: true,
         ..QfexModel::default()
     };
     let d = dropped(model, "drop-before-two-unread-said").await;

@@ -1278,7 +1278,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     read socket asks for once an armed connection ended answered with a frame that is no page, or
     by a server close), `page_after_ioc_end` (the same, once the connection the run's first limit
     IOC arrived on ended), `rest_fails_after_drop_reads` (once an armed connection dropped, the
-    first `GET /user/positions` after a historic-orders read answered HTTP 500) and
+    first `GET /user/positions` after a historic-orders read answered HTTP 500),
+    `rest_fails_after_historic` (the first `GET /user/positions` after the run's first
+    historic-orders read answered HTTP 500: the read before drop session two, however many reads
+    the comparison after X's place made) and
     `twap_elsewhere_after_close` (once an armed connection ended, every other account's pages
     listing one TWAP), all declared by path; eleven paths no flag or answer reaches, X spent from
     its list, X not priced, Y not priced (FBC-gisx), a session failing after its order's answer,
