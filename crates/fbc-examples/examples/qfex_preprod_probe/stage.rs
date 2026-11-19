@@ -4,8 +4,8 @@
 //! nothing and sends no command but each session's arm, its resync's reads and the probe's own
 //! reads. With `--hold-secs` it first holds one trade connection that never arms (decision 0146),
 //! and a run may hold without arming at all. With `--place-stages` it runs the place stages'
-//! preflight, each named account's drop test, which places X and Y, and stage two's crossing
-//! post-only (below).
+//! preflight, each named account's drop test, which places X and Y, stage two's crossing
+//! post-only and taker IOC, and stage three's pages (below).
 //!
 //! - **Before anything connects** ([`run`]): every credential the run reads is set
 //!   (`src/auth_qfex.rs`), and the configuration of each account it reads, under the adapter's
@@ -98,10 +98,12 @@
 //! - **The place stages' preflight** ([`run_places_until`], FBC-c6kw, the first slice of
 //!   FBC-9sk2; decision 0148): a run with `--place-stages` prints a `CAPS` line with the
 //!   environment and both caps first, before any request, the hold's included (decisions 0113
-//!   items 1 and 2 and 0148 item 7); it is refused, nothing sent, unless every origin is a
-//!   loopback test stub's (until FBC-4plj lands every stop decisions 0132 item 7 and 0148 item 8
-//!   require), and unless `--registry-span` is above the drop test's floor for the accounts the
-//!   configuration names (`probe_args::check_place_span`, 0151 item 3). It holds first when
+//!   items 1 and 2 and 0148 item 7); its origins are those the adapter's probe guard admits for
+//!   production alone (`--production`: QFEX production's three, or all three loopback), as every
+//!   run's are (decision 0143 item 2), FBC-4plj having lifted the loopback-only gate once every
+//!   stop decisions 0132 item 7 and 0148 item 8 require had landed; it is refused, nothing sent,
+//!   unless `--registry-span` is above the drop test's floor for the accounts the configuration
+//!   names (`probe_args::check_place_span`, 0151 item 3). It holds first when
 //!   `--hold-secs` asks, alone (the owner's Ctrl-C from the hold's first read to its last stops
 //!   it before its preflight, with no stop marker, [`Run::hold`]),
 //!   then runs [`crate::market`]'s preflight (the spec from this run's
@@ -213,8 +215,31 @@
 //!   until FBC-jdj7); one whose fills QFEX's count states but which had not all reached the
 //!   registry by its deadline is [`Stop::IocUnsettled`], not flat, with no flatten, whatever the
 //!   registry's position. Then the session's Stop and the read of every named account, as after a
-//!   crossing session. With no stop the run ends after the last account's taker IOC, naming
-//!   FBC-4plj, which builds stage three ([`NOT_BUILT`]).
+//!   crossing session. With no stop, the account's stage-three session follows (below).
+//! - **Stage three, the pages** ([`Run::pages_steps`], FBC-4plj; decision 0132 items 5 and 7,
+//!   0148 items 7, 8 and 10; [`crate::pager`]), on the account's pages registry, after its taker
+//!   IOC session, so only once its drop test passed and the run's exact-echo gate is open, run as
+//!   the crossing session is ([`Run::cross_test`] and [`Run::cross_session`] under
+//!   [`Which::Pages`]): every named account read clean, the registry built, tripped and seeded
+//!   flat; one session armed, resynced and Started; then [`crate::pager::PLAN`]: P1 and P2, page
+//!   0, P3, page 1, P1's cancel, pages 2 and 3, P2's and P3's cancels, then every page from offset
+//!   0 until a short one ([`Run::walk`], cut at [`crate::pager::WALK_PATIENCE`]). Each order is a
+//!   post-only GTC at the minimum size `--away-bps` behind the touch, an fbc-oms authorization
+//!   spent from the pages registry's own list ([`Run::place_resting`]), held to both USD caps at
+//!   the touch it is priced at; each cancel is by venue id ([`Run::cancel_paged`]); each place and
+//!   cancel is compared with never-arming reads. The pages come from the pager, a second socket
+//!   that never arms or places, on the session's account and the guarded configuration, at a page
+//!   size of 1, every frame charged to the shared limiter first (`compare::Socket::page`); each
+//!   is recorded with its size and offset, which of ours the streams showed open as it was asked
+//!   and what it listed by name ([`Run::page_now`]). A provider rate refusal on the pager is the
+//!   run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`], marked; a page that could
+//!   not be made otherwise is recorded and stops nothing. A maker fill of a stage-three order is
+//!   flattened while the session is open, then stops the run (the flatten, below). Then the
+//!   session's Stop and the read of every named account, as after a crossing session; the
+//!   session's frames and the pager's pages go in the `pages-production/` slice
+//!   ([`PAGES_SLICE`]). With no stop the run ends after the last account's stage three
+//!   ([`FINISHED`]), its outcome ok when its files and records are whole, and its report answers
+//!   decision 0132's list for each named account ([`crate::answers`]).
 //! - **The session machinery** ([`Run::end_session`], FBC-su9i): every place stage's session ends
 //!   through it under its [`Policy`]. A drop session cancels only at Ctrl-C or once a fill of
 //!   ours came and ends by a graceful close, or drop session two by its abrupt drop (above); a
@@ -314,14 +339,15 @@ use crate::interrupt::Presses;
 use crate::ledger::{self, Opened, PlaceBounds, PlaceLists, PlaceRegistry, RegistryLedger, Step};
 use crate::link::{Link, LinkHandler};
 use crate::market::{self, Discovered, PlaceCaps, Preflight};
+use crate::pager::PagesRun;
 use crate::places::{
     self, Allowance, Cancels, DropRun, Flattening, PlaceHandler, RunLeases, Stop, Traded, TwoRun,
     Watched,
 };
 use crate::probe_args::{self as args, Hold, Options, Places, RESYNC_TIMEOUT};
 use crate::refusals::{
-    self, AFTER_CROSS, AFTER_DROP_ONE, AFTER_DROP_TWO, AFTER_HOLD, AFTER_TAKE, HOLD, ReadSocket,
-    Refusals,
+    self, AFTER_CROSS, AFTER_DROP_ONE, AFTER_DROP_TWO, AFTER_HOLD, AFTER_PAGES, AFTER_TAKE, HOLD,
+    ReadSocket, Refusals,
 };
 use crate::stage_two::{self as two, CrossRun, StageTwo};
 use crate::tee::{Tap, Tee};
@@ -461,15 +487,16 @@ pub async fn run_places(
     run_places_until(opts, places, lookup, out, pending, Presses::none()).await
 }
 
-/// Runs a place-stage run (`--place-stages`, FBC-c6kw): the `CAPS` line, the guard, the
-/// loopback-only gate and the span bound's floor, the lease directory ([`RunLeases::open`]:
+/// Runs a place-stage run (`--place-stages`, FBC-c6kw): the `CAPS` line, the guard and the span
+/// bound's floor, the lease directory ([`RunLeases::open`]:
 /// its tag, the stop markers and `--reconciled`, the namespace lease and the mint), the hold
 /// when `opts.hold` asks for one (ended early by `interrupt`), then the place stages' preflight
 /// ([`crate::market`]) and, with `--reconciled`, the reads of every named account that clear
-/// the stop marker, then the files. It places nothing: it stops after them, its outcome not ok,
-/// since the place stages after them are not built yet. A press of `presses` during the
-/// preflight or the reads stops it, [`Stop::Interrupted`], its report and its stop marker
-/// written (decision 0148 item 8, 0151 item 6).
+/// the stop marker, then each named account's drop test, stage two and stage three
+/// ([`Run::drop_tests`]), then the files; with no stop it ends after the last account's stage
+/// three ([`FINISHED`]). A press of `presses` during the preflight or the reads stops it,
+/// [`Stop::Interrupted`], its report and its stop marker written (decision 0148 item 8, 0151
+/// item 6).
 pub async fn run_places_until(
     opts: &Options,
     places: &Places,
@@ -481,16 +508,11 @@ pub async fn run_places_until(
     run_with(opts, Some((places, presses)), lookup, out, interrupt).await
 }
 
-/// The refusal of a place-stage run on an origin that is not loopback (FBC-c6kw), until FBC-4plj
-/// lifts it.
-pub const LOOPBACK_ONLY: &str = "--place-stages: refused, nothing sent: until FBC-4plj lands \
-     every stop decisions 0132 item 7 and 0148 item 8 require, the place stages run only against \
-     a loopback test stub, every origin (trade, REST and MDS) a loopback address";
-
-/// Why a place-stage run ends after each named account's taker IOC, when no stop came first
-/// (FBC-ou9g): stage three is not built yet.
-pub const NOT_BUILT: &str = "stage three (decision 0132 item 7) is not built yet (FBC-4plj builds \
-     it): the run ends after each named account's taker IOC, its outcome not ok";
+/// What a place-stage run says when it ends with no stop (FBC-4plj): every place stage ran on
+/// every named account, each account's stage three last (decision 0132 item 7).
+pub const FINISHED: &str = "every place stage ran: each named account's drop test, then, on each \
+     whose drop test passed, its crossing post-only, its taker IOC and its stage three (decision \
+     0132 item 7); the report answers decision 0132's list for each named account";
 
 /// Why a place-stage run that holds stops when the owner's Ctrl-C comes before the hold's
 /// connection opens, during the reads before it or its connect: it is the hold's interrupt, so
@@ -574,10 +596,6 @@ async fn run_with(
         );
     }
     if let Some(places) = places {
-        // The guard admits one side for all three origins, so loopback here is every one.
-        if origins != Origins::Loopback {
-            return Err(LOOPBACK_ONLY.to_owned());
-        }
         args::check_place_span(opts, places, named.len())?;
     }
     // The lease directory, before anything connects or the evidence directory is made: its tag,
@@ -673,6 +691,7 @@ async fn run_with(
         unread: Vec::new(),
         built: Vec::new(),
         allowances: Vec::new(),
+        taker_secs: None,
     };
     let held = opts.hold.map_or(String::new(), |hold| {
         format!(
@@ -698,12 +717,16 @@ async fn run_with(
              at the far touch, and cancels every order of ours by venue id before its session \
              stops, then, in a session of its own (FBC-ou9g), one limit IOC at the minimum size at \
              the far touch, whose fill is flattened through Exit before that session stops; with \
-             the exact-echo gate shut the run ends NoEcho; the run ends after the last account's \
-             taker IOC, not ok, until FBC-4plj builds stage three; a fill of ours other than the \
-             taker IOC's and a flatten IOC's is flattened while its session is open: every other \
-             order of ours cancelled by venue id, the owner's Flatten into Exit, then reducing \
-             limit IOCs at the minimum size within --flatten-cap-bps under the account's one \
-             budget of --flatten-attempts, then the run stops{held}",
+             the exact-echo gate shut the run ends NoEcho; then stage three (FBC-4plj), in a \
+             session of its own on each account after its taker IOC: P1 and P2, each one post-only \
+             GTC at the minimum size behind the touch, P3, then their cancels by venue id, while a \
+             pager that never arms asks for get_user_orders at a page size of 1 between them; the \
+             run ends after the last account's stage three, its report answering decision 0132's \
+             list for each named account; a fill of ours other than the taker IOC's and a flatten \
+             IOC's is flattened while its session is open: every other order of ours cancelled by \
+             venue id, the owner's Flatten into Exit, then reducing limit IOCs at the minimum size \
+             within --flatten-cap-bps under the account's one budget of --flatten-attempts, then \
+             the run stops{held}",
             environment(env),
             env.mode(),
         )),
@@ -864,11 +887,17 @@ pub const DROP_SLICE: &str = "drop-production";
 /// has read every file.
 pub const PLACES_SLICE: &str = "places-production";
 
+/// The directory a place-stage run writes stage three's sessions' frames and its pagers' pages
+/// into (decision 0148 item 10, FBC-4plj), to commit as
+/// `fixtures/qfex/exec-recorded/pages-production/` once the owner has read every file.
+pub const PAGES_SLICE: &str = "pages-production";
+
 /// A place-stage run's [`write_slice`]: the slice scrubbed by `capture::Scrub::Places`
 /// (decision 0148 item 10), each resync page read on `specs`, the spec table its sessions held,
-/// the drop test's sessions' frames written into `dir/drop-production/` with its README, and,
-/// when a crossing session ran, stage two's into `dir/places-production/` with its own, each
-/// then checked by `script`.
+/// the drop test's sessions' frames written into `dir/drop-production/` with its README; when a
+/// crossing session ran, stage two's into `dir/places-production/` with its own; and when a
+/// stage-three session ran, its frames and its pager's pages into `dir/pages-production/` with
+/// its own; each then checked by `script`.
 pub fn write_place_slice(
     dir: &Path,
     ev: &mut Evidence,
@@ -877,15 +906,23 @@ pub fn write_place_slice(
 ) -> Result<(), String> {
     let files = capture::slice_places(&dir.join("journal"), SHARD, ev, specs)?;
     let (crossing, files) = capture::split_crossing(ev, files);
+    let (mut paging, files) = capture::split_paging(ev, files);
     let crossed = ev.sessions.iter().any(capture::is_crossing);
+    let paged = ev.sessions.iter().any(capture::is_paging);
     checked_fixtures(&dir.join(DROP_SLICE), ev, script, |fixtures, ev| {
         capture::write_fixtures_scrubbed(fixtures, files, ev, capture::Scrub::Places)
     })?;
-    if !crossed {
+    if crossed {
+        checked_fixtures(&dir.join(PLACES_SLICE), ev, script, |fixtures, ev| {
+            capture::write_crossing_fixtures(fixtures, crossing, ev)
+        })?;
+    }
+    if !paged {
         return Ok(());
     }
-    checked_fixtures(&dir.join(PLACES_SLICE), ev, script, |fixtures, ev| {
-        capture::write_crossing_fixtures(fixtures, crossing, ev)
+    paging.extend(capture::pager_files(ev));
+    checked_fixtures(&dir.join(PAGES_SLICE), ev, script, |fixtures, ev| {
+        capture::write_pages_fixtures(fixtures, paging, ev)
     })
 }
 
@@ -970,6 +1007,9 @@ struct Run<'a> {
     /// Each named account's allowance once its drop test's sessions ran, which its later
     /// registries spend from (decision 0148 item 7: one flatten budget per account).
     allowances: Vec<(Armed, Allowance)>,
+    /// When the current taker IOC session's taker IOC was handed to the session, in whole Unix
+    /// seconds: where its trades are read from after the session ([`Run::take_trades`]).
+    taker_secs: Option<u64>,
 }
 
 /// A place-stage registry the run built ([`Run::built`]): its account, its step, its `Link`, and,
@@ -2190,14 +2230,16 @@ impl From<Stop> for Halt {
     }
 }
 
-/// Which session of a place stage: one of a drop test's two (decision 0132 item 4), or stage
-/// two's crossing session (FBC-su9i) or taker IOC session (FBC-ou9g, decision 0132 item 7).
+/// Which session of a place stage: one of a drop test's two (decision 0132 item 4), stage two's
+/// crossing session (FBC-su9i) or taker IOC session (FBC-ou9g, decision 0132 item 7), or stage
+/// three's session (FBC-4plj, decision 0132 item 7).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Which {
     One,
     Two,
     Cross,
     Take,
+    Pages,
 }
 
 impl Which {
@@ -2208,6 +2250,7 @@ impl Which {
             Which::Two => places::DROP_TWO,
             Which::Cross => places::CROSS,
             Which::Take => places::TAKE,
+            Which::Pages => places::PAGES,
         }
     }
 
@@ -2218,16 +2261,18 @@ impl Which {
             Which::Two => AFTER_DROP_TWO,
             Which::Cross => AFTER_CROSS,
             Which::Take => AFTER_TAKE,
+            Which::Pages => AFTER_PAGES,
         }
     }
 
-    /// The order it places: X, Y, or the crossing post-only.
+    /// The order it places: X, Y, the crossing post-only, the taker IOC, or stage three's.
     fn order(self) -> &'static str {
         match self {
             Which::One => "X",
             Which::Two => "Y",
             Which::Cross => "the crossing post-only",
             Which::Take => "the taker IOC",
+            Which::Pages => "P1, P2 and P3",
         }
     }
 
@@ -2237,6 +2282,7 @@ impl Which {
             Which::One | Which::Two => Step::Drop,
             Which::Cross => Step::Cross,
             Which::Take => Step::Take,
+            Which::Pages => Step::Pages,
         }
     }
 
@@ -2246,6 +2292,18 @@ impl Which {
             Which::One | Which::Two => " (drop)",
             Which::Cross => " (cross)",
             Which::Take => " (take)",
+            Which::Pages => " (pages)",
+        }
+    }
+
+    /// Which stage-two or stage-three session it is, for the stops and the report's words that
+    /// differ between them; `None` for a drop session.
+    fn stage(self) -> Option<two::Session> {
+        match self {
+            Which::One | Which::Two => None,
+            Which::Cross => Some(two::Session::Cross),
+            Which::Take => Some(two::Session::Take),
+            Which::Pages => Some(two::Session::Pages),
         }
     }
 }
@@ -3003,6 +3061,12 @@ impl Run<'_> {
             Which::One => &mut self.drop_run().x,
             Which::Two => &mut self.two_run().y,
             Which::Cross | Which::Take => &mut self.stage_run(which).placed,
+            // The stage-three order being placed: its record is pushed before its place.
+            Which::Pages => {
+                &mut (self.three_run().orders.last_mut())
+                    .expect("a stage-three order begun")
+                    .1
+            }
         }
     }
 
@@ -3011,7 +3075,7 @@ impl Run<'_> {
         let flatten = match which {
             Which::One => &mut self.drop_run().flatten,
             Which::Two => &mut self.two_run().flatten,
-            Which::Cross | Which::Take => &mut self.stage_run(which).flatten,
+            Which::Cross | Which::Take | Which::Pages => &mut self.stage_run(which).flatten,
         };
         flatten.get_or_insert_with(|| FlattenRun {
             after: crate::flatten::AFTER_FILL,
@@ -3025,13 +3089,22 @@ impl Run<'_> {
     }
 
     /// Stage two's session `which` begun last, as the evidence holds it: the crossing session
-    /// (FBC-su9i), or, for [`Which::Take`], the taker IOC session (FBC-ou9g).
+    /// (FBC-su9i), or, for [`Which::Take`], the taker IOC session (FBC-ou9g); for
+    /// [`Which::Pages`], stage three's session (FBC-4plj).
     fn stage_run(&mut self, which: Which) -> &mut CrossRun {
+        if which == Which::Pages {
+            return &mut self.three_run().session;
+        }
         let two = self.ev.stage_two.get_or_insert_with(StageTwo::default);
         match which {
             Which::Take => two.takes.last_mut().expect("a taker IOC session begun"),
             _ => two.crosses.last_mut().expect("a crossing session begun"),
         }
+    }
+
+    /// Stage three's run begun last, as the evidence holds it (FBC-4plj).
+    fn three_run(&mut self) -> &mut PagesRun {
+        (self.ev.stage_three.last_mut()).expect("a stage-three session begun")
     }
 
     /// The drop test's verdict on `on` once drop session two dropped (decision 0132 item 4, 0151
@@ -3465,7 +3538,10 @@ impl Run<'_> {
         };
         let (authenticated, resynced) = (w.authenticated, w.resynced);
         drop(w);
-        self.placed_run(d.which).rested_at_close = rested_at_close;
+        // Stage three's session has no order of its own until P1 is placed.
+        if d.which != Which::Pages || !self.three_run().orders.is_empty() {
+            self.placed_run(d.which).rested_at_close = rested_at_close;
+        }
         match d.which {
             Which::One => {
                 let run = self.drop_run();
@@ -3485,7 +3561,7 @@ impl Run<'_> {
                 two.resynced = resynced;
                 two.ended_by = Some(ended_by);
             }
-            Which::Cross | Which::Take => {
+            Which::Cross | Which::Take | Which::Pages => {
                 let run = self.stage_run(d.which);
                 run.echoes = echoes;
                 run.as_encoded = as_encoded;
@@ -3749,7 +3825,9 @@ impl Run<'_> {
         match which {
             Which::One => self.drop_run().cancels = Some(cancels),
             Which::Two => self.two_run().cancels = Some(cancels),
-            Which::Cross | Which::Take => self.stage_run(which).cancels = Some(cancels),
+            Which::Cross | Which::Take | Which::Pages => {
+                self.stage_run(which).cancels = Some(cancels)
+            }
         }
     }
 
@@ -4040,13 +4118,15 @@ impl Run<'_> {
         two.y_open_at_drop = open && !y_cancelled;
     }
 
-    /// Places `d`'s order, X in drop session one or Y in two: a post-only GTC at the
-    /// instrument's minimum size `--away-bps` behind the touch, spent from the drop registry's
-    /// list first ([`Allowance`]), its client id minted under the run's namespace lease, as an
-    /// fbc-oms authorization; the one place before an ACK echoes our client id in its session
-    /// (decision 0132 item 7). Before it is built into a command, both USD caps are asked again
-    /// at the touch it is priced at ([`market::caps_admit`]); an order either would not admit
-    /// is not sent, and never resized, the run's stop [`Stop::BeyondCaps`] (decision 0113).
+    /// Places `d`'s order, X in drop session one, Y in two, or in stage three the one whose
+    /// record was pushed last, P1 to P3: a post-only GTC at the instrument's minimum size
+    /// `--away-bps` behind the touch, spent from its registry's list first ([`Allowance`]: the
+    /// drop registry's, or the pages registry's own), its client id minted under the run's
+    /// namespace lease, as an fbc-oms authorization; in a drop session the one place before an
+    /// ACK echoes our client id in its session (decision 0132 item 7). Before it is built into a
+    /// command, both USD caps are asked again at the touch it is priced at
+    /// ([`market::caps_admit`]); an order either would not admit is not sent, and never resized,
+    /// the run's stop [`Stop::BeyondCaps`] (decision 0113).
     /// Then its ACK, or its deadline. Gives it, as placed, once handed to the session (`placed`
     /// holds it from then); a stop or a press first places nothing.
     async fn place_resting(
@@ -4060,10 +4140,15 @@ impl Run<'_> {
     ) -> Result<Placed, Halt> {
         let what = match d.which {
             Which::One => ledger::X,
+            Which::Pages => ledger::PAGED,
             _ => ledger::Y,
         };
-        let order = d.which.order();
-        allowance.take(Step::Drop, what)?;
+        // Stage three's orders by name, P1 to P3, its record pushed before its place.
+        let order = match d.which {
+            Which::Pages => crate::pager::NAMES[self.three_run().orders.len() - 1],
+            _ => d.which.order(),
+        };
+        allowance.take(d.which.step(), what)?;
         let leases = self.leases.as_mut().expect("a place-stage run's leases");
         let cid = leases.mint.mint(1).await.map_err(Halt::Error)?[0];
         let quote = touch.now(places.touch_max_age).map_err(Halt::Error)?;
@@ -4122,6 +4207,10 @@ impl Run<'_> {
         };
         *placed = Some(now);
         self.placed_run(d.which).submitted = true;
+        // Stage three's session sent an order of ours, which the reads after it are held to.
+        if d.which == Which::Pages {
+            self.stage_run(Which::Pages).placed.submitted = true;
+        }
         self.line(format_args!(
             "PLACE {order} on {}: one post-only GTC at the instrument's minimum size, --away-bps \
              behind the touch (no price, size or id is shown)",
@@ -4164,9 +4253,11 @@ impl Run<'_> {
         run.outcome = acked.1.as_ref().map(places::outcome_name);
         run.exact_echo = exact;
         run.ack_after = run.acked.then(|| now.at.elapsed());
-        // A test's session failing once its order was answered, that order resting.
+        // A test's drop session failing once its order was answered, that order resting.
         #[cfg(test)]
-        if places.test.fail_after_place == Some(usize::from(d.which == Which::Two)) {
+        if matches!(d.which, Which::One | Which::Two)
+            && places.test.fail_after_place == Some(usize::from(d.which == Which::Two))
+        {
             return Err(Halt::Error(format!(
                 "a test's session failed after {order}'s answer"
             )));
@@ -4250,7 +4341,9 @@ impl Run<'_> {
         match which {
             Which::One => self.drop_run().compared.push(compared),
             Which::Two => self.two_run().compared.push(compared),
-            Which::Cross | Which::Take => self.stage_run(which).compared.push(compared),
+            Which::Cross | Which::Take | Which::Pages => {
+                self.stage_run(which).compared.push(compared)
+            }
         }
     }
 
@@ -4418,7 +4511,7 @@ impl Run<'_> {
     fn stop_disarm(&self, d: &DropCtx, c: &Cancels) {
         d.link.borrow_mut().reg().disarm(d.inst);
         let why = match d.which {
-            Which::Cross | Which::Take => "decision 0132 item 7, 0148 item 8",
+            Which::Cross | Which::Take | Which::Pages => "decision 0132 item 7, 0148 item 8",
             _ => "0151 item 2",
         };
         self.line(format_args!(
@@ -5103,10 +5196,7 @@ impl Run<'_> {
         self.line(format_args!(
             "READ after {}'s drop: {}: {rounds} of at most {} rounds of reads of every named \
              account, the last judged listing {}",
-            match which {
-                Which::Take => "the taker IOC session",
-                _ => "the crossing session",
-            },
+            which.name(),
             name(on),
             cadence.reads(),
             match (after.ours_resting, after.unexpected) {
@@ -5264,6 +5354,7 @@ impl Run<'_> {
         heard.limiter = self.rejected().saturating_sub(before);
         let what = match which {
             Which::One => "X and its trades",
+            Which::Take => "the taker IOC and its trades",
             _ => "X, Y and their trades",
         };
         self.ev.read_sockets.push(ReadSocket {
@@ -5339,6 +5430,8 @@ impl Run<'_> {
             for (n, order) in drop_orders.iter().enumerate() {
                 after.naming[n] += page.rows().iter().filter(|r| order.named_by(r)).count();
             }
+            let side = self.places.map(|p| p.side);
+            self.rows_read(page.rows(), &drop_orders, side, after);
             for row in page.rows() {
                 for member in &row.members {
                     let member = places::member_name(member);
@@ -5411,6 +5504,37 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// What `rows`, one `get_user_trades` page's, show beyond the counts naming each of `orders`
+    /// (FBC-4plj; decision 0132's Consequences), into `after`: the kind of each `timestamp` of a
+    /// row naming one of them ([`places::time_kind`]), whether its `trade_id` is one a
+    /// `fill_response` of ours carried (the tee's, in memory), how a row naming the first states
+    /// its side against `side`, ours, and the rows naming none of them, orders the codec did not
+    /// place. No value of a row is kept.
+    fn rows_read(
+        &self,
+        rows: &[account_reads::TradeRow],
+        orders: &[crate::verdict::DropOrder],
+        side: Option<fbc_core::Side>,
+        after: &mut Traded,
+    ) {
+        let kept = self.tee.kept();
+        for row in rows {
+            if !orders.iter().any(|o| o.named_by(row)) {
+                after.foreign += 1;
+                continue;
+            }
+            let kind = places::time_kind(row.timestamp.as_ref());
+            if !after.time_kinds.contains(&kind) {
+                after.time_kinds.push(kind);
+            }
+            (after.trade_ids).count(row.trade_id.as_deref(), |id| kept.heard_trade(id));
+            let first = orders.first().is_some_and(|o| o.named_by(row));
+            if let (true, Some(ours)) = (first, side) {
+                after.sides.count(ours, row.side, row.aggressor_side);
+            }
+        }
+    }
+
     /// Counts `frame`, off the read socket of X and its trades, as a read socket's
     /// ([`Refusals::hear`]), holding the shared budget for a `RateLimited` err, which is a stop;
     /// so is every other refusal its count shows, one in a frame the journal keeps whole
@@ -5465,11 +5589,11 @@ impl Run<'_> {
     /// carried to another run. Shut, the run ends [`Stop::NoEcho`], which is not a fault and
     /// writes no stop marker. Open, each named account whose drop test passed in this run
     /// ([`crate::stage_two::crossers`]) in turn places its crossing post-only, then, unless that
-    /// stopped the run, its taker IOC, each in a session of its own ([`Run::cross_test`] under
-    /// [`Which::Cross`], then [`Which::Take`]), before the next account's crossing session
-    /// (decision 0148 item 1: the stages on each named account in turn); the first stop ends the
-    /// run, and with none it ends after the last account's taker IOC, [`NOT_BUILT`], naming
-    /// FBC-4plj, which builds stage three.
+    /// stopped the run, its taker IOC, then stage three's pages ([`crate::pager`]), each in a
+    /// session of its own ([`Run::cross_test`] under [`Which::Cross`], [`Which::Take`] and
+    /// [`Which::Pages`]), before the next account's crossing session (decision 0148 item 1: the
+    /// stages on each named account in turn); the first stop ends the run, and with none it ends
+    /// `Ok` after the last account's stage three, saying [`FINISHED`].
     async fn cross_tests(&mut self, places: &Places, mut market: Market) -> Result<(), String> {
         let gate = two::EchoGate::of(&self.tee.kept());
         self.ev.stage_two.get_or_insert_with(StageTwo::default).gate = Some(gate.open);
@@ -5485,12 +5609,15 @@ impl Run<'_> {
                 .await?;
             self.cross_test(places, &mut market, on, Which::Take)
                 .await?;
+            self.cross_test(places, &mut market, on, Which::Pages)
+                .await?;
         }
         self.ev
             .stage_two
             .get_or_insert_with(StageTwo::default)
             .finished = true;
-        Err(NOT_BUILT.to_owned())
+        self.line(format_args!("FINISHED {FINISHED}"));
+        Ok(())
     }
 
     /// Stage two's session `which` on `on`, the crossing post-only ([`Which::Cross`]; decision
@@ -5583,6 +5710,10 @@ impl Run<'_> {
         };
         match which {
             Which::Take => two.takes.push(begun),
+            Which::Pages => self.ev.stage_three.push(PagesRun {
+                session: begun,
+                ..PagesRun::default()
+            }),
             _ => two.crosses.push(begun),
         }
         let at = self.allowances.iter().position(|(a, _)| *a == on);
@@ -5645,13 +5776,15 @@ impl Run<'_> {
         // The owner's hand cancel: an order of ours a read listed, one only the registry counts
         // resting, or the account not read once an order was sent there, each said as it is,
         // never an order seen resting that no read listed (FBC-gisx's review).
-        let hand = two::hand_cancel(self.stage_run(which), which == Which::Take);
+        let session = which.stage().expect("a stage-two or stage-three session");
+        let hand = two::hand_cancel(self.stage_run(which), session);
         if let Some(hand) = hand {
             self.line(format_args!("RESTING {hand}"));
         }
         if after.unexpected {
             let others = match which {
                 Which::Take => crate::taker::OTHERS_TAKE,
+                Which::Pages => crate::pager::OTHERS_PAGES,
                 _ => two::OTHERS_CROSS,
             };
             self.line(format_args!("READ after {}: {others}", which.name()));
@@ -5659,7 +5792,7 @@ impl Run<'_> {
         let first = (after.refused, after.pressed);
         let shown = (after.not_flat, after.unexpected);
         let resting = (after.ours_resting || counted, after.unread);
-        let read = stage_after_stop(which == Which::Take, first, shown, resting);
+        let read = stage_after_stop(session, first, shown, resting);
         // An order of ours no read listed, counted resting by the registry or on an account not
         // read, is said so, never as seen resting (the owner's ruling under 0151 item 6 on
         // FBC-gisx).
@@ -5673,9 +5806,54 @@ impl Run<'_> {
             (None, None, Some((stop, when))) => Err(self.halt_as(stop, when, says)),
             (None, None, None) => Ok(()),
         };
+        // The taker IOC's trades and historic orders, once its session and the reads after it
+        // ended with no stop (FBC-4plj): the answers decision 0132's Consequences ask of a
+        // trade.
+        let ended = match (ended, which) {
+            (Ok(()), Which::Take) => self.take_trades(on, &ours).await,
+            (ended, _) => ended,
+        };
         let stop = self.stop.map(Stop::name);
         self.stage_run(which).stop = stop;
         ended
+    }
+
+    /// After a taker IOC session on `on` that ended with no stop, its orders `ours` (the taker
+    /// IOC, then each flatten IOC) read as the drop test's are after a session
+    /// ([`Run::read_orders`], on a socket that never arms): every `get_user_trades` page since
+    /// the taker IOC's send and every `GET /user/historic-orders` page, each charged to the
+    /// shared limiter first, waiting out a hold for at most [`AFTER_PATIENCE`]. Its rows give
+    /// decision 0132's Consequences what kind of time a trade's `timestamp` is, whether its
+    /// `trade_id` is the fills channel's, which side field it carries, and any row naming an
+    /// order the codec did not place; the historic orders give each order's `terminal_status`.
+    /// A read that could not be made is recorded and stops nothing; a provider rate refusal in
+    /// it is the run's stop, marked, and so is the owner's Ctrl-C meanwhile. Nothing is read
+    /// when no taker IOC was handed to the session.
+    async fn take_trades(&mut self, on: Armed, ours: &[&AllowedOrder]) -> Result<(), String> {
+        let Some(since) = self.taker_secs.take().filter(|_| !ours.is_empty()) else {
+            return Ok(());
+        };
+        self.patient = Some(tokio::time::Instant::now() + AFTER_PATIENCE);
+        let (traded, refused, pressed) = self.read_orders(Which::Take, on, since, ours).await;
+        self.patient = None;
+        self.line(format_args!(
+            "TRADES after {} on {}: {} row{} read since the taker IOC's send, {} naming it; \
+             read whole: trades {}, historic orders {}",
+            places::TAKE,
+            name(on),
+            traded.trades,
+            if traded.trades == 1 { "" } else { "s" },
+            traded.naming.first().copied().unwrap_or(0),
+            places::yn(traded.trades_whole),
+            places::yn(traded.historic_whole)
+        ));
+        self.stage_run(Which::Take).traded = Some(traded);
+        let when = format!("reading the taker IOC's trades after {}", places::TAKE);
+        match (refused, pressed) {
+            (Some(stop), _) => Err(self.halt(stop, &when)),
+            (None, true) => Err(self.halt(Stop::Interrupted, &when)),
+            (None, false) => Ok(()),
+        }
     }
 
     /// Stage two's session `which` on `on` (decision 0132 item 7), the crossing session or the
@@ -5762,6 +5940,8 @@ impl Run<'_> {
         };
         let mut presses = std::mem::take(&mut self.presses);
         let mut placed = None;
+        // Stage three's orders, P1 to P3, as each is handed to the session (FBC-4plj).
+        let mut paged: Vec<Placed> = Vec::new();
         let (mut stop, mut error) = (None, None);
         let view = market.touch.clone();
         let found = market.found.clone();
@@ -5777,6 +5957,10 @@ impl Run<'_> {
                 match which {
                     Which::Take => {
                         (self.take_steps(places, ctx, &d, allowance, &mut presses, state)).await
+                    }
+                    Which::Pages => {
+                        let state = (state.0, &mut paged);
+                        (self.pages_steps(places, ctx, &d, allowance, &mut presses, state)).await
                     }
                     _ => (self.cross_steps(places, ctx, &d, allowance, &mut presses, state)).await,
                 }
@@ -5799,6 +5983,7 @@ impl Run<'_> {
             // the flatten, or stop the run left open with a fill (0151 item 8).
             let after = match which {
                 Which::Take => self.taken(&d, placed),
+                Which::Pages => crate::taker::After::Nothing,
                 _ => {
                     self.crossed(&d, placed.map(|p: Placed| p.cid));
                     crate::taker::After::Nothing
@@ -5811,7 +5996,11 @@ impl Run<'_> {
                 let lead = span_end.saturating_duration_since(tokio::time::Instant::now());
                 self.stage_run(which).cancels_lead = Some(lead);
             }
-            let ours: Vec<fbc_core::ClientOrderId> = placed.iter().map(|p| p.cid).collect();
+            // The session's orders: its own, or stage three's P1 to P3 once placed.
+            let ours: Vec<fbc_core::ClientOrderId> = match which {
+                Which::Pages => paged.iter().map(|p| p.cid).collect(),
+                _ => placed.iter().map(|p| p.cid).collect(),
+            };
             // A fill of ours, the crossing post-only's or the taker IOC's, the session still
             // open: the flatten, before its Stop (FBC-ou9g; 0151 item 9). The taker IOC's fill
             // is expected, so once flat it stops nothing.
@@ -5867,6 +6056,16 @@ impl Run<'_> {
         self.presses = presses;
         let counters = session.counters();
         drop(session);
+        // Stage three's pager, a read socket of the session's account, with the refusals it met
+        // as it went, kept whether or not its steps ran to their end.
+        if which == Which::Pages && self.three_run().paged {
+            let refusals = self.three_run().refusals;
+            self.ev.read_sockets.push(ReadSocket {
+                before: which.name(),
+                label: format!("{label} (stage three's pager)"),
+                refusals,
+            });
+        }
         let compared: u64 = (self.ev.read_sockets[sockets..].iter())
             .map(|r| r.refusals.limiter)
             .sum();
@@ -5874,9 +6073,12 @@ impl Run<'_> {
         let seen = (counters, refused, error.clone(), ended_by, rested_at_close);
         self.session_seen(&d, label, seen);
         self.stage_run(which).error = error;
-        // Every order of ours the session placed: its own, then each flatten IOC it sent, each
-        // once.
-        let mut orders: Vec<fbc_core::ClientOrderId> = placed.iter().map(|p| p.cid).collect();
+        // Every order of ours the session placed: its own, or stage three's, then each flatten
+        // IOC it sent, each once.
+        let mut orders: Vec<fbc_core::ClientOrderId> = match which {
+            Which::Pages => paged.iter().map(|p| p.cid).collect(),
+            _ => placed.iter().map(|p| p.cid).collect(),
+        };
         for cid in watched.borrow().expected.iter() {
             if !orders.contains(cid) {
                 orders.push(*cid);
@@ -6152,6 +6354,7 @@ impl Run<'_> {
             wall_secs: u64::try_from(wall_secs()).unwrap_or(0),
         };
         *placed = Some(now);
+        self.taker_secs = Some(now.wall_secs);
         self.stage_run(Which::Take).placed.submitted = true;
         self.line(format_args!(
             "PLACE the taker IOC on {}: one limit IOC at the instrument's minimum size at the far \
@@ -6257,6 +6460,345 @@ impl Run<'_> {
             Some(stop) => Err(Halt::Stop(stop)),
             None => Ok(()),
         }
+    }
+
+    /// Stage three's session's steps (FBC-4plj; decision 0132 item 7): authentication, an
+    /// `Accepted` arm and the resync ([`Run::armed`]); Start under the pages registry's market
+    /// lease; then the pager ([`crate::pager`]), a second socket that never arms, on the
+    /// session's account and the configuration the guard admitted, at a page size of 1, every
+    /// frame charged to the shared limiter first; then [`Run::paging`]; then the pager closed,
+    /// its close charged first as a read socket's is. Each step ends at the first stop
+    /// ([`Run::waiting`]).
+    async fn pages_steps(
+        &mut self,
+        places: &Places,
+        view: (&Discovered, &market::TouchView),
+        d: &DropCtx,
+        allowance: &mut Allowance,
+        presses: &mut Presses,
+        placed: (&mut Option<Placed>, &mut Vec<Placed>),
+    ) -> Result<(), Halt> {
+        self.armed(d, presses).await?;
+        let dir = self.leases.as_ref().map(|l| l.dir.clone());
+        let dir = dir.ok_or_else(|| Halt::Error("no lease directory".to_owned()))?;
+        places::start(d.link.borrow_mut().reg(), &dir, d.inst).map_err(Halt::Error)?;
+        self.stage_run(Which::Pages).started = true;
+        self.line(format_args!(
+            "START the pages registry on {}: the market armed under its market lease, with no \
+             account lease (QFEX's nonce scope is none)",
+            name(d.on)
+        ));
+        let (cfg, _) = configured(&self.base, self.lookup, d.on).map_err(Halt::Error)?;
+        let reader = account_selection(&cfg)
+            .map_err(|e| e.to_string())
+            .and_then(|selection| auth_qfex::reader(self.lookup, selection))
+            .map_err(Halt::Error)?;
+        // The pager's own handles on what the run shares: the limiter's clone shares its buckets.
+        let (connector, limiter, caps) = (
+            self.connector.clone(),
+            self.limiter.clone(),
+            self.caps.clone(),
+        );
+        let io = crate::compare::Io {
+            connector: &connector,
+            limiter: &limiter,
+            caps: &caps,
+            ns: self.ns(),
+            page_size: crate::pager::PAGE_SIZE,
+            connect_wait: self.opts.connect_wait,
+            read_wait: self.opts.read_wait,
+            symbol: view.0.spec.venue_symbol.as_wire(),
+        };
+        let mut nonces = self.nonces.clone();
+        let origin = self.origin;
+        let mut ctx = move || EncodeCtx {
+            wall: wall_ns(),
+            mono: ledger::mono_since(origin),
+            nonces: nonces.reserve(ReadAuth::NONCES),
+        };
+        let mut pager = crate::compare::Socket::new(io, &cfg, &reader, &mut ctx);
+        let paged = self
+            .paging(places, view, d, (allowance, presses), placed, &mut pager)
+            .await;
+        let heard = pager.close().await;
+        self.three_run().refusals = heard;
+        paged
+    }
+
+    /// Stage three's interleaving, [`crate::pager::PLAN`] (FBC-4plj): each place of P1 to P3
+    /// ([`Run::place_resting`], from the pages registry's own list), each cancel by venue id
+    /// ([`Run::cancel_paged`]), each followed by the streams compared with never-arming reads
+    /// (0151 item 4), and each page `pager` is asked for ([`Run::page_now`]), then the walk of
+    /// every page from offset 0 ([`Run::walk`]). `placed` holds the order placed last and `paged`
+    /// every one, as each is handed to the session.
+    async fn paging(
+        &mut self,
+        places: &Places,
+        view: (&Discovered, &market::TouchView),
+        d: &DropCtx,
+        (allowance, presses): (&mut Allowance, &mut Presses),
+        (placed, paged): (&mut Option<Placed>, &mut Vec<Placed>),
+        pager: &mut crate::compare::Socket<'_>,
+    ) -> Result<(), Halt> {
+        use crate::pager::{Action, CANCELLED, NAMES, PLACED, PLAN};
+        for action in PLAN {
+            match action {
+                Action::Place(n) => {
+                    let begun = (NAMES[n], places::XRun::default());
+                    self.three_run().orders.push(begun);
+                    let sent =
+                        (self.place_resting(places, view, d, allowance, presses, placed)).await?;
+                    paged.push(sent);
+                    let step = (PLACED[n], sent.at);
+                    self.compare_paged(d, view.0, paged, step, presses).await?;
+                }
+                Action::Cancel(n) => {
+                    let at = self.cancel_paged(d, presses, n, paged[n].cid).await?;
+                    let step = (CANCELLED[n], at);
+                    self.compare_paged(d, view.0, paged, step, presses).await?;
+                }
+                Action::Page(offset) => {
+                    self.page_now(d, presses, pager, paged, (offset, false))
+                        .await?;
+                }
+                Action::Walk => self.walk(d, presses, pager, paged).await?,
+            }
+        }
+        Ok(())
+    }
+
+    /// The streams of stage three's orders placed so far, `paged`, compared with never-arming
+    /// reads after `step`, made at its instant ([`Run::compare_step`]): the comparison's stop the
+    /// session's.
+    async fn compare_paged(
+        &mut self,
+        d: &DropCtx,
+        found: &Discovered,
+        paged: &[Placed],
+        (step, since): (&'static str, tokio::time::Instant),
+        presses: &mut Presses,
+    ) -> Result<(), Halt> {
+        let ours: Vec<fbc_core::ClientOrderId> = paged.iter().map(|p| p.cid).collect();
+        let compared = self.compare_step(d, (found, &ours), d.on, step, Some(since));
+        let compared = self.unless_stopped(d, presses, compared).await?;
+        let stop = compared.0.stop;
+        self.compared(Which::Pages, compared);
+        match stop {
+            Some(stop) => Err(Halt::Stop(stop)),
+            None => Ok(()),
+        }
+    }
+
+    /// Cancels stage three's order `n` of [`crate::pager::NAMES`], `cid`, by venue id, an fbc-oms
+    /// authorization through the `Link`, then waits until it ends or `--rpc-timeout-ms` from the
+    /// cancel's send, recording the cancel as it goes ([`crate::pager::CancelRun`]). An order
+    /// that already ended is not cancelled, and one whose acknowledgement, which a cancel by venue
+    /// id needs, has not come is left to the session's Stop, which cancels it once it lands; each
+    /// is recorded with why. A cancel fbc-oms or the session refuses is a failure that is no
+    /// stop. Gives when the cancel began, which its comparison is timed from.
+    async fn cancel_paged(
+        &mut self,
+        d: &DropCtx,
+        presses: &mut Presses,
+        n: usize,
+        cid: fbc_core::ClientOrderId,
+    ) -> Result<tokio::time::Instant, Halt> {
+        use crate::pager::{AWAITING_ACK, CancelRun, ENDED_FIRST, NAMES};
+        let who = NAMES[n];
+        let ended =
+            |link: &Link| (link.registry().get(cid)).is_none_or(|r| r.state().is_terminal());
+        let built = {
+            let mut link = d.link.borrow_mut();
+            match ended(&link) {
+                true => None,
+                false => {
+                    let caps = link.caps().clone();
+                    Some((link.reg().cancellable(cid)).map(|permit| permit.cancel(&caps)))
+                }
+            }
+        };
+        let at = tokio::time::Instant::now();
+        let mut record = CancelRun {
+            name: who,
+            ..CancelRun::default()
+        };
+        let cmd = match built {
+            None => {
+                record.not_sent = Some(ENDED_FIRST);
+                record.ended = true;
+                self.three_run().cancels.push(record);
+                return Ok(at);
+            }
+            Some(Ok(fbc_oms::CancelChoice::AwaitAck)) => {
+                record.not_sent = Some(AWAITING_ACK);
+                self.three_run().cancels.push(record);
+                return Ok(at);
+            }
+            Some(Err(e)) => {
+                let named = places::variant_name(&e);
+                return Err(Halt::Error(format!("{who}'s cancel was refused: {named}")));
+            }
+            Some(Ok(fbc_oms::CancelChoice::Send(cmd))) => cmd,
+        };
+        let submitted = {
+            let mut link = d.link.borrow_mut();
+            let auth = link.reg().authorize(d.acct, cmd).map_err(|e| {
+                let named = places::variant_name(&e);
+                format!("{who}'s cancel was not authorized: {named}")
+            });
+            auth.and_then(|auth| {
+                let submitted = link.submit(&d.orders, auth);
+                submitted.map_err(|e| {
+                    let named = places::refusal_named(&e);
+                    format!("{who}'s cancel was refused by the session: {named}")
+                })
+            })
+        };
+        let rpc = submitted.map_err(Halt::Error)?;
+        record.sent = true;
+        self.three_run().cancels.push(record);
+        self.line(format_args!(
+            "CANCEL {who} on {}: by venue id, an fbc-oms authorization (no id is shown)",
+            name(d.on)
+        ));
+        let due = at + Duration::from_millis(self.opts.rpc_timeout_ms);
+        let waited = self.waiting(d, presses, |link, _| {
+            (ended(link) || tokio::time::Instant::now() >= due).then_some(())
+        });
+        let woken = async {
+            tokio::time::sleep_until(due).await;
+            d.wake.notify_waiters();
+            std::future::pending::<()>().await
+        };
+        let waited = tokio::select! {
+            biased;
+            waited = waited => waited,
+            () = woken => unreachable!("it wakes the wait, then waits for ever"),
+        };
+        let (outcome, gone) = {
+            let link = d.link.borrow();
+            (link.outcome_of(rpc), ended(&link))
+        };
+        let record = (self.three_run().cancels.last_mut()).expect("the cancel's record");
+        record.outcome = outcome.as_ref().map(places::outcome_name);
+        record.ended = gone;
+        waited?;
+        Ok(at)
+    }
+
+    /// Stage three's orders placed so far, `paged`, by name, with their venue ids once the
+    /// streams named them: what a page is matched to ([`crate::pager::named`]).
+    fn paged_ours(&self, d: &DropCtx, paged: &[Placed]) -> Vec<crate::pager::Ours> {
+        let link = d.link.borrow();
+        (paged.iter().zip(crate::pager::NAMES))
+            .map(|(p, name)| crate::pager::Ours {
+                name,
+                cid: p.cid,
+                venue: (link.registry().get(p.cid)).and_then(|r| r.vid().cloned()),
+            })
+            .collect()
+    }
+
+    /// The names of stage three's orders placed so far, `paged`, that the registry holds open.
+    fn paged_open(&self, d: &DropCtx, paged: &[Placed]) -> Vec<&'static str> {
+        let link = d.link.borrow();
+        let open = |p: &&Placed| {
+            let state = link.registry().get(p.cid).map(|r| r.state());
+            matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled))
+        };
+        let named = paged.iter().zip(crate::pager::NAMES);
+        named.filter(|(p, _)| open(p)).map(|(_, n)| n).collect()
+    }
+
+    /// Asks `pager` for the page at `offset` (one of the walk's when `walk`) and records it
+    /// ([`crate::pager::PageRead`]): its size and offset, which of stage three's orders, `paged`,
+    /// the streams showed open as it was asked, what it listed by name, and its frame for the
+    /// slice; the pager's refusals kept as they go. A provider rate refusal on the pager is the
+    /// run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`] (decision 0148 item 8);
+    /// any other page that could not be made is recorded and stops nothing. Gives what it came
+    /// to.
+    async fn page_now(
+        &mut self,
+        d: &DropCtx,
+        presses: &mut Presses,
+        pager: &mut crate::compare::Socket<'_>,
+        paged: &[Placed],
+        (offset, walk): (u32, bool),
+    ) -> Result<crate::compare::PageAttempt, Halt> {
+        let open = self.paged_open(d, paged);
+        self.three_run().paged = true;
+        let attempt = self.unless_stopped(d, presses, pager.page(offset)).await;
+        self.three_run().refusals = pager.heard;
+        let attempt = attempt?;
+        let ours = self.paged_ours(d, paged);
+        let (came, stop) = crate::pager::came(&attempt, &ours);
+        if let crate::compare::PageAttempt::Read { kept, .. } = &attempt {
+            self.three_run().frames.push(kept.clone());
+        }
+        self.line(format_args!(
+            "PAGE {}at size {}, offset {offset}, on {}: {}",
+            if walk { "of the walk " } else { "" },
+            crate::pager::PAGE_SIZE,
+            name(d.on),
+            came.says()
+        ));
+        self.three_run().pages.push(crate::pager::PageRead {
+            walk,
+            size: crate::pager::PAGE_SIZE,
+            offset,
+            open,
+            came,
+        });
+        match stop {
+            Some(stop) => Err(Halt::Stop(stop)),
+            None => Ok(attempt),
+        }
+    }
+
+    /// The walk (FBC-4plj): `pager` asked for every page from offset 0 until a short one, a full
+    /// page listing an order an earlier one of the walk listed, or a page that could not be made
+    /// ([`crate::pager::walk_end`]), each recorded by [`Run::page_now`], all within
+    /// [`crate::pager::WALK_PATIENCE`] of its first page, so a venue answering new full pages for
+    /// ever cannot hold the run open.
+    async fn walk(
+        &mut self,
+        d: &DropCtx,
+        presses: &mut Presses,
+        pager: &mut crate::compare::Socket<'_>,
+        paged: &[Placed],
+    ) -> Result<(), Halt> {
+        use crate::pager::{PAGE_SIZE, WALK_PATIENCE, WalkEnd, walk_end};
+        let until = tokio::time::Instant::now() + WALK_PATIENCE;
+        let mut seen: Vec<fbc_core::VenueOrderId> = Vec::new();
+        let mut offset = 0;
+        let end = loop {
+            let page = self.page_now(d, presses, pager, paged, (offset, true));
+            let Ok(page) = tokio::time::timeout_at(until, page).await else {
+                break WalkEnd::Cut;
+            };
+            let page = match page {
+                Ok(page) => page,
+                Err(halt) => {
+                    self.three_run().walk = Some(WalkEnd::NotRead);
+                    return Err(halt);
+                }
+            };
+            if let Some(end) = walk_end(&page, &seen) {
+                break end;
+            }
+            if let crate::compare::PageAttempt::Read { listed, .. } = &page {
+                seen.extend(listed.iter().map(|l| l.order.clone()));
+            }
+            offset += u32::from(PAGE_SIZE);
+        };
+        self.three_run().walk = Some(end);
+        let walked = self.three_run().pages.iter().filter(|p| p.walk).count();
+        self.line(format_args!(
+            "WALK on {}: {walked} pages from offset 0, ended by {}",
+            name(d.on),
+            end.says()
+        ));
+        Ok(())
     }
 
     /// [`crate::stage_two::no_other_order`] for `inst` now: every registry the run built on every
@@ -6488,35 +7030,41 @@ fn test_listed(places: &Places, mut reads: Vec<AccountRead>) -> Vec<AccountRead>
     reads
 }
 
-/// The stop the reads after a stage-two session make, the taker IOC session's when `take`
-/// (FBC-ou9g), the crossing session's otherwise, and when it was met, said as met after that
-/// session, the first that applies: the provider rate refusal they met, `refused`; the owner's
-/// Ctrl-C during them, `pressed`; a position not flat; an order of ours still resting,
-/// `resting`, whether a read listed it or the session's registry counts it resting, an
-/// `Unknown` one included, never resent
-/// (decision 0005): an order of ours still resting after a session stops the probe (decision
-/// 0132 item 7); then a named account that could not be read, `unread`, after an order was
-/// placed on one: nobody looked at it, so an order of ours may still rest there unjudged, as
-/// the read before drop session two takes an account it could not read (`LeftResting`; before
-/// every session an account that cannot be read stops the probe, decision 0132 item 7). Each is
-/// marked (0151 item 6), so the next run must reconcile. None when they show none of them.
+/// The stop the reads after a stage-two or stage-three session of the kind `session` names make
+/// (the crossing session, FBC-su9i; the taker IOC session, FBC-ou9g; stage three's, FBC-4plj),
+/// and when it was met, said as met after that session, the first that applies: the provider
+/// rate refusal they met, `refused`; the owner's Ctrl-C during them, `pressed`; a position not
+/// flat; an order of ours still resting, `resting`, whether a read listed it or the session's
+/// registry counts it resting, an `Unknown` one included, never resent (decision 0005): an
+/// order of ours still resting after a session stops the probe (decision 0132 item 7); then a
+/// named account that could not be read, `unread`, after an order was placed on one: nobody
+/// looked at it, so an order of ours may still rest there unjudged, as the read before drop
+/// session two takes an account it could not read (`LeftResting`; before every session an
+/// account that cannot be read stops the probe, decision 0132 item 7). Each is marked (0151 item
+/// 6), so the next run must reconcile. None when they show none of them.
 pub fn stage_read_stop(
-    take: bool,
+    session: two::Session,
     (refused, pressed): (Option<Stop>, bool),
     (not_flat, resting, unread): (bool, bool, bool),
 ) -> Option<(Stop, &'static str)> {
-    let (after, in_reads, during, not_read) = match take {
-        false => (
+    let (after, in_reads, during, not_read) = match session {
+        two::Session::Cross => (
             AFTER_CROSS,
             "in the reads after the crossing session",
             "during the reads after the crossing session",
             "after the crossing session, a named account not read after it",
         ),
-        true => (
+        two::Session::Take => (
             AFTER_TAKE,
             "in the reads after the taker IOC session",
             "during the reads after the taker IOC session",
             "after the taker IOC session, a named account not read after it",
+        ),
+        two::Session::Pages => (
+            AFTER_PAGES,
+            "in the reads after the stage-three session",
+            "during the reads after the stage-three session",
+            "after the stage-three session, a named account not read after it",
         ),
     };
     if let Some(stop) = refused {
@@ -6531,26 +7079,27 @@ pub fn stage_read_stop(
     }
 }
 
-/// The stop the reads after a stage-two session make ([`Run::cross_test`]), the taker IOC
-/// session's when `take` (FBC-ou9g), the crossing session's otherwise: [`stage_read_stop`]'s,
+/// The stop the reads after a stage-two or stage-three session make ([`Run::cross_test`]), of
+/// the kind `session` names: [`stage_read_stop`]'s,
 /// with [`Stop::ReadDisagrees`] for an order or a TWAP not ours, `unexpected`, after a provider
 /// rate refusal, the owner's Ctrl-C and a position not flat, and before an order of ours resting
 /// (`resting`: listed by a read, counted by REST and listed by no page, or counted resting by the
 /// session's registry) or a named account not read (`unread`), as [`after_stop`] orders them
 /// after drop session two (decision 0148 item 8; FBC-77r8's review).
 pub fn stage_after_stop(
-    take: bool,
+    session: two::Session,
     first: (Option<Stop>, bool),
     (not_flat, unexpected): (bool, bool),
     (resting, unread): (bool, bool),
 ) -> Option<(Stop, &'static str)> {
-    let shown = stage_read_stop(take, first, (not_flat, false, false));
-    let others = match take {
-        true => TAKE_OTHERS,
-        false => CROSS_OTHERS,
+    let shown = stage_read_stop(session, first, (not_flat, false, false));
+    let others = match session {
+        two::Session::Cross => CROSS_OTHERS,
+        two::Session::Take => TAKE_OTHERS,
+        two::Session::Pages => crate::pager::PAGES_OTHERS,
     };
     let unexpected = unexpected.then_some((Stop::ReadDisagrees, others));
-    let rest = || stage_read_stop(take, (None, false), (false, resting, unread));
+    let rest = || stage_read_stop(session, (None, false), (false, resting, unread));
     (shown.or(unexpected)).or_else(rest)
 }
 

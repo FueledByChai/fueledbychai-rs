@@ -46,18 +46,19 @@ session's arm, its resync's reads (one GET /user/positions and get_user_orders p
 that never arms (the liveness hold, decision 0146, FBC-39ks), and a run may hold without arming
 at all.
 
-With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of FBC-9sk2;
-decisions 0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's drop test
-on each named account in turn, then stage two's crossing post-only and taker IOC on each in turn
-(decision 0132 item 7): on production alone (--production; 0151 item 1), and, until FBC-4plj lands
-every stop decisions 0132 item 7 and 0148 item 8 require, only against a loopback test stub, every
-origin (trade, REST and MDS) a loopback address. It prints a CAPS line with the environment and both
-caps first, before any request; runs the hold first, alone, when --hold-secs is given; reads the
-instrument --symbol names from this run's GET /refdata on the guarded REST origin, refusing one that
-is not listed, not trading, or that does not list both a post-only GTC and a limit IOC (decision
-0148 item 4); holds --ledger-max-entries above each place registry's fill ceiling (0151 item 3);
-opens the MDS touch (bbo) on the guarded MDS origin and refuses a touch older than
---touch-max-age-ms, a crossed or locked one, or one from before the MDS connection's current epoch;
+With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i, FBC-ou9g and FBC-4plj, slices of
+FBC-9sk2; decisions 0148 and 0151) it runs the place stages' preflight, then decision 0132 item 4's
+drop test on each named account in turn, then stage two's crossing post-only and taker IOC and
+stage three's pages on each in turn (decision 0132 item 7): on production alone (--production;
+0151 item 1), on QFEX production's own origins, or, for a test stub, every origin (trade, REST
+and MDS) a loopback address, as the adapter's probe guard admits them (decision 0143 item 2). It
+prints a CAPS line with the environment and both caps first, before any request; runs the hold
+first, alone, when --hold-secs is given; reads the instrument --symbol names from this run's
+GET /refdata on the guarded REST origin, refusing one that is not listed, not trading, or that
+does not list both a post-only GTC and a limit IOC (decision 0148 item 4); holds
+--ledger-max-entries above each place registry's fill ceiling (0151 item 3); opens the MDS touch
+(bbo) on the guarded MDS origin and refuses a touch older than --touch-max-age-ms, a crossed or
+locked one, or one from before the MDS connection's current epoch;
 and refuses either cap below three of the instrument's minimum size at the touch.
 
 Each account's drop test starts only once the one before ended with no stop. Drop session one:
@@ -114,8 +115,29 @@ it stops the run not flat with no flatten (IocRemainder; 0151 item 8, until FBC-
 fills its order events state that had not all reached the session by its deadline, it stops the run
 not flat with no flatten too (IocUnsettled), since the flatten judges the registry's position, which
 is then not QFEX's. Then every order of ours cancelled by venue id before the session stops, and the
-read of every named account, as after a crossing session. With no stop the run ends after the last
-account's taker IOC, its outcome not ok, until FBC-4plj builds stage three. The report gives the
+read of every named account, as after a crossing session. With no stop the account's stage three
+follows (FBC-4plj): every named account read clean, its pages registry built, tripped and seeded
+flat; one session armed, resynced and Started; P1 and P2, each one post-only GTC at the instrument's
+minimum size --away-bps behind the touch, then P3, then P1's cancel, then P2's and P3's, by venue
+id, each place and cancel compared with the reads; beside it a pager, a second socket that never
+arms, asks for get_user_orders at a page size of 1, every frame charged to the shared limiter
+first: page 0 after P1 and P2, page 1 after P3, pages 2 and 3 after P1's cancel, then every page
+from offset 0 until a short one, each recorded with its size and offset. A provider rate refusal on
+the pager stops the run (RateRefused(Pager)); a fill of a stage-three order is flattened (below) and
+stops it (UnexpectedFill). Then every order of ours cancelled by venue id before the session stops,
+and the read of every named account. After a taker IOC session that did not stop the run, the taker
+IOC's and its flatten IOCs' get_user_trades rows since its send and GET /user/historic-orders are
+read on a socket that never arms, for the trade items below. With no stop the run ends after the
+last account's stage three. The report answers decision 0132's list for each named account, each
+item in words or as fences met, from what the run showed, and not measured where it did not: what
+answers an arm, whether enabling cancels open orders and whether QFEX reports it, the drop test,
+whether a graceful close cancels, whether the other named accounts stayed clean, the client ids'
+full length, how long ACK takes for post-only and other places against the speed bump's hold, what
+historic-orders shows of each order of ours that ended, what kind of time a trade's timestamp is and
+whether its trade_id is the fills channel's, which side field a trades row carries, how the pages
+behave at their boundaries, what open_orders counts, the lag between the streams and the reads, each
+resync against REST's open_orders and its full pages, any trades row naming an order the codec did
+not place, the refusals by session and read socket, and the fill ledgers. It also gives the
 characters our client ids exercised (the rest not measured), whether QFEX accepted add_order as
 encoded, whether ACK, rejects and fills echo our client id exactly, which statuses are rejects and
 ends, how each crossing post-only was refused, and, of each taker IOC, how it came back, the taker
@@ -248,7 +270,9 @@ Options:
                            commit as fixtures/qfex/exec-recorded/drop-production/ once every
                            file is read (0151 item 7), and stage two's crossing sessions' frames
                            into places-production/, to commit as
-                           fixtures/qfex/exec-recorded/places-production/
+                           fixtures/qfex/exec-recorded/places-production/, and stage three's
+                           sessions' frames and the pagers' pages into pages-production/, to
+                           commit as fixtures/qfex/exec-recorded/pages-production/
   --arm <ACCOUNT>          once or twice, in run order: primary, or subaccount (the one
                            {SUB_ID_VAR} names); required unless --hold-secs is given, or
                            --place-stages, which refuses it
@@ -288,8 +312,8 @@ Options:
                            deadline, the longer of --rpc-timeout-ms and the resync's {resync} s
                            deadline and --agree-wait-ms, and the reads of every named account
                            between them, each --read-wait-ms (0151 item 3)
-  --place-stages           the place stages' preflight, drop tests and stage two's crossing
-                           post-only and taker IOC (above): refused
+  --place-stages           the place stages' preflight, drop tests, stage two's crossing
+                           post-only and taker IOC, and stage three's pages (above): refused
                            with --arm, and without --production; needs every flag below, each
                            of which it alone takes
   --symbol <SYMBOL>        required: the venue symbol traded, at most 32 ASCII letters, digits
@@ -329,6 +353,7 @@ Options:
   --rest-url <URL>         default {PREPROD_REST}, or {PRODUCTION_REST} with --production
   --mds-url <URL>          default {PREPROD_MDS}, or {PRODUCTION_MDS} with --production
   --socks5 <HOST:PORT>     connect through this SOCKS5 proxy (default: directly)
+  --help                   print this help, and run nothing
 
 Credentials, from the environment only:
   {PUBLIC_VAR}, {SECRET_VAR}   the primary account's credential (required)

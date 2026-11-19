@@ -520,7 +520,7 @@ fn stage_twos_report_gives_each_taker_ioc_session_after_its_crossing_session() {
         ..StageTwo::default()
     };
     let mut report = String::new();
-    stage_two::markdown(&mut report, &two);
+    stage_two::markdown(&mut report, &two, &["primary", "subaccount"]);
     // Each account's crossing session, then its taker IOC session, before the next account's.
     let at = |said: &str| {
         report
@@ -535,9 +535,8 @@ fn stage_twos_report_gives_each_taker_ioc_session_after_its_crossing_session() {
         "; the span bound stopped it, its cancels begun 300 ms before the bound",
         "- An order resting on the account when the session ended: not known: the account was \
          not read after the session",
-        &format!("- What followed: {}", taker::NEXT_ACCOUNT),
         "- An order resting on the account when the session ended: no\n",
-        &format!("- What followed: {}", taker::LAST_TAKE),
+        &format!("- What followed: {}", taker::THEN_PAGES),
         "; no amount): received\n",
     ] {
         assert!(report.contains(said), "{said}: {report}");
@@ -552,19 +551,19 @@ fn stage_twos_report_gives_each_taker_ioc_session_after_its_crossing_session() {
         ..StageTwo::default()
     };
     let mut report = String::new();
-    stage_two::markdown(&mut report, &ended);
+    stage_two::markdown(&mut report, &ended, &[]);
     let section = report.split("### The taker IOC on primary").nth(1).unwrap();
     assert!(
         section.contains(&format!("- What followed: {}", taker::RUN_ENDED)),
         "{section}"
     );
-    assert!(!report.contains(taker::LAST_TAKE) && !report.contains(taker::NEXT_ACCOUNT));
+    assert!(!report.contains(taker::THEN_PAGES), "{report}");
     let alone = StageTwo {
         crosses: vec![cross("primary")],
         ..StageTwo::default()
     };
     let mut report = String::new();
-    stage_two::markdown(&mut report, &alone);
+    stage_two::markdown(&mut report, &alone, &[]);
     assert!(
         report.contains(&format!("- What followed: {}", taker::RUN_ENDED)),
         "{report}"
@@ -582,7 +581,8 @@ fn the_reads_after_a_taker_ioc_session_say_their_stop_as_met_after_it() {
         on: places::RefusedOn::Rest,
     };
     let after = "after the taker IOC session";
-    for (take, said) in [(true, "taker IOC"), (false, "crossing")] {
+    use stage_two::Session;
+    for (session, said) in [(Session::Take, "taker IOC"), (Session::Cross, "crossing")] {
         let cases = [
             ((Some(rate), true), (true, true, true)),
             ((None, true), (true, true, true)),
@@ -598,12 +598,12 @@ fn the_reads_after_a_taker_ioc_session_say_their_stop_as_met_after_it() {
             places::Stop::LeftResting,
         ];
         for ((first, rest), want) in cases.into_iter().zip(stops) {
-            let (stop, when) = stage::stage_read_stop(take, first, rest).unwrap();
+            let (stop, when) = stage::stage_read_stop(session, first, rest).unwrap();
             assert_eq!(stop, want);
             assert!(when.contains(&format!("the {said} session")), "{when}");
-            assert_eq!(take, when.contains(after), "{when}");
+            assert_eq!(session == Session::Take, when.contains(after), "{when}");
         }
-        let none = stage::stage_read_stop(take, (None, false), (false, false, false));
+        let none = stage::stage_read_stop(session, (None, false), (false, false, false));
         assert_eq!(none, None);
     }
 }
@@ -716,7 +716,7 @@ fn the_reads_after_a_taker_ioc_session_order_an_order_not_ours_after_a_position_
         ((None, false, false, false, false, false), None),
     ] {
         let got = stage::stage_after_stop(
-            true,
+            stage_two::Session::Take,
             (refused, pressed),
             (not_flat, unexpected),
             (resting, not_read),
@@ -727,7 +727,12 @@ fn the_reads_after_a_taker_ioc_session_order_an_order_not_ours_after_a_position_
         );
     }
     // The crossing session's wording under the crossing session.
-    let got = stage::stage_after_stop(false, (None, false), (false, true), (false, false));
+    let got = stage::stage_after_stop(
+        stage_two::Session::Cross,
+        (None, false),
+        (false, true),
+        (false, false),
+    );
     assert_eq!(
         got,
         Some((places::Stop::ReadDisagrees, stage::CROSS_OTHERS))
@@ -749,7 +754,7 @@ fn a_taker_sessions_report_says_what_its_check_and_its_reads_showed() {
             ..StageTwo::default()
         };
         let mut report = String::new();
-        stage_two::markdown(&mut report, &two);
+        stage_two::markdown(&mut report, &two, &[]);
         let section = report.split("### The taker IOC on primary").nth(1).unwrap();
         section.to_owned()
     };

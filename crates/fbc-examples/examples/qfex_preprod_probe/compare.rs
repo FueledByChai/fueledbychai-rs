@@ -38,6 +38,10 @@
 //!   stop, [`Stop::ReadDisagrees`] (decision 0148 item 8); a read still missing an order of ours is
 //!   recorded as lag ([`Ended::Lagged`]); and a comparison none of whose reads was made is
 //!   recorded as unread ([`Ended::Unread`]), which the reads after the session then judge.
+//! - **Stage three's pager** ([`Socket::page`], FBC-4plj; [`crate::pager`]): a socket of this
+//!   kind at a page size of 1, asked for one `get_user_orders` page at a time at the offset its
+//!   plan names, with no REST read, each frame charged to the shared limiter first; what it came
+//!   to is a [`PageAttempt`], a provider rate refusal among them, as a read counts one.
 
 use std::future::Future;
 use std::time::Duration;
@@ -48,7 +52,7 @@ use fbc_core::{
 };
 use fbc_runtime::ws::WebSocket;
 use fbc_runtime::{Connector, RateLimiter};
-use fbc_venue_qfex::account_reads::{self, NotAPage, PageAsk, PageOrder, SocketErr};
+use fbc_venue_qfex::account_reads::{self, NotAPage, OrdersPage, PageAsk, PageOrder, SocketErr};
 use fbc_venue_qfex::auth::ReadAuth;
 use rust_decimal::Decimal;
 use tokio::time::Instant;
@@ -205,6 +209,47 @@ pub enum Attempt {
     /// The comparison's wait ended before it sent its next frame or request, so it sent no
     /// more and was not made.
     Cut,
+}
+
+/// What one page stage three's pager asked for came to ([`Socket::page`], [`crate::pager`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PageAttempt {
+    /// Read: every order it listed, its TWAPs, whether it was full, and its frame as a journal
+    /// would keep it, the spans the adapter names blanked, for the slice alone (never the report
+    /// or the evidence).
+    Read {
+        listed: Vec<Listed>,
+        twaps: usize,
+        full: bool,
+        kept: String,
+    },
+    /// The shared limiter had no room for one of its frames, so it was not sent.
+    Skipped,
+    /// It could not be made: what failed, never a value.
+    Failed(String),
+    /// A provider rate refusal on the pager's socket.
+    Refused,
+}
+
+/// What one page came to, from what [`Socket::page`] read and whether the shared limiter's
+/// `rejected.user` count rose while it ran (`rose`), which makes any page a refusal.
+pub fn page_attempt(paged: Result<(OrdersPage, String), Attempt>, rose: bool) -> PageAttempt {
+    match paged {
+        Err(Attempt::Refused(_)) => PageAttempt::Refused,
+        _ if rose => PageAttempt::Refused,
+        Ok((page, kept)) => PageAttempt::Read {
+            listed: page.orders().iter().map(Listed::of).collect(),
+            twaps: page.twaps(),
+            full: page.is_full(),
+            kept,
+        },
+        Err(Attempt::Skipped) => PageAttempt::Skipped,
+        Err(Attempt::Failed(why)) => PageAttempt::Failed(why),
+        // A pager is told no end, so no page is cut, and no page is a read.
+        Err(Attempt::Cut | Attempt::Read(_)) => {
+            PageAttempt::Failed("the page was not read".to_owned())
+        }
+    }
 }
 
 /// What makes a comparison's reads ([`Socket`] on a run; a test's own otherwise).
@@ -475,9 +520,10 @@ impl<'a> Socket<'a> {
         }
     }
 
-    /// One read's frames and request in turn: the socket opened and authenticated when it is
-    /// not yet, every page from offset 0, then REST positions.
-    async fn reading(&mut self) -> Result<Read, Attempt> {
+    /// Opens the socket and authenticates it, when it is not yet: a provider rate refusal
+    /// answering the authentication is [`Attempt::Refused`], and one QFEX did not authenticate
+    /// drops the socket, failed.
+    async fn opened(&mut self) -> Result<(), Attempt> {
         let failed = |e: String| Attempt::Failed(e);
         let (cfg, reader) = (self.cfg, self.reader);
         self.not_cut()?;
@@ -498,24 +544,62 @@ impl<'a> Socket<'a> {
             }
             self.authenticated = true;
         }
+        Ok(())
+    }
+
+    /// Asks for one `get_user_orders` page, `ask`, on the open, authenticated socket, and reads
+    /// it: the page, and its frame as a journal would keep it, the spans the adapter names blanked
+    /// ([`refusals::kept`]). A provider rate refusal answering it is [`Attempt::Refused`].
+    async fn one_page(&mut self, ask: PageAsk) -> Result<(OrdersPage, String), Attempt> {
+        let (cfg, reader) = (self.cfg, self.reader);
+        let write = account_reads::user_orders(cfg, ask);
+        let write = write.map_err(|e| Attempt::Failed(e.to_string()))?;
+        let reply = self.ask(&write).await?;
+        if self.heard(&reply) {
+            return Err(Attempt::Refused(RefusedOn::ReadSocket));
+        }
+        let (caps, ns) = (self.io.caps, self.io.ns);
+        let page = dispatch(caps, ns, |scope| {
+            account_reads::orders_page(reader, reply.raw(), ask, scope)
+        });
+        let page = page.map_err(|e| match e {
+            NotAPage::RateLimited(_) => Attempt::Refused(RefusedOn::ReadSocket),
+            e => self.failed(format!("get_user_orders: {e}")),
+        })?;
+        let spans = account_reads::redact_inbound(reader, Inbound::Frame(reply.raw()));
+        Ok((page, refusals::kept(reply.raw(), &spans)))
+    }
+
+    /// One `get_user_orders` page at `offset`, at the socket's page size, the socket opened and
+    /// authenticated first when it is not yet, as stage three's pager asks for each (decision
+    /// 0132 item 7, [`crate::pager`]): what it listed, or why it was not read. A provider rate
+    /// refusal its frames show, or any rise in the shared limiter's `rejected.user` count while
+    /// it ran, is [`PageAttempt::Refused`], as a comparison's read counts one ([`Reader::read`]).
+    pub async fn page(&mut self, offset: u32) -> PageAttempt {
+        let before = self.io.limiter.counts().rejected.user;
+        let paged = async {
+            self.opened().await?;
+            let ask = PageAsk::new(self.io.page_size, offset);
+            let ask = ask.map_err(|e| Attempt::Failed(e.to_string()))?;
+            self.one_page(ask).await
+        };
+        let paged = paged.await;
+        let rose = self.io.limiter.counts().rejected.user > before;
+        page_attempt(paged, rose)
+    }
+
+    /// One read's frames and request in turn: the socket opened and authenticated when it is
+    /// not yet, every page from offset 0, then REST positions.
+    async fn reading(&mut self) -> Result<Read, Attempt> {
+        let failed = |e: String| Attempt::Failed(e);
+        let (cfg, reader) = (self.cfg, self.reader);
+        self.opened().await?;
         let mut read = Read::default();
         let mut offset = 0;
         loop {
             let ask = PageAsk::new(self.io.page_size, offset);
             let ask = ask.map_err(|e| failed(e.to_string()))?;
-            let write = account_reads::user_orders(cfg, ask).map_err(|e| failed(e.to_string()))?;
-            let reply = self.ask(&write).await?;
-            if self.heard(&reply) {
-                return Err(Attempt::Refused(RefusedOn::ReadSocket));
-            }
-            let (caps, ns) = (self.io.caps, self.io.ns);
-            let page = dispatch(caps, ns, |scope| {
-                account_reads::orders_page(reader, reply.raw(), ask, scope)
-            });
-            let page = page.map_err(|e| match e {
-                NotAPage::RateLimited(_) => Attempt::Refused(RefusedOn::ReadSocket),
-                e => self.failed(format!("get_user_orders: {e}")),
-            })?;
+            let (page, _) = self.one_page(ask).await?;
             let before = read.listed.len();
             for row in page.orders() {
                 match read.listed.iter_mut().find(|l| l.order == row.order) {

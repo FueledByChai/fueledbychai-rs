@@ -848,11 +848,13 @@ holds two of them for one pull request. The rules after the three roles bind all
     spends (FBC-23ch); and its count bound above that list's ceiling (`PlaceBounds::accept`), the
     report showing the list and the ceiling as fences met (`place_markdown`, 0151 item 10),
     held in `tests/qfex_preprod_probe/place_registries.rs`, which `tests/qfex_preprod_probe.rs`
-    declares by path. With `--place-stages` (FBC-c6kw, FBC-23ch, FBC-77r8 and FBC-su9i, slices of
-    FBC-9sk2) it runs the place stages' preflight, then each named account's drop test, then stage
-    two's crossing post-only: on production alone
-    (`--production`) and, until FBC-4plj, only against a loopback test stub (every origin loopback,
-    refused otherwise before anything connects); every place-stage flag (`--symbol`, `--side`,
+    declares by path. With `--place-stages` (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i, FBC-ou9g and
+    FBC-4plj, slices of FBC-9sk2) it runs the place stages' preflight, then each named account's
+    drop test, then stage two's crossing post-only and taker IOC, then stage three's pages: on
+    production alone
+    (`--production`), on the origins the adapter's probe guard admits there, QFEX production's or
+    every one loopback, any other refused before anything connects (FBC-4plj lifted the
+    loopback-only gate once every stop had landed); every place-stage flag (`--symbol`, `--side`,
     `--sole-trader`, both caps, `--away-bps` 20 to 10000, `--flatten-cap-bps` below it,
     `--flatten-attempts` 1 to 3, `--namespace`, `--lease-dir` never the testnet samples',
     `--agree-wait-ms` and `--read-interval-ms` at most 10 reads per comparison,
@@ -1138,8 +1140,43 @@ holds two of them for one pull request. The rules after the three roles bind all
     states but which had not all reached the registry by its deadline is `IocUnsettled`, not flat,
     with no flatten, whatever the registry's position. Then the Stop and the reads after it as after
     a crossing session (`AFTER_TAKE`, `stage::stage_after_stop`, which says each stop as met after
-    the taker IOC session). With no stop the run ends after the last account's taker IOC, its line
-    naming FBC-4plj, which builds stage three (`stage::NOT_BUILT`). The flatten (FBC-ou9g;
+    the taker IOC session). With no stop, the taker IOC's and its flatten IOCs' trades since its
+    send and their historic orders are read as X's are after drop session one (`Run::take_trades`,
+    `Run::read_orders`, a read socket `<account> (the taker IOC and its trades)` under
+    `AFTER_TAKE`), each row's `timestamp` kept as a kind by its magnitude (`places::time_kind`),
+    its `trade_id` matched with those the tee kept of our `fill_response`s in memory
+    (`places::TradeIds`, `tee::Kept::heard_trade`), its side fields against ours
+    (`places::Sides`), and a row naming no order of the run counted; a provider rate refusal or
+    Ctrl-C during it is a stop, marked, and a read not made is recorded and stops nothing. With
+    no stop the account's stage three follows (FBC-4plj; `stage.rs`'s
+    `Run::pages_steps`, `pager.rs`; decisions 0132 items 5 and 7, 0148 items 7, 8 and 10), run as
+    the crossing session is under `Which::Pages`, after its taker IOC session, so only once its
+    drop test passed and the exact-echo gate is open: every named account read clean (a provider
+    rate refusal a stop, marked), its pages registry built, tripped and seeded flat; one session
+    armed, resynced and Started under the market lease; then `pager::PLAN`: P1 and P2, page 0, P3,
+    page 1, P1's cancel, pages 2 and 3, P2's and P3's cancels, then every page from offset 0 until
+    a short one, a full page repeating an earlier one of the walk, a page not made or
+    `pager::WALK_PATIENCE` (`Run::walk`, `pager::walk_end`). Each order is a post-only GTC at the
+    minimum size `--away-bps` behind the touch, an fbc-oms authorization spent from the pages
+    registry's own list (`Run::place_resting`), sent only while both USD caps admit it at that
+    touch; each cancel is by venue id through the `Link` (`Run::cancel_paged`: an order already
+    ended, or one whose acknowledgement has not come, left to the Stop and recorded so), waited
+    on until its order ends or `--rpc-timeout-ms`; each place and cancel is compared with
+    never-arming reads (`Run::compare_paged`). The pages come from the pager, a second socket that
+    never arms or places, on the session's account and the guarded configuration, at a page size
+    of 1 (`pager::PAGE_SIZE`), every frame charged to the shared limiter first and one without
+    room not sent (`compare::Socket::page`, `compare::page_attempt`); each is recorded with its
+    size and offset, the names of ours the streams showed open as it was asked and what it listed
+    by name (`Run::page_now`, `pager::named`, `pager::PageRead`), and page 0 shows the order the
+    pages list ours in (`pager::order_shown`). A provider rate refusal on the pager, a
+    `RateLimited` err or a rise in the limiter's rejected count, is the run's stop,
+    `RateRefused(Pager)`, marked; any other page not made is recorded and stops nothing. A maker
+    fill of a stage-three order is flattened while the session is open, then stops the run, as
+    below. Then the Stop and the reads after it as after a crossing session (`AFTER_PAGES`, each
+    stop said as met after the stage-three session), the pager's refusals counted as a read
+    socket's (`<account> (stage three's pager)`). With no stop the run ends `Ok` after the last
+    account's stage three, its line `FINISHED` (`stage::FINISHED`), its outcome ok when its files
+    and records are whole. The flatten (FBC-ou9g;
     `stage.rs`'s `Run::flatten`, `flatten.rs`; decisions 0012, 0063, 0148 items 5, 6, 8 and 9, 0151
     items 5, 8 and 9) is reached from every registry: once a fill of ours other than a flatten IOC's
     (`places::Watched::expected`) reached a session, a maker fill of X or Y, a crossing post-only
@@ -1227,10 +1264,34 @@ holds two of them for one pull request. The rules after the three roles bind all
     `--reconciled` declaration and the hand cancel or hand close the last reads leave,
     `taker::hand_actions`, not known when a named account was not read or its last read could not
     be made, `taker::hand_unknown` on `Evidence::last_unread`); its slices are `drop-production/`,
-    both sessions of each account's drop test, and `places-production/`, the crossing and taker IOC
-    sessions (`stage::PLACES_SLICE`, `capture::split_crossing`), each scrubbed by `Scrub::Places`,
-    each fee kept as its sign alone, with a README of its own. Held in
-    `tests/qfex_preprod_probe/place_stages.rs` and `compare_reads.rs`, against a QFEX model in
+    both sessions of each account's drop test, `places-production/`, the crossing and taker IOC
+    sessions (`stage::PLACES_SLICE`, `capture::split_crossing`), and `pages-production/`, the
+    stage-three sessions and the pages each pager read, `<account>-the-pager-<n>.json`, which no
+    journal holds (`stage::PAGES_SLICE`, `capture::split_paging`, `capture::pager_files`; the
+    report and the evidence give stage three's pages by size, offset and name alone,
+    `pager::markdown`), each scrubbed by `Scrub::Places`, each fee kept as its sign alone, with a
+    README of its own. The report and the evidence (`answers_0132`) also answer decision 0132's
+    list for each named account (FBC-4plj, 0148 item 10; `answers.rs`), each item in words or as
+    fences met from what the run showed, never an id, a price, a size or an amount, and not
+    measured, saying why, where it did not, the items read from the whole run's frames saying so:
+    what answers an arm, whether enabling cancels open orders and whether QFEX reports it, the
+    drop test, whether a graceful close cancels, whether the other named accounts stayed clean,
+    the client ids at the format's full length (`stage_two::FullLength`) and in every character,
+    whether `ACK`, rejects and fills echo them exactly, `ACK`'s latency for post-only and other
+    places from each `add_order`'s send on the journal's clock and against the 500 ms speed bump
+    (`stage_two::Acks`, `tee::Kept::ack_latencies`), the statuses and the crossing post-only's
+    refusal, each order's `terminal_status`, the kind of a trade's `timestamp` and whether its
+    `trade_id` is the fills channel's, the side fields a trades row carries and whose side they
+    are, the pager's page boundaries, what REST's `open_orders` counts against the orders a whole
+    page listed on each account read, the comparisons' lag, `add_order` as encoded, the IOC's frame
+    order, the taker fee's sign, each resync's orders against its own `GET /user/positions`'
+    `open_orders` from the session's journal (`pages::Pages::orders`,
+    `capture::SessionRun::resync_open_orders`, `capture::open_orders`), each resync's full pages,
+    the trades rows naming an order the codec did not place, the refusals by session and read
+    socket, and the fill ledgers (`ledger::PlaceRun::said`), beside the environment, the accounts
+    as named, and the declarations and unchecked confirmations of `taker::markdown`. Held in
+    `tests/qfex_preprod_probe/place_stages.rs` and `compare_reads.rs` (stage three's pure parts in
+    `pages_run.rs`, the report's in `answers_run.rs`), against a QFEX model in
     `tests/qfex_preprod_probe/model.rs` on the conformance stub's serving scripts (0150), whose
     trade sockets learn each connection's account from its authentication, answer the arm,
     `add_order`, `cancel_order` and the two pages, cancel an armed account's orders on a graceful
@@ -1240,7 +1301,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     `position_after_close`, `hold_on_place`, `cancel_place`,
     `venue_cancel`, `close_on_cancel`, `stray_after`, `part_fill_after`, `close_after`,
     `fill_on_trades`, `fill_after_close`, `part_fill_after_close`, `trade_after_close`,
-    `trades_err`, `historic_fails`, `touch_moves` and `hold_trades`, and, for drop session two
+    `trades_err`, `historic_fails`, `touch_moves`, `hold_trades`, `trades_err_page` and
+    `hold_trades_page` (the run's `n`th `get_user_trades` page answered an err or held; FBC-4plj),
+    `page_order` (oldest or newest first; FBC-4plj, which reads its pages at a limit of 1) and
+    `rate_limit`'s
+    `Limited::PagerPage` (the `n`th page asked at a limit of 1, stage three's pager's), and, for
+    drop session two
     (FBC-77r8, held in `tests/qfex_preprod_probe/drop_two.rs`), `arm_cancels_open` (no, reported,
     reported late, silent), the cod knobs `cod_on_close`, `cod_on_drop` and `cod_reach` (the
     account, its own connection, or the earlier ones), `foreign_after_close`, `ack_delay_on`,

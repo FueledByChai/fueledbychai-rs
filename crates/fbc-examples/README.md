@@ -12,7 +12,7 @@ program's flags.
 | `testnet_quote` | A plumbing test, not a strategy: keeps one post-only order a side a fixed offset behind the touch through fbc-oms's execution planner, cancel-and-replace only, until Ctrl-C, `--duration` or `--cycles`, then Stops (FBC-elg7). Paradex TESTNET, or with `--mainnet` a supervised short session on Paradex MAINNET (FBC-tyft). See below. |
 | `paradex_testnet_acceptance` | Paradex TESTNET only: FBC-8xr's acceptance run. It writes the evidence report that the snapshot-trust decision (FBC-2f7w) cites (FBC-xji8). |
 | `mainnet_smoke` | Paradex MAINNET, real money: testnet_trade's round trip (one post-only order of `--order-usd`, the operator's own size, well away from the touch, its cancel, Stop) on a separate small account, behind `--mainnet` and `--sole-trader` (FBC-p0aa). It Starts only after a trustworthy resync seeded the market (Paradex's snapshot source is trustworthy, decision 0094) and the account is flat. See below. |
-| `qfex_preprod_probe` | QFEX PRE-PRODUCTION, or with `--production` QFEX PRODUCTION (decision 0143): stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing; with `--hold-secs` it first holds one trade connection that never arms and records each server ping and close (decision 0146). See below. |
+| `qfex_preprod_probe` | QFEX PRE-PRODUCTION, or with `--production` QFEX PRODUCTION (decision 0143): stage one of decision 0132 item 7's probe (FBC-l931). It arms cancel-on-disconnect once per account and records what answers the arm, placing nothing; with `--hold-secs` it first holds one trade connection that never arms and records each server ping and close (decision 0146). See below. With `--production --place-stages`, the place stages (FBC-9sk2, decision 0148): each named account's drop test, then on each in turn a crossing post-only, a taker IOC whose fill is flattened, and stage three's pages at a page size of 1, its report answering decision 0132's list for each named account. |
 
 ## md_watch
 
@@ -284,9 +284,9 @@ PRE-PRODUCTION environment, with the credentials QFEX supplied for it, as a decl
 (decision 0067), or, with `--production`, on QFEX PRODUCTION with your production keys and no
 such declaration (decision 0143; below). It arms
 cancel-on-disconnect once per account and records what answers the arm. It places nothing, and
-it sends no command but each session's arm, its resync's reads and its own reads. FBC-9sk2's
-place stages build on it now that FBC-jxau has landed; decision 0148 lets them run on production
-too, behind `--production` and `--sole-trader`, once FBC-9sk2 builds them. With `--hold-secs` it
+it sends no command but each session's arm, its resync's reads and its own reads. With
+`--production --place-stages` it runs FBC-9sk2's place stages on production instead (decision
+0148; [below](#the-place-stages-on-qfex-production---place-stages)). With `--hold-secs` it
 first holds one trade connection that never arms, to record how QFEX keeps it alive (the
 liveness hold, decision 0146; below), and a run may hold without arming.
 
@@ -633,6 +633,99 @@ after it showed no open order and flat positions; every session authenticated, w
 saw its outcome with one connection attempt and kept a whole capture; every registry's ledger bounds held; and every file
 was written. Agents never run this program against QFEX, pre-production or production; its
 test (`tests/qfex_preprod_probe.rs`) runs it against a QFEX-shaped conformance stub.
+
+### The place stages on QFEX production (`--place-stages`)
+
+The place stages (FBC-9sk2; decisions 0132 item 7, 0148 and 0151) are an owner-supervised run on
+QFEX PRODUCTION alone, with production keys. In order:
+
+1. A `CAPS` line with the environment and both caps, before any request: check it.
+2. The lease directory: tagged production on its first use, a stop marker from an earlier run
+   refusing the run unless `--reconciled` is given (below), and the client-id namespace's lease
+   taken for the run.
+3. The hold first, when `--hold-secs` is given (above), then the preflight: the instrument's spec
+   from this run's `GET /refdata`, the MDS touch, and both caps at least three minimum sizes at
+   the touch.
+4. Each named account's drop test in turn (decision 0132 item 4): drop session one rests X and
+   closes gracefully; drop session two rests Y and drops its connection abruptly; the reads after
+   the drop give that account's verdict, judged in this run alone.
+5. With the run's exact-echo gate open (an `ACK` in this run echoed one of our client ids byte for
+   byte), on each account whose drop test passed, in turn: a crossing post-only; a taker IOC whose
+   fill is flattened through Exit before its session stops, its trades and historic orders read
+   after it; and stage three, which rests P1, P2 and P3 and cancels them while a pager that never
+   arms reads `get_user_orders` at a page size of 1 between them. With the gate shut the run ends
+   `NoEcho`, not a fault.
+
+Every order is at the instrument's minimum size, every place and cancel is an fbc-oms
+authorization through an unchanged `ExecSession`, and every session outside the drop test cancels
+every order of ours by venue id before it stops. The first stop ends the run with the read of
+every named account, its report and its stop marker; an order still resting is reported for your
+hand cancel. Ctrl-C is a stop too (`Interrupted`), cancelling by venue id first in a session.
+
+Before each run, confirm by hand what the probe cannot check, which its report states as
+unchecked:
+
+- in QFEX's app, that the user has no subaccount the configuration does not name (decision
+  0144);
+- that no other process, Java or Rust, trades or connects on any account of the user from the
+  first read to the last: `--sole-trader` is your declaration of it (decision 0148 item 7);
+- that every named account is flat with no open order and no TWAP; the probe reads this too, and
+  starts nothing otherwise.
+
+```text
+export QFEX_PUBLIC_KEY=...             # the primary account's production key
+export QFEX_SECRET_KEY=...
+export QFEX_SUBACCOUNT_ID=...          # the subaccount to run on too, lowercase
+export QFEX_SUBACCOUNT_PUBLIC_KEY=...  # the key scoped to that subaccount
+export QFEX_SUBACCOUNT_SECRET_KEY=...
+cargo run -p fbc-examples --example qfex_preprod_probe -- --production --place-stages \
+    --evidence-dir <NEW-EMPTY-ABSOLUTE-DIR> \
+    --symbol <SYMBOL> --side <buy|sell> --sole-trader \
+    --resting-cap-usd <USD> --inventory-cap-usd <USD> \
+    --away-bps <BPS> --flatten-cap-bps <BPS> --flatten-attempts <N> \
+    --namespace <N> --agree-wait-ms <MS> --read-interval-ms <MS> --touch-max-age-ms <MS> \
+    --registry-span <SECONDS> --ledger-max-age <SECONDS> --ledger-max-entries <N> \
+    [--lease-dir <ABSOLUTE-DIR>] [--reconciled <hand-cancel|hand-close|both|none>] \
+    [--hold-secs <SECONDS> --hold-account <ACCOUNT>] [--rpc-timeout-ms <MS>] \
+    [--read-wait-ms <MS>] [--connect-wait-ms <MS>] [--page-size <N>] [--socks5 <HOST:PORT>]
+```
+
+Each flag's range and meaning is in `--help`, which names every flag. Every value is yours: none is
+written to the report, the evidence or a slice, and the caps reach standard output on the `CAPS`
+line alone. The origins are QFEX production's own (the defaults with `--production`); any other is
+refused before anything connects.
+
+After a run that stopped, its stop marker stays in the lease directory, and the next place-stage
+run refuses to start until you reconcile: on QFEX production's site, while no connection of the
+user is armed, cancel by hand any order of ours the report lists, and close by hand any position
+it says is yours (decision 0148 item 9). Then start the next run with `--reconciled
+hand-cancel`, `hand-close`, `both` or `none`, saying what you did. The probe does not check that
+declaration: it reads every named account after its preflight and clears the marker only if
+every read is clean. `--reconciled` with no marker is refused.
+
+The evidence directory holds `report.md` and `evidence.json` (decision 0132's list answered for
+each named account, each item in words or as fences met, never an id, a price, a size or an
+amount, and not measured where the run did not measure it; the key, the declarations, the fences
+met, the unchecked confirmations, every hand action, the refusal counts per session and per read
+socket, the resyncs' full pages and the fill ledgers), its journal (`journal/`; keep it local),
+and three scrubbed slices, each with a README:
+
+- `drop-production/`: both sessions of each named account's drop test;
+- `places-production/`: stage two's crossing and taker IOC sessions;
+- `pages-production/`: stage three's sessions and each pager's pages.
+
+Each slice's identifiers are blanked, every number of a frame that echoes no request is zeroed
+but each fee's sign, and the traded symbol is one placeholder (decision 0148 item 10); the run
+passes each through `scripts/privacy-check.sh`. That check knows credential and address shapes
+only, so read every file of each slice before you copy it, for an identifying string (an email, a
+user name, an address in another form, a name), starting from the members `report.md` names as
+keeping a string value. Then copy each slice into `fixtures/qfex/exec-recorded/` under its own
+name, run the check again, and commit them with `report.md` in the PR that records the run,
+which waits for the owner's review.
+
+The exit status is 0 only when every place stage ran with no stop and every file and record of the
+run is whole. Agents never run this program against QFEX; its test (`tests/qfex_preprod_probe.rs`)
+runs every stage against a QFEX-shaped conformance stub on loopback origins.
 
 ## paradex_testnet_acceptance
 

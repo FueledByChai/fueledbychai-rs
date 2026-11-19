@@ -56,7 +56,7 @@
 //!   trade-socket authentication, [`QfexModel::touch_moves`]; on every read socket,
 //!   [`QfexModel::auth_fails`], [`QfexModel::stuck_pages`], [`QfexModel::stuck_trades`],
 //!   [`QfexModel::trades_err`] and [`QfexModel::hold_trades`], and on every read socket's pages
-//!   [`QfexModel::newest_first`], after the first `add_order` [`QfexModel::page_delay`] and,
+//!   [`QfexModel::page_order`], after the first `add_order` [`QfexModel::page_delay`] and,
 //!   once an armed connection ended, [`QfexModel::blank_cid_after_session`] and, on its
 //!   positions, [`QfexModel::stop_order_after_close`]; on one authentication,
 //!   [`QfexModel::silent_auth`] (FBC-77r8). With [`QfexModel::stray_order`] or
@@ -126,6 +126,9 @@
 //!   lists counted by its REST positions. FBC-8o7a's, on every read socket's `get_user_trades`
 //!   page or on every `GET /user/historic-orders` page: [`QfexModel::endless`] ([`Endless`]),
 //!   each page full, of rows made up from the offset and limit it asks for, without end.
+//!   FBC-4plj's, on the run's `n`th `get_user_trades` page: [`QfexModel::trades_err_page`], an
+//!   `InvalidRequest` err echoing it, and [`QfexModel::hold_trades_page`], held for the test to
+//!   release.
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -494,6 +497,21 @@ pub enum Limited {
     /// The first trade-socket authentication once the run's first limit IOC came, answered as
     /// [`Limited::ReadAuthEcho`] answers one, counted as [`Limited::ReadSocketAfterIoc`] is.
     ReadAuthEchoAfterIoc,
+    /// The `n`th `get_user_orders` page of the run asked at a limit of 1 on a read socket, from
+    /// 0, answered a `RateLimited` err echoing it: stage three's pager's `n`th page, when the
+    /// run's `--page-size` is not 1 (FBC-4plj).
+    PagerPage(usize),
+}
+
+/// The order a read socket's `get_user_orders` pages list an account's open orders in
+/// ([`QfexModel::page_order`]; FBC-4plj).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PageOrder {
+    /// The order placed first is listed first.
+    #[default]
+    OldestFirst,
+    /// The order placed last is listed first.
+    NewestFirst,
 }
 
 /// What an account's reads answer while [`QfexModel::rest_lag`] holds them back: its open orders
@@ -964,8 +982,12 @@ pub struct QfexModel {
     /// Once an armed connection ended, a read socket's page lists each order with an empty
     /// `client_order_id`, its `order_id` as before: a row naming X's venue id alone.
     pub blank_cid_after_session: bool,
-    /// Whether a read socket's pages list the newest order first.
-    pub newest_first: bool,
+    /// The order a read socket's pages list an account's open orders in: oldest first by
+    /// default (FBC-4plj's knob, which stage three's pager reads at a page size of 1).
+    pub page_order: PageOrder,
+    /// How many `get_user_orders` pages a read socket has asked for at a limit of 1, as
+    /// [`Limited::PagerPage`] counts them.
+    pub(super) pager_pages: usize,
     /// Each read socket's `get_user_orders` page after the first `add_order` is answered this
     /// long after it, through the pusher, instead of at once: an answer still on its way as a
     /// comparison's wait ends.
@@ -991,6 +1013,14 @@ pub struct QfexModel {
     /// Whether every read socket's `get_user_trades` page is answered an `InvalidRequest` err
     /// echoing it, which is no rate refusal: X's trades are not read.
     pub trades_err: bool,
+    /// The `n`th `get_user_trades` page of the run, from 0, as [`QfexModel::fill_on_trades_page`]
+    /// counts them, answered an `InvalidRequest` err echoing it, which is no rate refusal
+    /// (FBC-4plj: the taker IOC's trades read after its session, its read not made).
+    pub trades_err_page: Option<usize>,
+    /// The `n`th `get_user_trades` page of the run, from 0, counted so, held unanswered until
+    /// the test releases it ([`Venue::release_held`]), its hold logged `trades page held`
+    /// (FBC-4plj: the owner's Ctrl-C during the taker IOC's trades read).
+    pub hold_trades_page: Option<usize>,
     /// Once an armed connection closed gracefully, as the model settles that close, a trade on
     /// that connection's account of an order the model never had, the size of the account's
     /// first order, which moves its position: a trade after X's send naming another order, or
@@ -1196,7 +1226,8 @@ impl Default for QfexModel {
             fill_on_trades_page: None,
             touch_moves: None,
             blank_cid_after_session: false,
-            newest_first: false,
+            page_order: PageOrder::OldestFirst,
+            pager_pages: 0,
             page_delay: None,
             stuck_trades: false,
             stop_order_after_close: false,
@@ -1204,6 +1235,8 @@ impl Default for QfexModel {
             fill_after_close: false,
             part_fill_after_close: false,
             trades_err: false,
+            trades_err_page: None,
+            hold_trades_page: None,
             trade_after_close: None,
             netting_after_close: None,
             trade_on_drop: None,
@@ -1654,6 +1687,19 @@ impl QfexModel {
             "get_user_trades" if self.trades_err => Ok(vec![Frame::text(format!(
                 r#"{{"type":"Err","error_code":"InvalidRequest","message":"synthetic","incoming_message":{text}}}"#
             ))]),
+            "get_user_trades" if self.trades_err_page == Some(self.trades_asked) => {
+                self.trades_asked += 1;
+                Ok(vec![Frame::text(format!(
+                    r#"{{"type":"Err","error_code":"InvalidRequest","message":"synthetic","incoming_message":{text}}}"#
+                ))])
+            }
+            "get_user_trades" if self.hold_trades_page == Some(self.trades_asked) => {
+                self.trades_asked += 1;
+                self.event(format!("trade {conn} trades page held"), None);
+                let page = Frame::text(self.trades_page(conn, &v));
+                self.held.push((conn, page));
+                Ok(Vec::new())
+            }
             "get_user_trades"
                 if self.rate_limit == Some(Limited::TradesPage(self.trades_asked)) =>
             {
@@ -2688,6 +2734,15 @@ impl QfexModel {
             let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
             return limited(&echo.to_string(), 3).replace("exceeded,", "exceeded\\u002c");
         }
+        if !session && v["params"]["limit"] == 1 {
+            let n = self.pager_pages;
+            self.pager_pages += 1;
+            if self.rate_limit == Some(Limited::PagerPage(n)) {
+                self.rate_limit = None;
+                let echo = serde_json::json!({"type": "get_user_orders", "params": v["params"]});
+                return limited(&echo.to_string(), 3);
+            }
+        }
         if !session && self.places > 0 {
             let n = self.pages_after;
             self.pages_after += 1;
@@ -2715,7 +2770,7 @@ impl QfexModel {
             false => self.stale_of(&account, |s| &mut s.pages),
         };
         let mut open = stale.map_or_else(|| self.open_of(&account), |s| s.orders);
-        if !session && self.newest_first {
+        if !session && self.page_order == PageOrder::NewestFirst {
             open.reverse();
         }
         let mut asked = v.clone();

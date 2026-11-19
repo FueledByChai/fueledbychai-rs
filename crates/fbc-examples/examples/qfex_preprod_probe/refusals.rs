@@ -88,12 +88,16 @@ pub const AFTER_CROSS: &str = "after the crossing session";
 /// (FBC-ou9g) are reported under.
 pub const AFTER_TAKE: &str = "after the taker IOC session";
 
+/// What the reads of every named account after the stage-three session on an account (FBC-4plj)
+/// are reported under.
+pub const AFTER_PAGES: &str = "after the stage-three session";
+
 /// When a read was made, as the report and the evidence say it: `after the hold`, `after drop
-/// session one` or `two`, `after the crossing session`, `after the taker IOC session`, or before
-/// the session or the hold `before` names.
+/// session one` or `two`, `after the crossing session`, `after the taker IOC session`, `after
+/// the stage-three session`, or before the session or the hold `before` names.
 pub fn read_when(before: &str) -> String {
     match before {
-        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS | AFTER_TAKE => {
+        AFTER_HOLD | AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS | AFTER_TAKE | AFTER_PAGES => {
             before.to_owned()
         }
         _ => format!("before {before}"),
@@ -248,8 +252,9 @@ pub fn met(ev: &Evidence, sessions: &[SessionRun]) -> u64 {
 /// starts none). The hold is one of them, under [`HOLD`], with the read sockets before it and its
 /// own connection, and the read sockets after it are another, under [`AFTER_HOLD`]; so are the
 /// read sockets after the place stages' drop session one and two, under [`AFTER_DROP_ONE`] and
-/// [`AFTER_DROP_TWO`], and after stage two's crossing and taker IOC sessions, under
-/// [`AFTER_CROSS`] and [`AFTER_TAKE`] (FBC-ou9g), which ran when that session did. A place
+/// [`AFTER_DROP_TWO`], after stage two's crossing and taker IOC sessions, under [`AFTER_CROSS`]
+/// and [`AFTER_TAKE`] (FBC-ou9g), and after the stage-three sessions, under [`AFTER_PAGES`]
+/// (FBC-4plj), which ran when that session did. A place
 /// stage's session counts the read sockets of its comparisons with those before it, since they
 /// are reported under its name, and its name is every named account's: those sessions are
 /// counted together.
@@ -272,11 +277,12 @@ pub fn by_session(
         let (own, went) = match *name {
             HOLD => (hold.map(|hold| hold.refusals.met()), hold.is_some()),
             AFTER_HOLD => (None, hold.is_some()),
-            AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS | AFTER_TAKE => {
+            AFTER_DROP_ONE | AFTER_DROP_TWO | AFTER_CROSS | AFTER_TAKE | AFTER_PAGES => {
                 let session = match *name {
                     AFTER_DROP_ONE => crate::places::DROP_ONE,
                     AFTER_DROP_TWO => crate::places::DROP_TWO,
                     AFTER_CROSS => crate::places::CROSS,
+                    AFTER_PAGES => crate::places::PAGES,
                     _ => crate::places::TAKE,
                 };
                 let ran = sessions.iter().any(|run| run.label() == session);

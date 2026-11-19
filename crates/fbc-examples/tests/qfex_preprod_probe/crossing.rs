@@ -1532,8 +1532,11 @@ fn the_reads_after_a_crossing_session_stop_the_run_on_what_they_show() {
         ),
         ((None, false, false, false, false), None),
     ] {
-        let got =
-            stage::stage_read_stop(false, (refused, pressed), (not_flat, resting, unread_too));
+        let got = stage::stage_read_stop(
+            stage_two::Session::Cross,
+            (refused, pressed),
+            (not_flat, resting, unread_too),
+        );
         assert_eq!(got, want);
     }
 }
@@ -1592,7 +1595,7 @@ fn the_reads_after_a_crossing_session_order_an_order_not_ours_after_a_position_a
         ((None, false, false, false, false, false), None),
     ] {
         let got = stage::stage_after_stop(
-            false,
+            stage_two::Session::Cross,
             (refused, pressed),
             (not_flat, unexpected),
             (resting, not_read),
@@ -1795,7 +1798,7 @@ fn stage_twos_report_and_evidence_say_each_crossing_with_no_id_or_value() {
         ..stage_two::StageTwo::default()
     };
     let mut report = String::new();
-    stage_two::markdown(&mut report, &two);
+    stage_two::markdown(&mut report, &two, &[]);
     let fourth = report
         .split("### The crossing post-only on subaccount")
         .nth(2)
@@ -1843,7 +1846,7 @@ fn stage_twos_report_and_evidence_say_each_crossing_with_no_id_or_value() {
         ..stage_two::StageTwo::default()
     };
     let mut report = String::new();
-    stage_two::markdown(&mut report, &shut);
+    stage_two::markdown(&mut report, &shut, &[]);
     assert!(report.contains(&format!("- The exact-echo gate: {}", EchoGate::shut_said())));
     let json = stage_two::to_json(&two);
     assert_eq!(json["exact_echo_gate"], true);
@@ -1908,7 +1911,7 @@ fn the_crossing_report_says_what_the_reads_and_the_check_showed_not_the_sessions
         ..stage_two::StageTwo::default()
     };
     let mut report = String::new();
-    stage_two::markdown(&mut report, &two);
+    stage_two::markdown(&mut report, &two, &[]);
     let lines = |n: usize| {
         let heading = "### The crossing post-only on ";
         report.split(heading).nth(n + 1).unwrap().to_owned()

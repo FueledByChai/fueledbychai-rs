@@ -50,7 +50,8 @@ use std::time::Duration;
 use fbc_core::{
     AccountKey, CidMatch, CidMint, ClientOrderId, ConnKey, ConnState, Envelope, ExecEvent,
     FillEvent, InstrumentId, LeaseError, MarketLease, NamedLeaseError, Namespace, NamespaceLease,
-    OrderCaps, SubmitHandle, SubmitOutcome, VenueFactory, VenueOrderSnapshot, VenueSymbol, WallNs,
+    OrderCaps, Side, SubmitHandle, SubmitOutcome, VenueFactory, VenueOrderSnapshot, VenueSymbol,
+    WallNs,
 };
 use fbc_oms::{LeaseKeys, Leases, PositionCheck, Registry, ResyncReport};
 use fbc_runtime::{ExecControl, ExecHandler};
@@ -92,6 +93,10 @@ pub const CROSS: &str = "the crossing session";
 /// The reads of every named account before stage two's taker IOC session on an account (FBC-ou9g;
 /// decision 0132 item 7), as the report names them, and that session's own name.
 pub const TAKE: &str = "the taker IOC session";
+
+/// The reads of every named account before stage three's session on an account (FBC-4plj;
+/// decision 0132 item 7), as the report names them, and that session's own name.
+pub const PAGES: &str = "the stage-three session";
 
 /// Why the place stages stopped (decisions 0132 item 7 and 0148 item 8): each reported by name
 /// ([`Stop::name`]) and by what it is ([`Stop::says`]), never with an id or an amount.
@@ -1206,6 +1211,13 @@ pub struct XAfter {
     pub fields: Vec<String>,
     /// Why a read could not be made, when one could not.
     pub error: Option<String>,
+    /// What the rows naming X show of a trade, as [`Traded`] keeps it: the kinds of their
+    /// `timestamp`, their `trade_id`s against the fills channel's, how they state X's side, and
+    /// the rows naming no order of ours.
+    pub time_kinds: Vec<&'static str>,
+    pub trade_ids: TradeIds,
+    pub sides: Sides,
+    pub foreign: usize,
 }
 
 /// The reads of the drop test's orders after a session (FBC-be57, FBC-77r8): the
@@ -1227,6 +1239,123 @@ pub struct Traded {
     pub historic_whole: bool,
     /// Why a read could not be made, when one could not.
     pub error: Option<String>,
+    /// Each kind of time the rows naming one of the orders give their `timestamp`, by its
+    /// magnitude alone ([`time_kind`]), each once, in the order first read (decision 0132's
+    /// Consequences: what kind of time a trade's `timestamp` is).
+    pub time_kinds: Vec<&'static str>,
+    /// Whether the rows naming one of the orders carry the `trade_id` the fills channel gave.
+    pub trade_ids: TradeIds,
+    /// How the rows naming the first order state its side ([`Sides`]).
+    pub sides: Sides,
+    /// The rows naming none of the orders read for: orders the codec did not place (decision
+    /// 0132 item 5: such a row is reported in the evidence).
+    pub foreign: usize,
+}
+
+/// Of the `get_user_trades` rows naming an order of ours: those whose `trade_id` is exactly one a
+/// `fill_response` of ours carried (`tee::Kept::heard_trade`), those whose is not, and those
+/// carrying none (decision 0132's Consequences: whether a fill's `trade_id` is the same in the
+/// fills channel and in `get_user_trades`). Counts alone, never an id.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct TradeIds {
+    pub matched: usize,
+    pub unmatched: usize,
+    pub absent: usize,
+}
+
+impl TradeIds {
+    /// Counts one row's `trade_id`, `id`, given whether the fills channel carried it, `heard`.
+    pub fn count(&mut self, id: Option<&str>, heard: impl Fn(&str) -> bool) {
+        match id {
+            None => self.absent += 1,
+            Some(id) if heard(id) => self.matched += 1,
+            Some(_) => self.unmatched += 1,
+        }
+    }
+
+    /// The sum of two counts, as an account's reads are added up.
+    pub fn plus(self, other: TradeIds) -> TradeIds {
+        TradeIds {
+            matched: self.matched + other.matched,
+            unmatched: self.unmatched + other.unmatched,
+            absent: self.absent + other.absent,
+        }
+    }
+
+    /// What the report says of it.
+    pub fn says(&self) -> String {
+        let rows = self.matched + self.unmatched + self.absent;
+        match (rows, self.matched == rows) {
+            (0, _) => {
+                "not measured: no get_user_trades row naming an order of ours was read".to_owned()
+            }
+            (_, true) => format!(
+                "the same: each of the {rows} get_user_trades row{} naming an order of ours \
+                 carried a trade_id a fill_response of ours carried, exactly",
+                if rows == 1 { "" } else { "s" }
+            ),
+            _ => format!(
+                "not shown the same: of the {rows} get_user_trades rows naming an order of ours, \
+                 {} carried a trade_id a fill_response of ours carried, {} one none did, and {} \
+                 none",
+                self.matched, self.unmatched, self.absent
+            ),
+        }
+    }
+}
+
+/// How the `get_user_trades` rows naming one order state its side: in `side`, and in
+/// `aggressor_side`, each the order's own side, the other side, or absent (decision 0132's
+/// Consequences: which side field a row carries, and whether it is ours or the aggressor's).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Sides {
+    /// `side`: the order's side, the other, absent.
+    pub side: [usize; 3],
+    /// `aggressor_side`: the order's side, the other, absent.
+    pub aggressor: [usize; 3],
+}
+
+impl Sides {
+    /// Counts one row stating `side` and `aggressor`, of an order on `ours`.
+    pub fn count(&mut self, ours: Side, side: Option<Side>, aggressor: Option<Side>) {
+        let at = |s: Option<Side>| match s {
+            Some(s) if s == ours => 0,
+            Some(_) => 1,
+            None => 2,
+        };
+        self.side[at(side)] += 1;
+        self.aggressor[at(aggressor)] += 1;
+    }
+
+    /// The rows counted.
+    pub fn rows(&self) -> usize {
+        self.side.iter().sum()
+    }
+}
+
+/// What kind of time a `get_user_trades` row's `timestamp` is, by its magnitude alone: the Unix
+/// unit whose count of whole digits it has (10 for seconds, 13 for milliseconds, 16 for
+/// microseconds, 19 for nanoseconds, as for any time from 2001 to 2286), whether it has a
+/// fraction, or that it fits none. Never the value. Whether it is the matching engine's time is
+/// not something its magnitude shows.
+pub fn time_kind(timestamp: Option<&rust_decimal::Decimal>) -> &'static str {
+    let Some(ts) = timestamp else {
+        return "none read: absent, or not a number";
+    };
+    let whole = ts.trunc().abs().normalize().to_string();
+    let digits = whole.len();
+    let fraction = !ts.fract().is_zero();
+    match (digits, fraction) {
+        (10, false) => "whole Unix seconds, by its magnitude",
+        (10, true) => "Unix seconds with a fraction, by its magnitude",
+        (13, false) => "whole Unix milliseconds, by its magnitude",
+        (13, true) => "Unix milliseconds with a fraction, by its magnitude",
+        (16, false) => "whole Unix microseconds, by its magnitude",
+        (16, true) => "Unix microseconds with a fraction, by its magnitude",
+        (19, false) => "whole Unix nanoseconds, by its magnitude",
+        (19, true) => "Unix nanoseconds with a fraction, by its magnitude",
+        _ => "a number no Unix unit fits by its magnitude",
+    }
 }
 
 impl Traded {
@@ -1239,6 +1368,10 @@ impl Traded {
             terminal_status: self.terminal.first().cloned().flatten(),
             fields: self.fields.clone(),
             error: self.error.clone(),
+            time_kinds: self.time_kinds.clone(),
+            trade_ids: self.trade_ids,
+            sides: self.sides,
+            foreign: self.foreign,
         }
     }
 }
@@ -1959,23 +2092,9 @@ pub fn drop_markdown(s: &mut String, run: &DropRun, last: bool) {
     let arm_two = two
         .and_then(|t| t.arm.as_deref())
         .unwrap_or("none reported");
-    let enabling = match (&run.verdict, two) {
-        (Some(v), _) => v.arm.says(),
-        (None, Some(t)) if t.x_cancel_reported => {
-            "yes, reported: a CANCELLED of X came in the arm's window".to_owned()
-        }
-        _ => "not measured: drop session two did not reach its drop".to_owned(),
-    };
-    let verdict = match &run.verdict {
-        Some(v) => v.says(),
-        None => "not judged: the drop test ended before its drop (decision 0132 item 4), so it \
-                 did not pass"
-            .to_owned(),
-    };
-    let reach = run.verdict.as_ref().map_or_else(
-        || "not measured: the drop test ended before its drop".to_owned(),
-        |v| v.reach.says(),
-    );
+    let enabling = enabling_said(run);
+    let verdict = verdict_said(run);
+    let reach = reach_said(run);
     // A trades row naming X or Y is a fill of ours whatever stop came first (0151 item 9), so
     // the position is said to be the owner's from the verdict's failures, not from the stop's
     // name alone (FBC-77r8's review).
@@ -1989,47 +2108,9 @@ pub fn drop_markdown(s: &mut String, run: &DropRun, last: bool) {
         _ if traded => format!("; {OWNERS_POSITION_BESIDE}"),
         _ => String::new(),
     };
-    let others = match run.others_clean {
-        OthersClean::NoneNamed => "no other account is named",
-        OthersClean::Clean => "yes: every read of every other named account was clean",
-        OthersClean::NotClean => {
-            "no: a read of another named account was not clean (the reads below)"
-        }
-        OthersClean::NotKnown => {
-            "not known: every read of another named account made was clean, but one could not \
-             be made (the errors below)"
-        }
-    };
-    // A status any read showed; otherwise "not listed" only when the last read of
-    // historic-orders that could list it was read whole, and "not read" when it was not, or
-    // none was made (FBC-77r8's review): Y only after drop session two, X after either session.
-    let terminal = |n: usize| {
-        let after = two.and_then(|t| t.after.as_ref());
-        let status = after.and_then(|a| a.terminal.get(n).cloned().flatten());
-        let one = run.after.as_ref().and_then(|a| a.terminal_status.clone());
-        let status = if n == 0 { status.or(one) } else { status };
-        let whole = match (after, n) {
-            (Some(a), _) => a.historic_whole,
-            (None, 0) => run.after.as_ref().is_some_and(|a| a.error.is_none()),
-            (None, _) => false,
-        };
-        status.unwrap_or_else(|| match whole {
-            true => "not listed".to_owned(),
-            false => "not read".to_owned(),
-        })
-    };
-    let mut fields: Vec<&str> = Vec::new();
-    let read = run.after.iter().flat_map(|a| a.fields.iter());
-    let read = read.chain(
-        two.and_then(|t| t.after.as_ref())
-            .into_iter()
-            .flat_map(|a| &a.fields),
-    );
-    for field in read {
-        if !fields.contains(&field.as_str()) {
-            fields.push(field);
-        }
-    }
+    let others = others_said(run.others_clean);
+    let terminal = |n: usize| terminal_said(run, n);
+    let fields = drop_fields(run);
     let fields = match fields.is_empty() {
         true => "not shown: no row was read".to_owned(),
         false => fields.join(", "),
@@ -2071,9 +2152,90 @@ pub fn drop_markdown(s: &mut String, run: &DropRun, last: bool) {
     }
 }
 
+/// Whether enabling cancel-on-disconnect cancelled X, an open order, and whether QFEX reported
+/// it (decision 0132 item 4), as the report says it: the verdict's reading, or a reported cancel
+/// heard before the drop, or not measured.
+pub fn enabling_said(run: &DropRun) -> String {
+    match (&run.verdict, run.two.as_ref()) {
+        (Some(v), _) => v.arm.says(),
+        (None, Some(t)) if t.x_cancel_reported => {
+            "yes, reported: a CANCELLED of X came in the arm's window".to_owned()
+        }
+        _ => "not measured: drop session two did not reach its drop".to_owned(),
+    }
+}
+
+/// The drop test's verdict, as the report says it.
+pub fn verdict_said(run: &DropRun) -> String {
+    match &run.verdict {
+        Some(v) => v.says(),
+        None => "not judged: the drop test ended before its drop (decision 0132 item 4), so it \
+                 did not pass"
+            .to_owned(),
+    }
+}
+
+/// The drop's reach over X, an order of an earlier connection, as the report says it.
+pub fn reach_said(run: &DropRun) -> String {
+    run.verdict.as_ref().map_or_else(
+        || "not measured: the drop test ended before its drop".to_owned(),
+        |v| v.reach.says(),
+    )
+}
+
+/// Whether the other named accounts stayed clean through a drop test, as the report says it.
+pub fn others_said(clean: OthersClean) -> &'static str {
+    match clean {
+        OthersClean::NoneNamed => "no other account is named",
+        OthersClean::Clean => "yes: every read of every other named account was clean",
+        OthersClean::NotClean => {
+            "no: a read of another named account was not clean (the reads below)"
+        }
+        OthersClean::NotKnown => {
+            "not known: every read of another named account made was clean, but one could not \
+             be made (the errors below)"
+        }
+    }
+}
+
+/// The `terminal_status` of the drop test's order `n`, X (0) or Y (1), on
+/// `GET /user/historic-orders`, as the report says it: a status any read showed; otherwise "not
+/// listed" only when the last read of historic-orders that could list it was read whole, and
+/// "not read" when it was not, or none was made (FBC-77r8's review): Y only after drop session
+/// two, X after either session.
+pub fn terminal_said(run: &DropRun, n: usize) -> String {
+    let after = run.two.as_ref().and_then(|t| t.after.as_ref());
+    let status = after.and_then(|a| a.terminal.get(n).cloned().flatten());
+    let one = run.after.as_ref().and_then(|a| a.terminal_status.clone());
+    let status = if n == 0 { status.or(one) } else { status };
+    let whole = match (after, n) {
+        (Some(a), _) => a.historic_whole,
+        (None, 0) => run.after.as_ref().is_some_and(|a| a.error.is_none()),
+        (None, _) => false,
+    };
+    status.unwrap_or_else(|| match whole {
+        true => "not listed".to_owned(),
+        false => "not read".to_owned(),
+    })
+}
+
+/// The member names the drop test's `get_user_trades` rows carried, each once, in the order
+/// first read: drop session one's reads, then those after the drop.
+pub fn drop_fields(run: &DropRun) -> Vec<String> {
+    let mut fields: Vec<String> = Vec::new();
+    let read = run.after.iter().flat_map(|a| a.fields.iter());
+    let two = run.two.as_ref().and_then(|t| t.after.as_ref());
+    for field in read.chain(two.into_iter().flat_map(|a| &a.fields)) {
+        if !fields.contains(field) {
+            fields.push(field.clone());
+        }
+    }
+    fields
+}
+
 /// Whether drop session one's graceful close cancelled X ([`close_verdict`]), as the report
 /// says it: not measured with its reason when it was not.
-fn close_said(run: &DropRun) -> String {
+pub fn close_said(run: &DropRun) -> String {
     match (run.close_cancelled_x, run.close_not_measured) {
         (Some(true), _) => "yes: X rested before it, no cancel of ours was sent, and the read \
              after it no longer listed X, with X's account flat after it and X's trades since \

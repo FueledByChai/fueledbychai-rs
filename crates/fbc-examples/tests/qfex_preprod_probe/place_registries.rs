@@ -655,3 +655,26 @@ async fn a_place_registry_hands_its_trip_to_the_journal() {
     assert_eq!(other.registry().cancel_only_trip().trips(), 0);
     assert_eq!(other.registry().entry(INST).state(), EntryState::Quoting);
 }
+
+#[test]
+fn a_place_registrys_line_in_decision_0132s_list_gives_its_ledger_as_words_and_counts() {
+    // FBC-4plj: each registry's bounds and, at each of its sessions' ends, its horizon as a word
+    // and its replay counts, never a time or a value.
+    let built = place_registry(Step::Pages, "primary", PRIMARY, MonoNs(0));
+    assert_eq!(
+        built.run().said(),
+        "the pages registry: its bounds held yes; no session of it ended"
+    );
+    let (link, mut run) = built.into_link(order_caps(), ladder());
+    run.session_ended(&link, "the stage-three session", MonoNs(5_000_000));
+    assert_eq!(
+        run.said(),
+        "the pages registry: its bounds held yes; after the stage-three session: horizon full, 0 \
+         fills held, replays applied 0, duplicate 0, before the watermark 0, beyond the horizon \
+         0, untimed 0"
+    );
+    use fbc_oms::Horizon;
+    assert_eq!(ledger::horizon_word(Horizon::Full), "full");
+    assert_eq!(ledger::horizon_word(Horizon::At(ExchNs(7))), "moved");
+    assert_eq!(ledger::horizon_word(Horizon::Lost), "lost");
+}

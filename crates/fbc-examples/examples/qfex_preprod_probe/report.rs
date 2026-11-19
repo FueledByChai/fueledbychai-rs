@@ -13,7 +13,8 @@
 //! registries ([`crate::ledger::place_markdown`]) and what the run declares and leaves the owner
 //! (the key, the declarations, the fences met, the unchecked confirmations and every hand action:
 //! [`crate::taker::markdown`]), every cap, distance and attempt count as a fence met, never a
-//! value (0151 item 10).
+//! value (0151 item 10), stage three's pages ([`crate::pager`]), and decision 0132's list answered
+//! for each named account ([`crate::answers`]; decision 0148 item 10).
 
 use std::fmt::Write as _;
 
@@ -21,7 +22,7 @@ use serde_json::{Value, json};
 
 use crate::capture::{Evidence, SessionRun, has_gap, list, partial_accounts, shown};
 use crate::evidence::privacy_hits;
-use crate::{hold, ledger, market, places, refusals, stage_two};
+use crate::{hold, ledger, market, pager, places, refusals, stage_two};
 
 /// Where the accounts read came from, as `evidence.json` says it (decision 0144 item 3).
 const ACCOUNTS_NOTE: &str = "named by the run's configuration, not listed by QFEX: the probe \
@@ -59,10 +60,10 @@ pub fn markdown(ev: &Evidence) -> String {
     };
     let title = match ev.places_asked {
         true => format!(
-            "# QFEX {} place stages: the preflight, each named account's drop test and stage \
-             two's crossing post-only and taker IOC\n\n\
-             FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of FBC-9sk2; decisions \
-             0132 items 4 and 7, 0148 and 0151.",
+            "# QFEX {} place stages: the preflight, each named account's drop test, stage two's \
+             crossing post-only and taker IOC, and stage three's pages\n\n\
+             FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i, FBC-ou9g and FBC-4plj, slices of FBC-9sk2; \
+             decisions 0132 items 4, 5 and 7, 0148 and 0151.",
             ev.environment
         ),
         false => format!(
@@ -171,8 +172,20 @@ pub fn markdown(ev: &Evidence) -> String {
     for (n, run) in ev.drops.iter().enumerate() {
         places::drop_markdown(&mut s, run, n + 1 == ev.accounts.len());
     }
+    let paged: Vec<&'static str> = ev.stage_three.iter().map(|r| r.session.account).collect();
     if let Some(two) = &ev.stage_two {
-        stage_two::markdown(&mut s, two);
+        stage_two::markdown(&mut s, two, &paged);
+    }
+    if !ev.stage_three.is_empty() {
+        let two = ev.stage_two.as_ref();
+        let crossed: Vec<&'static str> = two.map_or(Vec::new(), |t| {
+            t.crosses.iter().map(|c| c.account).collect()
+        });
+        let finished = two.is_some_and(|t| t.finished);
+        pager::markdown(&mut s, &ev.stage_three, (&crossed, finished));
+    }
+    if ev.places_asked {
+        crate::answers::markdown(&mut s, ev, &sessions);
     }
     let asked_none = ev.arms.is_empty() && ev.hold_asked && !ev.places_asked;
     let _ = writeln!(s, "## The sessions\n");
@@ -271,16 +284,16 @@ const STAGE_ONE_NOT_MEASURED: &str = "Not measured by stage one (FBC-9sk2's stag
      (the owner must confirm none before the run, which the probe does not record: decision \
      0144).";
 
-/// What a place-stage run does not measure yet, as its report says it.
-const PLACES_NOT_MEASURED: &str = "Not measured until FBC-4plj builds stage three: anything \
-     of stage three's pages; a flatten is made only after a fill of ours, and the report shows \
-     each one made. Not measured by the \
-     drop test (decision 0132 item 4): an order placed through another live connection after the \
-     arm, and whether an arm or a drop cancels another account's orders, since no order of ours \
-     rests on another account while a session runs. Not checked by the probe: whether the user \
-     has a subaccount the configuration does not name, and `--sole-trader`'s declaration that \
-     nothing else trades on the named accounts (the owner confirms both before the run, which the \
-     probe does not record: decisions 0144 and 0148 item 7).";
+/// What a place-stage run does not measure, as its report says it.
+const PLACES_NOT_MEASURED: &str = "Decision 0132's list is answered above for each named \
+     account, each item not measured there saying why. A flatten is made only after a fill of \
+     ours, and the report shows each one made. Not measured by the drop test (decision 0132 item \
+     4): an order placed through another live connection after the arm, and whether an arm or a \
+     drop cancels another account's orders, since no order of ours rests on another account \
+     while a session runs. Not checked by the probe: whether the user has a subaccount the \
+     configuration does not name, and `--sole-trader`'s declaration that nothing else trades on \
+     the named accounts (the owner confirms both before the run, which the probe does not \
+     record: decisions 0144 and 0148 item 7).";
 
 /// A session's heading: its account, and its name when it has one of its own.
 fn heading(run: &SessionRun) -> String {
@@ -363,6 +376,8 @@ pub fn to_json(ev: &Evidence) -> Value {
         "place_registries": ledger::place_to_json(&ev.place_registries),
         "drop_tests": ev.drops.iter().map(places::drop_to_json).collect::<Vec<Value>>(),
         "stage_two": ev.stage_two.as_ref().map(stage_two::to_json),
+        "stage_three": pager::to_json(&ev.stage_three),
+        "answers_0132": ev.places_asked.then(|| crate::answers::to_json(ev, &shown)),
         "declared": ev.places_asked.then(|| crate::taker::to_json(ev)),
         "fixtures": ev.fixtures, "kept_string_members": ev.strings,
         "fixtures_withheld": ev.withheld, "errors": ev.errors})

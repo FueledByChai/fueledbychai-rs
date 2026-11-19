@@ -19,15 +19,17 @@
 //!   error or a line, and keeps no frame.
 //! - **What it keeps** ([`Kept`], read through a [`Tap`]):
 //!   - from each outbound `add_order`, its `client_order_id` as written between its quotes, when
-//!     it was written, and whether the frame carried `take_profit`, `stop_loss` or `reduce_only`
-//!     (FBC-blcw: the codec writes none of them); from each outbound `cancel_order`, that the
-//!     order it names is ours;
+//!     it was written, whether it was post-only (`order_type` `ALO`) and whether the frame
+//!     carried `take_profit`, `stop_loss` or `reduce_only` (FBC-blcw: the codec writes none of
+//!     them); from each outbound `cancel_order`, that the order it names is ours;
 //!   - from each inbound `order_response`, its status, as a status name or not one, and whether
 //!     its `client_order_id` is absent (or null), empty, exactly one we sent (the raw bytes
 //!     between its quotes: a JSON escape never matches), one we sent written otherwise (another
 //!     case or an escape), or none of ours ([`Cid`]), and whether it names an order of ours;
 //!   - from each inbound `fill_response`, the same, whether it names its `trade_id`, and its fee's
-//!     sign ([`Sign`]), never its amount;
+//!     sign ([`Sign`]), never its amount; and, of one naming an order of ours, its `trade_id` in
+//!     memory alone, so a `get_user_trades` row's can be matched with it ([`Kept::heard_trade`],
+//!     decision 0132's Consequences), never written anywhere;
 //!   - from each `ack` or `err` echo of an `add_order`, its envelope and its echoed client id
 //!     ([`EchoCid`]), for the report alone: an echo never opens FBC-su9i's exact-echo gate;
 //!   - every frame read, in arrival order with its receive time ([`Heard`]), so the order of an
@@ -227,6 +229,8 @@ pub struct Sent {
     /// Kept in memory only, to compare with what QFEX sends back: never written anywhere.
     cid: String,
     pub at: MonoNs,
+    /// Whether it was post-only: its `order_type` `ALO`, as the codec writes one.
+    pub post_only: bool,
     pub take_profit: bool,
     pub stop_loss: bool,
     pub reduce_only: bool,
@@ -273,6 +277,9 @@ pub struct Kept {
     pub stops: Vec<Stop>,
     /// Whether a fill of ours reached a session, with or without our client id.
     pub fill_of_ours: bool,
+    /// The `trade_id` of each `fill_response` naming an order of ours, kept in memory only, to
+    /// match with a `get_user_trades` row's: never written anywhere.
+    trades: Vec<String>,
 }
 
 impl Kept {
@@ -307,6 +314,39 @@ impl Kept {
             _ => None,
         });
         (sent, acked.flat_map(|s| s.cid.chars()).collect())
+    }
+
+    /// The length, in characters, of each client id the run sent, in order: lengths alone, for
+    /// the report's item on the format's full length (`stage_two::FullLength`).
+    pub fn sent_lengths(&self) -> Vec<usize> {
+        self.sent.iter().map(|s| s.cid.chars().count()).collect()
+    }
+
+    /// Whether a `fill_response` naming an order of ours carried the `trade_id` `id`, exactly:
+    /// whether a `get_user_trades` row's `trade_id` is the one the fills channel gave (decision
+    /// 0132's Consequences). Neither id is kept beyond the run.
+    pub fn heard_trade(&self, id: &str) -> bool {
+        self.trades.iter().any(|t| t == id)
+    }
+
+    /// Each `ACK` of an order the run sent, by its client id ([`Cid::sent`]), the first heard at
+    /// or after its `add_order`: whether that place was post-only, and how long after its send
+    /// the `ACK` came, on the journal's clock, in send order (decision 0132's Consequences: how
+    /// long `ACK` takes, for post-only and for other places).
+    pub fn ack_latencies(&self) -> Vec<(bool, std::time::Duration)> {
+        let first = |n: usize, sent: &Sent| {
+            self.heard.iter().find_map(|h| match h {
+                Heard::Order {
+                    at, status, cid, ..
+                } if status == "ACK" && cid.sent() == Some(n) && *at >= sent.at => {
+                    Some(*at - sent.at)
+                }
+                _ => None,
+            })
+        };
+        let each = self.sent.iter().enumerate();
+        each.filter_map(|(n, sent)| first(n, sent).map(|after| (sent.post_only, after)))
+            .collect()
     }
 
     /// [`Kept::exact_ack`] among the frames heard from the `from`th on: one session's.
@@ -479,9 +519,11 @@ impl Tap {
                     (_, Some(Value::String(cid))) => cid.clone(),
                     _ => return,
                 };
+                let post_only = params.get("order_type") == Some(&json_str("ALO"));
                 self.kept.borrow_mut().sent.push(Sent {
                     cid,
                     at,
+                    post_only,
                     take_profit: params.contains_key("take_profit"),
                     stop_loss: params.contains_key("stop_loss"),
                     reduce_only: params.contains_key("reduce_only"),
@@ -649,7 +691,11 @@ impl Tap {
     /// A `fill_response`.
     fn fill(&self, at: MonoNs, kept: &str, fill: &Map<String, Value>) {
         let (cid, ours, known) = self.judge(kept, fill);
-        let trade_id = matches!(fill.get("trade_id"), Some(Value::String(s)) if !s.is_empty());
+        let named = match fill.get("trade_id") {
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        };
+        let trade_id = named.is_some();
         let heard = Heard::Fill {
             at,
             cid,
@@ -660,6 +706,9 @@ impl Tap {
         let mut kept = self.kept.borrow_mut();
         kept.heard.push(heard);
         kept.fill_of_ours |= ours;
+        if let Some(named) = named.filter(|_| ours) {
+            kept.trades.push(named);
+        }
         drop(kept);
         self.stop_on(cid, ours, known);
     }
@@ -829,6 +878,7 @@ mod tests {
 
     use fbc_core::{ConnKey, Stamp, WireSlice};
     use fbc_journal::Opaque;
+    use std::time::Duration;
 
     /// A sink that counts what it is handed and names a gap, so the tee's delegation shows.
     #[derive(Default)]
@@ -1523,5 +1573,47 @@ mod tests {
         );
         assert_eq!(string_at(br#""a\"#, 0), None);
         assert_eq!(skip_space(b" \t\n\rx", 0), 4);
+    }
+
+    /// An IOC's `add_order`, as the codec writes one: no `ALO`.
+    fn add_ioc(cid: &str) -> String {
+        add_order(cid).replace(
+            r#""ALO","order_time_in_force":"GTC""#,
+            r#""LIMIT","order_time_in_force":"IOC""#,
+        )
+    }
+
+    #[test]
+    fn the_tee_keeps_each_places_kind_its_acks_latency_its_ids_length_and_our_fills_trade_ids() {
+        let (mut tee, tap) = teed();
+        outbound(&mut tee, &add_order(CID), Vec::new());
+        outbound(&mut tee, &add_ioc("0007abcd00000002"), Vec::new());
+        let kept = tap.kept();
+        let kinds: Vec<bool> = kept.sent().iter().map(|s| s.post_only).collect();
+        assert_eq!(kinds, [true, false]);
+        assert_eq!(kept.sent_lengths(), [16, 16]);
+        // No ACK yet: no latency.
+        assert!(kept.ack_latencies().is_empty());
+        drop(kept);
+        // The IOC's ACK, then the post-only's, each 2 ns after its send (sent at 3, heard at 5);
+        // a second ACK of the post-only is not its first.
+        let ack = |cid: &str| order_response(ORDER, "ACK", Some(&quoted(cid)));
+        inbound(&mut tee, &ack("0007abcd00000002"), &[]);
+        inbound(&mut tee, &ack(CID), &[]);
+        inbound(&mut tee, &ack(CID), &[]);
+        let two = Duration::from_nanos(2);
+        assert_eq!(tap.kept().ack_latencies(), [(true, two), (false, two)]);
+        // A fill of ours keeps its trade id in memory, matched exactly; a stray's is not kept.
+        inbound(
+            &mut tee,
+            &fill_response(ORDER, Some(&quoted(CID)), "0.002"),
+            &[],
+        );
+        let id = "55555555-5555-4555-8555-555555555555";
+        assert!(tap.kept().heard_trade(id));
+        assert!(!tap.kept().heard_trade(&id.replace('5', "6")));
+        let (mut tee, tap) = teed();
+        inbound(&mut tee, &fill_response(OTHER, None, "0"), &[]);
+        assert!(!tap.kept().heard_trade(id));
     }
 }

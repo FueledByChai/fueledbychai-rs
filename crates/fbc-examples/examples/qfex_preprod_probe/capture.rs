@@ -320,6 +320,10 @@ pub struct SessionRun {
     /// Its resync's `get_user_orders` pages, each full one with its page size and offset
     /// (decision 0132 item 5), as its journal kept them ([`crate::pages`]).
     pub pages: Pages,
+    /// The `open_orders` its resync's signed `GET /user/positions` counted, every row's summed,
+    /// as its journal kept the answer: what decision 0132 item 5's cross-check compares with the
+    /// orders its pages listed ([`Pages::orders`]); `None` when no such answer was journaled.
+    pub resync_open_orders: Option<u64>,
     /// Why its capture is partial: each way the journal could be missing its records ([`Gaps`]).
     /// Empty when the journal was written and read whole and kept every record it could hold.
     pub partial: Vec<String>,
@@ -503,6 +507,9 @@ pub struct Evidence {
     /// Stage two (FBC-su9i), once a drop session ran: the run's exact-echo gate, what its frames
     /// show of our client ids and QFEX's statuses, and each named account's crossing session.
     pub stage_two: Option<crate::stage_two::StageTwo>,
+    /// Stage three (FBC-4plj): each named account's session on its pages registry, with the
+    /// pager's pages, in run order.
+    pub stage_three: Vec<crate::pager::PagesRun>,
     /// Each place-stage registry built: its step, its declaration, its bounds as fences, and its
     /// ledger at each of its sessions' ends (decision 0132 item 5).
     pub place_registries: Vec<crate::ledger::PlaceRun>,
@@ -1225,9 +1232,39 @@ fn read(
                 });
             }
         }
+        // The session's own HTTP answer, its resync's signed GET /user/positions: the
+        // open_orders it counts, for decision 0132 item 5's cross-check.
+        Record::HttpResult {
+            stamp,
+            result: Ok(resp),
+            ..
+        } => {
+            if let (Some(run), Some(open)) = (
+                sessions.get_mut(usize::from(stamp.conn.conn)),
+                open_orders(&resp.body.0),
+            ) {
+                run.resync_open_orders = Some(open);
+            }
+        }
         // A gap, and every record no session's frames need, [`Gaps`] has read.
         _ => {}
     }
+}
+
+/// The `open_orders` a `GET /user/positions` answer, `body`, counts, every row's summed, when it
+/// is one: an object whose `positions` is an array (or null, no row) of objects, each with a
+/// whole `open_orders` of at least zero. `None` for any other body. Nothing else is read.
+pub fn open_orders(body: &[u8]) -> Option<u64> {
+    let top: Value = serde_json::from_slice(body).ok()?;
+    let rows = match top.as_object()?.get("positions")? {
+        Value::Null => return Some(0),
+        Value::Array(rows) => rows,
+        _ => return None,
+    };
+    let each = rows
+        .iter()
+        .map(|row| row.get("open_orders").and_then(Value::as_u64));
+    each.sum()
 }
 
 /// The fixture directory's README of a run that armed on no account, so wrote no frame: the hold
@@ -1280,7 +1317,7 @@ fn gap_note(ev: &Evidence) -> String {
 /// `places-production/` ([`readme_crossing`]).
 fn readme_places(ev: &Evidence) -> String {
     let sessions: Vec<String> = (ev.sessions.iter())
-        .filter(|run| !is_crossing(run))
+        .filter(|run| !is_crossing(run) && !is_paging(run))
         .map(|run| format!("{} on {}", run.label(), run.account))
         .collect();
     let sessions = match sessions.is_empty() {
@@ -1329,18 +1366,103 @@ pub fn is_crossing(run: &SessionRun) -> bool {
     run.name == crate::places::CROSS || run.name == crate::places::TAKE
 }
 
+/// Whether `run` is stage three's session (FBC-4plj), whose frames go in the `pages-production/`
+/// slice (decision 0148 item 10).
+pub fn is_paging(run: &SessionRun) -> bool {
+    run.name == crate::places::PAGES
+}
+
 /// Fixture files, each named, with its text.
 pub type Files = Vec<(String, String)>;
 
 /// The files of `files`, as [`slice_places`] named them, of stage two's crossing sessions of
 /// `ev`, then the others: each file's name begins with its session's [`SessionRun::slug`].
 pub fn split_crossing(ev: &Evidence, files: Files) -> (Files, Files) {
-    let crossing: Vec<String> = (ev.sessions.iter().filter(|run| is_crossing(run)))
+    split_sessions(ev, files, is_crossing)
+}
+
+/// The files of `files`, as [`slice_places`] named them, of stage three's sessions of `ev`, then
+/// the others.
+pub fn split_paging(ev: &Evidence, files: Files) -> (Files, Files) {
+    split_sessions(ev, files, is_paging)
+}
+
+/// The files of `files` of the sessions of `ev` that `of` picks, then the others.
+fn split_sessions(ev: &Evidence, files: Files, of: fn(&SessionRun) -> bool) -> (Files, Files) {
+    let picked: Vec<String> = (ev.sessions.iter().filter(|run| of(run)))
         .map(|run| format!("{}-", run.slug()))
         .collect();
     files
         .into_iter()
-        .partition(|(file, _)| crossing.iter().any(|slug| file.starts_with(slug.as_str())))
+        .partition(|(file, _)| picked.iter().any(|slug| file.starts_with(slug.as_str())))
+}
+
+/// The frames stage three's pagers read (FBC-4plj), each scrubbed as every place-stage frame is
+/// ([`scrub_places`]; decision 0148 item 10), named `<account>-the-pager-<n>.json` in the order
+/// read: the pages beside each account's stage-three session, which no journal holds.
+pub fn pager_files(ev: &Evidence) -> Files {
+    let mut files = Vec::new();
+    for run in &ev.stage_three {
+        for (n, frame) in run.frames.iter().enumerate() {
+            let name = format!("{}-the-pager-{:02}.json", run.session.account, n + 1);
+            files.push((name, scrub_places(frame)));
+        }
+    }
+    files
+}
+
+/// The README of a place-stage run's `pages-production/` fixture directory (decision 0148 item
+/// 10): stage three's sessions' frames and the pages its pagers read, scrubbed as the drop
+/// test's are.
+fn readme_pages(ev: &Evidence) -> String {
+    let sessions: Vec<String> = (ev.sessions.iter().filter(|run| is_paging(run)))
+        .map(|run| format!("{} on {}", run.label(), run.account))
+        .collect();
+    format!(
+        "# QFEX trade-socket frames: stage three's pages\n\n\
+         Recorded {} on QFEX {} (the probe mode `{}`), from {}, by the owner-run program \
+         `qfex_preprod_probe` (crates/fbc-examples, FBC-4plj, a slice of FBC-9sk2; decisions \
+         0132 item 7, 0148 and 0151): each named account's stage-three session ({}), placed only \
+         once that account's drop test passed and an ACK in the run echoed one of our client \
+         ids byte for byte (decision 0148 item 2). The session rests P1, P2 and P3, each one \
+         post-only GTC at the instrument's minimum size behind the touch, and cancels them by \
+         venue id, while the pager, a socket that never arms, asks for get_user_orders at a \
+         page size of 1 between them (decision 0132 item 5's evidence). These are recorded \
+         frames, not synthetic ones: this directory carries no SYNTHETIC marker.\n\n\
+         Each `<account>-the-stage-three-session-<n>-<when>.json` file is one frame QFEX sent on \
+         the session's trade socket, in the order received, against the session's arm: \
+         `before-arm`, `in-window` or `after-window`, or `partial` for a partial capture. Each \
+         `<account>-the-pager-<n>.json` file is one page QFEX sent the pager, in the order read, \
+         from page 0 to the walk's last page; the report gives each page's size and offset.\n\n\
+         Method: as the drop test's slice (`drop-production/`): each frame read with every span \
+         the adapter names blanked to `2`s, then scrubbed member by member as decision 0148 \
+         item 10 asks and 0151 item 7 reads it: each `symbol` becomes `{SYMBOL}`; a top-level \
+         ack or err echo is otherwise as the codec's spans left it; in any other frame every \
+         number and every decimal string is zeroed, each `fee` kept as its sign alone, and \
+         every `id` and `*_id` member blanked to `2`s at its length. No frame we wrote is kept. \
+         Every file passed the privacy check's patterns before it was written, and \
+         scripts/privacy-check.sh then scanned the directory; the owner reads every file before \
+         committing this directory as `fixtures/qfex/exec-recorded/pages-production/`, starting \
+         from the members the run found keeping a string value: {}.\n{}",
+        ev.started.get(..10).unwrap_or(""),
+        ev.environment,
+        ev.mode,
+        ev.target,
+        sessions.join(" then "),
+        list(&ev.strings),
+        gap_note(ev),
+    )
+}
+
+/// [`write_fixtures_scrubbed`] of stage three's sessions' files and its pagers' pages into
+/// `pages-production/` (decision 0148 item 10), with that directory's README, the strings they
+/// keep added to those the run's other slices kept.
+pub fn write_pages_fixtures(
+    dir: &Path,
+    files: Vec<(String, String)>,
+    ev: &mut Evidence,
+) -> Result<(), String> {
+    write_fixtures_with(dir, files, ev, Scrub::Places, readme_pages)
 }
 
 /// The README of a place-stage run's `places-production/` fixture directory (0151 item 7):
