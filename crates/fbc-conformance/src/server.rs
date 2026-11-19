@@ -1,9 +1,12 @@
 //! The stub venue server: a WebSocket endpoint that plays a [`WsScript`] (a timeline of steps,
 //! or a serving script, decision 0150) and an HTTP/1.1 endpoint that answers by an
 //! [`HttpRouter`]'s rules, each on its own 127.0.0.1 ephemeral port. Nothing here reaches beyond
-//! the loopback interface.
+//! the loopback interface. Every socket either endpoint accepts has TCP_NODELAY set (FBC-4ptk),
+//! so a small frame written right after another is not held for the client's acknowledgement
+//! of the first; no order rests on it (a barrier or a recorded close orders, decision 0150).
 
 use std::any::Any;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -22,7 +25,7 @@ use fbc_runtime::http::Method;
 
 use crate::routes::{HttpReply, HttpRequest, HttpRouter};
 use crate::script::{Frame, Responder, Step, WsScript};
-use crate::serving::{self, Link};
+use crate::serving::{self, Link, Records};
 
 /// The most bytes the stub reads of one request's head, and of its body.
 const MAX_REQUEST: usize = 64 * 1024;
@@ -157,8 +160,15 @@ impl StubServer {
     /// an [`HttpRouter`] or 0025's fixed [`HttpRoutes`](crate::HttpRoutes). A serving script
     /// ([`WsScript::serving`]) is refused, as `InvalidInput`, when it was given steps or was
     /// already started on a stub; it counts as started once both endpoints are bound, so a
-    /// failed bind leaves it free to start.
+    /// failed bind leaves it free to start. A step script is refused, as `InvalidInput`, when a
+    /// [`Step::Respond`] in it holds its first answer ([`Responder::hold_first`]), which only a
+    /// serving script does.
     pub async fn start(script: WsScript, router: impl Into<HttpRouter>) -> io::Result<StubServer> {
+        let holds = |step: &Step| matches!(step, Step::Respond { with, .. } if with.holds());
+        if script.steps.iter().any(holds) {
+            let why = "a responder that holds its first answer plays only in a serving script";
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, why));
+        }
         let ws_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let http_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let (ws, http) = (ws_listener.local_addr()?, http_listener.local_addr()?);
@@ -176,11 +186,22 @@ impl StubServer {
             played: Arc::new(played_tx),
         };
         let held = report.result.clone();
+        // Word of each change to the records; its sender ends with the stub's tasks.
+        let (changed_tx, changed) = watch::channel(());
+        let records = Records {
+            conns: conns.clone(),
+            changed,
+            stop: stop.clone(),
+        };
         // A serving script's listener reports its own failure; a step script's Accept step does.
         let served = link.map(|link| (link, report.clone()));
+        let listened = Listened {
+            conns: conns.clone(),
+            changed: Arc::new(changed_tx),
+        };
         tokio::spawn(accept_ws(
             ws_listener,
-            conns.clone(),
+            listened,
             accepted_tx,
             served,
             stop.clone(),
@@ -200,7 +221,7 @@ impl StubServer {
                 }
             }),
             // It serves until the stub's drop stops the listener, which ends `accepted`.
-            Some(serving) => tokio::spawn(serving::serve(serving, accepted, report)),
+            Some(serving) => tokio::spawn(serving::serve(serving, accepted, report, records)),
         };
         Ok(StubServer {
             ws,
@@ -335,10 +356,22 @@ trait Accept: Send + 'static {
     fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send;
 }
 
+/// Every socket the stub accepts, WebSocket and HTTP, is accepted here, and has TCP_NODELAY set
+/// (FBC-4ptk). A socket that refuses it is served all the same: no order rests on it.
 impl Accept for TcpListener {
-    fn accept(&self) -> impl Future<Output = io::Result<(TcpStream, SocketAddr)>> + Send {
-        TcpListener::accept(self)
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let (stream, addr) = TcpListener::accept(self).await?;
+        let _ = stream.set_nodelay(true);
+        Ok((stream, addr))
     }
+}
+
+/// The WebSocket endpoint's records, and the sender that tells a serving script's held answers
+/// of each change to them ([`Records`]).
+#[derive(Clone)]
+struct Listened {
+    conns: Shared<Vec<ConnRecord>>,
+    changed: Arc<watch::Sender<()>>,
 }
 
 /// Accepts every TCP connection, records it at once and upgrades it in a task of its own; hands
@@ -347,7 +380,7 @@ impl Accept for TcpListener {
 /// fails.
 async fn accept_ws(
     listener: impl Accept,
-    conns: Shared<Vec<ConnRecord>>,
+    listened: Listened,
     accepted: mpsc::UnboundedSender<Ready>,
     served: Option<(Arc<Link>, Report)>,
     mut stop: watch::Receiver<()>,
@@ -372,7 +405,7 @@ async fn accept_ws(
             }
         };
         let index = {
-            let mut conns = lock(&conns);
+            let mut conns = lock(&listened.conns);
             conns.push(ConnRecord {
                 accepted_at: Instant::now(),
                 upgraded: false,
@@ -387,7 +420,7 @@ async fn accept_ws(
         tokio::spawn(serve_ws(
             stream,
             index,
-            conns.clone(),
+            listened.clone(),
             link.clone(),
             ready_tx,
             stop.clone(),
@@ -398,12 +431,16 @@ async fn accept_ws(
 async fn serve_ws(
     stream: TcpStream,
     index: usize,
-    conns: Shared<Vec<ConnRecord>>,
+    listened: Listened,
     link: Option<Arc<Link>>,
     ready: oneshot::Sender<Option<Conn>>,
     mut stop: watch::Receiver<()>,
 ) {
-    let record = |f: &dyn Fn(&mut ConnRecord)| f(&mut lock(&conns)[index]);
+    // Each change is told once made, so a held answer released by it reads it.
+    let record = |f: &dyn Fn(&mut ConnRecord)| {
+        f(&mut lock(&listened.conns)[index]);
+        listened.changed.send_replace(());
+    };
     let upgraded = tokio::select! {
         ws = tokio_tungstenite::accept_async(stream) => ws.ok(),
         _ = stop.changed() => None,
@@ -422,8 +459,9 @@ async fn serve_ws(
     record(&|c| c.upgraded = true);
     let _ = ready.send(Some(Conn { frames, cmds }));
     let mut player = true;
-    // The ping a barrier waits on the pong to, by payload, and the barrier's answer.
-    let mut pinged: Option<(Vec<u8>, oneshot::Sender<bool>)> = None;
+    // The barriers waiting, in the order asked, each with its ping's payload, or none when its
+    // ping could not be written, and its answer.
+    let mut pinged: VecDeque<(Option<Vec<u8>>, oneshot::Sender<bool>)> = VecDeque::new();
     let mut pings: u64 = 0;
     loop {
         tokio::select! {
@@ -431,12 +469,18 @@ async fn serve_ws(
                 let frame = match msg {
                     Some(Ok(Message::Text(text))) => Frame::Text(text.as_str().to_owned()),
                     Some(Ok(Message::Binary(bytes))) => Frame::Binary(bytes.to_vec()),
-                    // The pong to the barrier's ping: the client has read past every frame
-                    // sent before it.
+                    // The pong to a barrier's ping: the client has read past every frame sent
+                    // before it, and so past every earlier ping, whose barriers resolve first.
+                    // A barrier whose ping was not written resolves false once every barrier
+                    // asked before it has resolved.
                     Some(Ok(Message::Pong(payload))) => {
-                        let ours = pinged.as_ref().is_some_and(|(p, _)| *p == payload[..]);
-                        if let Some((_, sent)) = pinged.take_if(|_| ours) {
-                            let _ = sent.send(true);
+                        let mine = |p: &Option<Vec<u8>>| p.as_deref() == Some(&payload[..]);
+                        let ours = pinged.iter().position(|(p, _)| mine(p));
+                        let through = ours.map_or(0, |at| at + 1);
+                        let after = pinged.iter().skip(through);
+                        let unsent = after.take_while(|(p, _)| p.is_none()).count();
+                        for (p, sent) in pinged.drain(..through + unsent) {
+                            let _ = sent.send(p.is_some());
                         }
                         continue;
                     }
@@ -478,13 +522,16 @@ async fn serve_ws(
                         r = ws.send(Message::Ping(payload.clone().into())) => r.is_ok(),
                         _ = stop.changed() => break,
                     };
-                    // A ping that did not go is answered false at once; one that went, when
-                    // its pong arrives, or false (the sender dropped) when the connection ends
-                    // first.
+                    // A ping that went is answered when its pong, or a later one, arrives, or
+                    // false (the sender dropped) when the connection ends first. One that did
+                    // not go is answered false at once when no barrier waits before it, and
+                    // otherwise once they have resolved, so barriers resolve in the order asked.
                     if ok {
-                        pinged = Some((payload, sent));
-                    } else {
+                        pinged.push_back((Some(payload), sent));
+                    } else if pinged.is_empty() {
                         let _ = sent.send(false);
+                    } else {
+                        pinged.push_back((None, sent));
                     }
                 }
                 Some(Cmd::Silent(sent)) => {
@@ -620,7 +667,7 @@ fn handle(
 }
 
 async fn accept_http(
-    listener: TcpListener,
+    listener: impl Accept,
     routes: Arc<HttpRouter>,
     requests: Shared<Vec<Option<String>>>,
     mut stop: watch::Receiver<()>,
@@ -743,6 +790,9 @@ async fn read_request(stream: &mut TcpStream) -> Option<(String, HttpRequest)> {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
     use super::*;
 
     /// A listener whose every accept fails.
@@ -752,6 +802,137 @@ mod tests {
         async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
             Err(io::Error::other("out of descriptors"))
         }
+    }
+
+    /// A listener that accepts through the stub's own ([`Accept`] for [`TcpListener`]) and
+    /// keeps a second handle on each socket it hands on, so a test reads the socket's options as
+    /// the stub left them.
+    struct Kept {
+        listener: TcpListener,
+        kept: Shared<Vec<std::net::TcpStream>>,
+    }
+
+    impl Accept for Kept {
+        async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+            let (stream, addr) = <TcpListener as Accept>::accept(&self.listener).await?;
+            let stream = stream.into_std()?;
+            lock(&self.kept).push(stream.try_clone()?);
+            Ok((TcpStream::from_std(stream)?, addr))
+        }
+    }
+
+    fn listened() -> Listened {
+        Listened {
+            conns: Shared::default(),
+            changed: Arc::new(watch::channel(()).0),
+        }
+    }
+
+    /// How long, on the wall clock, a test waits for what the stub owes it before failing, as
+    /// `tests/serving.rs` waits: a regression fails by name instead of hanging the run.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// `wait`, or a failure naming `what` once [`PATIENCE`] has passed on the wall clock. It
+    /// yields meanwhile, so the runtime keeps polling its sockets.
+    async fn within<T>(what: &str, wait: impl Future<Output = T>) -> T {
+        let deadline = std::time::Instant::now() + PATIENCE;
+        let expired = async {
+            while std::time::Instant::now() < deadline {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            done = wait => done,
+            () = expired => panic!("waited {PATIENCE:?} for {what}"),
+        }
+    }
+
+    /// Yields until `done` holds: an event, never a time, failing by `what` past [`PATIENCE`].
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        within(what, async {
+            while !done() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+    }
+
+    fn poll_once<F: Future>(f: std::pin::Pin<&mut F>) -> Poll<F::Output> {
+        f.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[tokio::test]
+    async fn every_socket_either_endpoint_accepts_has_tcp_nodelay_set() {
+        let bind = || TcpListener::bind((Ipv4Addr::LOCALHOST, 0));
+        // Without the stub's accept, an accepted socket has it unset: the test can tell.
+        let plain = bind().await.unwrap();
+        let _client = TcpStream::connect(plain.local_addr().unwrap()).await;
+        let (accepted, _) = plain.accept().await.unwrap();
+        assert!(!accepted.nodelay().unwrap());
+
+        let (_held, stop) = watch::channel(());
+        let kept: Shared<Vec<std::net::TcpStream>> = Shared::default();
+        let (ws, http) = (bind().await.unwrap(), bind().await.unwrap());
+        let (ws_at, http_at) = (ws.local_addr().unwrap(), http.local_addr().unwrap());
+        let ws = Kept {
+            listener: ws,
+            kept: kept.clone(),
+        };
+        let http = Kept {
+            listener: http,
+            kept: kept.clone(),
+        };
+        let (accepted, _ready) = mpsc::unbounded_channel();
+        tokio::spawn(accept_ws(ws, listened(), accepted, None, stop.clone()));
+        let router = Arc::new(HttpRouter::new());
+        tokio::spawn(accept_http(http, router, Shared::default(), stop));
+        let mut clients = Vec::new();
+        for at in [ws_at, ws_at, http_at, http_at] {
+            clients.push(TcpStream::connect(at).await.unwrap());
+        }
+        until("four accepted sockets", || lock(&kept).len() == 4).await;
+        for socket in lock(&kept).iter() {
+            assert!(socket.nodelay().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pong_to_a_later_ping_resolves_every_barrier_before_it() {
+        let never = crate::script::Responder::new(|_| Ok(Vec::new()));
+        let (script, pusher) = WsScript::serving(move |_| never.clone());
+        let server = StubServer::start(script, crate::HttpRoutes::new()).await;
+        let server = server.unwrap();
+        let tcp = TcpStream::connect(server.ws).await.unwrap();
+        let client = tokio_tungstenite::client_async(server.ws_url("/"), tcp).await;
+        let (mut client, _) = client.unwrap();
+        until("connection 0's upgrade", || {
+            server.connections()[0].upgraded
+        })
+        .await;
+        let mut first = pin!(pusher.barrier(0));
+        let mut second = pin!(pusher.barrier(0));
+        assert!(poll_once(first.as_mut()).is_pending());
+        assert!(poll_once(second.as_mut()).is_pending());
+        // Written once both pings were: the client, which reads nothing, has answered neither.
+        let after = pusher.push(0, Frame::text("after"));
+        within("the push after both pings", after).await.unwrap();
+        // A pong to no ping of a barrier's resolves none; the data frame after it, recorded,
+        // says the stub has read it.
+        client
+            .send(Message::Pong(b"other".to_vec().into()))
+            .await
+            .unwrap();
+        client.send(Message::text("mark")).await.unwrap();
+        let marked = || server.connections()[0].received.len() == 1;
+        until("the client's mark recorded", marked).await;
+        assert!(poll_once(first.as_mut()).is_pending());
+        // The client answers only the later ping, as RFC 6455 lets it: both barriers resolve.
+        client
+            .send(Message::Pong(b"barrier-2".to_vec().into()))
+            .await
+            .unwrap();
+        assert!(within("the second barrier's pong", second).await);
+        assert!(poll_once(first.as_mut()) == Poll::Ready(true));
     }
 
     fn report() -> Report {
@@ -768,7 +949,7 @@ mod tests {
         let served = report();
         let (accepted, mut ready) = mpsc::unbounded_channel();
         let pair = Some((Arc::new(Link::default()), served.clone()));
-        accept_ws(Refusing, Shared::default(), accepted, pair, stop.clone()).await;
+        accept_ws(Refusing, listened(), accepted, pair, stop.clone()).await;
         // The listener is dropped: no connection is handed on, and the failure is the script's.
         assert!(ready.recv().await.is_none());
         let failure = ScriptError::Listen {
@@ -780,7 +961,7 @@ mod tests {
         assert_eq!(failure.to_string(), shown);
         // A step script's listener reports nothing: its next Accept step fails instead.
         let (accepted, mut ready) = mpsc::unbounded_channel();
-        accept_ws(Refusing, Shared::default(), accepted, None, stop).await;
+        accept_ws(Refusing, listened(), accepted, None, stop).await;
         assert!(ready.recv().await.is_none());
     }
 }

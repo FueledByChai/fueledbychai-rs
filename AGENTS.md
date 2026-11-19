@@ -683,7 +683,16 @@ holds two of them for one pull request. The rules after the three roles bind all
     computes, each refused answer and a failed listener reported as a script failure
     (`ScriptError::Answer`, `ScriptError::Listen`, `StubServer::failures`), its `Pusher`
     sending an open connection unsolicited frames and closing it, with or without a code,
-    refused on a closed one; `tests/serving.rs`); and an HTTP/1.1 endpoint with fixed
+    refused on a closed one; `tests/serving.rs`; and, ordering by events, never by times
+    (FBC-4ptk): `Pusher::barrier`, true on the client's pong to a ping sent after every frame
+    asked before it on that connection, false on one closed or when its ping cannot be written,
+    several pending resolving in the order asked, a pong to a later ping resolving the earlier
+    ones too; `Responder::hold_first`, a connection's
+    first answer computed only once the connection its hold names for the first frame shows
+    the client's close frame or its end in the record, a hold naming no connection accepted or
+    panicking failing that answer alone, one the stub's drop ends computing nothing, and a step
+    script refusing such a responder; and TCP_NODELAY set on every socket either endpoint
+    accepts, which no order rests on); and an HTTP/1.1 endpoint with fixed
     responses by path; the reconnect-storm script and a check of connection attempts against
     `ReconnectPacing`; the duplicate-ack and silence-after-subscription scripts; venue crates
     take it as a dev-dependency instead of writing their own servers;

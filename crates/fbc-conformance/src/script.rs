@@ -66,26 +66,74 @@ pub type Responded = Result<Vec<Frame>, String>;
 
 type RespondFn = dyn Fn(&Frame) -> Responded + Send + Sync;
 
+type HoldFn = dyn Fn(&Frame) -> Option<usize> + Send + Sync;
+
 /// A typed Rust function from the frame a [`Step::Respond`] read to the frames it sends back.
-/// Clones share the function; two responders are equal only when they share it, so a script
-/// compares as it always did.
+/// Clones share the function, and its hold ([`Responder::hold_first`]) when it has one; two
+/// responders are equal only when they share both, so a script compares as it always did.
 #[derive(Clone)]
-pub struct Responder(Arc<RespondFn>);
+pub struct Responder {
+    respond: Arc<RespondFn>,
+    hold: Option<Arc<HoldFn>>,
+}
 
 impl Responder {
     pub fn new(respond: impl Fn(&Frame) -> Responded + Send + Sync + 'static) -> Responder {
-        Responder(Arc::new(respond))
+        Responder {
+            respond: Arc::new(respond),
+            hold: None,
+        }
+    }
+
+    /// This responder, holding its connection's first answer in a serving script (decisions
+    /// 0025 and 0150, FBC-4ptk) until another connection's close or end is recorded. When the
+    /// connection's first data frame arrives, the stub hands it to `until`. If `until` names a
+    /// connection `k`, the stub computes and sends that frame's answer only once `k`'s record
+    /// shows the client's close frame (`client_closed`) or the connection's end (`open`
+    /// false), and every later frame of the connection waits behind it, in order. `None`
+    /// answers it at once. `until` is called on this connection's answer task when that task
+    /// takes its first frame, so it sees the model as the answers computed so far left it; the
+    /// answers of other connections are not ordered with it.
+    ///
+    /// Each refusal fails that first answer alone, reported as
+    /// [`ScriptError::Answer`](crate::ScriptError::Answer): `until` naming a connection the
+    /// stub has not accepted, and a panic in `until`. A hold the stub's drop ends computes and
+    /// sends nothing. A step script refuses a responder with a hold when it starts: its
+    /// timeline orders its connections itself.
+    pub fn hold_first(
+        self,
+        until: impl Fn(&Frame) -> Option<usize> + Send + Sync + 'static,
+    ) -> Responder {
+        Responder {
+            hold: Some(Arc::new(until)),
+            ..self
+        }
     }
 
     /// The frames to send for `frame`, or why it was refused.
     pub(crate) fn respond(&self, frame: &Frame) -> Responded {
-        (self.0)(frame)
+        (self.respond)(frame)
+    }
+
+    /// The connection whose close or end the first answer waits for, given the first frame;
+    /// `None` when it has no hold or the hold names none.
+    pub(crate) fn held_for(&self, frame: &Frame) -> Option<usize> {
+        self.hold.as_ref().and_then(|until| until(frame))
+    }
+
+    /// Whether it holds its first answer.
+    pub(crate) fn holds(&self) -> bool {
+        self.hold.is_some()
     }
 }
 
 impl PartialEq for Responder {
     fn eq(&self, other: &Responder) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        let holds = match (&self.hold, &other.hold) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        Arc::ptr_eq(&self.respond, &other.respond) && holds
     }
 }
 
@@ -224,6 +272,23 @@ pub fn silence_after_ack(reads: usize, acks: &[Frame]) -> WsScript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responders_are_equal_only_when_they_share_their_function_and_their_hold() {
+        let plain = Responder::new(|_| Ok(Vec::new()));
+        let held = plain.clone().hold_first(|_| Some(0));
+        assert_eq!(plain, plain.clone());
+        assert_eq!(held, held.clone());
+        assert!(!plain.holds() && held.holds());
+        // The same function with a hold, or with another hold, is another responder.
+        assert_ne!(plain, held);
+        assert_ne!(held, plain);
+        assert_ne!(held, plain.clone().hold_first(|_| Some(0)));
+        assert_ne!(plain, Responder::new(|_| Ok(Vec::new())));
+        assert_eq!(held.held_for(&Frame::text("auth")), Some(0));
+        assert_eq!(plain.held_for(&Frame::text("auth")), None);
+        assert_eq!(format!("{held:?}"), "Responder(..)");
+    }
 
     #[test]
     fn a_storm_closes_every_connection_but_the_last() {
