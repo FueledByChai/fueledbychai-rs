@@ -727,7 +727,8 @@ impl Arm {
                 }
             }
         };
-        let auth = self.reg.authorize(self.acct, permitted).ok()?;
+        // Taken over as a gateway takes it, before its check at submit (decision 0152).
+        let auth = self.reg.authorize(self.acct, permitted).ok()?.hand_over();
         auth.check_at_submit().ok()?;
         let rpc = self.rpc();
         self.write(auth.command(), rpc, at, wall);

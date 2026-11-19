@@ -242,23 +242,29 @@ fn a_place_batch_or_amend_issued_before_a_trip_is_refused_at_submit_and_a_cancel
  {
     let (mut reg, bid, ask) = quoting();
     let place = reg.place(placement(cid(), 99, 5)).unwrap();
-    let place = reg.authorize(TEST_ACCT, place).unwrap();
+    let place = reg.authorize(TEST_ACCT, place).unwrap().hand_over();
     let batch = reg
         .place_batch(vec![placement(cid(), 98, 1), placement(cid(), 97, 1)])
         .unwrap();
-    let batch = reg.authorize(TEST_ACCT, batch.command.unwrap()).unwrap();
+    let batch = reg
+        .authorize(TEST_ACCT, batch.command.unwrap())
+        .unwrap()
+        .hand_over();
     let amend = reg
         .live(bid)
         .unwrap()
         .amend(&venue(), Ticks(99), lots(5), false)
         .unwrap();
-    let amend = reg.authorize(TEST_ACCT, amend).unwrap();
+    let amend = reg.authorize(TEST_ACCT, amend).unwrap().hand_over();
     let CancelChoice::Send(cancel) = reg.cancellable(ask).unwrap().cancel(&venue()) else {
         panic!("an acknowledged order's cancel is sent");
     };
-    let cancel = reg.authorize(TEST_ACCT, cancel).unwrap();
+    let cancel = reg.authorize(TEST_ACCT, cancel).unwrap().hand_over();
     let mut many = reg.cancel_many(&[bid], &venue());
-    let many = reg.authorize(TEST_ACCT, many.commands.remove(0)).unwrap();
+    let many = reg
+        .authorize(TEST_ACCT, many.commands.remove(0))
+        .unwrap()
+        .hand_over();
     for auth in [&place, &batch, &amend, &cancel, &many] {
         assert_eq!(auth.check_at_submit(), Ok(()));
     }
@@ -290,7 +296,7 @@ fn a_place_batch_or_amend_issued_before_a_trip_is_refused_at_submit_and_a_cancel
     let (mut fresh, _, _) = quoting();
     let built = fresh.place(placement(cid(), 99, 5)).unwrap();
     fresh.cancel_only_trip().trip();
-    let late = fresh.authorize(TEST_ACCT, built).unwrap();
+    let late = fresh.authorize(TEST_ACCT, built).unwrap().hand_over();
     assert!(
         matches!(
             late.check_at_submit(),
@@ -302,7 +308,7 @@ fn a_place_batch_or_amend_issued_before_a_trip_is_refused_at_submit_and_a_cancel
     // Once the owner's Start reached Quoting again, a place built then goes through.
     reg.start(INST, Leases::none()).unwrap();
     let again = reg.place(placement(cid(), 96, 1)).unwrap();
-    let again = reg.authorize(TEST_ACCT, again).unwrap();
+    let again = reg.authorize(TEST_ACCT, again).unwrap().hand_over();
     assert_eq!(again.check_at_submit(), Ok(()));
     // Until the next trip.
     trip.trip();
@@ -387,7 +393,7 @@ fn an_exit_market_keeps_building_and_sending_its_reducing_orders_through_a_trip(
     };
     // Authorized before the trip, and built before it and authorized after it.
     let built = reg.place(reducing(102)).unwrap();
-    let before = reg.authorize(TEST_ACCT, built).unwrap();
+    let before = reg.authorize(TEST_ACCT, built).unwrap().hand_over();
     let late = reg.place(reducing(103)).unwrap();
 
     let trip = reg.cancel_only_trip();
@@ -395,11 +401,11 @@ fn an_exit_market_keeps_building_and_sending_its_reducing_orders_through_a_trip(
     // Exit stays Exit, read at once and applied: its generation does not move.
     assert_eq!(seen(reg.entry(INST)), exit);
     assert_eq!(before.check_at_submit(), Ok(()));
-    let late = reg.authorize(TEST_ACCT, late).unwrap();
+    let late = reg.authorize(TEST_ACCT, late).unwrap().hand_over();
     assert_eq!(seen(reg.entry(INST)), exit);
     // Built and authorized after the trip, and every one through a further trip.
     let after = reg.place(reducing(104)).unwrap();
-    let after = reg.authorize(TEST_ACCT, after).unwrap();
+    let after = reg.authorize(TEST_ACCT, after).unwrap().hand_over();
     trip.trip();
     for auth in [&before, &late, &after] {
         assert_eq!(auth.check_at_submit(), Ok(()), "{auth:?}");

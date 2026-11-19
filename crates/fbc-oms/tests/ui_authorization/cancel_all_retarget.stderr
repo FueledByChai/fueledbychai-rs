@@ -1,11 +1,13 @@
-error[E0616]: field `cmd` of struct `Authorization` is private
+error[E0609]: no field `cmd` on type `Authorization`
  --> tests/ui_authorization/cancel_all_retarget.rs:7:10
   |
 7 |     auth.cmd = VenueCommand::CancelAll(CancelScope::Instrument(inst));
-  |          ^^^ private field
+  |          ^^^ unknown field
 
-error[E0616]: field `generation` of struct `Authorization` is private
+error[E0615]: attempted to take value of method `generation` on type `Authorization`
  --> tests/ui_authorization/cancel_all_retarget.rs:8:10
   |
 8 |     auth.generation = other.generation();
-  |          ^^^^^^^^^^ private field
+  |          ^^^^^^^^^^ method, not a field
+  |
+  = help: methods are immutable and cannot be assigned to

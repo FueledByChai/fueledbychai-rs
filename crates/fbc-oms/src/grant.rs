@@ -20,9 +20,26 @@
 //! authorized, so one retained after its build while a fill moved the position is refused.
 //! A command refused at issue is never sent: what it reserved is released.
 //!
+//! **The hand-over** (decision 0152). An authorization for a place, a batch or an amend holds
+//! what the command's build reserved, as the command did (decision 0084): its orders and the
+//! amend's build. Dropped before a gateway takes it over (an early return, a refusal for another
+//! account or an ended session, a session ending with it unencoded, a ladder command handed back
+//! unsubmitted), it hands them back to the registry that issued it, whose next mutating call
+//! releases them; [`Registry::withdraw`] releases them at once. A gateway takes it over with
+//! [`Authorization::hand_over`] before it runs the check at submit, encodes the command or
+//! reports anything of it: the [`Handed`] form alone runs the check, and dropping it releases
+//! nothing, so a gateway that keeps decision 0060, checking each command immediately before it
+//! encodes it, never writes one whose authorization a drop could release. The hand-over gates
+//! the check, not the encode: [`Authorization::command`] stays readable, as a consumer that
+//! inspects a command needs, and a gateway that skipped the check could write that command and
+//! then drop the authorization, releasing a written order; so could one that called
+//! [`Handed::unencoded`] after an encode. Both break 0060 or 0152, and no type prevents them.
+//! What the gateway reports of a handed authorization, sent or not sent, settles its orders, as
+//! before.
+//!
 //! **At submit** (decision 0060). The shard host interleaves handler work between the commands
 //! of one decide pass, so the kill switch can go on between an authorization's issue and its
-//! write. The gateway calls [`Authorization::check_at_submit`] immediately before encoding and
+//! write. The gateway calls [`Handed::check_at_submit`] immediately before encoding and
 //! writes nothing when it refuses:
 //!
 //! - a place, a batch of places or an amend goes through only while its market's
@@ -61,6 +78,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{AccountKey, CancelScope, ClientOrderId, InstrumentId, Side, VenueCommand};
 
+use crate::permit::{Dropped, Hold, Release};
+use crate::registry::Instance;
 use crate::{CapRefusal, PermittedCommand, Registry};
 
 /// How many times a market's state has changed: the kill switch, an arming call, a disarm or
@@ -173,7 +192,7 @@ impl Generations {
     }
 }
 
-/// What a built command is re-checked against at submit ([`Authorization::check_at_submit`]):
+/// What a built command is re-checked against at submit ([`Handed::check_at_submit`]):
 /// nothing for a cancel or a cancel-many, the market's state generation for a place, a batch or
 /// an amend, with its position revision too when built in Exit (decision 0066), and 0005's I7
 /// inputs for an instrument cancel-all: the changes of the registry's hold of the market's
@@ -290,7 +309,7 @@ impl fmt::Display for IssueRefusal {
 
 impl std::error::Error for IssueRefusal {}
 
-/// Why [`Authorization::check_at_submit`] refused an authorization: nothing is written for it.
+/// Why [`Handed::check_at_submit`] refused an authorization: nothing is written for it.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub enum StaleAuthorization {
     /// The market's state changed since the command was built: the kill switch, a disarm, an
@@ -364,11 +383,42 @@ impl std::error::Error for StaleAuthorization {}
 /// An order-affecting command `fbc-oms` admitted, for one account and one market, with that
 /// market's state generation when the command was built. Only `fbc-oms` builds one
 /// ([`Registry::authorize`]); it cannot be cloned or edited,
-/// [`OrderGateway::submit`](crate::OrderGateway::submit) consumes it, and the gateway checks it
-/// at submit ([`Authorization::check_at_submit`]).
+/// [`OrderGateway::submit`](crate::OrderGateway::submit) consumes it, and the gateway takes it
+/// over ([`Authorization::hand_over`]) before it checks it at submit
+/// ([`Handed::check_at_submit`]), encodes it or reports anything of it.
+///
+/// A place's, a batch's or an amend's holds what its build reserved until a gateway takes it
+/// over: dropped before then, wherever and on whatever thread, it hands its orders, or the
+/// amend's build, back to the registry that issued it, which releases them at its next mutating
+/// call (decision 0152); [`Registry::withdraw`] releases them at once.
 #[must_use = "an authorization is spent by submitting it"]
 #[derive(Debug)]
 pub struct Authorization {
+    grant: Grant,
+    /// The registry that issued it: only it withdraws it (decision 0152).
+    origin: Instance,
+    /// For a place or a batch, its hold on its orders, and for an amend on its build, until a
+    /// gateway takes it over; nothing for any other command.
+    hold: Hold,
+}
+
+/// An [`Authorization`] a gateway took over ([`Authorization::hand_over`]): the one form that runs
+/// the check at submit ([`Handed::check_at_submit`]), so the one a gateway keeping decision 0060
+/// encodes. Dropping it releases nothing: what the gateway reports of it, sent or not sent,
+/// settles its orders (decision 0152).
+#[derive(Debug)]
+#[must_use = "a handed authorization is settled only by what the gateway reports of it"]
+pub struct Handed {
+    grant: Grant,
+    origin: Instance,
+    /// What the authorization held, kept dormant: handed back only by
+    /// [`Handed::unencoded`], never by a drop.
+    dormant: Option<(std::sync::Arc<Dropped>, Release)>,
+}
+
+/// What an authorization carries, held or handed over.
+#[derive(Debug)]
+struct Grant {
     acct: AccountKey,
     market: InstrumentId,
     generation: StateGeneration,
@@ -392,7 +442,7 @@ impl Registry {
     /// authorization was issued, for a cancel, a cancel-many or an instrument cancel-all, which
     /// no state holds back).
     /// It does not refuse a command whose market changed state since its build: the check at
-    /// submit does ([`Authorization::check_at_submit`]), so a stale command has one fate, not
+    /// submit does ([`Handed::check_at_submit`]), so a stale command has one fate, not
     /// sent, whichever comes first (decision 0060).
     ///
     /// Refused for a command another registry built ([`IssueRefusal::OtherRegistry`]),
@@ -405,7 +455,8 @@ impl Registry {
     /// never sent, so what it reserved is released: a place or batch item ends not sent
     /// ([`NotSentReason::StaleAuthorization`](fbc_core::NotSentReason::StaleAuthorization)),
     /// an amend's build is withdrawn (decision 0082). An authorization issued spends each place
-    /// or batch item's command, so its outcomes then apply ([`Registry::on_outcome`]).
+    /// or batch item's command, so its outcomes then apply ([`Registry::on_outcome`]), and holds
+    /// its orders, or the amend's build, until a gateway takes it over (decision 0152).
     ///
     /// Refused for a command that affects no order, an account cancel-all, an empty batch or a
     /// batch naming more than one market, none of which this crate builds.
@@ -429,18 +480,29 @@ impl Registry {
             _ => self.rejudge(&cmd),
         };
         if let Err(refusal) = judged {
+            let mut cmd = cmd;
             self.release(&cmd);
+            cmd.spend_hold();
             return Err(refusal);
         }
         self.issued(acct, &cmd);
+        // An amend's authorization holds its build until a gateway takes it over (decision
+        // 0152); a place's or a batch's holds its orders, as its command did.
+        let built = match cmd.command() {
+            VenueCommand::Amend(_) => cmd.built(),
+            _ => None,
+        };
         let generation = self.entries.generation(market);
         // Only a market in Quoting is moved by a trip: a place, batch or amend authorized in
         // Exit, which builds only orders that reduce the position, is never held back by one
         // (decisions 0006, 0139).
         let tripped = self.entries.tripped_from(market);
         let mut auth = Authorization::issue(acct, cmd, generation)?;
-        if auth.guard.state.is_some() && tripped {
-            auth.trips = Some(trips);
+        if auth.grant.guard.state.is_some() && tripped {
+            auth.grant.trips = Some(trips);
+        }
+        if let Some((cid, build)) = built {
+            auth.hold = Hold::on(self.dropped(), Release::Amend(cid, build));
         }
         Ok(auth)
     }
@@ -448,28 +510,81 @@ impl Registry {
 
 impl Authorization {
     /// Issues an authorization for the command this crate built, carrying the generation of
-    /// its build where it was watched, else `current`.
+    /// its build where it was watched, else `current`, and the command's hold.
     pub(crate) fn issue(
         acct: AccountKey,
         cmd: PermittedCommand,
         current: StateGeneration,
     ) -> Result<Authorization, IssueRefusal> {
         let market = market_of(cmd.command())?;
-        let (cmd, guard) = cmd.into_parts();
+        let origin = cmd.origin();
+        let (cmd, guard, hold) = cmd.into_parts();
         let generation = guard
             .state
             .as_ref()
             .map_or(current, |w| StateGeneration(w.at()));
         Ok(Authorization {
-            acct,
-            market,
-            generation,
-            cmd,
-            guard,
-            trips: None,
+            grant: Grant {
+                acct,
+                market,
+                generation,
+                cmd,
+                guard,
+                trips: None,
+            },
+            origin,
+            hold,
         })
     }
 
+    /// The gateway takes the authorization over (decision 0152), before it checks it at submit
+    /// ([`Handed::check_at_submit`]), encodes its command or reports anything of it: from now
+    /// on its drop releases nothing, and what the gateway reports of it, sent or not sent,
+    /// settles its orders.
+    pub fn hand_over(mut self) -> Handed {
+        let dormant = self.hold.sleep();
+        Handed {
+            grant: self.grant,
+            origin: self.origin,
+            dormant,
+        }
+    }
+
+    /// The account the command is for.
+    pub fn account(&self) -> AccountKey {
+        self.grant.acct
+    }
+
+    /// The market every item of the command names.
+    pub fn market(&self) -> InstrumentId {
+        self.grant.market
+    }
+
+    /// The market's state generation when the command was built (for a cancel, a cancel-many
+    /// or an instrument cancel-all, when the authorization was issued).
+    pub fn generation(&self) -> StateGeneration {
+        self.grant.generation
+    }
+
+    /// The command, read only: what it is. A gateway encodes the command of the [`Handed`]
+    /// form once checked (decision 0060); one that wrote this one, skipping the check, and then
+    /// dropped the authorization would release a written order (decision 0152).
+    pub fn command(&self) -> &VenueCommand {
+        &self.grant.cmd
+    }
+
+    /// The registry that issued it.
+    pub(crate) fn origin(&self) -> Instance {
+        self.origin
+    }
+
+    /// Spends its hold, giving what it held: what its registry releases at once.
+    pub(crate) fn into_release(mut self) -> Option<Release> {
+        self.hold.take()
+    }
+}
+
+impl Handed {
     /// The check at submit (decision 0060), which the gateway runs immediately before it
     /// encodes the command, writing nothing when it refuses: a place, a batch or an amend whose
     /// market changed state since the command was built is refused
@@ -486,7 +601,53 @@ impl Authorization {
     /// Cancel-only since ([`StaleAuthorization::CancelOnly`], decision 0139); one authorized in
     /// Exit is not, as a trip leaves Exit as it is. A command that needs a guard and
     /// carries none is refused: it was not built here.
+    ///
+    /// It runs on the handed form alone, so no gateway checks a command while its authorization
+    /// could still release its orders, and one that keeps 0060 writes none then (decision
+    /// 0152).
     pub fn check_at_submit(&self) -> Result<(), StaleAuthorization> {
+        self.grant.check_at_submit()
+    }
+
+    /// The command to encode, once checked ([`Handed::check_at_submit`]).
+    pub fn command(&self) -> &VenueCommand {
+        &self.grant.cmd
+    }
+
+    /// The account the command is for.
+    pub fn account(&self) -> AccountKey {
+        self.grant.acct
+    }
+
+    /// The market every item of the command names.
+    pub fn market(&self) -> InstrumentId {
+        self.grant.market
+    }
+
+    /// The market's state generation when the command was built (for a cancel, a cancel-many
+    /// or an instrument cancel-all, when the authorization was issued).
+    pub fn generation(&self) -> StateGeneration {
+        self.grant.generation
+    }
+
+    /// Gives the authorization back, holding again what it held, for a gateway that took it
+    /// over and then encoded nothing of it and reports nothing of it (decision 0152): a session
+    /// that failed before its codec saw the command, as on a nonce source's refusal, keeping it
+    /// for the shard host to hand back unspent. A gateway calls it only then: never once any of
+    /// the command reached a codec, and never with an outcome reported for it, since dropped
+    /// or withdrawn the authorization it gives back releases its orders.
+    pub fn unencoded(self) -> Authorization {
+        Authorization {
+            grant: self.grant,
+            origin: self.origin,
+            hold: Hold::wake(self.dormant),
+        }
+    }
+}
+
+impl Grant {
+    /// The check at submit ([`Handed::check_at_submit`]).
+    fn check_at_submit(&self) -> Result<(), StaleAuthorization> {
         let moved = |watch: &Option<Watch>| watch.as_ref().is_none_or(|w| w.moved().is_some());
         match &self.cmd {
             VenueCommand::Cancel(_) | VenueCommand::CancelMany(_) => Ok(()),
@@ -523,27 +684,6 @@ impl Authorization {
                 }),
             },
         }
-    }
-
-    /// The account the command is for.
-    pub fn account(&self) -> AccountKey {
-        self.acct
-    }
-
-    /// The market every item of the command names.
-    pub fn market(&self) -> InstrumentId {
-        self.market
-    }
-
-    /// The market's state generation when the command was built (for a cancel, a cancel-many
-    /// or an instrument cancel-all, when the authorization was issued).
-    pub fn generation(&self) -> StateGeneration {
-        self.generation
-    }
-
-    /// The command to encode, read only.
-    pub fn command(&self) -> &VenueCommand {
-        &self.cmd
     }
 }
 
@@ -678,7 +818,7 @@ mod tests {
 
         for (market, generation) in [(btc, 2), (eth, 1)] {
             for cmd in order_commands(market) {
-                let auth = issue(cmd.clone(), &mut c).unwrap();
+                let auth = issue(cmd.clone(), &mut c).unwrap().hand_over();
                 assert_eq!(auth.market(), market, "{cmd:?}");
                 assert_eq!(auth.generation().get(), generation, "{cmd:?}");
                 assert_eq!(auth.check_at_submit(), Ok(()), "{cmd:?}");
@@ -702,9 +842,9 @@ mod tests {
     fn at_submit_a_place_batch_or_amend_built_before_a_state_change_is_refused() {
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
         let mut c = Counts::default();
-        let auths: Vec<Authorization> = order_commands(btc)
+        let auths: Vec<Handed> = order_commands(btc)
             .into_iter()
-            .map(|cmd| issue(cmd, &mut c).unwrap())
+            .map(|cmd| issue(cmd, &mut c).unwrap().hand_over())
             .collect();
         // Another market's change leaves them all standing.
         c.generations.advance(eth);
@@ -738,9 +878,9 @@ mod tests {
     fn at_submit_an_instrument_cancel_all_is_refused_once_its_exclusive_lease_hold_changed() {
         let (btc, eth) = (InstrumentId::new(1), InstrumentId::new(2));
         let mut c = Counts::default();
-        let auths: Vec<Authorization> = order_commands(btc)
+        let auths: Vec<Handed> = order_commands(btc)
             .into_iter()
-            .map(|cmd| issue(cmd, &mut c).unwrap())
+            .map(|cmd| issue(cmd, &mut c).unwrap().hand_over())
             .collect();
         c.lease.advance(eth);
         assert!(auths.iter().all(|a| a.check_at_submit().is_ok()));
@@ -767,12 +907,14 @@ mod tests {
             VenueCommand::CancelAll(CancelScope::Instrument(btc)),
             &mut c,
         )
-        .unwrap();
+        .unwrap()
+        .hand_over();
         let place = issue(
             VenueCommand::Place(on(btc, placement(cid(), 100, 1))),
             &mut c,
         )
-        .unwrap();
+        .unwrap()
+        .hand_over();
         c.seen.advance(eth);
         assert_eq!(cancel_all.check_at_submit(), Ok(()));
         c.seen.advance(btc);
@@ -795,6 +937,7 @@ mod tests {
                 StateGeneration(4),
             )
             .unwrap()
+            .hand_over()
         };
         for cmd in order_commands(btc) {
             let checked = with(cmd.clone(), Guard::default()).check_at_submit();
@@ -872,6 +1015,7 @@ mod tests {
                 c.generations.of(market),
             )
             .unwrap()
+            .hand_over()
         };
         let exits = |c: &mut Counts, positions: &mut Counters| {
             order_commands(btc)

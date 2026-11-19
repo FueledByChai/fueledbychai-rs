@@ -687,6 +687,27 @@ impl OrderRecord {
         held
     }
 
+    /// Ends the order not sent for `reason`, its place authorized and its authorization never
+    /// taken over by a gateway (decision 0152), while nothing was reported for it since: it is
+    /// PendingNew with no venue id, no send, no command in flight, no cancel sent, no fill and
+    /// no Unknown ladder. Whether it ended. An order anything was reported for keeps what it
+    /// counts, which fails closed: a gateway reports only what it took over.
+    pub(crate) fn withdraw_unsent(&mut self, reason: NotSentReason) -> bool {
+        let untouched = !self.unissued
+            && self.state == OrdState::PendingNew
+            && self.vid.is_none()
+            && self.sent.is_none()
+            && self.intent == Intent::None
+            && self.cancels_sent == 0
+            && self.cum_venue == Lots::ZERO
+            && self.cum_fills == Lots::ZERO
+            && self.unknown_since.is_none();
+        if untouched {
+            self.end(TerminalKind::NotSent(reason));
+        }
+        untouched
+    }
+
     /// Releases the amend built as number `build` and never handed to a gateway; whether it
     /// was the one built and not yet reported sent.
     pub(crate) fn withdraw_built(&mut self, build: u64) -> bool {
@@ -1618,6 +1639,29 @@ mod tests {
             reduce_only: false,
             reducing: false,
         })
+    }
+
+    /// Decision 0152: `withdraw_unsent` ends an issued place nothing was reported for, and
+    /// neither one whose command is still held nor one with fills counted while PendingNew.
+    /// The registry reaches neither: a fill moves an order off PendingNew, and an issued place
+    /// is never held again. Both guards are defensive, held here.
+    #[test]
+    fn withdraw_unsent_ends_neither_a_held_place_nor_a_pending_new_order_with_fills() {
+        let reason = NotSentReason::StaleAuthorization;
+        let mut untouched = order(4);
+        assert!(untouched.withdraw_unsent(reason));
+        assert_eq!(
+            untouched.state(),
+            OrdState::Terminal(TerminalKind::NotSent(reason))
+        );
+        let mut held = order(4);
+        held.set_unissued(true);
+        assert!(!held.withdraw_unsent(reason));
+        assert_eq!(held.state(), OrdState::PendingNew);
+        let mut filled = order(4);
+        filled.cum_fills = lots(1);
+        assert!(!filled.withdraw_unsent(reason));
+        assert_eq!(filled.state(), OrdState::PendingNew);
     }
 
     #[test]

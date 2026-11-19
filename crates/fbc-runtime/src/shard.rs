@@ -30,7 +30,7 @@
 //! between-command poll: frames the kernel has delivered are read and handed to the handlers),
 //! and only then submits the next. A command a handler submits
 //! through `ExecOrders` meanwhile is therefore taken before the ladder's next one, and every
-//! ladder command is re-checked at its encode (`Authorization::check_at_submit`, 0060, 0066): a
+//! ladder command is re-checked at its encode (`Handed::check_at_submit`, 0060, 0066, 0152): a
 //! kill switch a handler turns on between two commands leaves each remaining place, batch and
 //! amend `NotSent(StaleAuthorization)`, nothing written, while cancels still go out.
 //!
@@ -300,8 +300,11 @@ pub trait Decide {
     /// A ladder command the host never submitted: its session had ended when its turn came, or
     /// the run ended first (every member ended, or one failed); or one it submitted and took
     /// back, its session or the run ending before the session encoded it. Nothing of it reached
-    /// a codec, so no `on_submitted` reports it; an authorization comes back unspent. Nothing by
-    /// default.
+    /// a codec, so no `on_submitted` reports it; an authorization comes back unspent. Dropped,
+    /// as the default drops it, an authorization releases its place's or batch's orders or its
+    /// amend's build at its registry's next mutating call, and
+    /// [`Registry::withdraw`](fbc_oms::Registry::withdraw) releases them at once (decision
+    /// 0152). Nothing else by default.
     fn unsubmitted(&mut self, command: Unsubmitted) {
         let _ = command;
     }

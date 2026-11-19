@@ -284,13 +284,14 @@ fn a_place_command_dropped_on_another_thread_is_released() {
 
 #[test]
 fn a_place_authorized_or_withdrawn_is_not_released_again_when_its_command_goes() {
-    // Authorized: the authorization spent the command, and dropping the authorization ends
-    // nothing; the gateway's outcome applies by client id.
+    // Authorized and taken over by a gateway: the authorization spent the command, and
+    // dropping the handed authorization ends nothing (decision 0152); the gateway's outcome
+    // applies by client id.
     let mut reg = registry();
     let order = buy(5);
     let c = order.cid;
     let cmd = reg.place(order).unwrap();
-    drop(reg.authorize(ACCT, cmd).unwrap());
+    drop(reg.authorize(ACCT, cmd).unwrap().hand_over());
     let _ = reg.place(buy(1)).unwrap();
     assert_eq!(reg.get(c).unwrap().state(), OrdState::PendingNew);
     reg.on_outcome(c, OrderOp::Place, &item(Some("v")), &accepted(), MonoNs(1))

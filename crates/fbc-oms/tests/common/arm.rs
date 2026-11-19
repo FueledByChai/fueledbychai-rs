@@ -126,11 +126,11 @@ pub fn start(reg: &mut Registry, market: InstrumentId) -> MarketEntry {
 /// The account the tests' places are authorized for.
 pub const TEST_ACCT: AccountKey = AccountKey::new(1);
 
-/// Authorizes `cmd` for the tests' account, as a gateway is handed it: the authorization
-/// spends a place's command, so the gateway's outcomes then apply by client id (decision 0082),
-/// and the place is no longer held, so dropping nothing releases it (FBC-657c).
+/// Authorizes `cmd` for the tests' account and hands it to a gateway, which takes it over:
+/// the authorization spends a place's command, so the gateway's outcomes then apply by client
+/// id (decision 0082), and once taken over its drop releases nothing (decisions 0084, 0152).
 pub fn issue(reg: &mut Registry, cmd: PermittedCommand) {
-    drop(reg.authorize(TEST_ACCT, cmd).unwrap());
+    drop(reg.authorize(TEST_ACCT, cmd).unwrap().hand_over());
 }
 
 /// Places `order` and authorizes it for the tests' account ([`issue`]): PendingNew, its

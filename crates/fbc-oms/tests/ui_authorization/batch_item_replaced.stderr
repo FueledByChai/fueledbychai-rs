@@ -1,5 +1,5 @@
-error[E0616]: field `cmd` of struct `Authorization` is private
+error[E0609]: no field `cmd` on type `&mut Authorization`
  --> tests/ui_authorization/batch_item_replaced.rs:6:10
   |
 6 |     auth.cmd = VenueCommand::PlaceBatch(vec![extra]);
-  |          ^^^ private field
+  |          ^^^ unknown field

@@ -37,7 +37,7 @@ use fbc_core::{
     VenueCommand, VenueOrderSnapshot,
 };
 use fbc_journal::{Record, WriteRes};
-use fbc_oms::{Authorization, ControlCommand};
+use fbc_oms::{Authorization, ControlCommand, Handed};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
@@ -84,14 +84,63 @@ impl std::error::Error for SubmitRefusal {}
 /// What was submitted: the authorization fbc-oms issued for an order-affecting command, kept
 /// until the command is encoded so fbc-oms's submit-time re-check (decision 0060) runs then, in
 /// `ExecSession::send` just before the encode, not at queue time (decisions 0057, 0062; PR #87
-/// Reviewer B B7), or a command that affects no order.
+/// Reviewer B B7), or a command that affects no order. Until the session takes it over, at its
+/// turn or as it reports it refused for want of room, a dropped authorization releases its
+/// orders (decision 0152): one refused for another account or an ended session, and one still
+/// waiting when the session ends.
 pub(crate) enum Submitted {
     Authorized(Authorization),
     Control(VenueCommand),
 }
 
-impl Submitted {
+/// A submitted command the session took at its turn: an authorization taken over
+/// ([`Authorization::hand_over`]), whose drop releases nothing, as everything the session does
+/// with it from then on is reported to the handler (decision 0152), or a control command.
+pub(crate) enum Taken {
+    Handed(Handed),
+    Control(VenueCommand),
+}
+
+impl Taken {
     /// The command to encode.
+    pub(crate) fn command(&self) -> &VenueCommand {
+        match self {
+            Taken::Handed(handed) => handed.command(),
+            Taken::Control(cmd) => cmd,
+        }
+    }
+
+    /// The traffic class its frames are charged as ([`Submitted::class`]).
+    pub(crate) fn class(&self) -> TrafficClass {
+        match self {
+            Taken::Handed(handed) => handed.command().traffic_class(),
+            Taken::Control(_) => TrafficClass::Normal,
+        }
+    }
+
+    /// What it was submitted as, never encoded and never reported: an authorization given back
+    /// unspent ([`Handed::unencoded`]), for a session that failed before its codec saw it
+    /// (decisions 0057, 0100).
+    pub(crate) fn unencoded(self) -> Submitted {
+        match self {
+            Taken::Handed(handed) => Submitted::Authorized(handed.unencoded()),
+            Taken::Control(cmd) => Submitted::Control(cmd),
+        }
+    }
+}
+
+impl Submitted {
+    /// Taken at the session's turn: an authorization taken over, before anything checks,
+    /// encodes or reports it (decision 0152).
+    pub(crate) fn take(self) -> Taken {
+        match self {
+            Submitted::Authorized(auth) => Taken::Handed(auth.hand_over()),
+            Submitted::Control(cmd) => Taken::Control(cmd),
+        }
+    }
+
+    /// The command it carries, read only.
+    #[cfg(test)]
     pub(crate) fn command(&self) -> &VenueCommand {
         match self {
             Submitted::Authorized(auth) => auth.command(),
@@ -255,8 +304,10 @@ impl Shared {
     /// commands waiting leave room for its class (decision 0105): a Normal one while fewer than
     /// the bound's Normal part wait, a Safety one while fewer than the whole bound do. Otherwise
     /// it is refused, [`SubmitRefusal::Backpressure`] naming the request id it was given, with
-    /// nothing of it kept (an authorization is dropped, spent), the refusal counted and
-    /// journaled as a write result under its class and that id.
+    /// nothing of it kept (an authorization is taken over and dropped, spent, so the consumer's
+    /// settlement of the refusal applies, decision 0152), the refusal counted and journaled as a
+    /// write result under its class and that id. Refused for an ended session, an authorization
+    /// is dropped unspent, releasing its orders.
     fn push(&self, item: Submitted) -> Result<RpcId, SubmitRefusal> {
         if self.ended.get() {
             return Err(SubmitRefusal::Ended);
@@ -267,6 +318,9 @@ impl Shared {
         if !self.bound.admits(waiting, class) {
             self.backpressured.set(self.backpressured.get() + 1);
             self.journal_refusal(class, rpc);
+            // Reported under `rpc`, which the consumer settles: taken over, so its drop
+            // releases nothing (decision 0152).
+            drop(item.take());
             return Err(SubmitRefusal::Backpressure { rpc });
         }
         let epoch = self.ready.get();
@@ -387,7 +441,8 @@ impl Shared {
 
     /// The session has run or dropped, or its run was dropped: no more commands, none still
     /// waiting is sent, and none is in progress; of those waiting only the request
-    /// [kept](Shared::keep) is kept, for [`Shared::withdraw`].
+    /// [kept](Shared::keep) is kept, for [`Shared::withdraw`]. The others are dropped
+    /// unreported, an authorization unspent, so its orders are released (decision 0152).
     pub(crate) fn end(&self) {
         self.ended.set(true);
         self.ready.set(None);
@@ -455,9 +510,11 @@ impl ExecOrders {
 
     /// Submits the order-affecting command fbc-oms authorized, spending the authorization: its
     /// request id, or why nothing was submitted (an authorization for another account, or a
-    /// session that has ended). The session keeps the authorization until it encodes the
-    /// command, where fbc-oms's submit-time re-check runs: one it refuses is reported
-    /// `NotSent(StaleAuthorization)`, nothing reserved or written (decisions 0057, 0060, 0062).
+    /// session that has ended, either dropped unspent, so its orders are released at its
+    /// registry's next mutating call, decision 0152). The session keeps the authorization until
+    /// its turn takes it over, just before fbc-oms's submit-time re-check: one the check refuses
+    /// is reported `NotSent(StaleAuthorization)`, nothing reserved or written (decisions 0057,
+    /// 0060, 0062); one still waiting when the session ends is dropped unspent and released.
     pub fn submit(&self, auth: Authorization) -> Result<RpcId, SubmitRefusal> {
         if auth.account() != self.shared.acct {
             return Err(SubmitRefusal::OtherAccount);
@@ -832,6 +889,17 @@ mod tests {
         assert_eq!(second.push(fee()), Ok(RpcId(2)));
         assert_eq!(RpcIds::after(RpcId(41)).next(), RpcId(42));
         assert!(format!("{:?}", RpcIds::default()).starts_with("RpcIds"));
+    }
+
+    /// Decision 0152: a control command taken at the session's turn is the command it was, a
+    /// normal one, and given back unencoded is submitted as it was.
+    #[test]
+    fn a_control_command_taken_and_given_back_unencoded_is_the_command_it_was() {
+        let taken = Submitted::Control(VenueCommand::FeeQuery).take();
+        assert_eq!(taken.command(), &VenueCommand::FeeQuery);
+        assert_eq!(taken.class(), TrafficClass::Normal);
+        let back = taken.unencoded();
+        assert!(matches!(back, Submitted::Control(VenueCommand::FeeQuery)));
     }
 
     /// Decision 0100: a submission is attributed to the input the shard is handling as it is

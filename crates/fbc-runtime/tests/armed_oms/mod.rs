@@ -281,7 +281,8 @@ impl Oms {
             reducing: false,
         };
         let cmd = reg.place(order).unwrap();
-        drop(reg.authorize(ACCT, cmd).unwrap());
+        // Taken over by a gateway, so its drop releases nothing (decision 0152).
+        drop(reg.authorize(ACCT, cmd).unwrap().hand_over());
         let item = ItemRef {
             idx: 0,
             cid: None,
