@@ -7590,6 +7590,39 @@ async fn a_taker_iocs_final_order_response_after_its_fill_is_awaited_for_the_fra
 }
 
 #[tokio::test]
+async fn a_taker_iocs_ack_then_fill_with_no_final_order_response_leaves_the_frame_order_unmeasured()
+{
+    // PR #277's review (Codex, P2): QFEX acknowledges the taker IOC, then sends its
+    // fill_response, and its FILLED order_response comes only long after its deadline
+    // (--rpc-timeout-ms is 600). The wait ends at the deadline with the ACK the last
+    // order_response heard, which is no final order_response: the order FBC-tfxk asks about is
+    // not measured, in the record, the report and the evidence, never OrderFirst. The fill
+    // reached the take registry, so it is flattened and the run ends with no stop.
+    let model = QfexModel {
+        ioc_acked: true,
+        ioc_order_after: Some(Duration::from_secs(3600)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "take-acked-unordered", &primary_only(), |a| a).await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    let run = d.take(0);
+    let taken = (run.taken.as_ref()).unwrap_or_else(|| panic!("{run:?}: {}", d.printed));
+    assert_eq!(taken.ioc, Some(flatten::Ioc::Filled));
+    assert_eq!(taken.frame_order, Some(taker::FrameOrder::NoOrder));
+    assert_flattened(run.flatten.as_ref().unwrap(), 0);
+    let said = taker::FrameOrder::NoOrder.says();
+    let (report, json) = d.outputs();
+    let section = take_section(&report, "primary");
+    assert!(
+        section.contains(&format!(
+            "- The order of its final order_response and its fill_response (FBC-tfxk): {said}"
+        )),
+        "{section}"
+    );
+    assert_eq!(json["stage_two"]["takes"][0]["taken"]["frame_order"], said);
+}
+
+#[tokio::test]
 async fn a_fill_of_y_seen_after_the_drop_stops_not_flat() {
     // Y filled as the connection dropped, which no session was open to hear: the trades row
     // after the drop shows it, and the run stops not flat, the position the owner's.

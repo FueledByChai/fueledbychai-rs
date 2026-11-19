@@ -92,7 +92,8 @@
 //!   err, unanswered, answered by a server close, or acked and left resting (a sell, the flatten
 //!   IOC after a taker buy, answered as [`QfexModel::ioc_sells`] says when it is set), its fill's
 //!   fee paid, zero or received ([`QfexModel::fee_sign`]) and its `fill_response` before or after
-//!   its final `order_response`, or withheld ([`QfexModel::ioc_frame_order`]);
+//!   its final `order_response`, or withheld ([`QfexModel::ioc_frame_order`]), and, for PR
+//!   #277's review, an `ACK` before every frame of its fill ([`QfexModel::ioc_acked`]);
 //!   on every fill, [`QfexModel::position_push`] ([`PositionPush`]), a `position_response` before
 //!   or after its frames; on one place, [`QfexModel::touch_on_place`], a new touch pushed on the
 //!   MDS before that place's answer; on the first cancel, [`QfexModel::fill_on_cancel`], its
@@ -707,6 +708,9 @@ pub struct QfexModel {
     /// With a limit IOC the model fills whole, its final `order_response` pushed this long after
     /// its `fill_response` and not with it (FBC-ou9g, for FBC-tfxk's frame order).
     pub ioc_order_after: Option<Duration>,
+    /// Every limit IOC the model fills is answered `ACK` first, before every frame of its fill
+    /// (PR #277's review: an `ACK` is no final `order_response`); none by default.
+    pub ioc_acked: bool,
     pub rate_limit: Option<Limited>,
     /// After the first `ACK`: an `order_response` naming an order no run placed, with
     /// [`STRAY_CID`] (decision 0151 item 13's stray order). With it, as with
@@ -1027,6 +1031,7 @@ impl Default for QfexModel {
             fee_sign: FeeSign::Paid,
             ioc_frame_order: IocFrameOrder::FillFirst,
             ioc_order_after: None,
+            ioc_acked: false,
             rate_limit: None,
             stray_order: false,
             cid_absent_update: false,
@@ -2151,6 +2156,11 @@ impl QfexModel {
             }
             (how, Some(px)) => {
                 self.before_change(&account);
+                // Its ACK first, when the knob asks, before every frame of its fill.
+                let mut frames: Vec<Frame> = (self.ioc_acked)
+                    .then(|| echoed(&order, "ACK", self.ack_echo))
+                    .into_iter()
+                    .collect();
                 let lot = (self.listed.first())
                     .and_then(|l| Decimal::from_str(l.lot).ok())
                     .unwrap_or(order.quantity);
@@ -2193,13 +2203,15 @@ impl QfexModel {
                 let fill = with_fee(taker_fill(&filled), self.fee_sign);
                 if let Some(after) = self.ioc_order_after.filter(|_| whole) {
                     self.later(conn, vec![update], after, false);
-                    return vec![fill];
+                    frames.push(fill);
+                    return frames;
                 }
-                match self.ioc_frame_order {
+                frames.extend(match self.ioc_frame_order {
                     IocFrameOrder::FillFirst => self.filled_frames(&account, fill, update),
                     IocFrameOrder::OrderFirst => self.filled_frames(&account, update, fill),
                     IocFrameOrder::Withheld => vec![update],
-                }
+                });
+                frames
             }
         }
     }

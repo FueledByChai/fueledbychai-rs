@@ -57,6 +57,16 @@ fn order(cid: Cid) -> Heard {
     }
 }
 
+/// An `order_response` `ACK` heard naming the `n`th `add_order` the run sent, as `cid` says.
+fn acked(cid: Cid) -> Heard {
+    Heard::Order {
+        at: MonoNs(1),
+        status: "ACK".to_owned(),
+        cid,
+        ours: true,
+    }
+}
+
 /// A `fill_response` heard naming the `n`th `add_order` the run sent, as `cid` says.
 fn fill(cid: Cid) -> Heard {
     Heard::Fill {
@@ -97,6 +107,36 @@ fn the_frame_order_is_the_last_order_response_against_the_last_fill_response() {
         assert!(!order.says().chars().any(|c| c.is_ascii_digit()));
     }
     assert!(FrameOrder::OrderFirst.says().contains("FBC-tfxk"));
+}
+
+#[test]
+fn an_ack_is_no_final_order_response_so_an_ack_then_a_fill_is_not_measured() {
+    // PR #277's review (Codex, P2): the taker IOC's ACK, then its fill_response, and no final
+    // order_response before its deadline. The ACK is no final order_response, so the order
+    // FBC-tfxk asks about was never observed: not measured, never OrderFirst.
+    let us = Cid::Exact(3);
+    assert_eq!(
+        FrameOrder::of(&[acked(us), fill(us)], 3),
+        FrameOrder::NoOrder
+    );
+    assert_eq!(
+        FrameOrder::of(&[fill(us), acked(us)], 3),
+        FrameOrder::NoOrder
+    );
+    // With its final order_response heard, an ACK anywhere changes nothing.
+    let heard = [acked(us), fill(us), order(us)];
+    assert_eq!(FrameOrder::of(&heard, 3), FrameOrder::FillFirst);
+    let heard = [acked(us), order(us), fill(us)];
+    assert_eq!(FrameOrder::of(&heard, 3), FrameOrder::OrderFirst);
+    let heard = [order(us), fill(us), acked(us)];
+    assert_eq!(FrameOrder::of(&heard, 3), FrameOrder::OrderFirst);
+    // An ACK with no fill is still no fill.
+    assert_eq!(FrameOrder::of(&[acked(us)], 3), FrameOrder::NoFill);
+    // The report says it as not measured, naming the final order_response it lacks.
+    let said = FrameOrder::NoOrder.says();
+    assert!(said.starts_with("not measured: "), "{said}");
+    assert!(said.contains("no final order_response"), "{said}");
+    assert!(said.contains("ACK"), "{said}");
 }
 
 #[test]
@@ -424,11 +464,34 @@ fn the_models_fee_sign_and_frame_order_knobs_shape_a_filled_iocs_frames() {
     let frames = model.trade(0, &Frame::text(buy_ioc(cid, "100.2", "0.01")));
     assert_eq!(members(&frames.unwrap()), ["order_response"]);
     assert_eq!(model.fills.len(), 1);
+    // ioc_acked: its ACK first, then its fill's frames as the frame order says.
+    let mut model = QfexModel {
+        ioc_acked: true,
+        ..QfexModel::default()
+    };
+    crossing::session(&mut model, 0);
+    let frames = model.trade(0, &Frame::text(buy_ioc(cid, "100.2", "0.01")));
+    let frames = frames.unwrap();
+    let statuses: Vec<Value> = (frames.iter())
+        .map(|f| {
+            let Frame::Text(text) = f else {
+                panic!("a text frame")
+            };
+            let v: Value = serde_json::from_str(text).unwrap();
+            v["order_response"]["status"].clone()
+        })
+        .collect();
+    assert_eq!(
+        members(&frames),
+        ["order_response", "fill_response", "order_response"]
+    );
+    assert_eq!(statuses[0], "ACK");
+    assert_eq!(statuses[2], "FILLED");
     // The defaults: a fee paid, the fill_response first.
     let model = QfexModel::default();
     assert_eq!(
-        (model.fee_sign, model.ioc_frame_order),
-        (model::FeeSign::Paid, IocFrameOrder::FillFirst)
+        (model.fee_sign, model.ioc_frame_order, model.ioc_acked),
+        (model::FeeSign::Paid, IocFrameOrder::FillFirst, false)
     );
 }
 

@@ -82,7 +82,8 @@ pub fn fee_said(fees: &[FeeSign]) -> String {
 }
 
 /// The order of the taker IOC's final `order_response` and its `fill_response`s, as the tee
-/// heard them on its session (FBC-tfxk).
+/// heard them on its session (FBC-tfxk). Its final `order_response` is one with a status other
+/// than `ACK`: an `ACK` acknowledges it and ends nothing (PR #277's review).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum FrameOrder {
     /// Every `fill_response` came before the final `order_response`.
@@ -91,20 +92,23 @@ pub enum FrameOrder {
     OrderFirst,
     /// No `fill_response` named it: not measured.
     NoFill,
-    /// A `fill_response` named it, but no `order_response` did: not measured.
+    /// A `fill_response` named it, but no final `order_response` did, an `ACK` being none: not
+    /// measured.
     NoOrder,
 }
 
 impl FrameOrder {
     /// The order on `heard`, the frames the tee heard from the taker session's first on, of the
     /// frames naming `sent`, the taker IOC's `add_order` among those the run sent, by their client
-    /// id ([`Cid::sent`]): the last `order_response` naming it against the last `fill_response`
-    /// naming it.
+    /// id ([`Cid::sent`]): the last `order_response` naming it with a status other than `ACK`,
+    /// its final one, as `stage.rs`'s `Run::final_order_unheard` waits for it, against the last
+    /// `fill_response` naming it. An `ACK` is never taken for it, so an `ACK` and a fill with no
+    /// final `order_response` heard, as at its deadline, is [`FrameOrder::NoOrder`], not measured.
     pub fn of(heard: &[Heard], sent: usize) -> FrameOrder {
         let names = |cid: &Cid| cid.sent() == Some(sent);
-        let order = heard
-            .iter()
-            .rposition(|h| matches!(h, Heard::Order { cid, .. } if names(cid)));
+        let order = heard.iter().rposition(
+            |h| matches!(h, Heard::Order { cid, status, .. } if names(cid) && status != "ACK"),
+        );
         let fill = heard
             .iter()
             .rposition(|h| matches!(h, Heard::Fill { cid, .. } if names(cid)));
@@ -128,7 +132,8 @@ impl FrameOrder {
             }
             FrameOrder::NoFill => "not measured: no fill_response named the taker IOC",
             FrameOrder::NoOrder => {
-                "not measured: a fill_response named the taker IOC, but no order_response did"
+                "not measured: a fill_response named the taker IOC, but no final order_response \
+                 did (an order_response other than ACK, which ends nothing)"
             }
         }
     }
