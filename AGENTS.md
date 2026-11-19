@@ -944,9 +944,11 @@ holds two of them for one pull request. The rules after the three roles bind all
     once a fill of ours came, taken before the close, its cancels sent once there is room, or, with
     none within the patience, held as 0151 item 11 says; then the read of every named account and of
     X and its trades (`account_reads`' trades and historic-orders reads, FBC-be57; a full page
-    repeating the one before it, as a venue ignoring the offset answers, failing the read, and so in
-    every such read after a session), waiting out a rate hold rather than skipping, a provider
-    refusal (one kept whole included) or a Ctrl-C during them a stop, a trade naming X in them
+    repeating the one before it, as a venue ignoring the offset answers, failing the read, and the
+    whole read cut `AFTER_PATIENCE` after it began, its pages not all read (`stage::HISTORY_CUT`,
+    FBC-8o7a), and so in every such read after a session), waiting out a rate hold rather than
+    skipping, a provider refusal (one kept whole included) or a Ctrl-C during them a stop, a trade
+    naming X in them
     `NotFlat` (a fill seen with no session open, 0151 item 9), then X's own account not read for a
     reason that is no provider rate refusal `LeftResting` (FBC-gisx; decision 0005 as the owner
     ruled under 0151 item 6: X counted resting unless its registry holds it ended,
@@ -1298,7 +1300,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     (the MDS reached through a relay of the test's own, `tests/qfex_preprod_probe/mds_pings.rs`,
     that pings each connection on the runtime's clock, streams the touch before each ping and closes
     a connection whose ping goes unanswered too long) and `hold_page` (the next read socket's page
-    held for the test's release, set as the probe prints a line), all declared by path; eleven paths
+    held for the test's release, set as the probe prints a line), and, for FBC-8o7a, `endless`
+    (every read socket's `get_user_trades` page, or every historic-orders page, full of rows made
+    up from its own offset and limit, without end), all declared by path; eleven paths
     no flag or answer reaches, X spent from its list, X not priced, Y not priced (FBC-gisx), a
     session failing after its order's answer,
     the journal past its soft limit, another order of ours held in a cross registry before a

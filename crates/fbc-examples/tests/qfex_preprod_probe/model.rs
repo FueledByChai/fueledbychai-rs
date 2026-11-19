@@ -123,7 +123,9 @@
 //!   [`PageFault`] says. FBC-8mwz's, once an armed connection dropped:
 //!   [`QfexModel::silent_sub_after_drop_reads`], the subaccount's read after drop session two
 //!   left unanswered, and [`QfexModel::stop_order_after_drop_reads`], an open order no page
-//!   lists counted by its REST positions.
+//!   lists counted by its REST positions. FBC-8o7a's, on every read socket's `get_user_trades`
+//!   page or on every `GET /user/historic-orders` page: [`QfexModel::endless`] ([`Endless`]),
+//!   each page full, of rows made up from the offset and limit it asks for, without end.
 //! - **MDS** ([`QfexModel::mds`]), on a stub of its own at its own loopback origin: a `bbo`
 //!   subscribe answered with the touch of each symbol it names, or, with [`QfexModel::mds_err`],
 //!   with a `ServerError` err, which ends the connection's epoch (the MDS codec asks to
@@ -211,6 +213,16 @@ pub struct Filled {
     /// What it filled: the order's whole quantity, or part of it ([`QfexModel::part_fill_after`]).
     pub quantity: Decimal,
     pub at: i64,
+}
+
+/// The read [`QfexModel::endless`] answers without end (FBC-8o7a).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Endless {
+    /// Every `get_user_trades` page on a socket that never armed: rows of trades of orders the
+    /// model never had, each naming its made-up order by `order_id` and `client_order_id`.
+    Trades,
+    /// Every `GET /user/historic-orders` page: rows of ended orders the model never had.
+    Historic,
 }
 
 /// A trade on an account of an order the model never had ([`QfexModel::trade_after_close`]).
@@ -824,6 +836,10 @@ pub struct QfexModel {
     /// session two, which follows the reads of X's and Y's trades and historic orders after the
     /// drop on the primary account, shows an order resting.
     pub stop_order_after_drop_reads: bool,
+    /// Which read is answered without end (FBC-8o7a): each page it asks for full, its rows made
+    /// up from the page's own offset and limit, so no two pages are alike and none is short, as
+    /// a venue answering new rows for ever would.
+    pub endless: Option<Endless>,
     /// The first `cancel_order`'s answer is pushed this long after it, instead of at once.
     pub cancel_delay: Option<Duration>,
     /// Once an armed connection ended, its account's positions show a position on [`SYMBOL`]
@@ -1138,6 +1154,7 @@ impl Default for QfexModel {
             rest_fails_after_historic: false,
             silent_sub_after_drop_reads: false,
             stop_order_after_drop_reads: false,
+            endless: None,
             historic_after_drop: false,
             historic_asked: false,
             cancel_delay: None,
@@ -1298,6 +1315,7 @@ impl QfexModel {
                 ok(&self.positions_of(account))
             }
             "/user/subaccounts" => listing_refused(),
+            _ if self.endless == Some(Endless::Historic) => ok(&endless_historic(req)),
             _ if std::mem::take(&mut self.historic_fails) => {
                 status(500, r#"{"error":"synthetic failure"}"#)
             }
@@ -1648,6 +1666,12 @@ impl QfexModel {
                 self.rate_limit = None;
                 let echo = serde_json::json!({"type": "get_user_trades", "params": v["params"]});
                 Ok(vec![Frame::text(limited(&echo.to_string(), 1))])
+            }
+            "get_user_trades"
+                if self.endless == Some(Endless::Trades)
+                    && !self.conns.get(&conn).is_some_and(|c| c.session) =>
+            {
+                Ok(vec![Frame::text(endless_trades(&v))])
             }
             "get_user_trades" if self.hold_trades => {
                 let page = Frame::text(self.trades_page(conn, &v));
@@ -2782,6 +2806,54 @@ fn limited(request: &str, secs: u32) -> String {
     format!(
         r#"{{"type":"Err","error_code":"RateLimited","message":"Rate limit exceeded, retry after {secs} seconds","incoming_message":{request}}}"#
     )
+}
+
+/// A full `get_user_trades` page for `v`'s offset and limit ([`Endless::Trades`]): one row for
+/// each place on the page, its trade, order and client ids made up from that place, so every
+/// page differs from every other.
+fn endless_trades(v: &Value) -> String {
+    let offset = v["params"]["offset"].as_u64().unwrap_or(0);
+    let limit = v["params"]["limit"].as_u64().unwrap_or(1000);
+    let rows: Vec<Value> = (offset..offset + limit)
+        .map(|n| {
+            serde_json::json!({
+                "trade_id": format!("endless-{n}"), "symbol": SYMBOL, "price": "100.00",
+                "quantity": 1, "side": "BUY",
+                "order_id": format!("44444444-4444-4444-8444-{n:012x}"),
+                "client_order_id": format!("endless-{n}"), "fee": 0.001, "timestamp": 0,
+                "order_type": "LIMIT", "tif": "GTC"
+            })
+        })
+        .collect();
+    serde_json::json!({"user_trades_response": rows}).to_string()
+}
+
+/// A full `GET /user/historic-orders` page for `req`'s `limit` and `offset` query members
+/// ([`Endless::Historic`]): one ended order for each place on the page, its ids made up from
+/// that place, so every page differs from every other.
+fn endless_historic(req: &HttpRequest) -> String {
+    let member = |name: &str| {
+        let query = req.query.as_deref().unwrap_or_default();
+        let found = query.split('&').find_map(|kv| kv.strip_prefix(name));
+        found
+            .and_then(|v| v.strip_prefix('='))
+            .and_then(|v| v.parse::<u64>().ok())
+    };
+    let (offset, limit) = (
+        member("offset").unwrap_or(0),
+        member("limit").unwrap_or(1000),
+    );
+    let data: Vec<Value> = (offset..offset + limit)
+        .map(|n| {
+            serde_json::json!({
+                "order_id": format!("44444444-4444-4444-8444-{n:012x}"),
+                "client_order_id": format!("endless-{n}"), "terminal_status": "CANCELLED",
+                "symbol": SYMBOL, "side": "BUY", "type": "LIMIT", "time_in_force": "GTC",
+                "quantity": 1, "price": "100.00", "filled_qty": 0
+            })
+        })
+        .collect();
+    serde_json::json!({"count": data.len(), "data": data}).to_string()
 }
 
 /// The items of `all` the page `v` asks for: from its `offset`, at most its `limit`.
