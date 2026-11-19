@@ -113,7 +113,8 @@ fn the_run_wide_items_say_so_and_the_crossing_and_taker_items_read_their_session
     assert_eq!(fee, "not measured: the taker IOC brought no fill");
 }
 
-/// A trades read that named `naming` rows of its first order, kept as `Traded`.
+/// A trades read that named `naming` rows of its first order, every page read to a short one,
+/// kept as `Traded`.
 fn traded(sides: Sides, foreign: usize, fields: &[&str]) -> Traded {
     Traded {
         trades: sides.rows() + foreign,
@@ -122,6 +123,15 @@ fn traded(sides: Sides, foreign: usize, fields: &[&str]) -> Traded {
         fields: fields.iter().map(|f| (*f).to_owned()).collect(),
         sides,
         foreign,
+        trades_whole: true,
+        ..Traded::default()
+    }
+}
+
+/// A trades read with no row, every page read to a short one (an empty first page).
+fn whole() -> Traded {
+    Traded {
+        trades_whole: true,
         ..Traded::default()
     }
 }
@@ -202,7 +212,7 @@ fn which_side_field_a_row_carries_and_whose_side_it_is() {
         "1 row: an order of another's, or one this run did not name, traded on the account (none \
          is pushed as a fill)"
     );
-    let ev = with_trades(None, Some(Traded::default()));
+    let ev = with_trades(None, Some(whole()));
     assert_eq!(
         said(&ev, "primary", "Which side field"),
         "carried: not shown: no row was read; side is not measured: no row naming an order of \
@@ -212,12 +222,70 @@ fn which_side_field_a_row_carries_and_whose_side_it_is() {
 }
 
 #[test]
+fn a_trade_history_not_read_whole_never_reads_as_none() {
+    // PR #284's review: a trades read that failed before its first page read no row, so the
+    // items read from rows say not measured, with why, and never none.
+    let failed = Traded {
+        error: Some("get_user_trades: Err".to_owned()),
+        ..Traded::default()
+    };
+    let ev = with_trades(None, Some(failed.clone()));
+    let unread = "not measured: no get_user_trades page was read on this account (after the \
+                  taker IOC session: get_user_trades: Err)";
+    for item in [
+        "get_user_trades rows naming",
+        "Which side field",
+        "What kind of time",
+    ] {
+        assert_eq!(said(&ev, "primary", item), unread, "{item}");
+    }
+    // One whole read beside it: what the rows show is of the pages read alone, and the rows not
+    // ours are not measured, not none.
+    let ev = with_trades(Some(whole().x_after()), Some(failed));
+    let partly = "of the pages read alone, since a get_user_trades read was not read whole \
+                  (after the taker IOC session: get_user_trades: Err)";
+    assert_eq!(
+        said(&ev, "primary", "get_user_trades rows naming"),
+        "not measured: none on the pages read, but a get_user_trades read was not read whole \
+         (after the taker IOC session: get_user_trades: Err)"
+    );
+    assert!(said(&ev, "primary", "Which side field").ends_with(partly));
+    assert!(said(&ev, "primary", "What kind of time").ends_with(partly));
+    // A read that read a page and then failed: the rows it read are counted, of those pages
+    // alone, and with no error given, why is said so.
+    let part = Traded {
+        trades_whole: false,
+        error: None,
+        ..traded(Sides::default(), 2, &["trade_id"])
+    };
+    let ev = with_trades(None, Some(part));
+    assert_eq!(
+        said(&ev, "primary", "get_user_trades rows naming"),
+        "2 rows: an order of another's, or one this run did not name, traded on the account \
+         (none is pushed as a fill); of the pages read alone, since a get_user_trades read was \
+         not read whole (after the taker IOC session: its pages were not all read)"
+    );
+    // Drop session one's read, not whole, is named by when it was made.
+    let after = XAfter {
+        trades: 1,
+        foreign: 1,
+        error: Some("a synthetic failure".to_owned()),
+        ..XAfter::default()
+    };
+    let ev = with_trades(Some(after), None);
+    assert!(
+        said(&ev, "primary", "get_user_trades rows naming")
+            .ends_with("(after drop session one: a synthetic failure)")
+    );
+}
+
+#[test]
 fn the_kind_of_a_trades_time_and_whether_its_trade_id_is_the_fills_channels() {
     let at = |kinds: Vec<&'static str>, ids: TradeIds| {
         let take = Traded {
             time_kinds: kinds,
             trade_ids: ids,
-            ..Traded::default()
+            ..whole()
         };
         said(
             &with_trades(None, Some(take)),
@@ -253,6 +321,7 @@ fn the_kind_of_a_trades_time_and_whether_its_trade_id_is_the_fills_channels() {
             matched: 1,
             ..TradeIds::default()
         },
+        trades_read: true,
         ..XAfter::default()
     };
     let two = Traded {
@@ -261,7 +330,7 @@ fn the_kind_of_a_trades_time_and_whether_its_trade_id_is_the_fills_channels() {
             matched: 2,
             ..TradeIds::default()
         },
-        ..Traded::default()
+        ..whole()
     };
     let mut ev = with_trades(Some(after), None);
     ev.drops[0].two = Some(TwoRun {
@@ -596,6 +665,80 @@ fn each_resync_is_set_against_rests_open_orders_and_gives_its_full_pages() {
         said(&ev, "primary", "The provider rate refusals"),
         "at least 0 on this account's 3 sessions and 2 on its 1 read socket, each by name in the \
          provider rate refusals section"
+    );
+}
+
+#[test]
+fn pages_and_history_not_all_read_are_never_answered_as_absent_or_agreeing() {
+    // PR #284's review: an item read from pages or a history not all read says so.
+    let mut ev = named();
+    // The pager's pages, none read: not measured, never a no; some read: of those alone.
+    let mut skipped = page(&[], &[], false);
+    skipped.came = Came::Skipped;
+    let run = |pages: Vec<PageRead>| PagesRun {
+        session: CrossRun {
+            account: "primary",
+            ..CrossRun::default()
+        },
+        pages,
+        ..PagesRun::default()
+    };
+    ev.stage_three = vec![run(vec![skipped.clone()])];
+    assert!(said(&ev, "primary", "How the pages").contains(
+        "a page listing an order of ours the streams did not show open: not measured: no page \
+         was read;"
+    ));
+    ev.stage_three = vec![run(vec![page(&["P1"], &["P1"], false), skipped])];
+    assert!(said(&ev, "primary", "How the pages").contains(
+        "a page listing an order of ours the streams did not show open: none on the 1 page read;"
+    ));
+    // A resync whose pages were not all answered, or none journaled, is not compared, and its
+    // full pages are of the pages answered alone.
+    let session = |name: &'static str, (asked, read): (u64, u64), open: Option<u64>| {
+        let mut pages = pages::Pages::default();
+        pages.asked = asked;
+        pages.read = read;
+        SessionRun {
+            account: "primary",
+            name,
+            pages,
+            resync_open_orders: open,
+            ..SessionRun::default()
+        }
+    };
+    ev.sessions = vec![
+        session(places::DROP_ONE, (2, 1), Some(0)),
+        session(places::DROP_TWO, (0, 0), Some(1)),
+    ];
+    assert_eq!(
+        said(&ev, "primary", "Each resync against"),
+        "drop session one: its pages listed 0 orders, its GET /user/positions counted open_orders \
+         0: not compared, since 1 of the 2 pages it asked for were answered; drop session two: \
+         its pages listed 0 orders, its GET /user/positions counted open_orders 1: not compared, \
+         since no page it asked for was journaled"
+    );
+    assert_eq!(
+        said(&ev, "primary", "Each resync's full pages"),
+        "drop session one: not measured: none among the 1 of the 2 pages it asked for that were \
+         answered"
+    );
+    // Flatten IOCs not listed on historic-orders pages not all read.
+    let take = Traded {
+        terminal: vec![None, None],
+        ..Traded::default()
+    };
+    ev.stage_two = Some(StageTwo {
+        takes: vec![CrossRun {
+            account: "primary",
+            traded: Some(take),
+            ..CrossRun::default()
+        }],
+        ..StageTwo::default()
+    });
+    assert_eq!(
+        said(&ev, "primary", "What GET"),
+        "the taker IOC not read; its flatten IOCs 0 of 1 listed, on GET /user/historic-orders \
+         pages not all read; stage three's orders not read (no historic-orders read follows it)"
     );
 }
 

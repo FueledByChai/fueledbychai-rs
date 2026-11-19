@@ -11549,6 +11549,45 @@ async fn held_stop_cancels_end_by_a_drop_after_a_passed_drop_test() {
 }
 
 #[tokio::test]
+async fn stop_cancels_refused_locally_stop_the_run_cancels_blocked() {
+    // FBC-3xzn (0151 item 11): the crossing post-only rests, and every cancel of the crossing
+    // session's Stop is refused locally, as a failed submit (a test's hook; no answer of the
+    // QFEX model reaches it). The cancels are blocked with no stop before them: since this
+    // account's drop test passed in this run, the session ends by the abrupt drop, which cancels
+    // the order, and the reads after it list none of ours. The run then stops CancelsBlocked,
+    // marked, in its own right, its line saying nothing of an order resting, and no taker IOC
+    // session follows.
+    let hooks = probe_args::TestHooks {
+        refuse_stop_cancels: true,
+        ..probe_args::TestHooks::default()
+    };
+    let d = hooked(resting_cross(), "cross-cancels-blocked", |a| a, hooks).await;
+    assert_cross_stopped(&d, places::Stop::CancelsBlocked);
+    let run = d.cross(0);
+    let cancels = run.cancels.as_ref().unwrap();
+    assert!(
+        cancels.held && cancels.blocked && cancels.sent == 0,
+        "{cancels:?}"
+    );
+    assert_eq!(run.ended_by, Some(stage::DROPPED));
+    assert_eq!(run.stop, Some("CancelsBlocked"));
+    assert_eq!(d.count("cancel_order"), 0, "{:?}", d.what());
+    let conn: usize = d.cross_conns()[0].parse().unwrap();
+    assert!(d.what().contains(&format!("cod {conn} drop cancels")));
+    assert_eq!(d.crossing_orders()[0].state, model::State::Cancelled);
+    assert!(!run.resting && run.read, "{run:?}");
+    let stopped = d.ev.stopped.as_deref().unwrap();
+    assert_eq!(
+        stopped,
+        format!(
+            "CancelsBlocked in the crossing session: {}; no further session runs",
+            places::Stop::CancelsBlocked.says()
+        )
+    );
+    assert!(!d.printed.contains("RESTING "), "{}", d.printed);
+    assert!(d.stage_two().takes.is_empty());
+}
+#[tokio::test]
 async fn the_reads_after_a_held_drop_read_again_until_its_cancel_shows() {
     // As held_stop_cancels_end_by_a_drop_after_a_passed_drop_test, but QFEX's first read of the
     // account after the drop still shows the crossing post-only open, as a read made before QFEX
@@ -17598,6 +17637,78 @@ async fn a_rate_limited_page_on_the_pager_stops_the_run() {
 }
 
 #[tokio::test]
+async fn a_pager_page_listing_an_order_not_ours_stops_the_run_before_the_next_step() {
+    // PR #284's review: QFEX's page 0, after P1's and P2's comparisons, lists an order no run
+    // placed, which no other read or frame shows, as one gone before the next comparison would
+    // be. A read showing an order the streams did not show stops the run, ReadDisagrees, marked
+    // (decision 0148 item 8): P3 is never placed and no later page is asked; the session's Stop
+    // cancels P1 and P2 by venue id, and the read of every named account follows.
+    let model = QfexModel {
+        stray_on_pager_page: Some((0, model::PagerStray::Order)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-stray-order", &primary_only(), |a| a).await;
+    let name = places::Stop::ReadDisagrees.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let run = d.three(0);
+    let came: Vec<pager::Came> = run.pages.iter().map(|p| p.came.clone()).collect();
+    let stray = pager::Came::Read {
+        ours: Vec::new(),
+        others: 1,
+        twaps: 0,
+        full: true,
+    };
+    assert_eq!(came, [stray]);
+    assert_eq!(d.pages_asked(d.pager_conns()[0]), [(1, 0)]);
+    let placed: Vec<&str> = run.orders.iter().map(|(n, _)| *n).collect();
+    assert_eq!(placed, ["P1", "P2"]);
+    assert!(run.cancels.is_empty(), "{:?}", run.cancels);
+    assert_eq!(run.session.stop, Some(name));
+    let stop = run.session.cancels.as_ref().expect("the session's Stop");
+    assert_eq!(stop.sent, 2, "{stop:?}");
+    let after = (d.ev.reads.iter()).filter(|r| r.before == refusals::AFTER_PAGES);
+    assert_eq!(after.count(), 1, "{:?}", d.ev.reads);
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+    assert!(
+        report.contains("listed none of ours; 1 order not ours; 0 TWAPs; full"),
+        "{report}"
+    );
+    assert_eq!(json["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+    // A TWAP on the walk's first page, the pager's fifth: the walk ends there and the run stops
+    // the same way, every cancel of the plan made first.
+    let model = QfexModel {
+        stray_on_pager_page: Some((4, model::PagerStray::Twap)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-stray-twap", &primary_only(), |a| a).await;
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let run = d.three(0);
+    assert_eq!(run.walk, Some(pager::WalkEnd::Disagreed));
+    let last = run.pages.last().unwrap();
+    assert!(last.walk, "{last:?}");
+    assert!(
+        matches!(last.came, pager::Came::Read { twaps: 1, .. }),
+        "{last:?}"
+    );
+    assert_eq!(run.cancels.len(), 3);
+    let (report, _) = d.outputs();
+    assert!(
+        report.contains(&format!(
+            "- The walk from offset 0: {}",
+            pager::WalkEnd::Disagreed.says()
+        )),
+        "{report}"
+    );
+}
+#[tokio::test]
 async fn a_stage_three_cancel_is_not_sent_for_an_order_ended_or_not_yet_acknowledged() {
     // QFEX cancels P1 itself right after its ACK: P1's cancel is not sent, its order having
     // ended, and the plan goes on, no stop.
@@ -18436,10 +18547,19 @@ async fn a_taker_iocs_trades_read_not_made_is_recorded_and_stops_nothing() {
     let error = traded.error.as_deref().unwrap();
     assert_eq!(error, "get_user_trades: Err");
     assert_eq!(d.ev.stage_three.len(), 1);
+    // The drop test's reads were whole, so what the rows show is of their pages alone, and the
+    // rows not ours are not measured rather than none (PR #284's review).
     assert_eq!(
         answer(&d, "primary", item("What kind of time")),
         "the timestamp: not measured: no get_user_trades row naming an order of ours was read; \
-         the trade_id: not measured: no get_user_trades row naming an order of ours was read"
+         the trade_id: not measured: no get_user_trades row naming an order of ours was read; of \
+         the pages read alone, since a get_user_trades read was not read whole (after the taker \
+         IOC session: get_user_trades: Err)"
+    );
+    assert_eq!(
+        answer(&d, "primary", item("get_user_trades rows naming")),
+        "not measured: none on the pages read, but a get_user_trades read was not read whole \
+         (after the taker IOC session: get_user_trades: Err)"
     );
     assert!(
         answer(&d, "primary", item("What GET /user/historic-orders"))
@@ -18447,6 +18567,41 @@ async fn a_taker_iocs_trades_read_not_made_is_recorded_and_stops_nothing() {
     );
 }
 
+#[tokio::test]
+async fn a_taker_iocs_trades_naming_no_order_of_ours_stop_the_run() {
+    // PR #284's review: as the taker IOC's trades are read after its session, QFEX lists two
+    // trades of an order no run placed, one each way so the position stays flat, whose rows name
+    // another order, or none. A trade of an order the streams did not show stops the run,
+    // ReadDisagrees, marked (decision 0148 item 8), and no stage three runs.
+    for stray in [model::StrayTrade::Other, model::StrayTrade::Unnamed] {
+        let model = QfexModel {
+            netting_on_trades_page: Some((2, stray)),
+            ..QfexModel::default()
+        };
+        let d = dropped_in(model, "take-trades-foreign", &primary_only(), |a| a).await;
+        let name = places::Stop::ReadDisagrees.name();
+        assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+        let marker = d.marker().unwrap_or_default();
+        assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+        let (report, json) = d.outputs();
+        assert!(
+            report.contains(&format!("**The place stages' stop:** {name}.")),
+            "{report}"
+        );
+        assert_eq!(json["stop"], name);
+        assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+        let stopped = d.ev.stopped.as_deref().unwrap();
+        assert!(
+            stopped.starts_with(&format!("ReadDisagrees {}", stage::TAKE_TRADES_OTHERS)),
+            "{stopped}"
+        );
+        let traded = d.take(0).traded.as_ref().unwrap();
+        assert!(traded.trades_whole && traded.foreign == 2, "{traded:?}");
+        assert_eq!(d.take(0).stop, Some("ReadDisagrees"));
+        assert!(d.ev.stage_three.is_empty(), "{}", d.printed);
+        assert!(answer(&d, "primary", item("get_user_trades rows naming")).starts_with("2 rows"));
+    }
+}
 #[tokio::test]
 async fn ctrl_c_while_the_taker_iocs_trades_are_read_stops_the_run() {
     // The owner presses Ctrl-C while the primary account's taker IOC's trades page is held: the

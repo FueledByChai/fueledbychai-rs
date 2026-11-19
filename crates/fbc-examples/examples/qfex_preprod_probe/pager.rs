@@ -15,10 +15,12 @@
 //! before it stops, then the read of every named account.
 //!
 //! A provider rate refusal on the pager's socket stops the run, [`Stop::RateRefused`] on
-//! [`RefusedOn::Pager`] (decision 0148 item 8). A page that could not be made (no room in the
-//! shared limiter, or its socket failed) is recorded and stops nothing: the pages are evidence,
-//! and the next page opens the socket again. A maker fill of a stage-three order is flattened
-//! while the session is open, then stops the run, as every unexpected fill does (0151 item 9).
+//! [`RefusedOn::Pager`], and so does a page listing an order that is none of P1 to P3, or a
+//! TWAP, [`Stop::ReadDisagrees`] (decision 0148 item 8). A page that could not be made (no room
+//! in the shared limiter, or its socket failed) is recorded and stops nothing: the pages are
+//! evidence, and the next page opens the socket again. A maker fill of a stage-three order is
+//! flattened while the session is open, then stops the run, as every unexpected fill does (0151
+//! item 9).
 //!
 //! Nothing of a row is kept in the report or the evidence: a page is recorded by its size, its
 //! offset, the names P1 to P3 of ours it listed, and counts. The frames the pager read, their
@@ -152,6 +154,9 @@ pub enum WalkEnd {
     Cut,
     /// A page could not be made ([`Came::Skipped`] or [`Came::Failed`]).
     NotRead,
+    /// A page listed an order that is none of ours, or a TWAP: the run's stop,
+    /// [`Stop::ReadDisagrees`] (decision 0148 item 8).
+    Disagreed,
 }
 
 impl WalkEnd {
@@ -164,6 +169,10 @@ impl WalkEnd {
             }
             WalkEnd::Cut => "cut 60 s after its first page (the reads after a session's patience)",
             WalkEnd::NotRead => "a page that could not be made",
+            WalkEnd::Disagreed => {
+                "a page listing an order or a TWAP not ours, which the streams did not show: the \
+                 run's stop, ReadDisagrees (decision 0148 item 8)"
+            }
         }
     }
 }
@@ -212,8 +221,10 @@ pub fn named(listed: &[Listed], ours: &[Ours]) -> (Vec<&'static str>, usize) {
 }
 
 /// What `attempt`, a page of the pager, came to, by names alone ([`named`]), and the stop it is:
-/// [`Stop::RateRefused`] on [`RefusedOn::Pager`] for a provider rate refusal (decision 0148
-/// item 8), none otherwise.
+/// [`Stop::RateRefused`] on [`RefusedOn::Pager`] for a provider rate refusal, and
+/// [`Stop::ReadDisagrees`] for a page listing an order that is none of `ours`, or a TWAP: a read
+/// showing an order the streams did not show (decision 0148 item 8), which stops the run before
+/// the plan's next action (PR #284's review). None otherwise.
 pub fn came(attempt: &PageAttempt, ours: &[Ours]) -> (Came, Option<Stop>) {
     match attempt {
         PageAttempt::Read {
@@ -223,13 +234,14 @@ pub fn came(attempt: &PageAttempt, ours: &[Ours]) -> (Came, Option<Stop>) {
             ..
         } => {
             let (ours, others) = named(listed, ours);
+            let stop = (others > 0 || *twaps > 0).then_some(Stop::ReadDisagrees);
             let came = Came::Read {
                 ours,
                 others,
                 twaps: *twaps,
                 full: *full,
             };
-            (came, None)
+            (came, stop)
         }
         PageAttempt::Skipped => (Came::Skipped, None),
         PageAttempt::Failed(_) => (Came::Failed, None),

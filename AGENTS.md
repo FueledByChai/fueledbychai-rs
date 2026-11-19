@@ -1091,7 +1091,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     (waiting for room as a drop session's does, a Ctrl-C during that wait, after the cancels, left
     to the reads after the session), or the abrupt drop when those cancels were refused locally or
     met by a rate refusal (`places::Cancels::blocked`), since the account's drop test passed (0151
-    item 11); then the read of every named account, the session's orders (its own, then its
+    item 11), those cancels then the session's stop in their own right when none came before them,
+    `CancelsBlocked`, marked, which says nothing of an order resting (`stage::stage_session_stop`,
+    FBC-3xzn, its local refusal held by the test hook `refuse_stop_cancels`); then the read of
+    every named account, the session's orders (its own, then its
     flatten IOCs) known as ours on its own account, after the abrupt drop read again at the
     comparisons' cadence until a round lists no order of ours or `--agree-wait-ms` ends, or the
     round judged lists an order or a TWAP not ours, shows a position not flat, cannot read a named
@@ -1147,7 +1150,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     its `trade_id` matched with those the tee kept of our `fill_response`s in memory
     (`places::TradeIds`, `tee::Kept::heard_trade`), its side fields against ours
     (`places::Sides`), and a row naming no order of the run counted; a provider rate refusal or
-    Ctrl-C during it is a stop, marked, and a read not made is recorded and stops nothing. With
+    Ctrl-C during it is a stop, marked, then a row naming none of its orders, or none at all,
+    `ReadDisagrees` (0148 item 8; `stage::TAKE_TRADES_OTHERS`), and a read not made is recorded and
+    stops nothing. With
     no stop the account's stage three follows (FBC-4plj; `stage.rs`'s
     `Run::pages_steps`, `pager.rs`; decisions 0132 items 5 and 7, 0148 items 7, 8 and 10), run as
     the crossing session is under `Which::Pages`, after its taker IOC session, so only once its
@@ -1170,7 +1175,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     by name (`Run::page_now`, `pager::named`, `pager::PageRead`), and page 0 shows the order the
     pages list ours in (`pager::order_shown`). A provider rate refusal on the pager, a
     `RateLimited` err or a rise in the limiter's rejected count, is the run's stop,
-    `RateRefused(Pager)`, marked; any other page not made is recorded and stops nothing. A maker
+    `RateRefused(Pager)`, marked, and so is a page listing an order that is none of P1 to P3, or a
+    TWAP, `ReadDisagrees` (0148 item 8; `pager::came`, a walk so ended `pager::WalkEnd::Disagreed`),
+    before the plan's next step; any other page not made is recorded and stops nothing. A maker
     fill of a stage-three order is flattened while the session is open, then stops the run, as
     below. Then the Stop and the reads after it as after a crossing session (`AFTER_PAGES`, each
     stop said as met after the stage-three session), the pager's refusals counted as a read
@@ -1273,7 +1280,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     README of its own. The report and the evidence (`answers_0132`) also answer decision 0132's
     list for each named account (FBC-4plj, 0148 item 10; `answers.rs`), each item in words or as
     fences met from what the run showed, never an id, a price, a size or an amount, and not
-    measured, saying why, where it did not, the items read from the whole run's frames saying so:
+    measured, saying why, where it did not, the items read from the whole run's frames saying so,
+    and an item read from pages or a trades history not all read saying it is of those read alone,
+    never none or agreeing from them (a trades read not whole named by when it was made and why):
     what answers an arm, whether enabling cancels open orders and whether QFEX reports it, the
     drop test, whether a graceful close cancels, whether the other named accounts stayed clean,
     the client ids at the format's full length (`stage_two::FullLength`) and in every character,
@@ -1303,6 +1312,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     `fill_on_trades`, `fill_after_close`, `part_fill_after_close`, `trade_after_close`,
     `trades_err`, `historic_fails`, `touch_moves`, `hold_trades`, `trades_err_page` and
     `hold_trades_page` (the run's `n`th `get_user_trades` page answered an err or held; FBC-4plj),
+    `netting_on_trades_page` (two trades of an order no run placed, one each way, as the run's
+    `n`th `get_user_trades` page is asked), `stray_on_pager_page` (an order not ours or a TWAP on
+    the `n`th page at a limit of 1, in that answer alone; `model::PagerStray`),
     `page_order` (oldest or newest first; FBC-4plj, which reads its pages at a limit of 1) and
     `rate_limit`'s
     `Limited::PagerPage` (the `n`th page asked at a limit of 1, stage three's pager's), and, for
