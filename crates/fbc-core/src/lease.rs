@@ -379,11 +379,21 @@ mod tests {
     #[test]
     fn a_copy_dropped_in_a_process_that_did_not_take_the_lock_does_not_release_it() {
         // A forked child that drops its copy of a lease is a process other than the owner: it
-        // closes its descriptor and leaves the description locked for the parent.
+        // closes its descriptor and leaves the description locked for the parent. The parent's
+        // copy is a HeldLock this process owns, as its lease is, so its drop unlocks the
+        // description and frees the lock even while another descriptor still shares it. A bare
+        // File here would only close, and a sibling test's fork could keep the lock past it
+        // (FBC-1mvz).
         let dir = Scratch::new("owner");
         let path = dir.0.join("lease.lock");
         let mut copy = try_lock(&path).unwrap().unwrap();
-        let parent = copy.file.try_clone().unwrap();
+        let parent = HeldLock {
+            file: copy.file.try_clone().unwrap(),
+            owner: std::process::id(),
+        };
+        // Another descriptor sharing the description, as a sibling test's forked child holds
+        // one until its exec.
+        let shared = copy.file.try_clone().unwrap();
         copy.owner = std::process::id().wrapping_add(1);
         drop(copy);
         assert!(
@@ -391,7 +401,11 @@ mod tests {
             "the parent's descriptor still holds the lock"
         );
         drop(parent);
-        assert!(try_lock(&path).unwrap().is_some());
+        assert!(
+            try_lock(&path).unwrap().is_some(),
+            "free once the parent's copy is dropped, another descriptor still open"
+        );
+        drop(shared);
     }
 
     #[cfg(unix)]
