@@ -2284,6 +2284,13 @@ struct Placed {
 /// ([`Run::admitted`]): longer than any hold QFEX's rate page shows a refusal asking for.
 pub const AFTER_PATIENCE: Duration = Duration::from_secs(60);
 
+/// Why a read of the drop test's orders and their trades after a drop session
+/// ([`Run::read_orders`]) failed once [`AFTER_PATIENCE`] from its start passed with its pages
+/// not all read (FBC-8o7a): the run's bound on the reads after a session, which it gives each
+/// such read whole, so a venue answering new full pages for ever cannot hold the run open.
+pub const HISTORY_CUT: &str = "the get_user_trades and GET /user/historic-orders pages not all \
+                               read within 60 s of the read's start (AFTER_PATIENCE)";
+
 /// How long a graceful close may take before the session's socket is dropped, as
 /// `paradex_testnet_acceptance` waits for one.
 pub const CLOSE_WAIT: Duration = Duration::from_secs(5);
@@ -5216,9 +5223,12 @@ impl Run<'_> {
     /// the shared limiter first; the trades naming each of `orders` (X, then Y after the drop)
     /// counted, each one's `terminal_status` kept as a status name, and the member names the
     /// rows carry. A full page the same as the one before it, row for row, as a venue ignoring
-    /// the offset answers, fails the read rather than paging on. A provider rate refusal is a
-    /// stop. The owner's presses meanwhile, and one made before they end, are taken, none ending
-    /// them: whether one was is the last given.
+    /// the offset answers, fails the read rather than paging on, and the whole read ends within
+    /// [`AFTER_PATIENCE`] of its start ([`HISTORY_CUT`], FBC-8o7a), so a venue answering new
+    /// full pages for ever, on historic orders, which QFEX declares no REST bucket for, too,
+    /// leaves X's history not read whole rather than holding the run open. A provider rate
+    /// refusal is a stop. The owner's presses meanwhile, and one made before they end, are taken,
+    /// none ending them: whether one was is the last given.
     async fn read_orders(
         &mut self,
         which: Which,
@@ -5235,8 +5245,10 @@ impl Run<'_> {
         let mut heard = Refusals::default();
         let mut presses = std::mem::take(&mut self.presses);
         let mut pressed = false;
+        let cut = tokio::time::Instant::now() + AFTER_PATIENCE;
         let read = {
             let read = self.reading_orders(on, since, orders, &mut after, &mut heard);
+            let read = tokio::time::timeout_at(cut, read);
             tokio::pin!(read);
             loop {
                 tokio::select! {
@@ -5246,6 +5258,7 @@ impl Run<'_> {
                 }
             }
         };
+        let read = read.unwrap_or_else(|_| Err((HISTORY_CUT.to_owned(), None)));
         pressed |= presses.try_pressed();
         self.presses = presses;
         heard.limiter = self.rejected().saturating_sub(before);

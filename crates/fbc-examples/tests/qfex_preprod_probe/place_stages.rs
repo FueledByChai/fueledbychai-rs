@@ -177,6 +177,20 @@
 //!   one as the last read after a drop session two that a touch ended between the sessions failed
 //!   outranks LeftResting, X said resting as the read showed it
 //!   (`a_press_as_the_last_read_after_a_touch_ended_between_the_sessions_outranks_left_resting`).
+//!
+//! FBC-8o7a's done line: the read of X's history after drop session one cut `AFTER_PATIENCE`
+//! after it began, against a model answering new full pages without end on pages of one, on a
+//! paused clock the test moves a second a page, with a wall-clock guard:
+//!
+//! - endless historic-orders pages: the read cut at its patience, X left unjudged, the run
+//!   stopped LeftResting, marked, its report and evidence written
+//!   (`endless_historic_orders_pages_leave_x_unjudged_at_the_reads_patience`);
+//! - endless trades pages: the read cut at its patience, X left unjudged, the rows its pages
+//!   showed stopping the run DropFailed, marked
+//!   (`endless_trades_pages_leave_x_unjudged_at_the_reads_patience`);
+//! - a press of Ctrl-C during the endless pages taken, the read still cut at its patience, and
+//!   the press the run's stop
+//!   (`ctrl_c_during_endless_history_pages_is_taken_and_the_run_stops_at_the_reads_patience`).
 
 use super::*;
 
@@ -6612,6 +6626,219 @@ async fn a_full_page_repeating_the_one_before_fails_the_read_of_x_rather_than_pa
         assert_eq!(after.error.as_deref(), Some(why.as_str()), "{after:?}");
         d.venue.assert_served();
     }
+}
+
+// ----- FBC-8o7a: X's history read within the reads' patience -----
+
+/// A place-stage run against `model` on pages of one, whose clock stands still but for the
+/// test's own advance: once the model has answered the first page whose event ends `page`, one
+/// second for each such page it answers, never past [`stage::AFTER_PATIENCE`] from that first
+/// page, which is when the read of X's history began, since nothing moved the clock between.
+/// With `press_at`, the owner presses Ctrl-C once as the model has answered that many such pages.
+/// The run and the virtual time from that first page to the run's end. Panics after two minutes
+/// of wall-clock time, so a run that pages on without end fails instead of hanging.
+async fn endless_run(
+    model: QfexModel,
+    what: &str,
+    page: &str,
+    press_at: Option<usize>,
+) -> (Dropped, Duration) {
+    let frozen = freeze();
+    let (dir, removed) = temp_dir(what);
+    let venue = Venue::start(model).await;
+    let argv = set(drop_argv(&dir, &venue), "--page-size", "1");
+    let (mut opts, places) = parsed(&argv).unwrap();
+    opts.rate_user = user();
+    let env = environment();
+    let printed = venue.printed();
+    let lookup = |var: &str| env.get(var).cloned();
+    let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+    let (mut press, presses) = match press_at {
+        Some(_) => interrupt::Presses::channel(),
+        None => (interrupt::Presses::channel().0, interrupt::Presses::none()),
+    };
+    let ended = std::cell::Cell::new(None);
+    let drive = async {
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = expired.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(120));
+            flag.store(true, Ordering::SeqCst);
+        });
+        let (mut first, mut stepped) = (None, 0);
+        while ended.get().is_none() {
+            assert!(
+                !expired.load(Ordering::SeqCst),
+                "{what}: the run did not end within 120 s: {}",
+                printed.text()
+            );
+            let pages = (venue.log().iter())
+                .filter(|e| e.what.ends_with(page))
+                .count();
+            let now = tokio::time::Instant::now();
+            let start = *first.get_or_insert(now);
+            let left = (start + stage::AFTER_PATIENCE).saturating_duration_since(now);
+            if press_at.is_some_and(|at| stepped < at && at <= pages) {
+                press();
+            }
+            if pages > stepped {
+                let step = Duration::from_secs(u64::try_from(pages - stepped).unwrap());
+                tokio::time::advance(step.min(left)).await;
+                stepped = pages;
+            }
+            if pages == 0 {
+                first = None;
+            }
+            tokio::task::yield_now().await;
+        }
+        first.expect("a page of the endless read")
+    };
+    let ran = async {
+        let hold: stage::Interrupt = Box::pin(std::future::pending());
+        let ran = stage::run_places_until(&opts, &places, &lookup, out, hold, presses).await;
+        ended.set(Some(tokio::time::Instant::now()));
+        ran
+    };
+    let (ran, first) = tokio::join!(ran, drive);
+    drop(frozen);
+    let took = ended.get().expect("the run ended") - first;
+    let printed = printed.text();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    (d, took)
+}
+
+/// Asserts that `d`'s read of X after drop session one was cut at [`stage::AFTER_PATIENCE`],
+/// `took` after its first page, its pages not all read and X left unjudged, with the cut said in
+/// the report and the evidence.
+fn assert_history_cut(d: &Dropped, took: Duration) {
+    assert_eq!(took, stage::AFTER_PATIENCE, "{}", d.printed);
+    let run = d.drop_run();
+    let after = run.after.as_ref().expect("X was read");
+    assert_eq!(
+        after.error.as_deref(),
+        Some(stage::HISTORY_CUT),
+        "{after:?}"
+    );
+    assert_eq!(run.x_unseen, Some(places::Unseen::History), "{run:?}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("a read failed: {}", stage::HISTORY_CUT)),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "- X left unjudged after the session (decision 0005; the owner's ruling under 0151 \
+             item 6): yes"
+        ),
+        "{report}"
+    );
+    assert_eq!(json["drop_tests"][0]["session_one"]["x_unseen"], "History");
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+}
+
+/// The model's event for each `GET /user/historic-orders` page.
+const HISTORIC: &str = "GET /user/historic-orders";
+
+#[test]
+fn the_history_cut_names_the_reads_patience() {
+    let secs = stage::AFTER_PATIENCE.as_secs();
+    assert!(
+        stage::HISTORY_CUT.contains(&format!(" within {secs} s of the read's start")),
+        "{}",
+        stage::HISTORY_CUT
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn endless_historic_orders_pages_leave_x_unjudged_at_the_reads_patience() {
+    // FBC-8o7a: on pages of one, every GET /user/historic-orders page is answered full, with
+    // rows no page before it held, as a venue answering new rows for ever would, and QFEX
+    // declares no REST bucket to stop them. X's trades since its send are read whole, and the
+    // read of X ends AFTER_PATIENCE after it began, its historic orders not read whole: X is left
+    // unjudged, so the run stops LeftResting, marked, X still resting for the owner's hand
+    // cancel, said as left unjudged, never as seen resting (the owner's ruling under 0151 item 6
+    // on FBC-gisx), and no second session runs.
+    let model = QfexModel {
+        endless: Some(model::Endless::Historic),
+        ..QfexModel::default()
+    };
+    let (d, took) = endless_run(model, "drop-endless-historic", HISTORIC, None).await;
+    assert_history_cut(&d, took);
+    let after = d.drop_run().after.as_ref().unwrap();
+    assert!(after.trades_read && after.trades == 0, "{after:?}");
+    assert_stopped(&d, places::Stop::LeftResting);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("LeftResting reading X after drop session one")
+            && said.contains(places::LEFT_UNJUDGED),
+        "{said}"
+    );
+    assert!(d.drop_run().x_resting, "{:?}", d.drop_run());
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL))
+    );
+    assert!(d.drop_run().two.is_none());
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn endless_trades_pages_leave_x_unjudged_at_the_reads_patience() {
+    // FBC-8o7a: on pages of one, every get_user_trades page on a read socket is answered full,
+    // with a trade no page before it held, of an order the model never had, at one page a second
+    // of the paused clock, within the shared limiter's room. The read of X ends AFTER_PATIENCE
+    // after it began, its trades not read whole, so X is left unjudged; the rows its pages
+    // showed name another order, which fails the drop test already and ranks first (FBC-77r8:
+    // what a page showed survives a read not finished), so the run stops DropFailed, marked, X
+    // still resting for the owner's hand cancel, and no second session runs.
+    let model = QfexModel {
+        endless: Some(model::Endless::Trades),
+        ..QfexModel::default()
+    };
+    let (d, took) = endless_run(model, "drop-endless-trades", " get_user_trades", None).await;
+    assert_history_cut(&d, took);
+    let after = d.drop_run().after.as_ref().unwrap();
+    assert!(!after.trades_read && after.trades > 0, "{after:?}");
+    assert_eq!(after.trades_naming_x, 0, "{after:?}");
+    assert_stopped(&d, places::Stop::DropFailed);
+    assert!(d.drop_run().x_resting, "{:?}", d.drop_run());
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", places::HAND_CANCEL))
+    );
+    assert!(d.drop_run().two.is_none());
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (1, 0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctrl_c_during_endless_history_pages_is_taken_and_the_run_stops_at_the_reads_patience() {
+    // FBC-8o7a: as the previous test, but the owner presses Ctrl-C at the third historic-orders
+    // page. The press is taken and ends no read, as before; the read of X still ends at its
+    // patience, its historic orders not read whole, and the press is then the run's stop,
+    // Interrupted, marked, ranking before X left unjudged.
+    let model = QfexModel {
+        endless: Some(model::Endless::Historic),
+        ..QfexModel::default()
+    };
+    let (d, took) = endless_run(model, "drop-endless-pressed", HISTORIC, Some(3)).await;
+    assert_history_cut(&d, took);
+    assert_stopped(&d, places::Stop::Interrupted);
+    let said = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        said.starts_with("Interrupted during the reads after drop session one"),
+        "{said}"
+    );
+    let pages = (d.what().iter()).filter(|w| *w == HISTORIC).count();
+    assert!(pages > 3, "{pages}");
+    assert!(d.drop_run().two.is_none());
 }
 
 // ----- FBC-77r8: the drop test's second session's parts -----
