@@ -46,7 +46,7 @@ futures-util = { version = "=0.3.34", default-features = false }
 # TLS for wss:// and https:// over the same connector (FBC-27a, decision 0020): rustls with the
 # ring crypto provider (not aws-lc-rs), webpki-roots as the default trust anchors. rcgen is
 # test-only: it generates the test CA and server certificates in memory.
-rustls = { version = "=0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = { version = "=1.0.9", default-features = false }
 rcgen = { version = "=0.14.10", default-features = false, features = ["ring"] }
