@@ -5,8 +5,10 @@
 //!
 //! An order-affecting command reaches a gateway only as an [`Authorization`] this crate issued
 //! after its caps and the kill switch (0013 rule 2, 0012), which [`OrderGateway::submit`]
-//! consumes. A command that affects no order (a query, a fee query, a dead-man refresh, turning
-//! cancel-on-disconnect on) goes through [`OrderGateway::submit_control`] as a
+//! consumes. The gateway takes it over ([`Authorization::hand_over`]) before it checks it at
+//! submit, encodes it or reports anything of it: dropped before then, it releases its orders
+//! (decision 0152). A command that affects no order (a query, a fee query, a dead-man refresh,
+//! turning cancel-on-disconnect on) goes through [`OrderGateway::submit_control`] as a
 //! [`ControlCommand`], which cannot carry an order-affecting one. The traits live here, not in
 //! `fbc-core`, because `fbc-core` cannot name this crate's types; a gateway's crate depends on
 //! `fbc-oms`, never the reverse.
@@ -52,7 +54,10 @@ impl ControlCommand {
 /// socket write.
 pub trait OrderGateway {
     /// Submits the order-affecting command `fbc-oms` authorized, for the account and market the
-    /// authorization names. The authorization is spent: it is never submitted twice.
+    /// authorization names. The authorization is spent: it is never submitted twice. The
+    /// gateway takes it over ([`Authorization::hand_over`]) before it runs the check at submit
+    /// ([`Handed::check_at_submit`](crate::Handed::check_at_submit)), encodes the command or
+    /// reports anything of it, and reports what became of it (decision 0152).
     fn submit(
         &mut self,
         auth: Authorization,

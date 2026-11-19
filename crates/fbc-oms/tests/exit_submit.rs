@@ -31,9 +31,9 @@ use fbc_core::{
     SignedLots, SubmitOutcome, TagSet, Ticks, WallNs,
 };
 use fbc_oms::{
-    Admission, Authorization, CancelChoice, FillLedger, FillRouted, LadderConfig, Leases,
-    LedgerConfig, MarketCapsConfig, OrderKey, OrderOp, PermittedCommand, PreTradeCaps, Registry,
-    ResyncSnapshot, StaleAuthorization, TestnetRun,
+    Admission, CancelChoice, FillLedger, FillRouted, Handed, LadderConfig, Leases, LedgerConfig,
+    MarketCapsConfig, OrderKey, OrderOp, PermittedCommand, PreTradeCaps, Registry, ResyncSnapshot,
+    StaleAuthorization, TestnetRun,
 };
 
 const INST: InstrumentId = InstrumentId::new(1);
@@ -145,8 +145,9 @@ fn open(reg: &mut Registry, order: NewOrder, v: &str) -> ClientOrderId {
     c
 }
 
-fn authorize(reg: &mut Registry, cmd: PermittedCommand) -> Authorization {
-    reg.authorize(ACCT, cmd).unwrap()
+/// Authorizes `cmd` and hands it to a gateway, which checks it at submit (decision 0152).
+fn authorize(reg: &mut Registry, cmd: PermittedCommand) -> Handed {
+    reg.authorize(ACCT, cmd).unwrap().hand_over()
 }
 
 fn ledger() -> FillLedger {
@@ -229,7 +230,7 @@ fn an_exit_place_batch_or_amend_authorized_before_a_fill_moved_the_position_is_r
 }
 
 /// One of Exit's three builds on `reg`: `kind` is "place", "batch" or "amend".
-fn exits_one(reg: &mut Registry, pos: i64, kind: &'static str) -> (&'static str, Authorization) {
+fn exits_one(reg: &mut Registry, pos: i64, kind: &'static str) -> (&'static str, Handed) {
     let side = reducing(pos);
     let cmd = match kind {
         "place" => reg.place(exit_of(side, POS)).unwrap(),

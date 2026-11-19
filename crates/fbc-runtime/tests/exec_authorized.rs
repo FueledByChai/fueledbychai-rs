@@ -3,7 +3,7 @@
 //! authorized batch with exactly one reserved nonce per item; an authorization fbc-oms's check
 //! at submit refuses, because the kill switch went on, the market was disarmed or its state
 //! changed after it was issued, comes back `NotSent(StaleAuthorization)` with no nonce reserved
-//! and no byte written, since `ExecSession::send` runs `Authorization::check_at_submit` before
+//! and no byte written, since `ExecSession::send` runs `Handed::check_at_submit` before
 //! encoding every authorized command, so a change while the command waits in the session's
 //! queue is seen too; and a cancel issued before the change still goes out, as the check passes
 //! every cancel. The kill switch's instrument cancel-all is checked against 0005's I7 guard it

@@ -1,15 +1,31 @@
-error: cannot construct `Authorization` with struct literal syntax due to private fields
-  --> tests/ui_authorization/place_literal.rs:7:5
+error[E0560]: struct `Authorization` has no field named `acct`
+ --> tests/ui_authorization/place_literal.rs:8:9
+  |
+8 |         acct,
+  |         ^^^^ `Authorization` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0560]: struct `Authorization` has no field named `market`
+ --> tests/ui_authorization/place_literal.rs:9:9
+  |
+9 |         market: order.inst,
+  |         ^^^^^^ `Authorization` does not have this field
+  |
+  = note: all struct fields are already assigned
+
+error[E0560]: struct `Authorization` has no field named `generation`
+  --> tests/ui_authorization/place_literal.rs:10:9
    |
- 7 |     Authorization {
-   |     ^^^^^^^^^^^^^
- 8 |         acct,
-   |         ---- private field
- 9 |         market: order.inst,
-   |         ------------------ private field
 10 |         generation: other.generation(),
-   |         ------------------------------ private field
-11 |         cmd: VenueCommand::Place(order),
-   |         ------------------------------- private field
+   |         ^^^^^^^^^^ `Authorization` does not have this field
    |
-   = note: ...and other private fields `guard` and `trips` that were not provided
+   = note: all struct fields are already assigned
+
+error[E0560]: struct `Authorization` has no field named `cmd`
+  --> tests/ui_authorization/place_literal.rs:11:9
+   |
+11 |         cmd: VenueCommand::Place(order),
+   |         ^^^ `Authorization` does not have this field
+   |
+   = note: all struct fields are already assigned

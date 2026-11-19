@@ -14,8 +14,10 @@
 //! the registry that built it, and an amend's build token names that registry with its order
 //! and build number, so no other registry authorizes it or releases its reservation (decision
 //! 0082). A place's or a batch's command holds its orders: dropped unauthorized and not
-//! withdrawn, it hands them back to its registry, which ends each not sent ([`DroppedPlaces`];
-//! decision 0084), so no held place is stranded.
+//! withdrawn, it hands them back to its registry, which ends each not sent ([`Dropped`];
+//! decision 0084), so no held place is stranded. The [`Authorization`](crate::Authorization)
+//! issued from a place, a batch or an amend holds its orders, or the amend's build, until a
+//! gateway takes it over (decision 0152).
 //!
 //! A cancel names its order by the reference design §4.9 orders, as the venue's
 //! [`OrderCaps`] declare them (0032): the venue id when it is known and a cancel can name it;
@@ -133,7 +135,11 @@ pub enum AmendRefusal {
 /// another registry, on another thread), it hands its orders back to the registry that built
 /// it, which ends each still held not sent
 /// ([`NotSentReason::StaleAuthorization`](fbc_core::NotSentReason::StaleAuthorization)) at
-/// its next mutating call, freeing what it counted (decision 0084).
+/// its next mutating call, freeing what it counted (decision 0084). The authorization issued
+/// from a place, a batch or an amend holds its orders, or the amend's build, until a gateway
+/// takes it over ([`Authorization::hand_over`](crate::Authorization::hand_over), decision
+/// 0152); an amend's command itself holds nothing, and is withdrawn with
+/// [`Registry::amend_not_submitted`](crate::Registry::amend_not_submitted).
 #[derive(Eq, PartialEq, Debug)]
 pub struct PermittedCommand {
     cmd: VenueCommand,
@@ -160,20 +166,17 @@ impl PermittedCommand {
         &self.cmd
     }
 
-    /// The command and its guard, for the authorization issued from it, which spends its
-    /// hold on its orders.
-    pub(crate) fn into_parts(self) -> (VenueCommand, Guard) {
+    /// The command, its guard and its hold, issued: for the authorization issued from it,
+    /// which keeps the hold on a place's or a batch's orders until a gateway takes it over
+    /// (decision 0152).
+    pub(crate) fn into_parts(self) -> (VenueCommand, Guard, Hold) {
         let PermittedCommand {
-            cmd,
-            guard,
-            mut hold,
-            ..
+            cmd, guard, hold, ..
         } = self;
-        hold.spend();
-        (cmd, guard)
+        (cmd, guard, hold.issued())
     }
 
-    /// Spends its hold on its orders: its registry withdrew them itself.
+    /// Spends its hold on what its build reserved: its registry withdrew or released it itself.
     pub(crate) fn spend_hold(&mut self) {
         self.hold.spend();
     }
@@ -214,11 +217,11 @@ impl PermittedCommand {
         cmd: VenueCommand,
         guard: Guard,
         origin: Instance,
-        dropped: &Arc<DroppedPlaces>,
+        dropped: &Arc<Dropped>,
     ) -> PermittedCommand {
         let cids = places_of(&cmd);
         PermittedCommand {
-            hold: Hold(Some(Box::new((Arc::clone(dropped), cids)))),
+            hold: Hold::on(dropped, Release::Held(cids)),
             ..PermittedCommand::guarded(cmd, guard, origin)
         }
     }
@@ -248,53 +251,97 @@ pub(crate) fn places_of(cmd: &VenueCommand) -> Vec<ClientOrderId> {
     }
 }
 
-/// The orders of a registry whose place or batch command was dropped while it still held
-/// them, neither authorized nor withdrawn (decision 0084): the registry ends each still held not
-/// sent at its next mutating call. Shared by the
-/// registry with the commands it builds, which may be dropped on any thread.
-#[derive(Debug, Default)]
-pub(crate) struct DroppedPlaces {
-    /// Whether `cids` may hold any: read without the lock on every mutating call.
-    any: AtomicBool,
-    cids: Mutex<Vec<ClientOrderId>>,
+/// What a dropped command or authorization hands back to its registry (decisions 0084, 0152).
+#[derive(Clone, Eq, PartialEq, Debug)]
+pub(crate) enum Release {
+    /// The orders of a place or a batch whose command was dropped while it still held them,
+    /// neither authorized nor withdrawn: each still held ends not sent.
+    Held(Vec<ClientOrderId>),
+    /// The orders of a place or a batch whose authorization was dropped before a gateway took
+    /// it over: each that nothing was reported for since ends not sent.
+    Issued(Vec<ClientOrderId>),
+    /// The amend of the order built as the number given, whose authorization was dropped before
+    /// a gateway took it over: withdrawn while it is still the build its order holds.
+    Amend(ClientOrderId, u64),
 }
 
-impl DroppedPlaces {
-    fn hand_back(&self, cids: Vec<ClientOrderId>) {
-        let mut held = self.cids.lock().unwrap_or_else(PoisonError::into_inner);
-        held.extend(cids);
+/// What the commands and authorizations of a registry handed back when they were dropped
+/// holding what their build reserved (decisions 0084, 0152): the registry releases it at its
+/// next mutating call. Shared by the registry with the commands it builds and the
+/// authorizations it issues, which may be dropped on any thread.
+#[derive(Debug, Default)]
+pub(crate) struct Dropped {
+    /// Whether `released` may hold any: read without the lock on every mutating call.
+    any: AtomicBool,
+    released: Mutex<Vec<Release>>,
+}
+
+impl Dropped {
+    fn hand_back(&self, release: Release) {
+        let mut held = self.released.lock().unwrap_or_else(PoisonError::into_inner);
+        held.push(release);
         self.any.store(true, Ordering::Release);
     }
 
-    /// The orders handed back since the last call, in the order handed back.
-    pub(crate) fn take(&self) -> Vec<ClientOrderId> {
+    /// What was handed back since the last call, in the order handed back.
+    pub(crate) fn take(&self) -> Vec<Release> {
         if !self.any.load(Ordering::Acquire) {
             return Vec::new();
         }
-        let mut held = self.cids.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut held = self.released.lock().unwrap_or_else(PoisonError::into_inner);
         self.any.store(false, Ordering::Release);
         std::mem::take(&mut *held)
     }
 }
 
-/// A place's or a batch's hold on its orders: dropped unspent, it hands them back to its
-/// registry's [`DroppedPlaces`]. It is not part of what the command is: commands compare
-/// equal whatever their holds. Boxed, so it adds one pointer to every command.
+/// A command's or an authorization's hold on what its build reserved: dropped unspent, it hands
+/// it back to its registry's [`Dropped`]. It is not part of what the command is: commands
+/// compare equal whatever their holds. Boxed, so it adds one pointer to every command.
 #[derive(Debug, Default)]
-struct Hold(Option<Box<(Arc<DroppedPlaces>, Vec<ClientOrderId>)>>);
+pub(crate) struct Hold(Option<Box<(Arc<Dropped>, Release)>>);
 
 impl Hold {
-    /// The authorization issued from the command, or its withdrawal, took its orders.
-    fn spend(&mut self) {
+    /// A hold on `release`, handed back to `dropped` should it be dropped unspent.
+    pub(crate) fn on(dropped: &Arc<Dropped>, release: Release) -> Hold {
+        Hold(Some(Box::new((Arc::clone(dropped), release))))
+    }
+
+    /// Its registry withdrew or released what it holds, or a gateway took it over: it hands
+    /// nothing back.
+    pub(crate) fn spend(&mut self) {
         self.0 = None;
+    }
+
+    /// Spends it, giving what it held: what its registry releases at once.
+    pub(crate) fn take(&mut self) -> Option<Release> {
+        self.0.take().map(|held| held.1)
+    }
+
+    /// Spends it, giving where it hands back and what, for a hold kept dormant
+    /// ([`Hold::wake`]).
+    pub(crate) fn sleep(&mut self) -> Option<(Arc<Dropped>, Release)> {
+        self.0.take().map(|held| *held)
+    }
+
+    /// A hold again on what [`Hold::sleep`] gave.
+    pub(crate) fn wake(dormant: Option<(Arc<Dropped>, Release)>) -> Hold {
+        Hold(dormant.map(Box::new))
+    }
+
+    /// The hold the authorization issued from its command keeps: a place's or a batch's orders,
+    /// no longer held but issued, or an amend's build as it was.
+    fn issued(mut self) -> Hold {
+        match self.sleep() {
+            Some((dropped, Release::Held(cids))) => Hold::on(&dropped, Release::Issued(cids)),
+            other => Hold::wake(other),
+        }
     }
 }
 
 impl Drop for Hold {
     fn drop(&mut self) {
-        if let Some(held) = self.0.take() {
-            let (dropped, cids) = *held;
-            dropped.hand_back(cids);
+        if let Some((dropped, release)) = self.sleep() {
+            dropped.hand_back(release);
         }
     }
 }
@@ -426,7 +473,9 @@ impl<'r> Live<'r> {
     /// ([`OrderRecord::amend_built`]), so a check after it, of this order or another, sees
     /// it; it becomes the amend in flight when it is reported sent
     /// ([`Registry::amend_sent`](crate::Registry::amend_sent)), and an order whose amend was
-    /// built and never sent gets no further Live permit: it can still be cancelled.
+    /// built and never sent gets no further Live permit: it can still be cancelled. The
+    /// authorization issued from its command holds the build: dropped before a gateway takes it
+    /// over, the build is withdrawn at the registry's next mutating call (decision 0152).
     pub fn amend(
         self,
         caps: &OrderCaps,
@@ -741,7 +790,7 @@ mod tests {
     #[test]
     fn a_hold_is_no_part_of_what_a_command_is_and_only_an_unspent_one_hands_its_orders_back() {
         let origin = Instance::default();
-        let dropped = Arc::new(DroppedPlaces::default());
+        let dropped = Arc::new(Dropped::default());
         let order = placement(cid(), 100, 1);
         let c = order.cid;
         let place = VenueCommand::Place(order);
@@ -753,12 +802,40 @@ mod tests {
         );
         assert!(dropped.take().is_empty());
         drop(holding);
-        assert_eq!(dropped.take(), vec![c]);
+        assert_eq!(dropped.take(), vec![Release::Held(vec![c])]);
         assert!(dropped.take().is_empty());
         // Spent, it hands nothing back.
-        let mut spent = PermittedCommand::holding(place, Guard::default(), origin, &dropped);
+        let mut spent =
+            PermittedCommand::holding(place.clone(), Guard::default(), origin, &dropped);
         spent.spend_hold();
         drop(spent);
+        assert!(dropped.take().is_empty());
+        // Issued, its hold hands the orders back as issued, once.
+        let (_, _, hold) =
+            PermittedCommand::holding(place, Guard::default(), origin, &dropped).into_parts();
+        assert!(dropped.take().is_empty());
+        drop(hold);
+        assert_eq!(dropped.take(), vec![Release::Issued(vec![c])]);
+    }
+
+    #[test]
+    fn an_issued_amend_s_hold_hands_its_build_back_as_it_was_and_a_dormant_one_hands_back_nothing()
+    {
+        let dropped = Arc::new(Dropped::default());
+        let c = cid();
+        let hold = Hold::on(&dropped, Release::Amend(c, 3)).issued();
+        drop(hold);
+        assert_eq!(dropped.take(), vec![Release::Amend(c, 3)]);
+        // Asleep, it hands nothing back; woken, it does again.
+        let mut hold = Hold::on(&dropped, Release::Amend(c, 4));
+        let dormant = hold.sleep();
+        drop(hold);
+        assert!(dropped.take().is_empty());
+        drop(Hold::wake(dormant));
+        assert_eq!(dropped.take(), vec![Release::Amend(c, 4)]);
+        // A hold on nothing stays one, issued or woken.
+        drop(Hold::default().issued());
+        drop(Hold::wake(None));
         assert!(dropped.take().is_empty());
     }
 }

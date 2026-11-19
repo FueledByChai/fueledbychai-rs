@@ -1067,7 +1067,7 @@ fn a_liquidation_voids_an_exit_authorization_built_before_it() {
         ..placement(cid(), 101, qty)
     };
     let cmd = reg.place(exit(10)).unwrap();
-    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap().hand_over();
     assert_eq!(auth.check_at_submit(), Ok(()));
     let mut l = ledger();
     let held = liquidation("LIQUIDATION:held", None, Side::Sell, 4);

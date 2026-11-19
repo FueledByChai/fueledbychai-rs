@@ -884,4 +884,10 @@ async fn a_ladder_command_whose_session_fails_before_reporting_it_is_handed_back
         decide.unsubmitted
     );
     assert_eq!(host.unsubmitted(), 1);
+    // Given back unspent, though the session took it over before failing: withdrawn, it
+    // releases its place (decision 0152).
+    let Some(Unsubmitted::Authorized(auth)) = decide.unsubmitted.pop() else {
+        unreachable!("matched above");
+    };
+    assert!(decide.oms.reg.withdraw(auth));
 }

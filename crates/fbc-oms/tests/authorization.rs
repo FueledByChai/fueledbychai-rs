@@ -144,6 +144,8 @@ impl OrderGateway for Recording {
         _t: &mut PathStamps<'_>,
     ) -> SubmitHandle {
         let rpc = self.rpc();
+        // Taken over before it is checked, so its drop releases nothing (decision 0152).
+        let auth = auth.hand_over();
         match auth.check_at_submit() {
             Ok(()) => {
                 self.seen

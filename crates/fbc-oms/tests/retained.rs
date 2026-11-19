@@ -145,7 +145,7 @@ fn not_sent() -> SubmitOutcome {
 fn open(reg: &mut Registry, acct: AccountKey, order: NewOrder, v: &str) -> ClientOrderId {
     let c = order.cid;
     let cmd = reg.place(order).unwrap();
-    drop(reg.authorize(acct, cmd).unwrap());
+    drop(reg.authorize(acct, cmd).unwrap().hand_over());
     reg.on_outcome(c, OrderOp::Place, &item(Some(v)), &accepted(), MonoNs(1))
         .unwrap();
     assert_eq!(reg.get(c).unwrap().state(), OrdState::Open);
@@ -245,15 +245,16 @@ fn a_retained_place_is_still_authorized_when_nothing_it_was_judged_on_breaches_t
     let retained = reg.place(buy(CAP)).unwrap();
     // A sell fill moves the position away from the buy's side: the worst case shrinks.
     position(&mut reg, &mut l, Side::Sell, 5, "f1");
-    let auth = reg.authorize(ACCT, retained).unwrap();
+    let auth = reg.authorize(ACCT, retained).unwrap().hand_over();
     assert!(auth.check_at_submit().is_ok());
     // Two places built back to back, each counted when the other was judged: authorized in
     // either order.
     let mut reg = registry();
     let first = reg.place(buy(20)).unwrap();
     let second = reg.place(buy(30)).unwrap();
-    assert!(reg.authorize(ACCT, second).is_ok());
-    assert!(reg.authorize(ACCT, first).is_ok());
+    // Each taken over by a gateway, so neither is released by its drop (decision 0152).
+    drop(reg.authorize(ACCT, second).unwrap().hand_over());
+    drop(reg.authorize(ACCT, first).unwrap().hand_over());
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(50)));
 }
 
@@ -490,7 +491,7 @@ fn a_place_handed_to_a_gateway_is_reported_not_sent_by_client_id() {
     let order = buy(5);
     let c = order.cid;
     let cmd = reg.place(order).unwrap();
-    drop(reg.authorize(ACCT, cmd).unwrap());
+    drop(reg.authorize(ACCT, cmd).unwrap().hand_over());
     reg.on_outcome(c, OrderOp::Place, &item(None), &not_sent(), MonoNs(1))
         .unwrap();
     assert!(reg.get(c).unwrap().state().is_terminal());

@@ -328,7 +328,7 @@ fn an_orphan_suppresses_the_adding_side_for_the_configured_cooldown() {
     let before = reg.entry(INST).generation();
     // A place built and authorized before the resync, not yet sent.
     let cmd = reg.place(buy(1)).unwrap();
-    let waiting = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    let waiting = reg.authorize(arm::TEST_ACCT, cmd).unwrap().hand_over();
     assert_eq!(reg.orphan_cooldown(INST), None);
 
     let o = cid();
@@ -1040,7 +1040,7 @@ fn during_the_cooldown_a_place_built_before_a_fill_moved_the_position_is_refused
     // Moved after its authorization: refused at submit.
     let (mut reg, late, cmd) = setup();
     let mut l = ledger();
-    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap().hand_over();
     assert_eq!(auth.check_at_submit(), Ok(()));
     fill_at(
         &mut reg,
@@ -1129,7 +1129,7 @@ fn during_the_cooldown_an_amend_built_before_a_fill_moved_the_position_is_refuse
         .unwrap()
         .amend(&amending, Ticks(102), lots(17), false)
         .unwrap();
-    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap().hand_over();
     fill_at(
         &mut reg,
         &mut l,
@@ -1224,7 +1224,7 @@ fn a_place_authorized_during_the_cooldown_is_refused_at_submit_once_another_orph
     );
     assert_eq!(reg.orphan_cooldown(INST), Some(Cooldown::Pending));
     let cmd = reg.place(sell(20)).unwrap();
-    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap().hand_over();
     assert_eq!(auth.check_at_submit(), Ok(()));
     resync_at(
         &mut reg,
@@ -1832,7 +1832,7 @@ fn a_place_authorized_during_the_cooldown_is_refused_at_submit_once_a_resync_sho
     );
     assert_eq!(reg.orphans(INST), vec![o]);
     let cmd = reg.place(sell(15)).unwrap();
-    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap();
+    let auth = reg.authorize(arm::TEST_ACCT, cmd).unwrap().hand_over();
     assert_eq!(auth.check_at_submit(), Ok(()));
     resync_at(
         &mut reg,

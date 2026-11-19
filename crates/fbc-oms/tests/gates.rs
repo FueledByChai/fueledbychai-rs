@@ -1040,7 +1040,7 @@ fn a_batch_carries_its_places_guard_to_submit() {
     // (the kill switch), it is stale and is never sent.
     let caps = batching();
     let mut reg = quoting(0);
-    let plan = planner()
+    let mut plan = planner()
         .plan(
             &bids(3),
             &mut reg,
@@ -1051,7 +1051,7 @@ fn a_batch_carries_its_places_guard_to_submit() {
         )
         .unwrap();
     assert_eq!(kinds(&plan), vec![("batch", 3)]);
-    let batch = &plan.commands[0].auth;
+    let batch = plan.commands.remove(0).auth.hand_over();
     assert!(batch.check_at_submit().is_ok());
     reg.kill(INST);
     assert!(batch.check_at_submit().is_err());
