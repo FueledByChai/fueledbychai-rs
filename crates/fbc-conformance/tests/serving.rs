@@ -4,13 +4,23 @@
 //! failure; its pusher sends an open connection unsolicited frames and closes it, with or
 //! without a code, and is refused on a closed one; and the record still tells a client's close
 //! from a dropped socket. Step scripts are untouched: their own tests run unchanged.
+//!
+//! And FBC-4ptk's (decisions 0025 and 0150), each ordered by the client's reads and the stub's
+//! records, never by a time: a pusher's barrier resolves only once the client has read every
+//! frame asked before it, two on one connection each resolve in order, and one on a closed
+//! connection resolves false; a responder's first answer held until another connection's close
+//! or end is recorded is released by it, with each refusal of a hold failing that answer alone.
 
 use std::io::ErrorKind;
+use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use fbc_conformance::{
-    Frame, HttpRoutes, PushError, Responder, ScriptError, Step, StubServer, WsScript,
+    ConnectionsView, Frame, HttpRoutes, PushError, Responder, ScriptError, Step, StubServer,
+    WsScript,
 };
 use fbc_runtime::ws::{Message, WebSocket};
 use fbc_runtime::{Connector, ProxyConfig};
@@ -84,6 +94,19 @@ async fn until(what: &str, done: impl Fn() -> bool) {
         }
     })
     .await
+}
+
+/// Polls `f` once, without waiting: whether it has resolved at this point of the client's reads.
+fn poll_once<F: Future>(f: Pin<&mut F>) -> Poll<F::Output> {
+    f.poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// The next message the stub sent, a ping included.
+async fn next(ws: &mut WebSocket) -> Message {
+    within("the stub's next message", ws.next())
+        .await
+        .unwrap()
+        .unwrap()
 }
 
 /// Reads the client's side to its end, so its close reply goes.
@@ -398,4 +421,269 @@ async fn a_step_script_lists_its_one_failure_and_a_finished_one_none() {
     let err = failed.finished().await.unwrap_err();
     assert_eq!(err, ScriptError::NoConnection { step: 0, conn: 0 });
     assert_eq!(failed.failures(), [err]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_resolves_only_once_the_client_has_read_every_frame_asked_before_it() {
+    let (script, pusher) = WsScript::serving(numbered);
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    let mut ws = open(&server).await;
+    // An answer and a push are asked before the barrier.
+    send(&mut ws, "place").await;
+    until("the answer to place", || server.played() == 1).await;
+    pusher.push(0, Frame::text("fill")).await.unwrap();
+    let mut barrier = pin!(pusher.barrier(0));
+    assert!(poll_once(barrier.as_mut()).is_pending());
+    // A push asked after it is written only once its ping was; the client has read nothing, so
+    // the barrier still waits.
+    pusher.push(0, Frame::text("after")).await.unwrap();
+    assert!(poll_once(barrier.as_mut()).is_pending());
+    assert_eq!(recv_text(&mut ws).await, "0:1:place");
+    assert_eq!(recv_text(&mut ws).await, "fill");
+    // The client reads the ping; its next read writes the pong.
+    assert!(next(&mut ws).await.is_ping());
+    assert_eq!(recv_text(&mut ws).await, "after");
+    assert!(within("the barrier's pong", barrier).await);
+    assert!(server.failures().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_barriers_on_one_connection_each_resolve_in_order() {
+    let (script, pusher) = WsScript::serving(numbered);
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    let mut ws = open(&server).await;
+    until("connection 0's upgrade", || server.live() == 1).await;
+    let mut first = pin!(pusher.barrier(0));
+    assert!(poll_once(first.as_mut()).is_pending());
+    pusher.push(0, Frame::text("between")).await.unwrap();
+    let mut second = pin!(pusher.barrier(0));
+    assert!(poll_once(second.as_mut()).is_pending());
+    // Written once both pings were: both are pending together.
+    pusher.push(0, Frame::text("last")).await.unwrap();
+    assert!(poll_once(first.as_mut()).is_pending());
+    assert!(poll_once(second.as_mut()).is_pending());
+    // The client reads the first ping, and its next read writes the pong: the first resolves,
+    // while the second, whose ping the client has not read, still waits.
+    assert!(next(&mut ws).await.is_ping());
+    assert_eq!(recv_text(&mut ws).await, "between");
+    assert!(within("the first barrier's pong", first).await);
+    assert!(poll_once(second.as_mut()).is_pending());
+    assert!(next(&mut ws).await.is_ping());
+    assert_eq!(recv_text(&mut ws).await, "last");
+    assert!(within("the second barrier's pong", second).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_whose_ping_cannot_be_written_resolves_false_after_every_barrier_before_it() {
+    let (script, pusher) = WsScript::serving(numbered);
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    let mut ws = open(&server).await;
+    until("connection 0's upgrade", || server.live() == 1).await;
+    let mut first = pin!(pusher.barrier(0));
+    assert!(poll_once(first.as_mut()).is_pending());
+    // The stub's close: no later write on the connection goes, though it still reads pongs.
+    pusher.close(0).await.unwrap();
+    let mut second = pin!(pusher.barrier(0));
+    assert!(poll_once(second.as_mut()).is_pending());
+    // A push asked after the second barrier is refused, so its ping, which did not go, was
+    // taken: it still waits for the first.
+    let refused = pusher.push(0, Frame::text("after")).await;
+    assert_eq!(refused, Err(PushError::Closed { conn: 0 }));
+    assert!(poll_once(second.as_mut()).is_pending());
+    // The client reads the first ping, and its next read, of the stub's close, writes the pong:
+    // the first resolves true, and the second false behind it.
+    assert!(next(&mut ws).await.is_ping());
+    assert!(next(&mut ws).await.is_close());
+    assert!(within("the first barrier's pong", first).await);
+    assert_eq!(poll_once(second.as_mut()), Poll::Ready(false));
+
+    // With no barrier before it, one whose ping cannot be written resolves false at once, while
+    // the connection, whose client has read nothing, is still open.
+    let _quiet = open(&server).await;
+    let upgraded = || server.connections().get(1).is_some_and(|c| c.upgraded);
+    until("connection 1's upgrade", upgraded).await;
+    pusher.close(1).await.unwrap();
+    assert!(!within("the unwritten barrier", pusher.barrier(1)).await);
+    assert!(server.connections()[1].open);
+    assert!(server.failures().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_on_a_closed_connection_resolves_false() {
+    let (script, pusher) = WsScript::serving(numbered);
+    // A script that runs on no stub has no connection.
+    assert!(!pusher.barrier(0).await);
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    // A connection the client dropped.
+    let dropped = open(&server).await;
+    until("connection 0's upgrade", || server.live() == 1).await;
+    drop(dropped);
+    until("connection 0's drop", || !server.connections()[0].open).await;
+    assert!(!pusher.barrier(0).await);
+    // A connection never accepted.
+    assert!(!pusher.barrier(7).await);
+    // A connection that ends after the ping went and before the client's pong.
+    let ending = open(&server).await;
+    until("connection 1's upgrade", || server.live() == 1).await;
+    let mut barrier = pin!(pusher.barrier(1));
+    assert!(poll_once(barrier.as_mut()).is_pending());
+    pusher.push(1, Frame::text("after")).await.unwrap();
+    drop(ending);
+    assert!(!within("the barrier's end", barrier).await);
+    assert!(server.failures().is_empty());
+}
+
+/// Connection `conn`'s responder in the hold tests: it answers each text frame with
+/// `<conn>:<text>:ended=[..]`, listing the connections whose record showed the client's close
+/// frame or their end when the answer was computed.
+fn seeing(conn: usize, view: Arc<OnceLock<ConnectionsView>>) -> Responder {
+    Responder::new(move |frame| {
+        let Frame::Text(text) = frame else {
+            return Ok(Vec::new());
+        };
+        let conns = view.get().expect("the stub started").connections();
+        let ended = conns.iter().enumerate();
+        let ended = ended.filter(|(_, c)| c.client_closed || !c.open);
+        let ended: Vec<String> = ended.map(|(at, _)| at.to_string()).collect();
+        let answer = format!("{conn}:{text}:ended=[{}]", ended.join(","));
+        Ok(vec![Frame::text(answer)])
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_first_answer_held_until_another_connections_close_or_end_is_released_by_it() {
+    let view = Arc::new(OnceLock::new());
+    let (asked_tx, mut asked) = tokio::sync::mpsc::unbounded_channel();
+    let made = view.clone();
+    // Connection 2 reads once connection 0 has closed, and connection 3 once 1 has ended. Each
+    // hold tells the test it was asked, as the first frame arrives.
+    let (script, _pusher) = WsScript::serving(move |conn| {
+        let with = seeing(conn, made.clone());
+        let asked = asked_tx.clone();
+        match conn {
+            2 | 3 => with.hold_first(move |frame| {
+                let _ = asked.send((conn, frame.clone()));
+                Some(conn - 2)
+            }),
+            _ => with,
+        }
+    });
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    view.set(server.connections_view()).ok().unwrap();
+    let mut closing = open(&server).await;
+    send(&mut closing, "place").await;
+    assert_eq!(recv_text(&mut closing).await, "0:place:ended=[]");
+    let mut dropping = open(&server).await;
+    send(&mut dropping, "place").await;
+    assert_eq!(recv_text(&mut dropping).await, "1:place:ended=[]");
+
+    // Connection 2's first frame arrives while connection 0 is open, and a second behind it.
+    let mut after_close = open(&server).await;
+    send(&mut after_close, "auth").await;
+    send(&mut after_close, "page").await;
+    let first = within("connection 2's hold", asked.recv()).await;
+    assert_eq!(first, Some((2, Frame::text("auth"))));
+    // Every other connection is served meanwhile.
+    send(&mut dropping, "more").await;
+    assert_eq!(recv_text(&mut dropping).await, "1:more:ended=[]");
+    // Connection 0's close releases it: both answers are computed after the record showed it,
+    // in order. The stub records the client's close frame and the connection's end in one turn
+    // here, so this shows the release by both together; `src/serving.rs`'s unit test shows
+    // each releasing it alone.
+    closing.close(None).await.unwrap();
+    assert_eq!(recv_text(&mut after_close).await, "2:auth:ended=[0]");
+    assert_eq!(recv_text(&mut after_close).await, "2:page:ended=[0]");
+    drain(&mut closing).await;
+
+    // Connection 3's first answer waits for connection 1's end, a drop with no close frame.
+    let mut after_drop = open(&server).await;
+    send(&mut after_drop, "auth").await;
+    let first = within("connection 3's hold", asked.recv()).await;
+    assert_eq!(first, Some((3, Frame::text("auth"))));
+    drop(dropping);
+    assert_eq!(recv_text(&mut after_drop).await, "3:auth:ended=[0,1]");
+    // Only the first answer is held: a later frame is answered at once.
+    send(&mut after_close, "again").await;
+    assert_eq!(recv_text(&mut after_close).await, "2:again:ended=[0,1]");
+    assert!(server.failures().is_empty());
+    assert_eq!(server.played(), 7);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_hold_fails_its_first_answer_alone_and_none_answers_at_once() {
+    let (script, _pusher) = WsScript::serving(|conn| match conn {
+        0 => numbered(0).hold_first(|_| Some(9)),
+        1 => numbered(1).hold_first(|_| panic!("no hold")),
+        _ => numbered(conn).hold_first(|_| None),
+    });
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    let mut unaccepted = open(&server).await;
+    let mut panicking = open(&server).await;
+    let mut none = open(&server).await;
+    // A hold naming no connection answers at once, while connections 0 and 1 are open.
+    send(&mut none, "auth").await;
+    assert_eq!(recv_text(&mut none).await, "2:1:auth");
+    // A hold naming a connection the stub has not accepted, or panicking, fails the first
+    // answer alone: the next frame is answered.
+    for ws in [&mut unaccepted, &mut panicking] {
+        send(ws, "auth").await;
+        send(ws, "page").await;
+    }
+    assert_eq!(recv_text(&mut unaccepted).await, "0:1:page");
+    assert_eq!(recv_text(&mut panicking).await, "1:1:page");
+    until("five frames answered", || server.played() == 5).await;
+    let refused = |conn, reason: &str| ScriptError::Answer {
+        conn,
+        frame: 0,
+        reason: reason.to_owned(),
+    };
+    let failures = server.failures();
+    let waits = "its first answer waits for connection 9, not accepted";
+    assert!(failures.contains(&refused(0, waits)), "{failures:?}");
+    assert!(failures.contains(&refused(1, "its hold panicked: no hold")));
+    assert_eq!(failures.len(), 2);
+
+    // A step script refuses a responder with a hold when it starts.
+    let held = numbered(0).hold_first(|_| Some(0));
+    let steps = vec![
+        Step::Accept,
+        Step::Respond {
+            conn: 0,
+            with: held,
+        },
+    ];
+    let err = StubServer::start(WsScript::new(steps), HttpRoutes::new()).await;
+    let err = err.err().unwrap();
+    assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    let why = "a responder that holds its first answer plays only in a serving script";
+    assert_eq!(err.to_string(), why);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_the_stubs_drop_ends_answers_nothing() {
+    let (computed_tx, mut computed) = tokio::sync::mpsc::unbounded_channel();
+    // Connection 1's responder tells each answer it computes; its drop, with the stub's last
+    // task, ends the channel.
+    let (script, _pusher) = WsScript::serving(move |conn| {
+        let computed = computed_tx.clone();
+        let with = Responder::new(move |_| {
+            let _ = computed.send(conn);
+            Ok(Vec::new())
+        });
+        match conn {
+            1 => with.hold_first(|_| Some(0)),
+            _ => with,
+        }
+    });
+    let server = StubServer::start(script, HttpRoutes::new()).await.unwrap();
+    let _open = open(&server).await;
+    let mut held = open(&server).await;
+    send(&mut held, "auth").await;
+    until("connection 1's first frame", || {
+        server.connections()[1].received.len() == 1
+    })
+    .await;
+    drop(server);
+    // The held answer is never computed: the channel ends with nothing in it.
+    assert_eq!(within("the stub's last task", computed.recv()).await, None);
 }

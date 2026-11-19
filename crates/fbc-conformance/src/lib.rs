@@ -21,7 +21,10 @@
 //!   at once, with what the [`Responder`] made for that connection computes from it, and its
 //!   [`Pusher`] sends a connection unsolicited frames and closes it, with or without a code; a
 //!   refused answer fails itself alone, and each refused answer and a failed listener is
-//!   reported ([`StubServer::failures`]).
+//!   reported ([`StubServer::failures`]). Orderings by events, never by times (FBC-4ptk):
+//!   [`Pusher::barrier`], the client's pong to a ping after every frame asked before it, several
+//!   pending in order; [`Responder::hold_first`], a connection's first answer computed only once
+//!   another connection's close or end is recorded; and TCP_NODELAY on every accepted socket.
 //! - [`reconnect_storm`], the storm of [`STORM_RECONNECTS`] forced reconnects, and
 //!   [`check_pacing`], which holds the attempts a stub saw to the client's reconnect pacing.
 //! - [`duplicate_acks`], every subscription acknowledged twice and each data frame pushed once,
