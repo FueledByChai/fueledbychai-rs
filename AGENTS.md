@@ -1177,7 +1177,14 @@ holds two of them for one pull request. The rules after the three roles bind all
     `RateLimited` err or a rise in the limiter's rejected count, is the run's stop,
     `RateRefused(Pager)`, marked, and so is a page listing an order that is none of P1 to P3, or a
     TWAP, `ReadDisagrees` (0148 item 8; `pager::came`, a walk so ended `pager::WalkEnd::Disagreed`),
-    before the plan's next step; any other page not made is recorded and stops nothing. A maker
+    and so is a page listing one of P1 to P3 that the streams showed ended past its lag, as
+    `compare::judge` and `compare::compare` rule (0109, 0151 item 4): once a comparison begun after
+    the run saw it ended has ended, or `--agree-wait-ms` from then has passed (`pager::Ends`,
+    `pager::ended_listed`); one within its lag is recorded (`PagesRun::ended_listed`) and stops
+    nothing; each before the plan's next step; any other page not made is recorded and stops
+    nothing. Each order's `ACK`, exact echo, `ACK` latency and err echo are read by its own client
+    id (`tee::Kept::exact_ack_of`, `acked_of` and `err_echo_of`), never another order's in the
+    same session (P1 to P3, the flatten IOCs; PR #284's review). A maker
     fill of a stage-three order is flattened while the session is open, then stops the run, as
     below. Then the Stop and the reads after it as after a crossing session (`AFTER_PAGES`, each
     stop said as met after the stage-three session), the pager's refusals counted as a read
@@ -1307,14 +1314,15 @@ holds two of them for one pull request. The rules after the three roles bind all
     close or a drop as their knobs say, and take the knobs `ack_delay`, `rate_limit`, `stray_order`,
     `cid_absent_update`, `stray_fill`, `maker_fill`, `server_close`, `rest_lag`, `rest_fails`,
     `cancel_delay`, `close_on_place`, `arm_err`, `foreign_order`, `position_on_place`,
-    `position_after_close`, `hold_on_place`, `cancel_place`,
+    `position_after_close`, `hold_on_place`, `cancel_place` (on a given place, `cancel_place_on`),
     `venue_cancel`, `close_on_cancel`, `stray_after`, `part_fill_after`, `close_after`,
     `fill_on_trades`, `fill_after_close`, `part_fill_after_close`, `trade_after_close`,
     `trades_err`, `historic_fails`, `touch_moves`, `hold_trades`, `trades_err_page` and
     `hold_trades_page` (the run's `n`th `get_user_trades` page answered an err or held; FBC-4plj),
     `netting_on_trades_page` (two trades of an order no run placed, one each way, as the run's
-    `n`th `get_user_trades` page is asked), `stray_on_pager_page` (an order not ours or a TWAP on
-    the `n`th page at a limit of 1, in that answer alone; `model::PagerStray`),
+    `n`th `get_user_trades` page is asked), `stray_on_pager_page` (an order not ours, a TWAP, or
+    the order cancelled last as if it rested, on the `n`th page at a limit of 1, in that answer
+    alone; `model::PagerStray`),
     `page_order` (oldest or newest first; FBC-4plj, which reads its pages at a limit of 1) and
     `rate_limit`'s
     `Limited::PagerPage` (the `n`th page asked at a limit of 1, stage three's pager's), and, for

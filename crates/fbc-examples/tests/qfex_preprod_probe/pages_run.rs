@@ -8,7 +8,7 @@ use super::*;
 
 use compare::{Listed, PageAttempt};
 use fbc_core::{CidMatch, Lots, Namespace, VenueOrderId, dispatch};
-use pager::{Action, Came, PageRead, PagesRun, WalkEnd};
+use pager::{Action, Came, EndedListed, Ends, PageRead, PagesRun, WalkEnd};
 
 #[test]
 fn the_plan_interleaves_places_pages_and_cancels_as_the_ticket_orders_them() {
@@ -100,6 +100,79 @@ fn a_pages_rows_are_named_by_venue_id_or_by_client_id_while_no_venue_id_is_known
     ];
     assert_eq!(pager::named(&rows, &ours), (vec!["P2", "P3"], 2));
     assert_eq!(pager::named(&[], &ours), (Vec::new(), 0));
+}
+
+#[test]
+fn an_ended_order_a_page_lists_is_lag_until_a_comparison_after_its_end_ends_or_the_wait_passes() {
+    // PR #284's second review, as compare::judge and compare::compare rule (decisions 0109 and
+    // 0151 item 4): an order of ours a read lists that the streams showed ended is lag only until
+    // a comparison begun after the streams showed it ended has ended, or --agree-wait-ms from
+    // then has passed; past either, a page listing it is the run's stop.
+    let wait = Duration::from_secs(5);
+    let at = tokio::time::Instant::now();
+    let mut ends = Ends::new(wait);
+    assert!(ends.ended().is_empty() && ends.past(at).is_empty());
+    ends.note(&["P1"], at);
+    // Seen again later, it keeps the instant it was first seen ended.
+    ends.note(&["P1"], at + Duration::from_secs(3));
+    assert!(ends.past(at).is_empty());
+    assert!(ends.past(at + wait - Duration::from_millis(1)).is_empty());
+    assert_eq!(ends.past(at + wait), ["P1"]);
+    // A comparison that began after P1 was seen ended has ended: P1 is past its lag at once, and
+    // P2, seen ended only after that comparison began, is not.
+    let covered = ends.ended();
+    ends.note(&["P2"], at);
+    ends.compared(&covered);
+    assert_eq!(ends.ended(), ["P1", "P2"]);
+    assert_eq!(ends.past(at), ["P1"]);
+    assert_eq!(ends.past(at + wait), ["P1", "P2"]);
+    // What a page lists of them: one past its lag stops the run, ReadDisagrees; one within its
+    // lag, or one the streams did not show ended, stops nothing.
+    let came = Came::Read {
+        ours: vec!["P1", "P2", "P3"],
+        others: 0,
+        twaps: 0,
+        full: true,
+    };
+    let (listed, stop) = pager::ended_listed(&came, 2, (&["P1", "P2"], &["P1"]));
+    let past = EndedListed {
+        page: 2,
+        name: "P1",
+        past: true,
+    };
+    let within = EndedListed {
+        page: 2,
+        name: "P2",
+        past: false,
+    };
+    assert_eq!(listed, [past.clone(), within.clone()]);
+    assert_eq!(stop, Some(places::Stop::ReadDisagrees));
+    let (listed, stop) = pager::ended_listed(&came, 2, (&["P2"], &[]));
+    assert_eq!((listed, stop), (vec![within.clone()], None));
+    assert_eq!(
+        pager::ended_listed(&came, 2, (&[], &[])),
+        (Vec::new(), None)
+    );
+    let failed = pager::ended_listed(&Came::Failed, 2, (&["P1"], &["P1"]));
+    assert_eq!(failed, (Vec::new(), None));
+    // What the report says of each, with no id and no value.
+    assert_eq!(
+        pager::ended_said(&[&past, &within]),
+        "; it listed P1, which the streams showed ended past its lag: the run's stop, \
+         ReadDisagrees (decision 0148 item 8); and P2, which the streams showed ended within its \
+         lag (decisions 0109 and 0151 item 4): no stop"
+    );
+    assert_eq!(pager::ended_said(&[]), "");
+    // The last page recorded is the run's stop only when one of ours it listed was past its lag.
+    let page = page_read(2, &["P2", "P3"], came);
+    let mut run = PagesRun {
+        pages: vec![page],
+        ended_listed: vec![EndedListed { page: 0, ..within }],
+        ..PagesRun::default()
+    };
+    assert!(!pager::last_disagreed(&run));
+    run.ended_listed.push(EndedListed { page: 0, ..past });
+    assert!(pager::last_disagreed(&run));
 }
 
 #[test]

@@ -259,6 +259,10 @@ pub enum Heard {
         /// `ack` or `err`.
         envelope: &'static str,
         cid: EchoCid,
+        /// The `add_order` of the run whose client id it echoes, exactly or not
+        /// ([`EchoCid::Exact`] or [`EchoCid::Differs`]): what scopes an echo to one order
+        /// ([`Kept::err_echo_of`]; PR #284's review). `None` otherwise.
+        sent: Option<usize>,
         /// Whether it is an `err` whose `error_code` is `RateLimited`: a provider rate refusal
         /// (decision 0148 item 8), which refuses the request and says nothing of the order, so
         /// the report counts it as no refusal of the order (FBC-su9i).
@@ -363,9 +367,50 @@ impl Kept {
             .any(|h| matches!(h, Heard::Order { status, ours: true, .. } if status == "ACK"))
     }
 
+    /// Whether QFEX sent an `order_response` whose status is `ACK` naming the `add_order` that
+    /// carried `cid`, exactly as written, by that client id byte for byte, among the frames
+    /// heard from the `from`th on: that order's own exact echo, never another's in the same
+    /// session (PR #284's review).
+    pub fn exact_ack_of(&self, from: usize, cid: &str) -> bool {
+        let Some(n) = self.index_of(cid) else {
+            return false;
+        };
+        (self.heard.iter().skip(from)).any(|h| {
+            matches!(h, Heard::Order { status, cid: Cid::Exact(m), .. }
+                if status == "ACK" && *m == n)
+        })
+    }
+
+    /// Whether QFEX sent an `order_response` whose status is `ACK` naming the `add_order` that
+    /// carried `cid`, by that client id written exactly or otherwise, among the frames heard from
+    /// the `from`th on: that order's own `ACK`, never another's (PR #284's review).
+    pub fn acked_of(&self, from: usize, cid: &str) -> bool {
+        let Some(n) = self.index_of(cid) else {
+            return false;
+        };
+        (self.heard.iter().skip(from)).any(|h| {
+            matches!(h, Heard::Order { status, cid, .. }
+                    if status == "ACK" && cid.sent() == Some(n))
+        })
+    }
+
+    /// Whether QFEX echoed the `add_order` that carried `cid` with an `err` that is no provider
+    /// rate refusal, among the frames heard from the `from`th on: a refusal of that order alone,
+    /// never another order's (PR #284's review).
+    pub fn err_echo_of(&self, from: usize, cid: &str) -> bool {
+        let Some(n) = self.index_of(cid) else {
+            return false;
+        };
+        (self.heard.iter().skip(from)).any(|h| {
+            matches!(h, Heard::Echo { envelope: "err", sent: Some(m), rate_limited: false, .. }
+                if *m == n)
+        })
+    }
+
     /// Whether QFEX echoed one of our `add_order`s with an `err` that is no provider rate
     /// refusal, among the frames heard from the `from`th on: a refusal of the order it echoes,
-    /// which settles nothing (FBC-ou9g: a flatten IOC's, the one `add_order` then in flight).
+    /// which settles nothing. The probe reads [`Kept::err_echo_of`], scoped to one order.
+    #[allow(dead_code)] // the flatten tests read it
     pub fn err_echo_from(&self, from: usize) -> bool {
         (self.heard.iter().skip(from)).any(|h| {
             matches!(
@@ -606,6 +651,7 @@ impl Tap {
                 at,
                 envelope,
                 cid: EchoCid::Unechoed,
+                sent: None,
                 rate_limited,
             };
             self.kept.borrow_mut().heard.push(heard);
@@ -616,6 +662,7 @@ impl Tap {
             return;
         };
         let named = echoed.get("params").and_then(|p| p.get("client_order_id"));
+        let mut index = None;
         let cid = match named {
             Some(Value::String(s)) if !s.is_empty() => {
                 // The member's bytes as they arrived: the kept text has the span the codec
@@ -634,6 +681,19 @@ impl Tap {
                     true => ours(s),
                     false => arrived.iter().filter_map(decoded).any(|d| ours(&d)),
                 };
+                // Which add_order it echoes: by its bytes exactly, else by its value in either
+                // case, as `named_ours` reads it.
+                let like = |text: &str| {
+                    kept.sent
+                        .iter()
+                        .position(|t| t.cid.eq_ignore_ascii_case(text))
+                };
+                let exact = |b: &[u8]| kept.sent.iter().position(|t| t.cid.as_bytes() == b);
+                index = match arrived.as_slice() {
+                    [one] if sent(one) => exact(one),
+                    [] => like(s),
+                    many => many.iter().filter_map(decoded).find_map(|d| like(&d)),
+                };
                 match (arrived.as_slice(), named_ours) {
                     ([one], _) if sent(one) => EchoCid::Exact,
                     (_, true) => EchoCid::Differs,
@@ -646,6 +706,7 @@ impl Tap {
             at,
             envelope,
             cid,
+            sent: index,
             rate_limited,
         };
         self.kept.borrow_mut().heard.push(heard);

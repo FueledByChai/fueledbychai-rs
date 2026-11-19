@@ -16,7 +16,13 @@
 //!
 //! A provider rate refusal on the pager's socket stops the run, [`Stop::RateRefused`] on
 //! [`RefusedOn::Pager`], and so does a page listing an order that is none of P1 to P3, or a
-//! TWAP, [`Stop::ReadDisagrees`] (decision 0148 item 8). A page that could not be made (no room
+//! TWAP, [`Stop::ReadDisagrees`] (decision 0148 item 8). So does a page listing one of P1 to P3
+//! that the streams showed ended past its lag ([`Ends`]): judged as `compare::judge` judges such
+//! a row (an order of ours listed that the streams showed ended), and allowed as lag only as
+//! `compare::compare` allows it, until a comparison begun after the streams showed it ended has
+//! ended, or `--agree-wait-ms` from then has passed (decisions 0109 and 0151 item 4; PR #284's
+//! review). A page listing one within its lag is recorded and stops nothing; the next comparison
+//! judges it. A page that could not be made (no room
 //! in the shared limiter, or its socket failed) is recorded and stops nothing: the pages are
 //! evidence, and the next page opens the socket again. A maker fill of a stage-three order is
 //! flattened while the session is open, then stops the run, as every unexpected fill does (0151
@@ -32,6 +38,7 @@ use std::time::Duration;
 
 use fbc_core::{CidMatch, ClientOrderId, VenueOrderId};
 use serde_json::{Value, json};
+use tokio::time::Instant;
 
 use crate::compare::{Listed, PageAttempt};
 use crate::places::{RefusedOn, Stop, XRun};
@@ -154,8 +161,9 @@ pub enum WalkEnd {
     Cut,
     /// A page could not be made ([`Came::Skipped`] or [`Came::Failed`]).
     NotRead,
-    /// A page listed an order that is none of ours, or a TWAP: the run's stop,
-    /// [`Stop::ReadDisagrees`] (decision 0148 item 8).
+    /// A page listed an order that is none of ours, or a TWAP, or one of ours the streams showed
+    /// ended past its lag ([`Ends`]): the run's stop, [`Stop::ReadDisagrees`] (decision 0148 item
+    /// 8).
     Disagreed,
 }
 
@@ -170,8 +178,9 @@ impl WalkEnd {
             WalkEnd::Cut => "cut 60 s after its first page (the reads after a session's patience)",
             WalkEnd::NotRead => "a page that could not be made",
             WalkEnd::Disagreed => {
-                "a page listing an order or a TWAP not ours, which the streams did not show: the \
-                 run's stop, ReadDisagrees (decision 0148 item 8)"
+                "a page listing an order or a TWAP not ours, or one of ours the streams showed \
+                 ended past its lag, which the streams did not show: the run's stop, \
+                 ReadDisagrees (decision 0148 item 8)"
             }
         }
     }
@@ -254,6 +263,137 @@ pub fn came(attempt: &PageAttempt, ours: &[Ours]) -> (Came, Option<Stop>) {
     }
 }
 
+/// When the run first saw each of stage three's orders ended in the streams, by name, and whether
+/// a comparison begun after then has ended since: what a page listing one is judged by
+/// ([`Ends::past`]; PR #284's review).
+///
+/// `compare::judge` counts an order of ours a read lists that the streams showed ended as a
+/// disagreement, and `compare::compare` allows it as lag only within its wait: a read after the
+/// step may still list the order until a read agrees or `--agree-wait-ms` from the comparison's
+/// start passes, and the comparison then stops the run, [`Stop::ReadDisagrees`], if its last
+/// read still lists it (decisions 0109 and 0151 item 4). A page is held to the same rule: one of
+/// ours it lists that the streams showed ended is within its lag until a comparison begun after
+/// the streams showed it ended has ended, or until `--agree-wait-ms` from then has passed, the
+/// lag measured from the stream's event as 0109 measures it; past either, it is the run's stop.
+#[derive(Clone, Debug)]
+pub struct Ends {
+    wait: Duration,
+    /// Each order's name, when the run first saw it ended, and whether a comparison begun after
+    /// then has ended since.
+    seen: Vec<(&'static str, Instant, bool)>,
+}
+
+impl Ends {
+    /// `wait`, `--agree-wait-ms`: how long a read may lag the streams (0151 item 4).
+    pub fn new(wait: Duration) -> Ends {
+        Ends {
+            wait,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Notes `ended`, the names of ours the streams show ended `now`, each when first seen.
+    pub fn note(&mut self, ended: &[&'static str], now: Instant) {
+        for name in ended {
+            if !self.seen.iter().any(|(n, ..)| n == name) {
+                self.seen.push((name, now, false));
+            }
+        }
+    }
+
+    /// The names the run has seen ended so far, in the order it saw them: what a comparison
+    /// beginning now covers once it has ended ([`Ends::compared`]).
+    pub fn ended(&self) -> Vec<&'static str> {
+        self.seen.iter().map(|(n, ..)| *n).collect()
+    }
+
+    /// Marks `names`, seen ended before a comparison began, past their lag: that comparison has
+    /// ended, by a read that agreed or at the end of its wait.
+    pub fn compared(&mut self, names: &[&'static str]) {
+        for seen in &mut self.seen {
+            if names.contains(&seen.0) {
+                seen.2 = true;
+            }
+        }
+    }
+
+    /// The names past their lag `at`: a comparison begun after the run saw them ended has ended,
+    /// or `--agree-wait-ms` from then has passed.
+    pub fn past(&self, at: Instant) -> Vec<&'static str> {
+        (self.seen.iter())
+            .filter(|(_, seen, compared)| *compared || at >= *seen + self.wait)
+            .map(|(n, ..)| *n)
+            .collect()
+    }
+}
+
+/// One of ours a page listed that the streams showed ended as it was asked: the page, by its
+/// place among the pages the pager asked for, the order's name, and whether it was past its lag
+/// ([`Ends::past`]), the run's stop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndedListed {
+    pub page: usize,
+    pub name: &'static str,
+    pub past: bool,
+}
+
+/// What `came`, the `page`th page, lists of ours that the streams showed ended as it was asked,
+/// `ended`, each past its lag when `past` names it ([`Ends`]), and the stop it is:
+/// [`Stop::ReadDisagrees`] when any is past its lag, as `compare::compare` stops on such a read at
+/// the end of its wait (decision 0148 item 8). None otherwise.
+pub fn ended_listed(
+    came: &Came,
+    page: usize,
+    (ended, past): (&[&'static str], &[&'static str]),
+) -> (Vec<EndedListed>, Option<Stop>) {
+    let Came::Read { ours, .. } = came else {
+        return (Vec::new(), None);
+    };
+    let listed: Vec<EndedListed> = (ours.iter())
+        .filter(|name| ended.contains(name))
+        .map(|name| EndedListed {
+            page,
+            name,
+            past: past.contains(name),
+        })
+        .collect();
+    let stop = listed.iter().any(|l| l.past).then_some(Stop::ReadDisagrees);
+    (listed, stop)
+}
+
+/// Whether the last page `run` recorded was its stop for what it listed: an order or a TWAP not
+/// ours, or one of ours the streams showed ended past its lag ([`WalkEnd::Disagreed`]).
+pub fn last_disagreed(run: &PagesRun) -> bool {
+    let at = run.pages.len().checked_sub(1);
+    let foreign = (run.pages.last())
+        .is_some_and(|p| matches!(p.came, Came::Read { others, twaps, .. } if others + twaps > 0));
+    let stale = (run.ended_listed.iter()).any(|l| Some(l.page) == at && l.past);
+    foreign || stale
+}
+
+/// What the report says of a page's listing of ours the streams showed ended, `listed`: nothing
+/// when it listed none.
+pub fn ended_said(listed: &[&EndedListed]) -> String {
+    let each: Vec<String> = (listed.iter())
+        .map(|l| match l.past {
+            true => format!(
+                "{}, which the streams showed ended past its lag: the run's stop, ReadDisagrees \
+                 (decision 0148 item 8)",
+                l.name
+            ),
+            false => format!(
+                "{}, which the streams showed ended within its lag (decisions 0109 and 0151 item \
+                 4): no stop",
+                l.name
+            ),
+        })
+        .collect();
+    match each.is_empty() {
+        true => String::new(),
+        false => format!("; it listed {}", each.join("; and ")),
+    }
+}
+
 /// The order QFEX's pages list our orders in, as page 0 showed it with P1 and P2 open and P1
 /// placed first: oldest first when it listed P1, newest first when it listed P2, and `None` when
 /// no such page was read.
@@ -300,6 +440,9 @@ pub struct PagesRun {
     pub cancels: Vec<CancelRun>,
     /// Each page the pager asked for, in order.
     pub pages: Vec<PageRead>,
+    /// Each order of ours a page listed that the streams showed ended as it was asked
+    /// ([`ended_listed`]).
+    pub ended_listed: Vec<EndedListed>,
     /// How the walk ended, once it began.
     pub walk: Option<WalkEnd>,
     /// The provider rate refusals the pager's socket met, as a read socket's are counted.
@@ -414,10 +557,12 @@ pub fn markdown(s: &mut String, runs: &[PagesRun], (crossed, finished): (&[&str]
                 yn(c.ended)
             );
         }
-        for page in &run.pages {
+        for (at, page) in run.pages.iter().enumerate() {
+            let ended: Vec<&EndedListed> =
+                run.ended_listed.iter().filter(|l| l.page == at).collect();
             let _ = writeln!(
                 s,
-                "- {}page at size {}, offset {} (open in the streams: {}): {}",
+                "- {}page at size {}, offset {} (open in the streams: {}): {}{}",
                 if page.walk { "The walk's " } else { "A " },
                 page.size,
                 page.offset,
@@ -425,7 +570,8 @@ pub fn markdown(s: &mut String, runs: &[PagesRun], (crossed, finished): (&[&str]
                     true => "none".to_owned(),
                     false => page.open.join(", "),
                 },
-                page.came.says()
+                page.came.says(),
+                ended_said(&ended)
             );
         }
         let _ = writeln!(s);
@@ -459,10 +605,13 @@ pub fn to_json(runs: &[PagesRun]) -> Value {
                         "open": p.open, "came": p.came.says()})
                 })
                 .collect();
+            let ended: Vec<Value> = (run.ended_listed.iter())
+                .map(|l| json!({"page": l.page, "name": l.name, "past_its_lag": l.past}))
+                .collect();
             let compared: Vec<Value> = session.compared.iter().map(compared_json).collect();
             json!({"account": session.account, "authenticated": session.authenticated,
                 "arm": session.arm, "resynced": session.resynced, "started": session.started,
-                "orders": orders, "cancels": cancels, "pages": pages,
+                "orders": orders, "cancels": cancels, "pages": pages, "ended_listed": ended,
                 "page_order": order_shown(&run.pages),
                 "walk": run.walk.map(WalkEnd::says), "compared": compared,
                 "ended_by": session.ended_by, "resting": session.resting,

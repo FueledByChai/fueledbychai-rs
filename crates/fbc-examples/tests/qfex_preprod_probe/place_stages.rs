@@ -17709,6 +17709,100 @@ async fn a_pager_page_listing_an_order_not_ours_stops_the_run_before_the_next_st
     );
 }
 #[tokio::test]
+async fn a_pager_page_listing_an_order_of_ours_the_streams_showed_ended_stops_the_run() {
+    // PR #284's second review: page 2, asked after P1's cancel and the comparison after it, lists
+    // P1 as if it still rested, in that answer alone, as a stale listing gone before the next
+    // comparison would be. The comparison after P1's cancel ended, so P1 is past the lag
+    // compare::compare allows a read (decisions 0109 and 0151 item 4): the page shows an order
+    // the streams showed ended, and the run stops, ReadDisagrees, marked (decision 0148 item 8),
+    // before the plan's next step. The session's Stop cancels P2 and P3 by venue id.
+    let model = QfexModel {
+        stray_on_pager_page: Some((2, model::PagerStray::Ended)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-stale-ended", &primary_only(), |a| a).await;
+    let name = places::Stop::ReadDisagrees.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let run = d.three(0);
+    assert_eq!(d.pages_asked(d.pager_conns()[0]), [(1, 0), (1, 1), (1, 2)]);
+    let stale = &run.pages[2];
+    assert_eq!(stale.open, ["P2", "P3"]);
+    let listed = pager::Came::Read {
+        ours: vec!["P1"],
+        others: 0,
+        twaps: 0,
+        full: true,
+    };
+    assert_eq!(stale.came, listed);
+    let past = pager::EndedListed {
+        page: 2,
+        name: "P1",
+        past: true,
+    };
+    assert_eq!(run.ended_listed, [past]);
+    assert_eq!(run.cancels.len(), 1, "{:?}", run.cancels);
+    assert_eq!(run.session.stop, Some(name));
+    let stop = run.session.cancels.as_ref().expect("the session's Stop");
+    assert_eq!(stop.sent, 2, "{stop:?}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "listed P1; 0 orders not ours; 0 TWAPs; full; it listed P1, which the streams showed \
+             ended past its lag: the run's stop, ReadDisagrees (decision 0148 item 8)"
+        ),
+        "{report}"
+    );
+    assert_eq!(json["stop"], name);
+    let ended = &json["stage_three"][0]["ended_listed"][0];
+    assert_eq!(
+        (&ended["page"], &ended["name"]),
+        (&Value::from(2), &Value::from("P1"))
+    );
+    assert_eq!(ended["past_its_lag"], true);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+}
+
+#[tokio::test]
+async fn each_stage_three_order_is_given_its_own_ack_evidence_alone() {
+    // PR #284's second review: P1 is acknowledged, its ACK echoing its client id exactly, and
+    // QFEX ends P2 CANCELLED as it comes, with no ACK. P1's ACK, heard earlier in the same
+    // session, is P1's alone: P2 is not acknowledged, not exactly echoed and has no ACK latency.
+    // The plan goes on, P2's cancel not sent, its order having ended.
+    let model = QfexModel {
+        cancel_place_on: Some(6),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-own-ack", &primary_only(), |a| a).await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let run = d.three(0);
+    let names: Vec<&str> = run.orders.iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["P1", "P2", "P3"]);
+    let p2 = &run.orders[1].1;
+    assert!(p2.submitted && !p2.acked && !p2.exact_echo, "{p2:?}");
+    assert_eq!(p2.ack_after, None, "{p2:?}");
+    for (name, placed) in [&run.orders[0], &run.orders[2]] {
+        assert!(
+            placed.acked && placed.exact_echo && placed.ack_after.is_some(),
+            "{name}: {placed:?}"
+        );
+    }
+    let second = &run.cancels[1];
+    assert_eq!((second.name, second.sent), ("P2", false));
+    assert_eq!(second.not_sent, Some(pager::ENDED_FIRST));
+    let (_, json) = d.outputs();
+    let p2 = &json["stage_three"][0]["orders"][1];
+    assert_eq!(p2["name"], "P2");
+    assert_eq!(p2["placed"]["acked"], false);
+    assert_eq!(p2["placed"]["exact_echo"], false);
+    assert_eq!(p2["placed"]["ack_after_ms"], Value::Null);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+}
+
+#[tokio::test]
 async fn a_stage_three_cancel_is_not_sent_for_an_order_ended_or_not_yet_acknowledged() {
     // QFEX cancels P1 itself right after its ACK: P1's cancel is not sent, its order having
     // ended, and the plan goes on, no stop.
