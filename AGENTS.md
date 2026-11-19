@@ -1076,7 +1076,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     than `ACK` (`Run::final_order_unheard`), or its deadline, never resent; how it came back
     (`flatten::Ioc`), each fill's fee sign as fbc-core's `Fee` holds it (`taker::FeeSign`, read in
     `places::PlaceHandler`) and the order of its final `order_response` and its `fill_response` from
-    the tee (`taker::FrameOrder`, for FBC-tfxk), read before any cancel of ours (`Run::taken`); a
+    the tee (`taker::FrameOrder`, for FBC-tfxk; the final one a status other than `ACK`, so an `ACK`
+    and a fill with none after are not measured), read before any cancel of ours (`Run::taken`); a
     comparison. Then (`taker::after_ioc`): a position off flat is flattened while the session is
     open, as below (`taker::AFTER_TAKER`), REST flat before the Stop, and stops nothing once flat;
     an IOC that expired unfilled flattens nothing; one left open with a fill (QFEX's
@@ -1235,11 +1236,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     `touch_after` (the touch pushed again on the MDS later), `fill_other_on_place` (another order
     filled as a place arrives, the place left unanswered), `rest_lag_from` (`rest_lag` held to the
     changes from a given place on), `ioc_order_after` (a filled IOC's final `order_response` pushed
-    later), `fill_in_resync` (an arm's fills sent before its connection's next `get_user_orders`
-    page), `resync_page_held` (that page held for the test's release, `Venue::release_held`), the
-    read sockets' pages held after a `maker_fill` the reads lag until its connection's client writes
-    again (`knob_frames_unread`), and `Limited::ReadSocketAfterIoc` and `ReadAuthEchoAfterIoc` (a
-    refusal counted from the run's first limit IOC), all declared by path; ten paths no flag or
+    later), `ioc_acked` (every limit IOC it fills answered `ACK` first), `fill_in_resync` (an
+    arm's fills sent before its connection's next `get_user_orders` page), `resync_page_held` (that
+    page held for the test's release, `Venue::release_held`), the read sockets' pages held after a
+    `maker_fill` the reads lag until its connection's client writes again (`knob_frames_unread`),
+    and `Limited::ReadSocketAfterIoc` and `ReadAuthEchoAfterIoc` (a refusal counted from the run's
+    first limit IOC), all declared by path; ten paths no flag or
     answer reaches, X spent from its list, X not priced, a session failing after its order's answer,
     the journal past its soft limit, another order of ours held in a cross registry before a
     crossing order or a taker IOC, the account's flatten budget spent by its drop registry on the
