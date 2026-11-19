@@ -445,6 +445,55 @@ fn an_err_echoing_our_add_order_is_a_refusal_and_a_rate_refusal_is_not() {
     assert!(!tap.kept().err_echo_from(later));
 }
 
+#[test]
+fn each_orders_ack_and_err_echo_are_its_own_never_another_orders_in_the_session() {
+    // PR #284's second review: a session that places several orders (stage three's P1 to P3, or
+    // the flatten IOCs after a fill) reads each order's ACK and err echo by its own client id, so
+    // one order's evidence is never given to another.
+    let cids: Vec<String> = crossing::minted(3)
+        .into_iter()
+        .map(crossing::text_of)
+        .collect();
+    let ack = |order: &str, cid: &str| {
+        Frame::text(format!(
+            concat!(
+                r#"{{"order_response":{{"order_id":"11111111-1111-4111-8111-0000000000{}","#,
+                r#""symbol":"SYN-USD","status":"ACK","client_order_id":"{}"}}}}"#,
+            ),
+            order, cid
+        ))
+    };
+    let (mut tee, tap) = crossing::teed();
+    let first = crossing::add_order(&cids[0], "SELL", "99.9");
+    crossing::sent(&mut tee, &first);
+    let from = tap.kept().heard.len();
+    crossing::heard(&mut tee, &[ack("01", &cids[0])]);
+    // The second sent after the first's ACK, which an err echo of the first then follows; the
+    // third acknowledged by its client id written in capitals.
+    let second = crossing::add_order(&cids[1], "SELL", "99.8");
+    crossing::sent(&mut tee, &second);
+    crossing::heard_err(&mut tee, "err", "InvalidOrder", &first, &cids[0]);
+    let third = crossing::add_order(&cids[2], "SELL", "99.7");
+    crossing::sent(&mut tee, &third);
+    crossing::heard(&mut tee, &[ack("03", &cids[2].to_uppercase())]);
+    let kept = tap.kept();
+    // Read across the session, the first's ACK and err are any order's.
+    assert!(kept.exact_ack_from(from) && kept.acked_ours_from(from));
+    assert!(kept.err_echo_from(from));
+    // Read by each order's client id: the first acknowledged exactly and refused by an err echo,
+    // the second neither, the third acknowledged but not byte for byte.
+    assert!(kept.exact_ack_of(from, &cids[0]) && kept.acked_of(from, &cids[0]));
+    assert!(kept.err_echo_of(from, &cids[0]));
+    assert!(!kept.exact_ack_of(from, &cids[1]) && !kept.acked_of(from, &cids[1]));
+    assert!(!kept.err_echo_of(from, &cids[1]));
+    assert!(!kept.exact_ack_of(from, &cids[2]) && kept.acked_of(from, &cids[2]));
+    assert!(!kept.err_echo_of(from, &cids[2]));
+    // A client id never sent names nothing, and only the frames heard from `from` on count.
+    assert!(!kept.acked_of(from, "never-sent") && !kept.err_echo_of(from, "never-sent"));
+    let later = kept.heard.len();
+    assert!(!kept.exact_ack_of(later, &cids[0]) && !kept.err_echo_of(later, &cids[0]));
+}
+
 /// A limit IOC `add_order` of `cid` on `side` at `price`, as the codec writes one.
 fn ioc_order(cid: &str, side: &str, price: &str, quantity: &str) -> String {
     format!(

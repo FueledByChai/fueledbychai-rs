@@ -44,7 +44,7 @@
 //!   [`QfexModel::rest_lag`], [`QfexModel::rest_fails`], [`QfexModel::cancel_delay`],
 //!   [`QfexModel::foreign_order`], [`QfexModel::position_on_place`] and
 //!   [`QfexModel::position_after_close`], [`QfexModel::foreign_after_close`] (FBC-77r8),
-//!   [`QfexModel::cancel_place`],
+//!   [`QfexModel::cancel_place`] (on a given place, [`QfexModel::cancel_place_on`]),
 //!   [`QfexModel::venue_cancel`],
 //!   [`QfexModel::close_on_cancel`], [`QfexModel::hold_cancel`], [`QfexModel::stray_after`],
 //!   [`QfexModel::part_fill_after`], [`QfexModel::close_after`],
@@ -514,6 +514,9 @@ pub enum PagerStray {
     Order,
     /// A TWAP, beside the account's orders.
     Twap,
+    /// The account's order cancelled last, listed as if it still rested, in place of the
+    /// account's orders: a stale listing of an order whose end the streams showed.
+    Ended,
 }
 
 /// The order a read socket's `get_user_orders` pages list an account's open orders in
@@ -951,6 +954,10 @@ pub struct QfexModel {
     /// The first `add_order` answered an `order_response` `CANCELLED` naming its client id, the
     /// order never resting, as QFEX ends a post-only order that would cross.
     pub cancel_place: bool,
+    /// The `n`th `add_order` of the run, from 0, answered as [`QfexModel::cancel_place`] answers
+    /// the first: an `order_response` `CANCELLED` naming its client id, with no `ACK` (PR #284's
+    /// review: a stage-three order ended with no `ACK` of its own).
+    pub cancel_place_on: Option<usize>,
     /// After the first `ACK`: that order cancelled by QFEX itself, its `order_response`
     /// `CANCELLED` naming its client id.
     pub venue_cancel: bool,
@@ -1236,6 +1243,7 @@ impl Default for QfexModel {
             silent_auth: None,
             stuck_pages: false,
             cancel_place: false,
+            cancel_place_on: None,
             venue_cancel: false,
             close_on_cancel: false,
             hold_trades: false,
@@ -2144,7 +2152,7 @@ impl QfexModel {
         if order.kind == "LIMIT" && order.tif == "IOC" {
             return self.ioc(conn, order, text);
         }
-        if first && self.cancel_place {
+        if (first && self.cancel_place) || self.cancel_place_on == Some(self.places - 1) {
             let ended = Order {
                 state: State::Cancelled,
                 ..order
@@ -2831,6 +2839,15 @@ impl QfexModel {
                 ..first
             });
             rows = foreign.iter().map(row).collect();
+        }
+        if stray == Some(PagerStray::Ended) {
+            let ended = (self.orders.iter().rev())
+                .find(|o| o.account == account && o.state == State::Cancelled)
+                .map(|o| Order {
+                    state: State::Open,
+                    ..o.clone()
+                });
+            rows = ended.iter().map(row).collect();
         }
         serde_json::json!({"all_orders_response": {"orders": rows, "twaps": twaps}}).to_string()
     }

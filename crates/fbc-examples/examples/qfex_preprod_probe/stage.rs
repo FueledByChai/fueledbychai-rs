@@ -4233,7 +4233,10 @@ impl Run<'_> {
                 }
             })
             .await?;
-        let exact = self.tee.kept().exact_ack_from(d.heard_from);
+        // Its own ACK alone, by its client id, never another order's in the same session (stage
+        // three places three; PR #284's review).
+        let text = two::cid_text(cid).unwrap_or_default();
+        let exact = self.tee.kept().exact_ack_of(d.heard_from, &text);
         // It is ours whatever client id its later frames carry (decision 0132 item 7).
         let vid = d
             .link
@@ -4251,7 +4254,7 @@ impl Run<'_> {
             let state = link.registry().get(cid).map(|r| r.state());
             matches!(state, Some(OrdState::Open | OrdState::PartiallyFilled))
         };
-        let acked_ours = self.tee.kept().acked_ours_from(d.heard_from);
+        let acked_ours = self.tee.kept().acked_of(d.heard_from, &text);
         let run = self.placed_run(d.which);
         run.acked = acked.0 && (open || acked_ours);
         run.outcome = acked.1.as_ref().map(places::outcome_name);
@@ -4914,7 +4917,10 @@ impl Run<'_> {
                 let counts =
                     record.map_or((Lots::ZERO, Lots::ZERO), |r| (r.cum_fills(), r.cum_venue()));
                 let not_sent = matches!(link.outcome_of(rpc), Some(SubmitOutcome::NotSent(_)));
-                let echoed = self.tee.kept().err_echo_from(heard_from);
+                // An err echoing this IOC's own add_order alone, never an earlier IOC's that
+                // came late (PR #284's review).
+                let text = two::cid_text(cid).unwrap_or_default();
+                let echoed = self.tee.kept().err_echo_of(heard_from, &text);
                 let vid = record.and_then(|r| r.vid().cloned());
                 if let Some(vid) = vid {
                     self.tee.ours(vid.as_str());
@@ -6212,7 +6218,9 @@ impl Run<'_> {
         let state = record.map(|r| r.state());
         let counts = record.map_or((Lots::ZERO, Lots::ZERO), |r| (r.cum_fills(), r.cum_venue()));
         let qty = record.map_or(Lots::ZERO, |r| r.qty());
-        let echoed = self.tee.kept().err_echo_from(d.heard_from);
+        // An err echoing its own add_order alone, never a flatten IOC's (PR #284's review).
+        let text = two::cid_text(cid).unwrap_or_default();
+        let echoed = self.tee.kept().err_echo_of(d.heard_from, &text);
         let ioc = Ioc::of(state, (counts.0, counts.1, qty), echoed, not_sent);
         (ioc, link.registry().inventory(d.inst), counts.1 > counts.0)
     }
@@ -6414,8 +6422,10 @@ impl Run<'_> {
         if let Some(vid) = vid {
             self.tee.ours(vid.as_str());
         }
-        let exact = self.tee.kept().exact_ack_from(d.heard_from);
-        let acked_ours = self.tee.kept().acked_ours_from(d.heard_from);
+        // Its own ACK alone, by its client id (PR #284's review).
+        let text = two::cid_text(cid).unwrap_or_default();
+        let exact = self.tee.kept().exact_ack_of(d.heard_from, &text);
+        let acked_ours = self.tee.kept().acked_of(d.heard_from, &text);
         let outcome = d.link.borrow().outcome_of(rpc);
         let run = &mut self.stage_run(Which::Take).placed;
         run.acked = acked_ours;
@@ -6551,7 +6561,8 @@ impl Run<'_> {
     /// ([`Run::cancel_paged`]), each followed by the streams compared with never-arming reads
     /// (0151 item 4), and each page `pager` is asked for ([`Run::page_now`]), then the walk of
     /// every page from offset 0 ([`Run::walk`]). `placed` holds the order placed last and `paged`
-    /// every one, as each is handed to the session.
+    /// every one, as each is handed to the session. When the run saw each order ended, and the
+    /// comparisons since, are kept for the pages ([`crate::pager::Ends`]).
     async fn paging(
         &mut self,
         places: &Places,
@@ -6561,7 +6572,8 @@ impl Run<'_> {
         (placed, paged): (&mut Option<Placed>, &mut Vec<Placed>),
         pager: &mut crate::compare::Socket<'_>,
     ) -> Result<(), Halt> {
-        use crate::pager::{Action, CANCELLED, NAMES, PLACED, PLAN};
+        use crate::pager::{Action, CANCELLED, Ends, NAMES, PLACED, PLAN};
+        let mut ends = Ends::new(places.agree_wait);
         for action in PLAN {
             match action {
                 Action::Place(n) => {
@@ -6571,18 +6583,19 @@ impl Run<'_> {
                         (self.place_resting(places, view, d, allowance, presses, placed)).await?;
                     paged.push(sent);
                     let step = (PLACED[n], sent.at);
-                    self.compare_paged(d, view.0, paged, step, presses).await?;
+                    (self.compare_paged(d, view.0, (paged, &mut ends), step, presses)).await?;
                 }
                 Action::Cancel(n) => {
                     let at = self.cancel_paged(d, presses, n, paged[n].cid).await?;
                     let step = (CANCELLED[n], at);
-                    self.compare_paged(d, view.0, paged, step, presses).await?;
+                    (self.compare_paged(d, view.0, (paged, &mut ends), step, presses)).await?;
                 }
                 Action::Page(offset) => {
+                    let paged = (paged.as_slice(), &mut ends);
                     self.page_now(d, presses, pager, paged, (offset, false))
                         .await?;
                 }
-                Action::Walk => self.walk(d, presses, pager, paged).await?,
+                Action::Walk => self.walk(d, presses, pager, (paged, &mut ends)).await?,
             }
         }
         Ok(())
@@ -6590,18 +6603,23 @@ impl Run<'_> {
 
     /// The streams of stage three's orders placed so far, `paged`, compared with never-arming
     /// reads after `step`, made at its instant ([`Run::compare_step`]): the comparison's stop the
-    /// session's.
+    /// session's. Each order the run saw ended before it began is past its lag once it has ended
+    /// (`ends`, [`crate::pager::Ends::compared`]).
     async fn compare_paged(
         &mut self,
         d: &DropCtx,
         found: &Discovered,
-        paged: &[Placed],
+        (paged, ends): (&[Placed], &mut crate::pager::Ends),
         (step, since): (&'static str, tokio::time::Instant),
         presses: &mut Presses,
     ) -> Result<(), Halt> {
+        ends.note(&self.paged_ended(d, paged), tokio::time::Instant::now());
+        let covered = ends.ended();
         let ours: Vec<fbc_core::ClientOrderId> = paged.iter().map(|p| p.cid).collect();
         let compared = self.compare_step(d, (found, &ours), d.on, step, Some(since));
         let compared = self.unless_stopped(d, presses, compared).await?;
+        ends.compared(&covered);
+        ends.note(&self.paged_ended(d, paged), tokio::time::Instant::now());
         let stop = compared.0.stop;
         self.compared(Which::Pages, compared);
         match stop {
@@ -6720,6 +6738,15 @@ impl Run<'_> {
             .collect()
     }
 
+    /// The names of stage three's orders placed so far, `paged`, that the registry holds ended.
+    fn paged_ended(&self, d: &DropCtx, paged: &[Placed]) -> Vec<&'static str> {
+        let link = d.link.borrow();
+        let ended =
+            |p: &&Placed| (link.registry().get(p.cid)).is_some_and(|r| r.state().is_terminal());
+        let named = paged.iter().zip(crate::pager::NAMES);
+        named.filter(|(p, _)| ended(p)).map(|(_, n)| n).collect()
+    }
+
     /// The names of stage three's orders placed so far, `paged`, that the registry holds open.
     fn paged_open(&self, d: &DropCtx, paged: &[Placed]) -> Vec<&'static str> {
         let link = d.link.borrow();
@@ -6737,28 +6764,46 @@ impl Run<'_> {
     /// slice; the pager's refusals kept as they go. A provider rate refusal on the pager is the
     /// run's stop, [`Stop::RateRefused`] on [`places::RefusedOn::Pager`], and so is a page listing
     /// an order that is none of `paged`, or a TWAP, [`Stop::ReadDisagrees`], each recorded first
-    /// (decision 0148 item 8); any other page that could not be made is recorded and stops
+    /// (decision 0148 item 8), and then a page listing one of `paged` that the streams showed
+    /// ended as it was asked, past its lag (`ends`, [`crate::pager::Ends::past`]), as
+    /// `compare::compare` stops on such a read at the end of its wait; one within its lag is
+    /// recorded and stops nothing. Any other page that could not be made is recorded and stops
     /// nothing. Gives what it came to.
     async fn page_now(
         &mut self,
         d: &DropCtx,
         presses: &mut Presses,
         pager: &mut crate::compare::Socket<'_>,
-        paged: &[Placed],
+        (paged, ends): (&[Placed], &mut crate::pager::Ends),
         (offset, walk): (u32, bool),
     ) -> Result<crate::compare::PageAttempt, Halt> {
         let open = self.paged_open(d, paged);
+        let asked = tokio::time::Instant::now();
+        let ended = self.paged_ended(d, paged);
+        ends.note(&ended, asked);
+        let past = ends.past(asked);
         self.three_run().paged = true;
         let attempt = self.unless_stopped(d, presses, pager.page(offset)).await;
         self.three_run().refusals = pager.heard;
         let attempt = attempt?;
+        ends.note(&self.paged_ended(d, paged), tokio::time::Instant::now());
         let ours = self.paged_ours(d, paged);
         let (came, stop) = crate::pager::came(&attempt, &ours);
+        let at = self.three_run().pages.len();
+        let (listed, stale) = crate::pager::ended_listed(&came, at, (&ended, &past));
+        let stop = stop.or(stale);
+        self.three_run().ended_listed.extend(listed);
         if let crate::compare::PageAttempt::Read { kept, .. } = &attempt {
             self.three_run().frames.push(kept.clone());
         }
+        let said = {
+            let run = self.three_run();
+            let ended: Vec<&crate::pager::EndedListed> =
+                run.ended_listed.iter().filter(|l| l.page == at).collect();
+            crate::pager::ended_said(&ended)
+        };
         self.line(format_args!(
-            "PAGE {}at size {}, offset {offset}, on {}: {}",
+            "PAGE {}at size {}, offset {offset}, on {}: {}{said}",
             if walk { "of the walk " } else { "" },
             crate::pager::PAGE_SIZE,
             name(d.on),
@@ -6787,24 +6832,23 @@ impl Run<'_> {
         d: &DropCtx,
         presses: &mut Presses,
         pager: &mut crate::compare::Socket<'_>,
-        paged: &[Placed],
+        (paged, ends): (&[Placed], &mut crate::pager::Ends),
     ) -> Result<(), Halt> {
         use crate::pager::{PAGE_SIZE, WALK_PATIENCE, WalkEnd, walk_end};
         let until = tokio::time::Instant::now() + WALK_PATIENCE;
         let mut seen: Vec<fbc_core::VenueOrderId> = Vec::new();
         let mut offset = 0;
         let end = loop {
-            let page = self.page_now(d, presses, pager, paged, (offset, true));
+            let page = self.page_now(d, presses, pager, (paged, &mut *ends), (offset, true));
             let Ok(page) = tokio::time::timeout_at(until, page).await else {
                 break WalkEnd::Cut;
             };
             let page = match page {
                 Ok(page) => page,
                 Err(halt) => {
-                    // The page itself, recorded, listed an order or a TWAP not ours: its stop.
-                    use crate::pager::Came;
-                    let came = self.three_run().pages.last().map(|p| p.came.clone());
-                    let disagreed = matches!(came, Some(Came::Read { others, twaps, .. }) if others + twaps > 0);
+                    // The page itself, recorded, listed an order or a TWAP not ours, or one of
+                    // ours the streams showed ended past its lag: its stop.
+                    let disagreed = crate::pager::last_disagreed(self.three_run());
                     let end = match disagreed {
                         true => WalkEnd::Disagreed,
                         false => WalkEnd::NotRead,
@@ -7029,8 +7073,10 @@ impl Run<'_> {
             ended = ended => ended?,
             () = woken => unreachable!("it wakes the wait, then waits for ever"),
         }
-        let exact = self.tee.kept().exact_ack_from(d.heard_from);
-        let acked_ours = self.tee.kept().acked_ours_from(d.heard_from);
+        // Its own ACK alone, by its client id (PR #284's review).
+        let text = two::cid_text(cid).unwrap_or_default();
+        let exact = self.tee.kept().exact_ack_of(d.heard_from, &text);
+        let acked_ours = self.tee.kept().acked_of(d.heard_from, &text);
         let outcome = d.link.borrow().outcome_of(rpc);
         let run = &mut self.cross_run().placed;
         run.acked = rested || acked_ours;
