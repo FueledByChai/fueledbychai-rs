@@ -115,7 +115,8 @@
 //!   once an armed connection ended: [`QfexModel::page_after_session`] ([`PageFault`]), a read
 //!   socket's first page answered with a frame that is no page, or by a server close, and
 //!   [`QfexModel::rest_fails_after_drop_reads`], the read of the account after drop session two
-//!   answered HTTP 500; and, for its restack onto FBC-77r8's review fixes,
+//!   answered HTTP 500, and [`QfexModel::rest_fails_after_historic`] (PR #278's review), the
+//!   first account's read before drop session two answered HTTP 500; and, for its restack onto FBC-77r8's review fixes,
 //!   [`QfexModel::twap_elsewhere_after_close`], a TWAP on every other account once an armed
 //!   connection ended, and [`QfexModel::page_after_ioc_end`], a read socket's first page once the
 //!   run's first limit IOC's connection ended, answered as [`PageFault`] says.
@@ -788,6 +789,11 @@ pub struct QfexModel {
     /// drop session two, which follows the reads of X's and Y's trades and historic orders after
     /// the drop, however many reads the wait after the drop made.
     pub rest_fails_after_drop_reads: bool,
+    /// The first `GET /user/positions` after the run's first `GET /user/historic-orders`
+    /// answered HTTP 500 (PR #278's review): the first account's read before drop session two,
+    /// which follows the reads of X's trades and historic orders after drop session one, however
+    /// many reads the comparison after X's place made.
+    pub rest_fails_after_historic: bool,
     /// The first `cancel_order`'s answer is pushed this long after it, instead of at once.
     pub cancel_delay: Option<Duration>,
     /// Once an armed connection ended, its account's positions show a position on [`SYMBOL`]
@@ -996,6 +1002,8 @@ pub struct QfexModel {
     /// Whether a `GET /user/historic-orders` came once an armed connection dropped abruptly
     /// ([`QfexModel::rest_fails_after_drop_reads`]).
     pub(super) historic_after_drop: bool,
+    /// Whether a `GET /user/historic-orders` came ([`QfexModel::rest_fails_after_historic`]).
+    pub(super) historic_asked: bool,
     /// Trade-socket authentications answered since the first `add_order`, a session's included
     /// ([`Limited::ReadAuth`]).
     pub(super) auths_after: usize,
@@ -1094,7 +1102,9 @@ impl Default for QfexModel {
             page_after_session: None,
             page_after_ioc_end: None,
             rest_fails_after_drop_reads: false,
+            rest_fails_after_historic: false,
             historic_after_drop: false,
+            historic_asked: false,
             cancel_delay: None,
             position_after_close: false,
             position_on_place: false,
@@ -1194,6 +1204,7 @@ impl QfexModel {
         if req.path == "/user/historic-orders" && self.dropped() {
             self.historic_after_drop = true;
         }
+        self.historic_asked |= req.path == "/user/historic-orders";
         match req.path.as_str() {
             "/refdata" if self.refdata.is_some() => {
                 let (status, body) = self.refdata.expect("set");
@@ -1236,6 +1247,10 @@ impl QfexModel {
                 }
                 if self.rest_fails_after_drop_reads && self.historic_after_drop {
                     self.rest_fails_after_drop_reads = false;
+                    return status(500, r#"{"error":"synthetic failure"}"#);
+                }
+                if self.rest_fails_after_historic && self.historic_asked {
+                    self.rest_fails_after_historic = false;
                     return status(500, r#"{"error":"synthetic failure"}"#);
                 }
                 ok(&self.positions_of(account))
