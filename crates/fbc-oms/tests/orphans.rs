@@ -3,9 +3,11 @@
 //! market's adding side for the consumer's cooldown and cancels them by explicit reference in
 //! a cancel-many, in every market state, a disarmed market included. Above the consumer's level
 //! limit it escalates to an instrument cancel-all, only while the registry holds the market's
-//! exclusive lease and no order not ours is in view (the snapshot's included); otherwise the
-//! explicit cancels repeat on each resync. No foreign-namespace order is ever cancelled. From an
-//! untrustworthy snapshot source it acts only on the orders a live account event also showed.
+//! exclusive lease, a trustworthy resync requested after the latest order-entry epoch end the
+//! consumer reported has shown the account's open orders (FBC-9svb) and no order not ours is in
+//! view (the snapshot's included); otherwise the explicit cancels repeat on each resync. No
+//! foreign-namespace order is ever cancelled. From an untrustworthy snapshot source it acts
+//! only on the orders a live account event also showed.
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
 //! where one lot is worth $1, so 50 lots; the resting cap is set past any order here.
@@ -609,6 +611,53 @@ fn above_the_level_limit_an_instrument_cancel_all_is_built_only_under_the_exclus
     );
     let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_000));
     assert_explicit(&plan, &names[..3], None);
+}
+
+#[test]
+fn after_an_epoch_end_the_escalation_waits_for_a_trustworthy_resync_requested_after_it() {
+    // Armed (the exclusive lease held), viewed, nothing not ours: four orphans, above the
+    // limit, registered by a trustworthy resync requested at 2 000.
+    let mut reg = seeded(0);
+    arm::start(&mut reg, INST);
+    let orphans: Vec<ClientOrderId> = (0..4).map(|_| cid()).collect();
+    let shown = || -> Vec<VenueOrderSnapshot> {
+        orphans
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| ours(c, &format!("o{i}"), Side::Buy))
+            .collect()
+    };
+    let names = ["o0", "o1", "o2", "o3"];
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, shown(), 0);
+
+    // The order-entry connection ends, its last envelope received at 2 500: explicit.
+    reg.order_entry_epoch_ended(MonoNs(2_500));
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(2_600));
+    assert_eq!(plan.orphans, orphans);
+    assert_explicit(&plan, &names, Some(CancelAllRefusal::NotViewed));
+
+    // A trustworthy resync requested before the end and answered after it, and an
+    // untrustworthy one requested after it, restore nothing.
+    for (source, at) in [
+        (SnapshotSource::Trustworthy, 2_400),
+        (SnapshotSource::Untrustworthy, 2_700),
+    ] {
+        resync_at(&mut reg, source, at, shown(), 0);
+        let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(2_800));
+        assert_explicit(&plan, &names, Some(CancelAllRefusal::NotViewed));
+    }
+
+    // A trustworthy resync requested after the end restores the view: the cancel-all.
+    resync_at(&mut reg, SnapshotSource::Trustworthy, 3_000, shown(), 0);
+    let plan = reg.cancel_orphans(INST, &cfg(), &venue(), MonoNs(3_100));
+    assert_eq!(plan.orphans, orphans);
+    let OrphanCancels::CancelAll { command, .. } = plan.cancels else {
+        panic!("expected a cancel-all, got {plan:?}");
+    };
+    assert_eq!(
+        command.command(),
+        &VenueCommand::CancelAll(CancelScope::Instrument(INST))
+    );
 }
 
 #[test]

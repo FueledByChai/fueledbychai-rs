@@ -7,10 +7,11 @@
 //! non-canonical or unattributed order is in view on the market; otherwise it cancels our
 //! orders on the market by explicit reference in a cancel-many, and no foreign-namespace
 //! order is ever cancelled. Every resync names the Killed markets, whose cancel everything goes
-//! out again, the orders whose cancel is in flight included. No account-scope cancel-all is
-//! ever built, in any state. An own-namespace fill arriving in Killed or Cancel-only for an
-//! order whose cancel is in flight moves the inventory once; a foreign-namespace or
-//! non-canonical one is flagged and moves nothing.
+//! out again, the orders whose cancel is in flight included. An order-entry connection epoch's
+//! end the consumer reports keeps it explicit until a trustworthy resync requested after the
+//! end (FBC-9svb). No account-scope cancel-all is ever built, in any state. An own-namespace
+//! fill arriving in Killed or Cancel-only for an order whose cancel is in flight moves the
+//! inventory once; a foreign-namespace or non-canonical one is flagged and moves nothing.
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
 //! where one lot is worth $1, so 50 lots; the resting cap is set past any order here.
@@ -972,6 +973,90 @@ fn an_own_fill_in_killed_or_cancel_only_for_an_order_whose_cancel_is_in_flight_m
     }
 }
 
+/// The instrument cancel-all of `INST` `out` built, every order of ours acknowledged so
+/// nothing more with it.
+fn assert_cancel_all(case: &str, out: CancelEverything) {
+    let CancelEverything::CancelAll {
+        command,
+        unanswered,
+    } = out
+    else {
+        panic!("{case}: expected an instrument cancel-all, got {out:?}");
+    };
+    assert_eq!(
+        command.command(),
+        &VenueCommand::CancelAll(CancelScope::Instrument(INST)),
+        "{case}"
+    );
+    assert_eq!(unanswered, CancelPlan::default(), "{case}");
+}
+
+#[test]
+fn an_epoch_end_keeps_the_cancel_everything_explicit_until_a_trustworthy_resync_after_it() {
+    // The exclusive lease held, the account viewed at 1 000, nothing not ours in view.
+    let (mut reg, bid, ask) = killed(viewed());
+    assert_eq!(reg.order_entry_epoch_end(), None);
+    assert_cancel_all("viewed", reg.cancel_everything(INST, &venue()));
+    let shown = || {
+        vec![
+            shown_ours(bid, "v-bid", Side::Buy, 100),
+            shown_ours(ask, "v-ask", Side::Sell, 101),
+        ]
+    };
+
+    // The order-entry connection ends, its last envelope received at 2 000: another engine may
+    // have placed an order on the market while the stream was down, so the cancels are
+    // explicit.
+    reg.order_entry_epoch_ended(MonoNs(2_000));
+    assert_eq!(reg.order_entry_epoch_end(), Some(MonoNs(2_000)));
+    assert!(!reg.foreign_in_view(INST));
+    let out = reg.cancel_everything(INST, &venue());
+    assert_explicit(&reg, "ended", out, CancelAllRefusal::NotViewed, &[bid, ask]);
+    // An end reported late, earlier than the latest, moves nothing back.
+    reg.order_entry_epoch_ended(MonoNs(1_800));
+    assert_eq!(reg.order_entry_epoch_end(), Some(MonoNs(2_000)));
+
+    // A trustworthy resync requested before the end and answered after it restores nothing,
+    // nor does one requested at the end itself.
+    for at in [1_500, 2_000] {
+        resync_from(&mut reg, SnapshotSource::Trustworthy, at, shown());
+        let out = reg.cancel_everything(INST, &venue());
+        let case = format!("requested at {at}");
+        assert_explicit(&reg, &case, out, CancelAllRefusal::NotViewed, &[bid, ask]);
+    }
+
+    // An untrustworthy resync requested after it restores nothing.
+    resync_from(&mut reg, SnapshotSource::Untrustworthy, 2_500, shown());
+    let out = reg.cancel_everything(INST, &venue());
+    let why = CancelAllRefusal::NotViewed;
+    assert_explicit(&reg, "untrustworthy", out, why, &[bid, ask]);
+
+    // A trustworthy resync requested after it restores the instrument cancel-all.
+    resync_from(&mut reg, SnapshotSource::Trustworthy, 3_000, shown());
+    assert_cancel_all("restored", reg.cancel_everything(INST, &venue()));
+
+    // An end reported late, earlier than the latest, leaves the latest where it is but still
+    // clears the view, which a trustworthy resync requested after the latest restores.
+    reg.order_entry_epoch_ended(MonoNs(1_800));
+    assert_eq!(reg.order_entry_epoch_end(), Some(MonoNs(2_000)));
+    let out = reg.cancel_everything(INST, &venue());
+    assert_explicit(&reg, "late", out, CancelAllRefusal::NotViewed, &[bid, ask]);
+    resync_from(&mut reg, SnapshotSource::Trustworthy, 3_500, shown());
+    assert_cancel_all("restored again", reg.cancel_everything(INST, &venue()));
+
+    // The next end takes it away again.
+    reg.order_entry_epoch_ended(MonoNs(4_000));
+    assert_eq!(reg.order_entry_epoch_end(), Some(MonoNs(4_000)));
+    let out = reg.cancel_everything(INST, &venue());
+    assert_explicit(
+        &reg,
+        "ended again",
+        out,
+        CancelAllRefusal::NotViewed,
+        &[bid, ask],
+    );
+}
+
 #[test]
 fn every_refusal_says_why_no_cancel_all_was_built() {
     for (why, text) in [
@@ -981,5 +1066,18 @@ fn every_refusal_says_why_no_cancel_all_was_built() {
         (CancelAllRefusal::ForeignInView, "another"),
     ] {
         assert!(why.to_string().contains(text), "{why:?}: {why}");
+    }
+}
+
+#[test]
+fn the_not_viewed_refusal_names_both_its_causes() {
+    // A registry with no epoch end reported refuses it too, when no trustworthy resync has
+    // shown the account's open orders yet, so the text names that cause as well as the end.
+    let text = CancelAllRefusal::NotViewed.to_string();
+    for cause in [
+        "has shown the account's open orders yet",
+        "order-entry connection end",
+    ] {
+        assert!(text.contains(cause), "{cause:?} in {text:?}");
     }
 }

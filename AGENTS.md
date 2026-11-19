@@ -588,7 +588,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     every state (0012;
     `src/sweep.rs`, `tests/sweep.rs`): the kill switch's cancel everything an instrument
     cancel-all only under the held market lease after a trustworthy resync with no order not
-    ours in view, otherwise our orders cancelled by explicit reference, named again on each
+    ours in view, the resync requested after the latest order-entry epoch end the consumer
+    reports (`Registry::order_entry_epoch_ended`, at the `recv_mono` of the last envelope
+    before it, as the samples' `src/link.rs` does; the orphan escalation alike; FBC-9svb),
+    otherwise our orders cancelled by explicit reference, named again on each
     resync while Killed, never an account cancel-all, and own fills counted once in every state
     while foreign ones are flagged; venue-initiated fills (0120; `tests/venue_fills.rs`): a
     `Venue`-origin fill counted once on the inventory through the `FillLedger` in every state

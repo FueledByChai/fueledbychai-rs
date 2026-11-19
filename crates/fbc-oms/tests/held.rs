@@ -201,6 +201,18 @@ fn a_registry_passed_through_a_builder_releases_a_place_dropped_before() {
 }
 
 #[test]
+fn an_order_entry_epoch_end_releases_a_place_dropped_before() {
+    // FBC-9svb: the epoch end the consumer reports is a mutating call, so it reaps too.
+    let mut reg = registry();
+    let order = buy(RESTING);
+    let c = order.cid;
+    drop(reg.place(order).unwrap());
+    reg.order_entry_epoch_ended(MonoNs(1));
+    assert_eq!(reg.get(c).unwrap().state(), released());
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(Lots::ZERO));
+}
+
+#[test]
 fn a_place_passed_to_amend_not_submitted_is_released() {
     let mut reg = registry();
     let order = buy(RESTING);

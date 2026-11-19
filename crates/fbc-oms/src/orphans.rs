@@ -41,8 +41,9 @@
 //! ([`Registry::cancel_many`]), a cancel in flight included. Above the consumer's level limit
 //! ([`OrphanConfig::level_limit`]) it escalates to an instrument cancel-all, only under the
 //! same guard as the kill switch's cancel everything (the venue has one, the registry holds the
-//! market's exclusive lease, a trustworthy resync has shown the account's open orders and no
-//! order not ours is in view on the market, a snapshot's included); otherwise it says why and
+//! market's exclusive lease, a trustworthy resync requested after the latest order-entry epoch
+//! end the consumer reported has shown the account's open orders, FBC-9svb, and no order not
+//! ours is in view on the market, a snapshot's included); otherwise it says why and
 //! builds the explicit cancels. Each resync names the markets that still hold orphans
 //! ([`ResyncReport::orphans`](crate::ResyncReport)), so the consumer builds them again: the
 //! explicit cancels repeat on each resync. An account cancel-all is never built.
@@ -292,9 +293,10 @@ impl Registry {
     /// clock: by explicit reference in a cancel-many, the orphans with a cancel in flight
     /// included; above `cfg`'s level limit an instrument cancel-all instead, only under the
     /// kill switch's guard (the venue has one, the registry holds the market's exclusive lease,
-    /// a trustworthy resync has shown the account's open orders, and no order not ours is in
-    /// view on the market), with the explicit cancels of our orders on it the venue may not
-    /// hold yet. Never an account cancel-all, and never an order not ours.
+    /// a trustworthy resync requested after the latest order-entry epoch end the consumer
+    /// reported ([`Registry::order_entry_epoch_ended`]) has shown the account's open orders, and
+    /// no order not ours is in view on the market), with the explicit cancels of our orders on
+    /// it the venue may not hold yet. Never an account cancel-all, and never an order not ours.
     ///
     /// Starts the market's cooldown when it waits for this call, or holds orphans: until `now`
     /// plus `cfg`'s cooldown, or later if it already ran later.

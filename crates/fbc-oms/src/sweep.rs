@@ -6,9 +6,9 @@
 //! - an instrument cancel-all ([`CancelEverything::CancelAll`]), only when the venue declares
 //!   one (`OrderCaps::cancel_all_instrument`), the registry holds the market's exclusive
 //!   account-and-instrument lease (its [`MarketLease`](fbc_core::MarketLease), held while the
-//!   market is armed and still covered by the registry's current lease names), a trustworthy
-//!   resync has shown the account's open orders, and no order that is not ours is in view on
-//!   the market; with it, the explicit cancels of our orders the venue may not hold yet
+//!   market is armed and still covered by the registry's current lease names), the account's
+//!   open orders are viewed (below), and no order that is not ours is in view on the market;
+//!   with it, the explicit cancels of our orders the venue may not hold yet
 //!   (PendingNew or Unknown), which the cancel-all can miss; or
 //! - the cancels of our orders on the market that are not terminal, each by explicit reference
 //!   in a cancel-many ([`Registry::cancel_many`]), saying why no cancel-all was built
@@ -32,13 +32,27 @@
 //! is not in that snapshot, and nothing here orders the two (FBC-6m4q). One seen with no venue
 //! id cannot be ended by any event, and stays in view. Whatever stays in view keeps the
 //! market's cancel everything explicit, which cancels every order of ours all the same.
+//!
+//! **Viewed.** The account's open orders are viewed from the first trustworthy resync on, until
+//! an order-entry connection epoch ends: an order not ours placed while the account's private
+//! stream was down never reaches the view, so after the end only a trustworthy resync requested
+//! after it shows the account's open orders again (FBC-9svb). The consumer reports each end
+//! through [`Registry::order_entry_epoch_ended`], from its `ExecHandler::on_epoch_end`, with the
+//! last `recv_mono` of the envelopes the session handed it before the end, of any of its
+//! connections, which is never earlier than the ended epoch's own last envelope and is that
+//! envelope's on a session of one connection: decision 0039 gives an epoch's end no stamp of its
+//! own, and that value is the same in replay. A resync requested at or before the latest end
+//! reported restores nothing, even one answered after it, and a resync from an untrustworthy
+//! source never does. Until a resync restores it, the cancel everything is explicit
+//! ([`CancelAllRefusal::NotViewed`]), and so is the orphan escalation (`src/orphans.rs`). An
+//! instrument cancel-all authorized before an end is not voided by it (FBC-vkju).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use fbc_core::{
-    CancelScope, ClientOrderId, InstrumentId, OrderCaps, OrderUpdate, Support, VenueCommand,
-    VenueOrderId, VenueOrderState,
+    CancelScope, ClientOrderId, InstrumentId, MonoNs, OrderCaps, OrderUpdate, Support,
+    VenueCommand, VenueOrderId, VenueOrderState,
 };
 
 use crate::grant::{Counters, Guard, Watch};
@@ -77,8 +91,9 @@ pub enum CancelAllRefusal {
     /// The registry does not hold the market's exclusive lease: the market is disarmed, or the
     /// lease names given since no longer cover the lease it holds (0005's I7).
     NoExclusiveLease,
-    /// No trustworthy resync has shown the account's open orders yet, so what else rests on
-    /// the market is not known.
+    /// No trustworthy resync has shown the account's open orders yet, or none requested after
+    /// the latest order-entry epoch end the consumer reported
+    /// ([`Registry::order_entry_epoch_ended`]), so what else rests on the market is not known.
     NotViewed,
     /// An order not ours is in view on the market (0005's I7).
     ForeignInView,
@@ -92,7 +107,8 @@ impl fmt::Display for CancelAllRefusal {
                 "the market's exclusive lease is not held under the current lease names"
             }
             CancelAllRefusal::NotViewed => {
-                "no trustworthy resync has shown the account's open orders yet"
+                "no trustworthy resync has shown the account's open orders yet, or none requested \
+                 after the latest order-entry connection end the consumer reported"
             }
             CancelAllRefusal::ForeignInView => {
                 "an order of another namespace or system is in view on the market"
@@ -104,10 +120,13 @@ impl fmt::Display for CancelAllRefusal {
 impl std::error::Error for CancelAllRefusal {}
 
 /// The orders not ours in view, per market, and whether a trustworthy resync has shown the
-/// account's open orders.
+/// account's open orders since the latest order-entry epoch end.
 #[derive(Debug, Default)]
 pub(crate) struct ForeignView {
     viewed: bool,
+    /// The latest order-entry epoch end the consumer reported: only a trustworthy resync
+    /// requested after it views the account's open orders.
+    ended: Option<MonoNs>,
     by_market: HashMap<InstrumentId, HashSet<VenueOrderId>>,
     /// Markets on which an order not ours was seen with no venue id.
     nameless: HashSet<InstrumentId>,
@@ -117,9 +136,19 @@ pub(crate) struct ForeignView {
 }
 
 impl ForeignView {
-    /// A trustworthy resync showed the account's open orders.
-    pub(crate) fn viewed(&mut self) {
-        self.viewed = true;
+    /// A trustworthy resync requested at `requested_at` showed the account's open orders: viewed
+    /// unless it was requested at or before the latest order-entry epoch end.
+    pub(crate) fn viewed(&mut self, requested_at: MonoNs) {
+        if self.ended.is_none_or(|end| requested_at > end) {
+            self.viewed = true;
+        }
+    }
+
+    /// An order-entry epoch ended at `at`: the account's open orders are not viewed until a
+    /// trustworthy resync requested after the latest end reported.
+    fn epoch_ended(&mut self, at: MonoNs) {
+        self.viewed = false;
+        self.ended = Some(self.ended.map_or(at, |end| end.max(at)));
     }
 
     /// An order not ours shown open on `market` under `vid`.
@@ -177,9 +206,33 @@ impl Registry {
         self.foreign.in_view(market)
     }
 
+    /// An order-entry connection epoch of the registry's account ended (FBC-9svb): the consumer
+    /// calls it from its `ExecHandler::on_epoch_end`, once per end, with `at`, the last
+    /// `recv_mono` of the envelopes the session handed it before the end, of any of its
+    /// connections (never earlier than the ended epoch's own last envelope, and that envelope's
+    /// on a session of one connection; decision 0039 gives the end no stamp of its own, and that
+    /// value is the same in replay). From it the account's open orders are not viewed, so the
+    /// kill switch's cancel everything and the orphan escalation build no instrument
+    /// cancel-all ([`CancelAllRefusal::NotViewed`]), until a trustworthy resync requested after
+    /// the latest end reported shows them again: an order not ours placed while the stream was
+    /// down is in no earlier snapshot. An end earlier than one already reported leaves the
+    /// latest end where it is, but still clears the view.
+    pub fn order_entry_epoch_ended(&mut self, at: MonoNs) {
+        self.reap_dropped();
+        self.foreign.epoch_ended(at);
+    }
+
+    /// The latest order-entry epoch end the consumer reported
+    /// ([`Registry::order_entry_epoch_ended`]); `None` before the first.
+    pub fn order_entry_epoch_end(&self) -> Option<MonoNs> {
+        self.foreign.ended
+    }
+
     /// The kill switch's cancel everything for `market` on a venue whose order caps are `caps`
     /// (decision 0012), built in every market state: an instrument cancel-all only when the
-    /// venue has one, the registry holds the market's exclusive lease, a trustworthy resync has
+    /// venue has one, the registry holds the market's exclusive lease, a trustworthy resync
+    /// requested after the latest order-entry epoch end the consumer reported
+    /// ([`Registry::order_entry_epoch_ended`], which the consumer must call at each end) has
     /// shown the account's open orders and no order not ours is in view on the market, with
     /// the explicit cancels of our PendingNew and Unknown orders on it, which it can miss;
     /// otherwise the cancels of our orders on the market that are not terminal, in client id
