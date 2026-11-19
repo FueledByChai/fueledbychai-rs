@@ -144,10 +144,13 @@
 //! Cancels and fills in every state (decision 0012; 0005's I4 and I7; `tests/sweep.rs`): the
 //! kill switch's cancel everything for a market ([`Registry::cancel_everything`]) is an
 //! instrument cancel-all only while the registry holds the market's exclusive lease, a
-//! trustworthy resync has shown the account's open orders and no order not ours is in view on
-//! the market ([`Registry::foreign_in_view`]); otherwise our orders on it are cancelled by
-//! explicit reference in a cancel-many ([`CancelEverything`], [`CancelAllRefusal`]), and no
-//! foreign-namespace order is ever cancelled. Each resync names the Killed markets, whose
+//! trustworthy resync has shown the account's open orders, requested after the latest
+//! order-entry epoch end the consumer reported ([`Registry::order_entry_epoch_ended`], called
+//! from each `ExecHandler::on_epoch_end` with the ended epoch's last envelope's `recv_mono`;
+//! FBC-9svb), and no order not ours is in view on the market ([`Registry::foreign_in_view`]);
+//! otherwise our orders on it are cancelled by explicit reference in a cancel-many
+//! ([`CancelEverything`], [`CancelAllRefusal`]), and no foreign-namespace order is ever
+//! cancelled. Each resync names the Killed markets, whose
 //! cancel everything goes out again ([`ResyncReport::cancel_everything`]). No account cancel-all
 //! is ever built, and an instrument one is authorized only as built here. An own-namespace
 //! fill moves the inventory once in every state, Killed included, as does a change the venue

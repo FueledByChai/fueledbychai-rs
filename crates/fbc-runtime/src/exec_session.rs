@@ -283,6 +283,16 @@ pub trait ExecHandler {
     /// Connection epoch `key` ended (a drop, a reconnect the codec asked for, a stalled write,
     /// an error or a stop): called once per epoch, after every event of it the handler is given
     /// and before any of the next (as 0039 for market data). Nothing by default.
+    ///
+    /// A consumer whose fbc-oms [`Registry`](fbc_oms::Registry) holds the account's orders
+    /// calls [`Registry::order_entry_epoch_ended`](fbc_oms::Registry::order_entry_epoch_ended)
+    /// here, at each end, with the last `recv_mono` of the envelopes this handler was given
+    /// before it, of any of the session's connections: never earlier than the ended epoch's own
+    /// last envelope, and that envelope's on a session of one connection. The end carries no
+    /// stamp of its own (0039), and that value is the same in replay. Until a trustworthy resync
+    /// requested after it, the registry builds no instrument cancel-all, since an order of
+    /// another engine placed while the connection was down is in no earlier snapshot
+    /// (FBC-9svb).
     fn on_epoch_end(&mut self, key: ConnKey) {
         let _ = key;
     }

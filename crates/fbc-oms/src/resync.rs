@@ -718,14 +718,15 @@ impl Registry {
         }
 
         // The orders not ours it shows open come into view, from any source; only a
-        // trustworthy one shows the account's open orders (FBC-gzm).
+        // trustworthy one shows the account's open orders (FBC-gzm), and only when requested
+        // after the latest order-entry epoch end (FBC-9svb).
         for o in &snap.orders {
             if o.state == VenueOrderState::Open && self.not_ours(o) {
                 self.foreign.open(o.inst, Some(&o.vid));
             }
         }
         if !report.untrustworthy {
-            self.foreign.viewed();
+            self.foreign.viewed(snap.requested_at);
         }
 
         self.register_shown(snap, key, &mut report);

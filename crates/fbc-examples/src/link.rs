@@ -44,7 +44,14 @@
 //!   closed the connection, or the socket ended and fbc-runtime does not say why (FBC-dmlw).
 //!   A venue error is shown through [`shown`]: Paradex's codec withholds a login refusal's
 //!   echoed words itself, but an auth frame's refusal is the venue's message as received, and
-//!   that frame carries the session token.
+//!   that frame carries the session token. Each end is also reported to the registry
+//!   ([`Registry::order_entry_epoch_ended`], FBC-9svb) at the last `recv_mono` of the envelopes
+//!   the session handed the link before it, of any of its connections (the clock's origin,
+//!   `MonoNs(0)`, before the first), never earlier than the ended epoch's own last envelope and
+//!   that envelope's on a session of one connection, so no instrument cancel-all is built until
+//!   a trustworthy resync requested after it. A resync's request time is the latest
+//!   authentication of any connection, so the link serves sessions of one order-entry
+//!   connection, which is what every venue here plans.
 //! - **Unprotected orders** ([`ExecHandler::on_unprotected`], decision 0080): the orders of
 //!   ours a connection's resync showed resting from an earlier connection or run, which its
 //!   cancel-on-disconnect may not cover, are cancelled at once: a Safety cancel per order, built
@@ -493,6 +500,8 @@ pub struct Link {
     collecting: Option<ResyncSnapshot>,
     /// When the socket was last reported authenticated.
     authenticated_at: Option<MonoNs>,
+    /// The receive time of the last envelope the session handed the link.
+    last_recv: Option<MonoNs>,
     /// The current connection: whether it authenticated, whether the codec closed it, and the
     /// last venue error naming no request it reported (its end's reason).
     epoch_authenticated: bool,
@@ -528,6 +537,7 @@ impl Link {
             sent: HashMap::new(),
             collecting: None,
             authenticated_at: None,
+            last_recv: None,
             epoch_authenticated: false,
             epoch_closed: false,
             epoch_error: None,
@@ -971,6 +981,7 @@ impl Link {
 
     fn on_event(&mut self, env: Envelope<ExecEvent>) {
         let now = env.stamp.recv_mono;
+        self.last_recv = Some(now);
         let key = OrderKey {
             venue: env.venue_seq,
             ingest: env.stamp.ingest_seq,
@@ -1180,9 +1191,12 @@ impl Link {
         self.notes.push(Note::Unprotected { told, rpcs, left });
     }
 
-    /// Connection epoch `key` ended: noted with why ([`Note::EpochEnd`]), and the next starts
+    /// Connection epoch `key` ended: reported to the registry at the last envelope's receive
+    /// time (module documentation), noted with why ([`Note::EpochEnd`]), and the next starts
     /// unauthenticated with nothing said.
     fn on_epoch_end(&mut self, key: ConnKey) {
+        self.reg
+            .order_entry_epoch_ended(self.last_recv.unwrap_or(MonoNs(0)));
         let why = match (self.epoch_error.take(), self.epoch_closed) {
             (Some(error), _) => error,
             (None, true) => CODEC_CLOSED.to_owned(),
