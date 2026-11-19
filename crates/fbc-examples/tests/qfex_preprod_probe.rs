@@ -77,6 +77,17 @@
 //!   ping on the MDS socket is answered and each later place is priced from a current touch,
 //!   between the sessions and between named accounts too, and a touch connection that ended
 //!   between the sessions still stops the run before the next place.
+//! - runs stage three on each account after its taker IOC session (FBC-4plj, decision 0132 items
+//!   5 and 7, 0148 items 7, 8 and 10, in [`place_stages`], its pure parts in [`pages_run`] and the
+//!   pager's socket in [`compare_reads`]): P1, P2 and P3 placed and cancelled by venue id while a
+//!   pager pages at a size of 1 between them, each page recorded with its size and offset, a
+//!   provider rate refusal on the pager a stop, a maker fill flattened, and the pages-production/
+//!   slice; the QFEX model's paging and its page_order knob.
+//! - lifts the loopback-only gate and finishes the report (FBC-4plj's second pass, in
+//!   [`place_stages`], its pure parts in [`answers_run`]): production's guarded origins admitted,
+//!   every origin the probe guard refuses still refused before anything connects, decision
+//!   0132's list answered for each named account, the taker IOC's trades read after its session,
+//!   every session and read socket reported, and the whole evidence passing the privacy check.
 //!
 //! The stub answers as QFEX's pages show (each frame below names its page): each account's
 //! positions selected by `x-qfex-requested-account-id`, the authentication reply, the
@@ -88,6 +99,12 @@
 //! and one whose arm its ack answers stops once its resync's page, which the stub answers empty
 //! after the arm's replies, has ended the resync (FBC-jxau).
 
+// Decision 0132's list for each named account (FBC-4plj), read by the place stages' report,
+// tested in [`answers_run`] and run in [`place_stages`].
+#[path = "../examples/qfex_preprod_probe/answers.rs"]
+mod answers;
+#[path = "qfex_preprod_probe/answers_run.rs"]
+mod answers_run;
 #[path = "../src/auth_qfex.rs"]
 mod auth_qfex;
 #[path = "../examples/qfex_preprod_probe/capture.rs"]
@@ -132,6 +149,12 @@ mod mds_pings;
 mod model;
 #[path = "../examples/qfex_preprod_probe/pages.rs"]
 mod pages;
+// Stage three (FBC-4plj): its interleaving, its pager's records and the report's section on it,
+// tested in [`pages_run`] and run in [`place_stages`].
+#[path = "../examples/qfex_preprod_probe/pager.rs"]
+mod pager;
+#[path = "qfex_preprod_probe/pages_run.rs"]
+mod pages_run;
 // The place stages' registries' proof (FBC-oxjs), declared by path so it is part of this test
 // binary, as decision 0148's Consequences name it (0151 item 12), and Cargo
 // builds no target of its own for it.
@@ -1810,13 +1833,14 @@ async fn each_full_page_a_sessions_resync_reads_is_recorded_with_its_size_and_of
     let evidence = json(&evidence);
     assert_eq!(
         evidence["sessions"][0]["orders_pages"],
-        json(
-            r#"{"asked":3,"read":3,"full_pages":[{"page_size":1,"offset":0},{"page_size":1,"offset":1}]}"#
-        )
+        json(concat!(
+            r#"{"asked":3,"read":3,"orders":1,"#,
+            r#""full_pages":[{"page_size":1,"offset":0},{"page_size":1,"offset":1}]}"#
+        ))
     );
     assert_eq!(
         evidence["sessions"][1]["orders_pages"],
-        json(r#"{"asked":1,"read":1,"full_pages":[]}"#)
+        json(r#"{"asked":1,"read":1,"orders":0,"full_pages":[]}"#)
     );
     // No id or amount of a page is kept in the report or the evidence, and both pass the
     // privacy check.
@@ -1876,7 +1900,7 @@ async fn a_full_page_the_codec_refuses_is_counted_asked_and_not_read() {
         let evidence = fs::read_to_string(opts.evidence_dir.join("evidence.json")).unwrap();
         assert_eq!(
             json(&evidence)["sessions"][0]["orders_pages"],
-            json(r#"{"asked":1,"read":0,"full_pages":[]}"#),
+            json(r#"{"asked":1,"read":0,"orders":0,"full_pages":[]}"#),
             "{refused:?}"
         );
         assert_report_and_evidence_pass_the_privacy_check(&opts.evidence_dir);
@@ -1964,7 +1988,7 @@ fn a_page_is_read_as_the_codec_reads_one_and_paired_with_the_ask_it_answers() {
     assert!(line.ends_with(": page size 1 at offset 0"), "{line}");
     assert_eq!(
         seen.to_json(),
-        json(r#"{"asked":3,"read":2,"full_pages":[{"page_size":1,"offset":0}]}"#)
+        json(r#"{"asked":3,"read":2,"orders":1,"full_pages":[{"page_size":1,"offset":0}]}"#)
     );
     assert_eq!(pages::Pages::default().listed(), "none");
 }

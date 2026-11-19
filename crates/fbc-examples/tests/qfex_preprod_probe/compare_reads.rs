@@ -14,7 +14,10 @@
 //! - a comparison against the model times its first agreeing read past the model's lag;
 //! - the model answers the arm, a place, a cancel and the two pages as QFEX does, cancels an
 //!   armed connection's account's orders as its knobs say once it ends, and sends each knob's
-//!   frames.
+//!   frames;
+//! - stage three's pager (FBC-4plj) asks one page at a time at its offset and page size, every
+//!   frame charged first, one without room not sent, and a `RateLimited` page is a refusal that
+//!   holds the budget ([`compare::Socket::page`], [`compare::page_attempt`]).
 
 use super::*;
 
@@ -1316,4 +1319,116 @@ async fn a_read_the_wait_ends_during_sends_nothing_more_and_is_not_judged() {
     assert_eq!((sent.len(), pages), (2, 1), "{sent:?}");
     assert_eq!(bench.positions_read(), 0);
     bench.venue.assert_served();
+}
+
+// ----- Stage three's pager (FBC-4plj; decision 0132 item 7, 0148 item 8) -----
+
+#[tokio::test]
+async fn a_pager_asks_one_page_at_a_time_at_its_offset_every_frame_charged_first() {
+    let bench = Bench::start(QfexModel::default()).await;
+    let ours = cids(2);
+    {
+        let mut model = bench.model();
+        resting(&mut model, ID_1, ours[0]);
+        resting(&mut model, ID_2, ours[1]);
+    }
+    // Room for one authentication and two pages an hour, nothing else.
+    let page = PAGE_WEIGHT.get();
+    let limits = [hourly(OpKind::Control, 1), hourly(OpKind::Query, 2 * page)];
+    let limiter = RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut pager = Socket::new(bench.io(&limiter, 1), &bench.cfg, &bench.reader, &mut ctx);
+    // Page 1 of the two, at a page size of 1: the second order alone, full, its frame kept for
+    // the slice as a journal would keep it.
+    let compare::PageAttempt::Read {
+        listed,
+        twaps,
+        full,
+        kept,
+    } = pager.page(1).await
+    else {
+        panic!("a page");
+    };
+    let rows: Vec<(VenueOrderId, CidMatch)> =
+        listed.iter().map(|l| (l.order.clone(), l.client)).collect();
+    assert_eq!(rows, [(vid(&bench.caps, ID_2), CidMatch::Ours(ours[1]))]);
+    assert_eq!((twaps, full), (0, true));
+    assert!(kept.contains("all_orders_response"), "{kept}");
+    // Page 2: past both, short, on the same socket, with no second authentication.
+    let short = pager.page(2).await;
+    assert!(
+        matches!(
+            &short,
+            compare::PageAttempt::Read { listed, full: false, .. } if listed.is_empty()
+        ),
+        "{short:?}"
+    );
+    // A third page has no room in the shared limiter: not sent, and not waited for.
+    let began = tokio::time::Instant::now();
+    assert_eq!(pager.page(0).await, compare::PageAttempt::Skipped);
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert_eq!(limiter.counts().refused.ip, 1);
+    let heard = pager.close().await;
+    assert_eq!(heard, Refusals::default());
+    let sent: Vec<Value> = bench.received(0).iter().map(|f| json(f)).collect();
+    let asked: Vec<(String, String)> = (sent.iter())
+        .filter(|v| v["type"] == "get_user_orders")
+        .map(|v| {
+            let params = &v["params"];
+            (params["limit"].to_string(), params["offset"].to_string())
+        })
+        .collect();
+    let at = |offset: &str| ("1".to_owned(), offset.to_owned());
+    assert_eq!(asked, [at("1"), at("2")]);
+    assert_eq!(sent.iter().filter(|v| v["type"] == "auth").count(), 1);
+    bench.venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_rate_limited_page_on_the_pager_is_a_refusal_that_holds_the_budget() {
+    let bench = Bench::start(QfexModel {
+        rate_limit: Some(Limited::PagerPage(0)),
+        ..QfexModel::default()
+    })
+    .await;
+    let limiter = bench.limiter();
+    let mut nonces = QfexNonces::os();
+    let mut ctx = || ctx_of(&mut nonces);
+    let mut pager = Socket::new(bench.io(&limiter, 1), &bench.cfg, &bench.reader, &mut ctx);
+    assert_eq!(pager.page(0).await, compare::PageAttempt::Refused);
+    assert!(limiter.counts().rejected.user >= 1);
+    let heard = pager.close().await;
+    assert_eq!((heard.errs, heard.limiter), (1, 1));
+    bench.venue.assert_served();
+}
+
+#[test]
+fn what_a_pagers_page_comes_to() {
+    // A provider rate refusal, whatever else came, and any rise in the shared limiter's
+    // rejected count, are refusals; a page not sent is skipped; a failure is a failure; and a
+    // cut or a read, which a pager never makes, is a page not read.
+    let refused = Err(Attempt::Refused(RefusedOn::ReadSocket));
+    assert_eq!(
+        compare::page_attempt(refused, false),
+        compare::PageAttempt::Refused
+    );
+    let skipped = || Err(Attempt::Skipped);
+    assert_eq!(
+        compare::page_attempt(skipped(), true),
+        compare::PageAttempt::Refused
+    );
+    assert_eq!(
+        compare::page_attempt(skipped(), false),
+        compare::PageAttempt::Skipped
+    );
+    let failed = Err(Attempt::Failed("synthetic".to_owned()));
+    assert_eq!(
+        compare::page_attempt(failed, false),
+        compare::PageAttempt::Failed("synthetic".to_owned())
+    );
+    let unread = compare::PageAttempt::Failed("the page was not read".to_owned());
+    assert_eq!(compare::page_attempt(Err(Attempt::Cut), false), unread);
+    let read = Err(Attempt::Read(Read::default()));
+    assert_eq!(compare::page_attempt(read, false), unread);
 }

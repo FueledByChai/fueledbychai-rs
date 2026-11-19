@@ -218,14 +218,10 @@ pub const THEN_TAKE: &str = "this account's taker IOC session, which starts only
      named account reads clean again and no registry of the run holds an order of ours (decision \
      0148 item 6)";
 
-/// What follows a taker IOC session that did not stop the run, on an account before the last.
-pub const NEXT_ACCOUNT: &str = "the next named account's crossing session, which starts only \
-     after every named account reads clean again and no registry of the run holds an order of \
-     ours (decision 0148 item 6)";
-
-/// What follows the last named account's taker IOC session that did not stop the run: the run's
-/// end, until FBC-4plj builds stage three.
-pub const LAST_TAKE: &str = "the run's end: stage three is not built yet (FBC-4plj builds it)";
+/// What follows a taker IOC session that did not stop the run: its account's stage-three session
+/// (FBC-4plj).
+pub const THEN_PAGES: &str = "this account's stage-three session, which starts only after every \
+     named account reads clean again";
 
 /// What the report says of an order resting after a taker IOC session, for the owner (decision
 /// 0132 item 7, on production's site as decision 0143 item 4 reads it).

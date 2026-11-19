@@ -69,6 +69,9 @@ pub struct Pages {
     pub asked: u64,
     /// The asks a page answered.
     pub read: u64,
+    /// The orders those pages listed, TWAPs aside: what decision 0132 item 5's cross-check
+    /// compares with REST's `open_orders` ([`crate::capture::SessionRun::resync_open_orders`]).
+    pub orders: u64,
     /// Each full page, in the order read: its page size and offset.
     pub full: Vec<Page>,
     /// The page asked for that no page has answered yet.
@@ -106,11 +109,12 @@ impl Pages {
         let Some(page) = self.waiting else {
             return;
         };
-        let Some(listed) = rows_on(text, page.size, specs) else {
+        let Some((orders, listed)) = orders_on(text, page.size, specs) else {
             return;
         };
         self.waiting = None;
         self.read += 1;
+        self.orders += orders as u64;
         if listed == usize::from(page.size) {
             self.full.push(page);
         }
@@ -144,7 +148,7 @@ impl Pages {
         let full: Vec<Value> = (self.full.iter())
             .map(|p| json!({"page_size": p.size, "offset": p.offset}))
             .collect();
-        json!({"asked": self.asked, "read": self.read, "full_pages": full})
+        json!({"asked": self.asked, "read": self.read, "orders": self.orders, "full_pages": full})
     }
 }
 
@@ -174,6 +178,11 @@ pub fn rows(text: &str, size: u16) -> Option<usize> {
 /// `order_id` and, unless its `type` is a stop kind, a non-empty string `symbol`, and a row on a
 /// symbol `specs` holds read as [`held`] reads it. `None` for any other frame.
 pub fn rows_on(text: &str, size: u16, specs: &SpecTable) -> Option<usize> {
+    orders_on(text, size, specs).map(|(_, rows)| rows)
+}
+
+/// [`rows_on`]'s page, and how many of its rows are orders, TWAPs aside: `(orders, rows)`.
+fn orders_on(text: &str, size: u16, specs: &SpecTable) -> Option<(usize, usize)> {
     let Ok(Value::Object(top)) = serde_json::from_str::<Value>(text) else {
         return None;
     };
@@ -199,7 +208,7 @@ pub fn rows_on(text: &str, size: u16, specs: &SpecTable) -> Option<usize> {
         && orders.iter().all(read)
         && twaps.iter().all(Value::is_object)
         && orders.len() + twaps.len() <= usize::from(size);
-    shaped.then_some(orders.len() + twaps.len())
+    shaped.then_some((orders.len(), orders.len() + twaps.len()))
 }
 
 /// Whether `row`, an order row on `spec`'s symbol, reads as the codec reads an open order of its

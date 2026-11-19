@@ -28,9 +28,7 @@
 //!   exactly three admit three resting minimum-size orders in fbc-oms, and a count bound at a
 //!   place registry's ceiling is refused before any account connects;
 //! - `qfex.exec.production_places` is set on a place stage's session configuration alone;
-//! - no `GET /user/subaccounts` is sent, and `--place-stages` is refused on every origin that is
-//!   not loopback, its test run through a SOCKS5 proxy no one listens on, so a gate that let it
-//!   through would reach no QFEX host.
+//! - no `GET /user/subaccounts` is sent; FBC-4plj's lifting of the loopback-only gate, below.
 //!
 //! FBC-23ch's done line (`places.rs`, `tee.rs`, `compare.rs` and the driver in `stage.rs`;
 //! decisions 0132 items 4 and 7, 0148 and 0151), against the model's trade sockets:
@@ -191,6 +189,48 @@
 //! - a press of Ctrl-C during the endless pages taken, the read still cut at its patience, and
 //!   the press the run's stop
 //!   (`ctrl_c_during_endless_history_pages_is_taken_and_the_run_stops_at_the_reads_patience`).
+//!
+//! FBC-4plj's first pass: stage three's pages, against the model's trade sockets, its pure parts
+//! in `pages_run.rs` and the pager's socket in `compare_reads.rs`:
+//!
+//! - stage three on each account after its taker IOC session, only once its drop test passed and
+//!   the exact-echo gate opened, and nothing of it with the gate shut or a drop test failed
+//!   (`stage_three_runs_only_after_a_passed_verdict_and_an_open_exact_echo_gate`);
+//! - P1 and P2, page 0, P3, page 1, P1's cancel, pages 2 and 3, P2's and P3's cancels, then the
+//!   walk from offset 0, the pager a socket of its own at a page size of 1 that never arms, each
+//!   page recorded with its size and offset, each place and cancel compared, the Stop and the
+//!   read after the session, with the model listing the oldest first and the newest first
+//!   (`stage_three_pages_at_size_one_between_places_and_cancels`); a cancel not sent for an order
+//!   already ended or not yet acknowledged, and a walk ended by a repeated page;
+//! - a RateLimited page on the pager, in the plan or the walk, stopping the run
+//!   (`a_rate_limited_page_on_the_pager_stops_the_run`);
+//! - a maker fill of a stage-three order flattened, then stopping the run, and the account's one
+//!   flatten budget shared with the take registry's
+//!   (`a_maker_fill_in_stage_three_is_flattened_then_stops`);
+//! - the pages-production/ slice, the stage-three sessions' frames and the pagers' pages apart
+//!   from the other slices, scrubbed, holding no synthetic id and passing the privacy check
+//!   (`each_stage_writes_its_own_scrubbed_slice`, its stage-three part).
+//!
+//! FBC-4plj's second pass: the full report, the taker IOC's trades read and the gate lifted, its
+//! pure parts in `answers_run.rs`:
+//!
+//! - production's guarded origins admitted for the place stages, the defaults and the same named,
+//!   through a SOCKS5 proxy no one listens on, so nothing reaches a QFEX host, while every origin
+//!   the adapter's probe guard refuses is refused before anything connects
+//!   (`place_stages_admit_the_guarded_production_origins`);
+//! - a whole run on both named accounts, each account's drop test in turn, then on each in turn
+//!   its crossing post-only, its taker IOC with its trades read after its session, and its stage
+//!   three, ending ok (`place_stages_run_each_named_account_in_turn`);
+//! - decision 0132's list answered for both accounts in the report and the evidence
+//!   (`the_report_answers_each_item_for_both_accounts`), with an upper-cased echo reading "not
+//!   byte for byte", the fee_sign knob giving the matching sign word, the cod_on_close knob the
+//!   matching graceful-close answer and the ioc_frame_order knob the IOC's frame order;
+//! - every session and read socket in the report and the evidence
+//!   (`the_report_and_evidence_carry_each_session_and_read_socket`), and the whole evidence
+//!   directory holding no synthetic value and passing the privacy check
+//!   (`the_whole_evidence_holds_no_synthetic_value`);
+//! - the taker IOC's trades read: a provider rate refusal in it a stop, one not made recorded,
+//!   and Ctrl-C during it a stop.
 
 use super::*;
 
@@ -337,13 +377,26 @@ async fn place_run(
     (ran, printed.text())
 }
 
-/// A run's outcome, which must end after the preflight it passed, or with the refusal `why`
-/// before it: never ok, since the place stages after the preflight are not built yet.
+/// A run's evidence, once it ran past its refusals: not ok when it stopped, or a file or record
+/// is not whole; a run that finished every place stage with no stop (FBC-4plj) is ok when its
+/// files and records are whole, its last line saying which.
 fn stopped(ran: Result<stage::Outcome, String>, printed: &str) -> Evidence {
     let outcome = ran.unwrap();
-    assert!(!outcome.ok, "{printed}");
-    assert!(printed.contains("DONE INCOMPLETE"), "{printed}");
-    outcome.evidence
+    let ev = outcome.evidence;
+    match (ev.stopped.is_some(), outcome.ok) {
+        (true, ok) => assert!(!ok, "{printed}"),
+        (false, true) => assert!(printed.contains("DONE ok"), "{printed}"),
+        (false, false) => assert!(printed.contains("DONE INCOMPLETE"), "{printed}"),
+    }
+    if outcome.ok {
+        assert!(
+            printed.contains(&format!("FINISHED {}", stage::FINISHED)),
+            "{printed}"
+        );
+    } else {
+        assert!(printed.contains("DONE INCOMPLETE"), "{printed}");
+    }
+    ev
 }
 
 /// Asserts the model received no `GET /user/subaccounts` (decision 0144): only positions,
@@ -615,23 +668,51 @@ fn place_stage_flags_are_refused_naming_the_flag() {
         "--agree-wait-ms <MS>",
         "--read-interval-ms <MS>",
         "--touch-max-age-ms <MS>",
+        // And every other flag the program takes (FBC-4plj: --help names every flag).
+        "--production",
+        "--evidence-dir <DIR>",
+        "--arm <ACCOUNT>",
+        "--hold-secs <S>",
+        "--hold-account <ACCOUNT>",
+        "--rpc-timeout-ms <MS>",
+        "--page-size <N>",
+        "--read-wait-ms <MS>",
+        "--connect-wait-ms <MS>",
+        "--session-wait <S>",
+        "--registry-span <S>",
+        "--ledger-max-age <S>",
+        "--ledger-max-entries <N>",
+        "--reconciled <WHAT>",
+        "--trade-url <URL>",
+        "--rest-url <URL>",
+        "--mds-url <URL>",
+        "--socks5 <HOST:PORT>",
+        "--help ",
     ] {
-        assert!(usage.contains(flag), "{flag}");
+        assert!(usage.contains(&format!("\n  {flag}")), "{flag}");
     }
     let usage = usage.split_whitespace().collect::<Vec<_>>().join(" ");
     for said in [
-        "With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of \
-         FBC-9sk2; decisions 0148 and 0151) it runs the place stages' preflight, then decision \
-         0132 item 4's drop test on each named account in turn, then stage two's crossing \
-         post-only and taker IOC on each in turn",
-        "only against a loopback test stub, every origin (trade, REST and MDS) a loopback address",
+        "With --place-stages (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i, FBC-ou9g and FBC-4plj, \
+         slices of FBC-9sk2; decisions 0148 and 0151) it runs the place stages' preflight, then \
+         decision 0132 item 4's drop test on each named account in turn, then stage two's \
+         crossing post-only and taker IOC and stage three's pages on each in turn",
+        "on QFEX production's own origins, or, for a test stub, every origin (trade, REST and \
+         MDS) a loopback address, as the adapter's probe guard admits them (decision 0143 item 2)",
         "It prints a CAPS line with the environment and both caps first, before any request",
         "Drop session two: every named account read again, X alone admitted, as one open order \
          on its symbol",
         "then the abrupt drop of its connection, with no WebSocket close",
         "With no stop, stage two follows.",
-        "With no stop the run ends after the last account's taker IOC, its outcome not ok, until \
-         FBC-4plj builds stage three.",
+        "With no stop the account's stage three follows (FBC-4plj)",
+        "beside it a pager, a second socket that never arms, asks for get_user_orders at a page \
+         size of 1, every frame charged to the shared limiter first",
+        "A provider rate refusal on the pager stops the run (RateRefused(Pager))",
+        "With no stop the run ends after the last account's stage three. The report answers \
+         decision 0132's list for each named account",
+        "the taker IOC's and its flatten IOCs' get_user_trades rows since its send and GET \
+         /user/historic-orders are read on a socket that never arms",
+        "stage three's sessions' frames and the pagers' pages into pages-production/",
         "it stops the run not flat with no flatten (IocRemainder; 0151 item 8, until FBC-jdj7)",
         "the key qfex.exec.production_places = probe_place_stages, the CodProbeRun declarations, \
          the fences met (never their values), --sole-trader and your confirmations as unchecked, \
@@ -923,7 +1004,7 @@ async fn the_place_stage_span_floor_counts_both_drop_sessions_and_the_reads_betw
     assert!(venue.log().is_empty() && !dir.join("evidence").exists());
     let (ran, printed) = place_run(&venue, &argv, &primary_only()).await;
     let ev = stopped(ran, &printed);
-    assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(ev.stopped.as_deref(), None);
     assert_eq!(ev.accounts, ["primary"]);
     venue.assert_served();
 }
@@ -937,7 +1018,7 @@ async fn caps_are_printed_before_the_first_request_and_before_the_hold() {
     let argv = set(argv(&dir, &venue), "--hold-secs", "1");
     let (ran, printed) = place_run(&venue, &argv, &environment()).await;
     let ev = stopped(ran, &printed);
-    assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT), "{printed}");
+    assert_eq!(ev.stopped.as_deref(), None, "{printed}");
     // The first line, before every other, is the CAPS line, with the environment and both caps.
     let first = printed.lines().next().unwrap();
     assert_eq!(
@@ -1019,7 +1100,7 @@ async fn a_hold_runs_before_the_preflight_with_nothing_else_open() {
         ev.preflight.unwrap().passed,
         [DISCOVERED, COUNTED, TOUCHED, CAPPED]
     );
-    assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(ev.stopped.as_deref(), None);
 
     // The hold's connection, the one trade socket that subscribed, opened alone: every read
     // socket before it closed, and no MDS connection or /refdata read yet.
@@ -1068,8 +1149,8 @@ async fn a_hold_runs_before_the_preflight_with_nothing_else_open() {
     let (report, _) = outputs_of(&dir);
     assert!(
         report.starts_with(
-            "# QFEX production place stages: the preflight, each named account's drop test and \
-             stage two's crossing post-only and taker IOC\n"
+            "# QFEX production place stages: the preflight, each named account's drop test, \
+             stage two's crossing post-only and taker IOC, and stage three's pages\n"
         ),
         "{report}"
     );
@@ -1347,11 +1428,11 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         ev.preflight.unwrap().passed,
         [DISCOVERED, COUNTED, TOUCHED, CAPPED]
     );
-    assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(ev.stopped.as_deref(), None);
     // Past the preflight, each named account's drop test ran, two sessions each (FBC-23ch and
-    // FBC-77r8), then each one's crossing session (FBC-su9i) and its taker IOC session
-    // (FBC-ou9g), and no stage-one registry was built.
-    assert_eq!(ev.sessions.len(), 8);
+    // FBC-77r8), then each one's crossing session (FBC-su9i), its taker IOC session (FBC-ou9g)
+    // and its stage-three session (FBC-4plj), and no stage-one registry was built.
+    assert_eq!(ev.sessions.len(), 10);
     assert!(ev.registries.is_empty());
     assert_eq!(
         (ev.environment, ev.target),
@@ -1375,12 +1456,15 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
          turn places its crossing post-only",
         "then, in a session of its own (FBC-ou9g), one limit IOC at the minimum size at the far \
          touch, whose fill is flattened through Exit before that session stops; with the \
-         exact-echo gate shut the run ends NoEcho; the run ends after the last account's taker \
-         IOC, not ok, until FBC-4plj builds stage three",
+         exact-echo gate shut the run ends NoEcho; then stage three (FBC-4plj), in a session of \
+         its own on each account after its taker IOC",
+        "while a pager that never arms asks for get_user_orders at a page size of 1 between \
+         them; the run ends after the last account's stage three, its report answering decision \
+         0132's list for each named account",
         "PREFLIGHT the instrument's spec from GET /refdata on the guarded REST origin",
         "PREFLIGHT the touch from the guarded MDS origin",
         "PREFLIGHT passed: the spec, the count bound, the touch and the caps",
-        &format!("STOPPED {}", stage::NOT_BUILT),
+        &format!("FINISHED {}", stage::FINISHED),
     ] {
         assert!(printed.contains(line), "{line}: {printed}");
     }
@@ -1394,8 +1478,8 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         "{report}"
     );
     assert!(report.contains(
-        "the run ends after the last account's taker IOC: stage three is not built yet (FBC-4plj \
-         builds it)"
+        "each followed by that account's stage three (FBC-4plj), and the run ends after the last \
+         account's stage three, its report answering decision 0132's list for each named account"
     ));
     let json = super::json(&json);
     assert_eq!(json["place_stages"]["passed"].as_array().unwrap().len(), 4);
@@ -1409,7 +1493,8 @@ async fn preflight_discovery_and_touch_take_the_guarded_origins() {
         "{report}"
     );
     assert!(!report.contains("the run asked for no session"), "{report}");
-    assert_eq!(json["ok"], false);
+    // Every place stage ran with no stop and every file and record is whole (FBC-4plj).
+    assert_eq!(json["ok"], true);
     assert_report_and_evidence_pass_the_privacy_check(&dir.join("evidence"));
     assert_no_listing(&venue);
     venue.assert_served();
@@ -1827,7 +1912,7 @@ async fn caps_below_three_minimum_sizes_refuse_the_run_before_any_account_connec
         [DISCOVERED, COUNTED, TOUCHED, CAPPED]
     );
     // Past the preflight, drop session one runs (FBC-23ch).
-    assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(ev.stopped.as_deref(), None);
 
     // A minimum size whose three would overflow a lot count admits no cap.
     let mut huge = spec_of(Listed::trading());
@@ -2013,53 +2098,111 @@ fn a_stage_one_production_run_sets_no_key() {
     }
 }
 
-// ----- The loopback-only gate -----
+// ----- The origins the adapter's probe guard admits (FBC-4plj lifted the loopback-only gate) --
+
+/// A SOCKS5 proxy no one listens on, on this machine: a run through it whose guard admitted a
+/// non-loopback origin connects to nothing beyond 127.0.0.1, its first connection refused there,
+/// as stage one's guard tests run a non-loopback origin.
+fn nowhere() -> ProxyConfig {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    ProxyConfig::Socks5 {
+        host: "127.0.0.1".into(),
+        port,
+    }
+}
 
 #[tokio::test]
-async fn place_stages_refuse_a_non_loopback_origin_until_built() {
+async fn place_stages_admit_the_guarded_production_origins() {
     let env = environment();
-    // Production's own origins, the defaults with --production, and the same named: refused
-    // before anything connects, naming the reason.
-    let defaults = without(
-        without(without(parse_only(), "--trade-url"), "--rest-url"),
-        "--mds-url",
-    );
-    let named = set(defaults.clone(), "--trade-url", "wss://trade.qfex.com");
-    let named = set(named, "--rest-url", "https://api.qfex.com");
-    let named = set(named, "--mds-url", "wss://mds.qfex.com");
-    // Through a SOCKS5 proxy no one listens on, as stage one's guard tests run a non-loopback
-    // origin: the guard admits production's origins through a proxy, so the gate is still what
-    // the run meets, and a gate that let it through would reach no QFEX host.
-    let nowhere = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        ProxyConfig::Socks5 {
-            host: "127.0.0.1".into(),
-            port,
-        }
-    };
-    for argv in [defaults, named] {
-        let (mut opts, places) = parsed(&argv).unwrap();
-        assert_eq!(opts.mds_url, "wss://mds.qfex.com");
-        let (dir, _removed) = temp_dir("place-gate");
-        opts.evidence_dir = dir.join("evidence");
-        opts.proxy = nowhere.clone();
+    let (dir, _removed) = temp_dir("place-guard");
+    let home = dir.join("home");
+    let lookup = |var: &str| env.get(var).cloned();
+    let urls = ["--trade-url", "--rest-url", "--mds-url"];
+    let on = |name: &str, [trade, rest, mds]: [&str; 3]| argv_on(&dir.join(name), trade, rest, mds);
+    let production = [PRODUCTION_TRADE, PRODUCTION_REST, PRODUCTION_MDS];
+    // Production's own origins, the defaults with --production and the same named, admitted:
+    // the run passes the guard, opens its lease directory, prints its PROBE line and writes its
+    // report, its first connection refused by the proxy no one listens on, so nothing it sent
+    // left this machine.
+    let defaults = urls
+        .iter()
+        .fold(on("defaults", production), |a, f| without(a, f));
+    for (name, argv) in [("defaults", defaults), ("named", on("named", production))] {
+        let (mut opts, places) = parsed_home(&argv, &home);
+        let origins = [&opts.trade_url, &opts.rest_url, &opts.mds_url].map(String::as_str);
+        assert_eq!(origins, production);
+        opts.proxy = nowhere();
         let printed = Printed::default();
-        let lookup = |var: &str| env.get(var).cloned();
+        let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
+        let ran = stage::run_places(&opts, &places, &lookup, out).await;
+        let text = printed.text();
+        let ev = stopped(ran, &text);
+        assert!(
+            text.starts_with("CAPS on QFEX production"),
+            "{name}: {text}"
+        );
+        assert!(
+            text.contains(
+                "PROBE place stages on QFEX production (production_probe), against QFEX \
+                 production"
+            ),
+            "{name}: {text}"
+        );
+        assert_eq!(
+            (ev.environment, ev.target),
+            ("production", "QFEX production")
+        );
+        assert!(ev.stopped.is_some(), "{name}: {text}");
+        assert!(ev.drops.is_empty(), "{name}: {text}");
+        assert!(opts.evidence_dir.join("report.md").exists(), "{name}");
+        let tag = leases_of(&dir.join(name)).join(places::ENVIRONMENT);
+        assert_eq!(fs::read_to_string(tag).unwrap(), "production\n");
+    }
+    // Every origin the guard refuses for production is still refused before anything connects,
+    // naming the setting and never a value: each pre-production origin and all three, an origin
+    // of neither environment, and a mix of loopback and production origins; the evidence
+    // directory and the lease directory never made, and the CAPS line the one line printed.
+    let preproduction = [PREPROD_TRADE, PREPROD_REST, PREPROD_MDS];
+    let loopback = ["ws://127.0.0.1:1", "http://127.0.0.1:2", "ws://127.0.0.1:3"];
+    let mut cases: Vec<(Argv, bool, String)> = Vec::new();
+    for (n, flag) in urls.iter().enumerate() {
+        let setting = flag.trim_start_matches("--").replace('-', "_");
+        let one = set(on("one", production), flag, preproduction[n]);
+        let refused = format!("qfex.{setting}: a pre-production qfex.io host");
+        cases.push((one, true, refused));
+        let other = set(on("other", production), flag, "wss://elsewhere.example");
+        let refused = format!("qfex.{setting}: neither its production origin nor a loopback");
+        cases.push((other, true, refused));
+    }
+    let all = "qfex.trade_url: a pre-production qfex.io host".to_owned();
+    cases.push((on("all", preproduction), true, all));
+    let mixed = set(on("mixed", loopback), "--trade-url", PRODUCTION_TRADE);
+    let refused = "qfex.rest_url: mixes a loopback origin with a production one".to_owned();
+    cases.push((mixed, false, refused));
+    for (argv, proxied, refused) in cases {
+        let (mut opts, places) = parsed_home(&argv, &home);
+        if proxied {
+            opts.proxy = nowhere();
+        }
+        let printed = Printed::default();
         let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
         let err = stage::run_places(&opts, &places, &lookup, out)
             .await
             .unwrap_err();
-        assert_eq!(err, stage::LOOPBACK_ONLY);
-        assert!(err.contains("until FBC-4plj"), "{err}");
-        assert!(!opts.evidence_dir.exists());
-        // The CAPS line still came first; nothing after it but the refusal.
+        assert!(err.starts_with("refused, nothing sent: "), "{err}");
+        assert!(err.contains(&refused), "{refused}: {err}");
+        assert!(!opts.evidence_dir.exists(), "{refused}");
+        let leases = opts.evidence_dir.parent().unwrap().join("leases");
+        assert!(!leases.exists(), "{refused}");
         let text = printed.text();
         assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(text.starts_with("CAPS on QFEX production"));
-        printed.clone().flush().unwrap();
+        assert!(text.starts_with("CAPS on QFEX production"), "{text}");
     }
+    // And the place stages without --production are refused as they are parsed (0151 item 1).
+    let refused = refusal(&without(on("preprod", preproduction), "--production"));
+    assert!(refused.contains("--place-stages"), "{refused}");
 }
 
 // ----- The model -----
@@ -2267,10 +2410,7 @@ async fn ids_are_minted_under_one_lease_and_the_mark_survives_a_second_run() {
     let (run_dir, _removed) = temp_dir("place-mint-run");
     let venue = Venue::start(QfexModel::default()).await;
     let (ran, printed) = place_run(&venue, &argv(&run_dir, &venue), &environment()).await;
-    assert_eq!(
-        stopped(ran, &printed).stopped.as_deref(),
-        Some(stage::NOT_BUILT)
-    );
+    assert_eq!(stopped(ran, &printed).stopped.as_deref(), None);
     once_free(taken, || {
         places::Mint::open(&leases_of(&run_dir), ns, WALL, wait)
     });
@@ -2296,10 +2436,7 @@ async fn a_held_namespace_lease_refuses_a_second_run() {
     // Another namespace there is its own lease, and runs.
     let other = set(argv(&dir, &venue), "--namespace", "8");
     let (ran, printed) = place_run(&venue, &other, &environment()).await;
-    assert_eq!(
-        stopped(ran, &printed).stopped.as_deref(),
-        Some(stage::NOT_BUILT)
-    );
+    assert_eq!(stopped(ran, &printed).stopped.as_deref(), None);
     drop(held);
     venue.assert_served();
 }
@@ -2333,10 +2470,7 @@ async fn a_lease_directory_tagged_for_another_environment_is_refused() {
             leases_of(&dir).to_str().unwrap(),
         );
         let (ran, printed) = place_run(&venue, &argv, &environment()).await;
-        assert_eq!(
-            stopped(ran, &printed).stopped.as_deref(),
-            Some(stage::NOT_BUILT)
-        );
+        assert_eq!(stopped(ran, &printed).stopped.as_deref(), None);
         let tag = fs::read_to_string(leases_of(&dir).join(places::ENVIRONMENT)).unwrap();
         assert_eq!(tag, "production\n");
     }
@@ -2642,7 +2776,7 @@ async fn a_stopped_run_needs_the_reconciled_flag_and_clean_reads_to_clear_its_ma
     let out: stage::Out = Rc::new(RefCell::new(printed.clone()));
     let ran = stage::run_places(&opts, &places, &lookup, out).await;
     let ev = stopped(ran, &printed.text());
-    assert_eq!(ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(ev.stopped.as_deref(), None);
     assert!(!leases.join(places::MARKER).exists() && !default.join(places::MARKER).exists());
     assert!(
         printed
@@ -2686,10 +2820,7 @@ async fn a_stopped_run_needs_the_reconciled_flag_and_clean_reads_to_clear_its_ma
     );
     let argv = set(argv, "--namespace", "8");
     let (ran, printed) = place_run(&venue, &argv, &environment()).await;
-    assert_eq!(
-        stopped(ran, &printed).stopped.as_deref(),
-        Some(stage::NOT_BUILT)
-    );
+    assert_eq!(stopped(ran, &printed).stopped.as_deref(), None);
 }
 
 #[tokio::test]
@@ -3402,9 +3533,11 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     // Two sessions on each named account, none of which reconnected, one add_order each and no
     // cancel: X and Y alone (FBC-77r8); then each one's crossing session, its crossing post-only
     // refused CANCELLED, so nothing to cancel (FBC-su9i); then each one's taker IOC session, its
-    // taker IOC filled and flattened by one flatten IOC, so nothing to cancel either (FBC-ou9g).
-    assert_eq!(d.count("subscribe"), 24);
-    assert_eq!((d.count("add_order"), d.count("cancel_order")), (10, 0));
+    // taker IOC filled and flattened by one flatten IOC, so nothing to cancel either (FBC-ou9g);
+    // then each one's stage-three session, which places P1, P2 and P3 and cancels each
+    // (FBC-4plj).
+    assert_eq!(d.count("subscribe"), 30);
+    assert_eq!((d.count("add_order"), d.count("cancel_order")), (16, 6));
     // The lines, in order.
     let lines = [
         "READ before drop session one: primary (drop)",
@@ -3419,7 +3552,7 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
         "READ after drop session one: subaccount",
         "READ before drop session two: primary (drop)",
         "SESSION primary (drop session two)",
-        "STOPPED stage three",
+        "FINISHED every place stage ran",
     ];
     for pair in lines.windows(2) {
         assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
@@ -3429,9 +3562,8 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     // (FBC-ou9g).
     assert!(!d.printed.contains("RESTING"), "{}", d.printed);
     assert!(d.marker().is_none() && d.ev.stop.is_none());
-    let stopped = d.ev.stopped.clone().unwrap();
-    assert_eq!(stopped, stage::NOT_BUILT);
-    assert!(stopped.contains("FBC-4plj"), "{stopped}");
+    assert_eq!(d.ev.stopped, None);
+    assert!(d.printed.contains(&format!("FINISHED {}", stage::FINISHED)));
     // What the session did, as the evidence keeps it.
     let run = d.drop_run();
     assert!(run.authenticated && run.resynced && run.started);
@@ -3446,7 +3578,7 @@ async fn drop_session_one_steps_and_reads_run_in_order() {
     assert_eq!((after.trades, after.trades_naming_x), (0, 0));
     assert_eq!(after.terminal_status, None);
     assert_eq!(run.as_encoded, Some(true));
-    assert_eq!(d.ev.sessions.len(), 8);
+    assert_eq!(d.ev.sessions.len(), 10);
     let session = &d.ev.sessions[0];
     assert_eq!(
         (session.label(), session.account),
@@ -3469,21 +3601,22 @@ async fn every_place_is_the_minimum_size() {
     // the cent grid; then each one's crossing post-only (FBC-su9i), at the minimum size too, at
     // the far touch, the ask of 100.10; then each one's taker IOC (FBC-ou9g), a limit IOC at the
     // minimum size at the far touch too, and its flatten IOC, a limit IOC at the minimum size on
-    // the other side.
-    assert_eq!(model.orders.len(), 10);
+    // the other side; then each one's P1, P2 and P3 (FBC-4plj), each a post-only GTC at the
+    // minimum size --away-bps behind the bid, as X and Y are.
+    assert_eq!(model.orders.len(), 16);
     for (n, x) in model.orders.iter().enumerate() {
         assert_eq!(x.quantity, Decimal::new(1, 2));
         let (kind, side) = match n {
-            0..4 => (("ALO", "GTC"), "BUY"),
-            4 | 7 => (("ALO", "GTC"), "BUY"),
-            5 | 8 => (("LIMIT", "IOC"), "BUY"),
+            0..4 | 7..10 | 13..16 => (("ALO", "GTC"), "BUY"),
+            4 | 10 => (("ALO", "GTC"), "BUY"),
+            5 | 11 => (("LIMIT", "IOC"), "BUY"),
             _ => (("LIMIT", "IOC"), "SELL"),
         };
         assert_eq!((x.kind.as_str(), x.tif.as_str()), kind, "{n}");
         assert_eq!(x.side, side, "{n}");
         let price = match n {
-            0..4 => Some("99.5"),
-            4 | 5 | 7 | 8 => Some("100.1"),
+            0..4 | 7..10 | 13..16 => Some("99.5"),
+            4 | 5 | 10 | 11 => Some("100.1"),
             _ => None,
         };
         if let Some(price) = price {
@@ -3552,8 +3685,9 @@ async fn each_session_arms_under_an_authority_for_its_own_account() {
         model.conns.iter().filter(|(_, c)| c.armed).collect();
     armed.sort_by_key(|(n, _)| **n);
     // Each drop test's two sessions armed on its own account, as their authentication named it:
-    // the primary account's, then the subaccount's (FBC-77r8); then each crossing session and
-    // taker IOC session, on its own account too (FBC-su9i, FBC-ou9g).
+    // the primary account's, then the subaccount's (FBC-77r8); then each crossing session, taker
+    // IOC session and stage-three session, on its own account too (FBC-su9i, FBC-ou9g,
+    // FBC-4plj).
     let accounts: Vec<Option<&str>> = armed.iter().map(|(_, c)| c.account.as_deref()).collect();
     assert_eq!(
         accounts,
@@ -3564,6 +3698,8 @@ async fn each_session_arms_under_an_authority_for_its_own_account() {
             Some(SUB),
             None,
             None,
+            None,
+            Some(SUB),
             Some(SUB),
             Some(SUB)
         ]
@@ -3600,12 +3736,13 @@ async fn a_registrys_trip_reaches_the_journal_before_any_market_arms() {
     assert!(d.printed.contains(
         "its CancelOnlyTrip given to the journal before any market arms (decision 0139)"
     ));
-    // One drop registry per named account (FBC-77r8), then one cross registry (FBC-su9i) and
-    // one take registry (FBC-ou9g) each, whose trip is given before its market arms too.
+    // One drop registry per named account (FBC-77r8), then one cross registry (FBC-su9i), one
+    // take registry (FBC-ou9g) and one pages registry (FBC-4plj) each, whose trip is given
+    // before its market arms too.
     let registries = &d.ev.place_registries;
     let steps: Vec<ledger::Step> = registries.iter().map(|r| r.step).collect();
-    use ledger::Step::{Cross, Drop, Take};
-    assert_eq!(steps, [Drop, Drop, Cross, Take, Cross, Take]);
+    use ledger::Step::{Cross, Drop, Pages, Take};
+    assert_eq!(steps, [Drop, Drop, Cross, Take, Pages, Cross, Take, Pages]);
     for registry in registries {
         assert_eq!(registry.declaration, ledger::PLACES_DECLARATION);
     }
@@ -3640,9 +3777,9 @@ async fn the_seed_follows_clean_reads_of_every_named_account() {
     let sub = d.at("READ before drop session one: subaccount (drop)");
     assert!(d.at("VERDICT drop test on primary") < sub);
     assert!(sub < d.at("REGISTRY drop on subaccount"));
-    // And each one's cross and take registries once each, after clean reads of every named
-    // account (FBC-su9i, FBC-ou9g).
-    assert_eq!(d.printed.matches("seeded flat").count(), 6);
+    // And each one's cross, take and pages registries once each, after clean reads of every
+    // named account (FBC-su9i, FBC-ou9g, FBC-4plj).
+    assert_eq!(d.printed.matches("seeded flat").count(), 8);
     let cross = d.at("READ before the crossing session: subaccount");
     assert!(cross < d.at("REGISTRY cross on primary"));
     // An account that does not read clean stops the run before any registry is built, so
@@ -3676,11 +3813,12 @@ async fn no_two_sessions_are_ever_open() {
     // and the reads' sockets never arm or subscribe.
     let model = d.venue.model.lock().unwrap();
     assert!(!model.overlapped);
-    // Two sessions on each named account (FBC-77r8), then one crossing session (FBC-su9i) and
-    // one taker IOC session (FBC-ou9g) each, one after the other.
+    // Two sessions on each named account (FBC-77r8), then one crossing session (FBC-su9i), one
+    // taker IOC session (FBC-ou9g) and one stage-three session (FBC-4plj) each, one after the
+    // other: stage three's pager never arms or subscribes.
     let sessions = model.conns.values().filter(|c| c.session).count();
-    assert_eq!(sessions, 8);
-    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 8);
+    assert_eq!(sessions, 10);
+    assert_eq!(model.conns.values().filter(|c| c.armed).count(), 10);
 }
 
 #[tokio::test]
@@ -3712,15 +3850,15 @@ async fn before_the_echo_each_session_places_at_most_one_order() {
     };
     let d = dropped(model, "drop-one-place").await;
     // Y's ACK echoed exactly, so each crossing session placed its one crossing post-only too
-    // (FBC-su9i), and each taker IOC session its taker IOC and the one flatten IOC its fill
-    // needed (FBC-ou9g).
-    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1, 2, 1, 2]);
+    // (FBC-su9i), each taker IOC session its taker IOC and the one flatten IOC its fill
+    // needed (FBC-ou9g), and each stage-three session P1, P2 and P3 (FBC-4plj).
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1, 2, 3, 1, 2, 3]);
     let run = d.drop_run();
     assert!(!run.x.acked && !run.x.exact_echo, "{run:?}");
     assert_eq!(run.x.outcome.as_deref(), Some("Unknown"));
     // And with the echo: still one a session, X or Y (FBC-77r8), then as above.
     let d = dropped(QfexModel::default(), "drop-one-place-echoed").await;
-    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1, 2, 1, 2]);
+    assert_eq!(d.places_by_session(), [1, 1, 1, 1, 1, 2, 3, 1, 2, 3]);
     assert!(d.drop_run().x.exact_echo);
 }
 
@@ -3736,10 +3874,11 @@ async fn the_probe_authorizes_no_place_beyond_a_registrys_list() {
     assert_eq!(refused, places::Stop::BeyondList);
     assert!(refused.marks() && !refused.cancels_in_drop(false));
     // A run spends its list: X and Y alone reached QFEX from the drop registries, once each on
-    // each named account, one crossing post-only from each cross registry (FBC-su9i), and one
-    // taker IOC and one flatten IOC from each take registry (FBC-ou9g).
+    // each named account, one crossing post-only from each cross registry (FBC-su9i), one taker
+    // IOC and one flatten IOC from each take registry (FBC-ou9g), and P1, P2 and P3 from each
+    // pages registry (FBC-4plj).
     let d = dropped(QfexModel::default(), "drop-list").await;
-    assert_eq!(d.count("add_order"), 10);
+    assert_eq!(d.count("add_order"), 16);
     assert_eq!(d.ev.place_registries[0].step, Step::Drop);
     // Its list holds X and Y once: a third resting place is beyond it.
     assert_eq!(allowance.take(Step::Drop, ledger::Y), Ok(()));
@@ -3782,7 +3921,7 @@ async fn a_graceful_close_that_cancels_x_is_recorded() {
     assert_eq!(after.trades_naming_x, 0);
     // Nothing rests, so nothing stops the run and no marker is written: it ends naming FBC-77r8.
     assert_eq!(d.ev.stop, None);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.ev.stopped.as_deref(), None);
     assert!(d.marker().is_none());
     let (report, json) = d.outputs();
     assert!(
@@ -4750,7 +4889,7 @@ async fn every_read_and_page_is_charged_to_the_shared_limiter() {
     // drop tests then ran to the run's end (FBC-77r8).
     assert_after_reads(&d);
     assert_eq!(d.ev.stop, None);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.ev.stopped.as_deref(), None);
 }
 
 #[test]
@@ -4845,12 +4984,12 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
     drop(model);
     // Every synthetic value the run met: the credentials and the subaccount's id, X's and Y's
     // venue ids and client ids on both accounts, and the crossing post-only's (FBC-su9i), the
-    // taker IOC's and its flatten IOC's (FBC-ou9g), the user id QFEX's frames name, their prices
-    // and size, both caps, the symbol and the namespace.
+    // taker IOC's and its flatten IOC's (FBC-ou9g), P1's, P2's and P3's (FBC-4plj), the user id
+    // QFEX's frames name, their prices and size, both caps, the symbol and the namespace.
     let mut values: Vec<String> = [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB, model::USER_ID]
         .map(str::to_owned)
         .to_vec();
-    assert_eq!(orders.len(), 10);
+    assert_eq!(orders.len(), 16);
     for order in &orders {
         values.extend([order.id.clone(), order.cid.clone(), order.price.to_string()]);
     }
@@ -4896,11 +5035,13 @@ async fn no_synthetic_value_reaches_an_output_but_the_journal() {
     }
     assert!(d.printed.lines().next().unwrap().contains("424242.17"));
     // The journal, which stays local (decision 0006), keeps each add_order as written.
-    assert_eq!(written(&d, "add_order"), [true; 10]);
-    // Each output passes scripts/privacy-check.sh, each slice by the run itself.
+    assert_eq!(written(&d, "add_order"), [true; 16]);
+    // Each output passes scripts/privacy-check.sh, each slice by the run itself, stage three's
+    // pages-production/ included (FBC-4plj).
     assert_report_and_evidence_pass_the_privacy_check(&evidence);
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
     evidence::privacy_check(&script, &slice).unwrap();
+    evidence::privacy_check(&script, &evidence.join(stage::PAGES_SLICE)).unwrap();
     evidence::privacy_check(&script, &evidence.join(stage::PLACES_SLICE)).unwrap();
     let (report, _) = d.outputs();
     for account in ["primary", "subaccount"] {
@@ -6491,7 +6632,7 @@ async fn x_absent_from_a_full_page_after_the_session_is_not_measured() {
     // unread, not absent, so whether the graceful close cancelled it is not measured.
     let model = QfexModel {
         foreign_order: true,
-        newest_first: true,
+        page_order: model::PageOrder::NewestFirst,
         ..QfexModel::default()
     };
     let paged = |argv| set(short_wait(argv), "--page-size", "1");
@@ -7141,10 +7282,10 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
             .position(|e| e == w)
             .unwrap_or_else(|| panic!("{w}: {what:?}"))
     };
-    // The drop test's two sessions, then the crossing session (FBC-su9i) and the taker IOC
-    // session (FBC-ou9g).
+    // The drop test's two sessions, then the crossing session (FBC-su9i), the taker IOC
+    // session (FBC-ou9g) and the stage-three session (FBC-4plj).
     let conns = d.session_conns();
-    assert_eq!(conns.len(), 4, "{what:?}");
+    assert_eq!(conns.len(), 5, "{what:?}");
     let (one, two) = (&conns[0], &conns[1]);
     let on = |conn: &str, kind: &str| at(&format!("trade {conn} {kind}"));
     // Session one: its arm, X, its graceful close.
@@ -7194,14 +7335,17 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
         .filter(|w| w.ends_with(" cancel_on_disconnect"))
         .count();
     assert_eq!(arms, 2, "{what:?}");
-    assert_eq!(d.count("subscribe"), 12);
+    assert_eq!(d.count("subscribe"), 15);
     let attempts: Vec<(u64, u64)> = (d.ev.sessions.iter())
         .map(|s| (s.attempts, s.failed_attempts))
         .collect();
-    assert_eq!(attempts, [(1, 0); 4]);
+    assert_eq!(attempts, [(1, 0); 5]);
     let ended: Vec<&str> = d.ev.sessions.iter().map(|s| s.ended_by).collect();
     let graceful = stage::GRACEFUL;
-    assert_eq!(ended, [graceful, stage::DROPPED, graceful, graceful]);
+    assert_eq!(
+        ended,
+        [graceful, stage::DROPPED, graceful, graceful, graceful]
+    );
     // The abrupt drop sent no WebSocket close; every other socket was closed.
     let n: usize = two.parse().unwrap();
     assert!(!d.venue.trade.connections()[n].client_closed);
@@ -7216,7 +7360,7 @@ async fn the_drop_tests_steps_run_in_order_with_no_cancel_or_reconnect() {
         "READ after the drop: primary:",
         "VERDICT drop test on primary: passed",
         "READ after drop session two: primary (drop)",
-        "STOPPED stage three",
+        "FINISHED every place stage ran",
     ];
     for pair in lines.windows(2) {
         assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
@@ -7236,15 +7380,17 @@ async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
     .await;
     // One drop registry for the account, built, tripped and seeded once, whose ledger is read at
     // the end of each of its two sessions (decision 0148 item 3); the cross registry after it is
-    // the account's next (FBC-su9i), then the take registry (FBC-ou9g).
-    assert_eq!(d.ev.place_registries.len(), 3);
+    // the account's next (FBC-su9i), then the take registry (FBC-ou9g), then the pages registry
+    // (FBC-4plj).
+    assert_eq!(d.ev.place_registries.len(), 4);
     assert_eq!(d.ev.place_registries[1].step, ledger::Step::Cross);
     assert_eq!(d.ev.place_registries[2].step, ledger::Step::Take);
+    assert_eq!(d.ev.place_registries[3].step, ledger::Step::Pages);
     let ends = &d.ev.place_registries[0].registry_run().ends;
     let sessions: Vec<&str> = ends.iter().map(|e| e.session).collect();
     assert_eq!(sessions, [places::DROP_ONE, places::DROP_TWO]);
     assert_eq!(d.printed.matches("REGISTRY drop on primary").count(), 1);
-    assert_eq!(d.printed.matches("seeded flat").count(), 3);
+    assert_eq!(d.printed.matches("seeded flat").count(), 4);
     // Started once, by drop session one: drop session two's market stays armed.
     assert_eq!(d.printed.matches("START primary").count(), 1);
     assert!(d.at("REGISTRY drop on primary") < d.at("SESSION primary (drop session one)"));
@@ -7257,7 +7403,8 @@ async fn the_drop_tests_sessions_share_one_registry_and_seed_once() {
             ("primary", places::DROP_ONE),
             ("primary", places::DROP_TWO),
             ("primary", places::CROSS),
-            ("primary", places::TAKE)
+            ("primary", places::TAKE),
+            ("primary", places::PAGES)
         ]
     );
     // Y went out through the same Link and registry: the market Started in session one placed
@@ -7288,8 +7435,8 @@ async fn the_drop_cancels_x_and_y_and_the_test_passes() {
         let clean = places::OthersClean::Clean;
         assert_eq!((run.stop, run.others_clean), (None, clean));
     }
-    // Every post-only order ended cancelled; the taker IOCs and their flatten IOCs filled
-    // (FBC-ou9g).
+    // Every post-only order ended cancelled, P1, P2 and P3 on each account included
+    // (FBC-4plj); the taker IOCs and their flatten IOCs filled (FBC-ou9g).
     let model = d.venue.model.lock().unwrap();
     let post_only = model.orders.iter().filter(|o| o.kind == "ALO");
     assert!(
@@ -7297,11 +7444,18 @@ async fn the_drop_cancels_x_and_y_and_the_test_passes() {
             .clone()
             .all(|o| o.state == model::State::Cancelled)
     );
-    assert_eq!(post_only.count(), 6);
+    assert_eq!(post_only.count(), 12);
     drop(model);
     assert_eq!((d.ev.stop, d.marker()), (None, None));
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
-    assert_eq!(d.count("cancel_order"), 0);
+    assert_eq!(d.ev.stopped.as_deref(), None);
+    // No cancel but stage three's, of P1, P2 and P3 on each account (FBC-4plj).
+    let pages = d.pages_conns();
+    let cancelled_outside = |w: &&String| {
+        let on_pages = pages.iter().any(|c| w.starts_with(&format!("trade {c} ")));
+        w.ends_with(" cancel_order") && !on_pages
+    };
+    assert_eq!(d.what().iter().filter(cancelled_outside).count(), 0);
+    assert_eq!(d.count("cancel_order"), 6);
     let (report, json) = d.outputs();
     for (account, followed) in [
         ("primary", places::NEXT_ACCOUNT),
@@ -8167,8 +8321,8 @@ async fn the_report_gives_each_accounts_drop_items_and_the_slice_passes_the_priv
     // Every session's capture is whole, drop session two's, which journals no Closed control,
     // included; its frames are in the drop-production/ slice, which passes the privacy check.
     // The crossing and taker IOC sessions' frames are in the places-production/ slice (FBC-su9i,
-    // FBC-ou9g).
-    assert_eq!(d.ev.sessions.len(), 8);
+    // FBC-ou9g), and the stage-three sessions' in the pages-production/ slice (FBC-4plj).
+    assert_eq!(d.ev.sessions.len(), 10);
     assert!(
         d.ev.sessions
             .iter()
@@ -10365,12 +10519,12 @@ impl Dropped {
     }
 
     /// The trade connections of the crossing sessions, in order: after the drop tests' two
-    /// sessions each, every other session, since each account's taker IOC session follows its
-    /// crossing session (FBC-ou9g).
+    /// sessions each, every third session, since each account's taker IOC session (FBC-ou9g)
+    /// and its stage-three session (FBC-4plj) follow its crossing session.
     fn cross_conns(&self) -> Vec<String> {
         let drops = 2 * self.ev.drops.len();
         let conns = self.session_conns().into_iter().skip(drops);
-        conns.step_by(2).collect()
+        conns.step_by(3).collect()
     }
 
     /// The trade connections of the taker IOC sessions, in order (FBC-ou9g): each the session
@@ -10378,7 +10532,15 @@ impl Dropped {
     fn take_conns(&self) -> Vec<String> {
         let drops = 2 * self.ev.drops.len();
         let conns = self.session_conns().into_iter().skip(drops + 1);
-        conns.step_by(2).collect()
+        conns.step_by(3).collect()
+    }
+
+    /// The trade connections of the stage-three sessions, in order (FBC-4plj): each the session
+    /// after its account's taker IOC session.
+    fn pages_conns(&self) -> Vec<String> {
+        let drops = 2 * self.ev.drops.len();
+        let conns = self.session_conns().into_iter().skip(drops + 2);
+        conns.step_by(3).collect()
     }
 
     /// Whether the run's journal holds a `kind` frame it wrote naming `id`.
@@ -10399,8 +10561,10 @@ impl Dropped {
         let model = self.venue.model.lock().unwrap();
         let drops = 2 * self.ev.drops.len();
         let after = model.orders.iter().skip(drops);
-        // The post-only orders alone: no taker IOC or flatten IOC (FBC-ou9g).
-        after.filter(|o| o.kind == "ALO").cloned().collect()
+        // The post-only orders through the touch alone: no taker IOC or flatten IOC (FBC-ou9g),
+        // and no stage-three order, which rests --away-bps behind the bid (FBC-4plj).
+        let crossing = |o: &&model::Order| o.kind == "ALO" && o.price != super::json("99.5");
+        after.filter(crossing).cloned().collect()
     }
 }
 
@@ -10639,14 +10803,14 @@ async fn the_crossing_post_only_is_refused_and_recorded() {
         match stop {
             None => {
                 assert_eq!((d.ev.stop, d.marker()), (None, None), "{how:?}");
-                assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+                assert_eq!(d.ev.stopped.as_deref(), None);
                 assert_eq!(d.stage_two().crosses.len(), 2);
                 assert_eq!(d.cross(1).crossed.as_ref(), Some(&want));
                 assert_eq!(placed(&conns[1]), 1);
                 assert!(section.contains(&format!("- What followed: {}", taker::THEN_TAKE)));
                 let last = take_section(&report, "subaccount");
                 assert!(
-                    last.contains(&format!("- What followed: {}", taker::LAST_TAKE)),
+                    last.contains(&format!("- What followed: {}", taker::THEN_PAGES)),
                     "{last}"
                 );
             }
@@ -10768,7 +10932,7 @@ async fn each_session_cancels_by_venue_id_before_it_stops() {
     // (decision 0132 item 7, 0148 item 8).
     let d = dropped(resting_cross(), "cross-cancels").await;
     assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.ev.stopped.as_deref(), None);
     let orders = d.crossing_orders();
     assert_eq!(orders.len(), 2);
     assert!(orders.iter().all(|o| o.state == model::State::Cancelled));
@@ -11319,10 +11483,7 @@ async fn an_open_gate_is_not_carried_into_a_second_run() {
     let (ran, printed) = place_run(&venue, &argv, &primary_only()).await;
     let ev = stopped(ran, &printed);
     assert_eq!(ev.stage_two.as_ref().unwrap().gate, Some(true), "{printed}");
-    assert_eq!(
-        (ev.stop, ev.stopped.as_deref()),
-        (None, Some(stage::NOT_BUILT))
-    );
+    assert_eq!((ev.stop, ev.stopped.as_deref()), (None, None));
     assert!(!leases.join(places::MARKER).exists());
     let venue = Venue::start(QfexModel {
         ack_echo: model::Echo::Upper,
@@ -11779,8 +11940,8 @@ async fn a_crossing_order_is_kept_back_in_a_run_while_another_order_of_ours_rest
     // the subaccount's. Either keeps the crossing order back, a stop, LeftResting, with no
     // crossing order (decision 0148 item 6).
     // Before the subaccount's, the primary account's crossing post-only, then its taker IOC and
-    // the flatten IOC its fill needed (FBC-ou9g).
-    for (n, account, places_before) in [(0, "primary", 4), (1, "subaccount", 7)] {
+    // the flatten IOC its fill needed (FBC-ou9g), then its P1, P2 and P3 (FBC-4plj).
+    for (n, account, places_before) in [(0, "primary", 4), (1, "subaccount", 10)] {
         let (dir, removed) = temp_dir("cross-blocked");
         let venue = Venue::start(QfexModel::default()).await;
         let (mut opts, mut places) = parsed(&drop_argv(&dir, &venue)).unwrap();
@@ -13405,8 +13566,8 @@ async fn the_taker_ioc_fills_at_the_touch() {
     // last account's taker IOC, naming FBC-4plj, with no stop and no marker.
     let d = dropped(QfexModel::default(), "take-fills").await;
     assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
-    assert!(stage::NOT_BUILT.contains("FBC-4plj"));
+    assert_eq!(d.ev.stopped.as_deref(), None);
+    assert!(stage::FINISHED.contains("decision 0132's list"));
     assert_eq!(d.stage_two().takes.len(), 2);
     for (n, account) in ["primary", "subaccount"].into_iter().enumerate() {
         let run = d.take(n);
@@ -13449,12 +13610,12 @@ async fn the_taker_ioc_fills_at_the_touch() {
         "- The taker IOC: handed to the session yes;",
         "- How the taker IOC came back: filled whole, its fills settled",
         "- The taker fee's sign (decision 0148 item 10; no amount): paid",
-        &format!("- What followed: {}", taker::NEXT_ACCOUNT),
+        &format!("- What followed: {}", taker::THEN_PAGES),
     ] {
         assert!(section.contains(said), "{said}: {section}");
     }
     let last = take_section(&report, "subaccount");
-    assert!(last.contains(&format!("- What followed: {}", taker::LAST_TAKE)));
+    assert!(last.contains(&format!("- What followed: {}", taker::THEN_PAGES)));
     let entry = &json["stage_two"]["takes"][0];
     assert_eq!(entry["account"], "primary");
     assert_eq!(
@@ -13562,7 +13723,7 @@ async fn an_ioc_that_expires_unfilled_is_recorded_and_flattens_nothing() {
     };
     let d = dropped(model, "take-expires").await;
     assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.ev.stopped.as_deref(), None);
     assert_eq!(events(&d, "ioc Expire"), 2);
     assert_eq!(d.iocs("SELL").len(), 0, "no flatten IOC");
     for (n, account) in ["primary", "subaccount"].into_iter().enumerate() {
@@ -13704,8 +13865,10 @@ async fn the_report_names_the_key_declarations_fences_and_fee_sign_and_no_value(
          (decision 0148 item 3): drop on primary: CodProbeRun::owner_supervised_places; drop on \
          subaccount: CodProbeRun::owner_supervised_places; cross on primary: \
          CodProbeRun::owner_supervised_places; take on primary: \
+         CodProbeRun::owner_supervised_places; pages on primary: \
          CodProbeRun::owner_supervised_places; cross on subaccount: \
          CodProbeRun::owner_supervised_places; take on subaccount: \
+         CodProbeRun::owner_supervised_places; pages on subaccount: \
          CodProbeRun::owner_supervised_places",
         &format!("- The fences met, never their values: {}", taker::FENCES),
         "- The taker fee's sign, by account (no amount): primary: paid; subaccount: paid",
@@ -14294,7 +14457,7 @@ async fn what_followed_a_session_the_run_ended_after_is_the_runs_end() {
         section.contains(&format!("- What followed: {}", taker::RUN_ENDED)),
         "{section}"
     );
-    assert!(!section.contains(taker::LAST_TAKE), "{section}");
+    assert!(!section.contains(taker::THEN_PAGES), "{section}");
     // The crossing post-only is not placed, likewise: no taker IOC session followed it.
     let model = QfexModel {
         crossed_on_place: Some(3),
@@ -16833,7 +16996,7 @@ async fn the_touch_is_driven_between_the_place_stages_sessions() {
     );
     assert!(d.drop_run().verdict.as_ref().unwrap().passed);
     assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.ev.stopped.as_deref(), None);
     d.venue.assert_served();
 }
 
@@ -16867,7 +17030,7 @@ async fn the_touch_is_driven_between_named_accounts() {
     // The read held came after the primary account's X and Y, and before the subaccount's.
     assert_eq!(places_before_the_hold(&d), 2);
     assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
-    assert_eq!(d.ev.stopped.as_deref(), Some(stage::NOT_BUILT));
+    assert_eq!(d.ev.stopped.as_deref(), None);
     d.venue.assert_served();
 }
 
@@ -17097,4 +17260,1211 @@ async fn a_press_as_the_last_read_after_a_touch_ended_between_the_sessions_outra
     let two = &json["drop_tests"][0]["session_two"];
     assert_eq!(two["counted_resting"], Value::Null);
     assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+}
+
+// ----- Stage three, the pages (FBC-4plj; decision 0132 items 5 and 7, 0148 items 7, 8 and 10) --
+
+impl Dropped {
+    /// The `n`th stage-three session, in run order.
+    fn three(&self, n: usize) -> &pager::PagesRun {
+        &self.ev.stage_three[n]
+    }
+
+    /// The trade connections that asked for a `get_user_orders` page at a limit of 1: stage
+    /// three's pagers, in order, when the run's `--page-size` is not 1.
+    fn pager_conns(&self) -> Vec<usize> {
+        let conns = self.venue.trade.connections().len();
+        let paged = |conn: &usize| self.pages_asked(*conn).iter().any(|(limit, _)| *limit == 1);
+        (0..conns).filter(paged).collect()
+    }
+
+    /// The offsets trade connection `conn` asked `get_user_orders` pages at, in order, each with
+    /// its limit.
+    fn pages_asked(&self, conn: usize) -> Vec<(u64, u64)> {
+        let conns = self.venue.trade.connections();
+        let frames = conns[conn].received.iter().filter_map(|f| match f {
+            Frame::Text(text) => Some(super::json(text)),
+            Frame::Binary(_) => None,
+        });
+        let pages = frames.filter(|v| v["type"] == "get_user_orders");
+        let asked = |v: Value| {
+            let params = &v["params"];
+            (
+                params["limit"].as_u64().unwrap(),
+                params["offset"].as_u64().unwrap(),
+            )
+        };
+        pages.map(asked).collect()
+    }
+}
+
+/// The pages of `run` as `(walk, size, offset, open, came)`.
+fn pages_of(run: &pager::PagesRun) -> Vec<(bool, u16, u32, Vec<&'static str>, pager::Came)> {
+    (run.pages.iter())
+        .map(|p| (p.walk, p.size, p.offset, p.open.clone(), p.came.clone()))
+        .collect()
+}
+
+/// A page read listing `ours` alone, full when it lists one.
+fn listing(ours: &[&'static str]) -> pager::Came {
+    pager::Came::Read {
+        ours: ours.to_vec(),
+        others: 0,
+        twaps: 0,
+        full: !ours.is_empty(),
+    }
+}
+
+#[tokio::test]
+async fn stage_three_pages_at_size_one_between_places_and_cancels() {
+    // On the one named account, once its taker IOC session ended: the pages registry built,
+    // tripped and seeded flat; one session armed, resynced and Started; P1 and P2, page 0, P3,
+    // page 1, P1's cancel, pages 2 and 3, P2's and P3's cancels, then the walk from offset 0
+    // until a short page, the pager a socket of its own that never arms, asking at a page size
+    // of 1 (decision 0132 item 7). Each place and cancel is compared; the session's Stop finds
+    // nothing left to cancel and closes gracefully; then the read of every named account.
+    let d = dropped_in(QfexModel::default(), "pages-at-one", &primary_only(), |a| a).await;
+    assert_eq!((d.ev.stop, d.marker()), (None, None), "{}", d.printed);
+    assert_eq!(d.ev.stopped.as_deref(), None);
+    assert_eq!(d.ev.stage_three.len(), 1);
+    let run = d.three(0);
+    let session = &run.session;
+    assert_eq!(session.account, "primary");
+    assert!(
+        session.authenticated && session.resynced && session.started,
+        "{session:?}"
+    );
+    assert_eq!(session.arm.as_deref(), Some("Accepted"));
+    // Each page recorded with its size and offset (FBC-4h1p), what the streams showed open as
+    // it was asked, and what it listed: the model lists the oldest order first.
+    assert_eq!(
+        pages_of(run),
+        [
+            (false, 1, 0, vec!["P1", "P2"], listing(&["P1"])),
+            (false, 1, 1, vec!["P1", "P2", "P3"], listing(&["P2"])),
+            (false, 1, 2, vec!["P2", "P3"], listing(&[])),
+            (false, 1, 3, vec!["P2", "P3"], listing(&[])),
+            (true, 1, 0, vec![], listing(&[])),
+        ]
+    );
+    assert_eq!(run.walk, Some(pager::WalkEnd::Short));
+    assert_eq!(pager::order_shown(&run.pages), Some("oldest first"));
+    // The pager: one socket that never armed or subscribed, every page at a limit of 1, in the
+    // plan's offsets.
+    let pagers = d.pager_conns();
+    assert_eq!(pagers.len(), 1, "{:?}", d.what());
+    let asked: Vec<u64> = d.pages_asked(pagers[0]).iter().map(|(_, o)| *o).collect();
+    assert_eq!(asked, [0, 1, 2, 3, 0]);
+    assert!(
+        d.pages_asked(pagers[0])
+            .iter()
+            .all(|(limit, _)| *limit == 1)
+    );
+    {
+        let model = d.venue.model.lock().unwrap();
+        let conn = &model.conns[&pagers[0]];
+        assert!(!conn.armed && !conn.session, "{conn:?}");
+    }
+    // The interleaving, on the model's log: each page between the places and cancels the plan
+    // puts it between.
+    let what = d.what();
+    let session_conn = &d.pages_conns()[0];
+    let pager = pagers[0];
+    let events: Vec<&str> = (what.iter())
+        .filter_map(|w| {
+            let on_session = w.starts_with(&format!("trade {session_conn} "));
+            let on_pager = w.starts_with(&format!("trade {pager} "));
+            match (on_session, on_pager) {
+                (true, _) if w.ends_with(" add_order") => Some("place"),
+                (true, _) if w.ends_with(" cancel_order") => Some("cancel"),
+                (_, true) if w.ends_with(" get_user_orders") => Some("page"),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "place", "place", "page", "place", "page", "cancel", "page", "page", "cancel",
+            "cancel", "page"
+        ]
+    );
+    // Every order a post-only GTC at the minimum size --away-bps behind the bid, as an fbc-oms
+    // authorization from the pages registry's own list, each placed and cancelled.
+    let orders = d.venue.model.lock().unwrap().orders.clone();
+    let paged: Vec<&model::Order> = orders.iter().skip(5).collect();
+    assert_eq!(paged.len(), 3);
+    for order in &paged {
+        assert_eq!((order.kind.as_str(), order.tif.as_str()), ("ALO", "GTC"));
+        assert_eq!(
+            (order.side.as_str(), order.quantity),
+            ("BUY", Decimal::new(1, 2))
+        );
+        assert_eq!(order.price, super::json("99.5"));
+        assert_eq!(order.state, model::State::Cancelled);
+    }
+    let names: Vec<&str> = run.orders.iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, pager::NAMES);
+    assert!(
+        run.orders
+            .iter()
+            .all(|(_, x)| x.submitted && x.acked && x.exact_echo),
+        "{:?}",
+        run.orders
+    );
+    let cancels: Vec<(&str, bool, bool, Option<&str>)> = (run.cancels.iter())
+        .map(|c| (c.name, c.sent, c.ended, c.outcome.as_deref()))
+        .collect();
+    let accepted = Some("Accepted");
+    assert_eq!(
+        cancels,
+        [
+            ("P1", true, true, accepted),
+            ("P2", true, true, accepted),
+            ("P3", true, true, accepted)
+        ]
+    );
+    let registry = d.ev.place_registries.last().unwrap();
+    assert_eq!(registry.step, ledger::Step::Pages);
+    // Each place and each cancel compared with never-arming reads, each agreeing; then the
+    // Stop's: nothing of ours left to cancel, so none sent, and a graceful close.
+    let steps: Vec<&str> = session.compared.iter().map(|c| c.step).collect();
+    assert_eq!(
+        steps,
+        [
+            pager::PLACED[0],
+            pager::PLACED[1],
+            pager::PLACED[2],
+            pager::CANCELLED[0],
+            pager::CANCELLED[1],
+            pager::CANCELLED[2],
+            "the stop's cancels"
+        ]
+    );
+    assert!(
+        session
+            .compared
+            .iter()
+            .all(|c| c.ended == compare::Ended::Agreed),
+        "{:?}",
+        session.compared
+    );
+    let stop = session.cancels.as_ref().expect("the session's Stop");
+    assert!(stop.ended && !stop.held && stop.sent == 0, "{stop:?}");
+    assert_eq!(session.ended_by, Some(stage::GRACEFUL));
+    // The read after the session: the account flat with no open order.
+    let after: Vec<&capture::AccountRead> = (d.ev.reads.iter())
+        .filter(|r| r.before == refusals::AFTER_PAGES)
+        .collect();
+    assert_eq!(after.len(), 1, "{:?}", d.ev.reads);
+    assert!(after[0].flat && after[0].page_orders == 0, "{after:?}");
+    assert!(session.read && !session.resting && !session.counted_resting);
+    // The pager is a read socket of the session's, its refusals counted as one's.
+    let socket = (d.ev.read_sockets.iter())
+        .find(|r| r.label == "primary (stage three's pager)")
+        .expect("the pager's read socket");
+    assert_eq!(
+        (socket.before, &socket.refusals),
+        (places::PAGES, &Refusals::default())
+    );
+    // The lines, in order.
+    for pair in [
+        "SESSION primary (the taker IOC session): arm outcome Accepted",
+        "SESSION primary (the stage-three session): it arms, resyncs and Starts, places P1, P2 \
+         and P3",
+        "START the pages registry on primary",
+        "PLACE P1 on primary",
+        "PLACE P2 on primary",
+        "PAGE at size 1, offset 0, on primary: listed P1",
+        "PLACE P3 on primary",
+        "PAGE at size 1, offset 1, on primary: listed P2",
+        "CANCEL P1 on primary",
+        "PAGE at size 1, offset 2, on primary: listed none of ours",
+        "PAGE at size 1, offset 3, on primary",
+        "CANCEL P2 on primary",
+        "CANCEL P3 on primary",
+        "PAGE of the walk at size 1, offset 0, on primary",
+        "WALK on primary: 1 pages from offset 0, ended by a short page, its end",
+        "SESSION primary (the stage-three session): arm outcome Accepted, ended by a graceful \
+         close",
+        "READ after the stage-three session: primary (pages)",
+    ]
+    .windows(2)
+    {
+        assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
+    }
+    // The report and the evidence give each page by its size and offset, and no id.
+    let (report, json) = d.outputs();
+    for said in [
+        "### Stage three on primary",
+        "- The order QFEX's pages list ours in, as page 0 showed it: oldest first",
+        "- A page at size 1, offset 1 (open in the streams: P1, P2, P3): listed P2",
+        "- The walk's page at size 1, offset 0 (open in the streams: none): listed none of ours",
+        &format!("- What followed: {}", pager::LAST_PAGES),
+    ] {
+        assert!(report.contains(said), "{said}: {report}");
+    }
+    let pages = &json["stage_three"][0]["pages"];
+    assert_eq!(pages.as_array().unwrap().len(), 5);
+    assert_eq!(
+        (&pages[3]["size"], &pages[3]["offset"]),
+        (&super::json("1"), &super::json("3"))
+    );
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+    // With QFEX listing the newest first, page 0 shows P2 and page 1 shows P2 again, now second
+    // of three.
+    let newest = QfexModel {
+        page_order: model::PageOrder::NewestFirst,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(newest, "pages-newest", &primary_only(), |a| a).await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let run = d.three(0);
+    let listed: Vec<pager::Came> = run.pages.iter().map(|p| p.came.clone()).collect();
+    assert_eq!(listed[..2], [listing(&["P2"]), listing(&["P2"])]);
+    assert_eq!(pager::order_shown(&run.pages), Some("newest first"));
+}
+
+#[tokio::test]
+async fn a_rate_limited_page_on_the_pager_stops_the_run() {
+    // QFEX answers the pager's second page, page 1 after P3, a RateLimited err echoing it: a
+    // provider rate refusal on the pager, the run's stop, RateRefused(Pager), marked (decision
+    // 0148 item 8). No later page is asked and no later step runs: P1 is not cancelled in the
+    // plan; the session's Stop cancels every order of ours by venue id, and the read of every
+    // named account follows. The refusal is the pager's, counted on its read socket, not the
+    // session's.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::PagerPage(1)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-rate-limited", &primary_only(), |a| a).await;
+    let refused = places::Stop::RateRefused {
+        on: places::RefusedOn::Pager,
+    };
+    let name = refused.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let run = d.three(0);
+    let came: Vec<pager::Came> = run.pages.iter().map(|p| p.came.clone()).collect();
+    assert_eq!(came, [listing(&["P1"]), pager::Came::Refused]);
+    assert_eq!(d.pages_asked(d.pager_conns()[0]), [(1, 0), (1, 1)]);
+    assert!(run.cancels.is_empty(), "{:?}", run.cancels);
+    assert_eq!(run.session.stop, Some(name));
+    // The session's Stop cancelled P1, P2 and P3 by venue id before it stopped.
+    let stop = run.session.cancels.as_ref().expect("the session's Stop");
+    assert_eq!(stop.sent, 3, "{stop:?}");
+    let orders = d.venue.model.lock().unwrap().orders.clone();
+    assert!(
+        (orders.iter().skip(5)).all(|o| o.state == model::State::Cancelled),
+        "{orders:?}"
+    );
+    let socket = (d.ev.read_sockets.iter())
+        .find(|r| r.label == "primary (stage three's pager)")
+        .expect("the pager's read socket");
+    assert_eq!((socket.refusals.errs, socket.refusals.limiter), (1, 1));
+    let session = (d.ev.sessions.iter())
+        .find(|s| s.name == places::PAGES)
+        .unwrap();
+    assert_eq!(session.refusals.limiter, 0, "{session:?}");
+    let after = (d.ev.reads.iter()).filter(|r| r.before == refusals::AFTER_PAGES);
+    assert_eq!(after.count(), 1, "{:?}", d.ev.reads);
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(&format!("**The place stages' stop:** {name}.")),
+        "{report}"
+    );
+    assert!(
+        report.contains("a provider rate refusal on the pager: the run's stop"),
+        "{report}"
+    );
+    assert_eq!(json["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+    // A refusal of the walk's page, the pager's fifth: the walk ends there, not read, and the
+    // run stops on it the same way, every cancel of the plan made first.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::PagerPage(4)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-walk-limited", &primary_only(), |a| a).await;
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let run = d.three(0);
+    assert_eq!(run.walk, Some(pager::WalkEnd::NotRead));
+    assert_eq!(run.pages.last().unwrap().came, pager::Came::Refused);
+    assert!(run.pages.last().unwrap().walk);
+    assert_eq!(run.cancels.len(), 3);
+}
+
+#[tokio::test]
+async fn a_stage_three_cancel_is_not_sent_for_an_order_ended_or_not_yet_acknowledged() {
+    // QFEX cancels P1 itself right after its ACK: P1's cancel is not sent, its order having
+    // ended, and the plan goes on, no stop.
+    let model = QfexModel {
+        on_ack: Some((5, model::OnAck::VenueCancel)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-ended-first", &primary_only(), |a| a).await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let first = &d.three(0).cancels[0];
+    assert_eq!((first.name, first.sent, first.ended), ("P1", false, true));
+    assert_eq!(first.not_sent, Some(pager::ENDED_FIRST));
+    assert_eq!(d.count("cancel_order"), 2);
+    // P1's ACK never comes before its deadline: it ends Unknown, never resent, and its cancel by
+    // venue id waits for an acknowledgement that does not come, so it is left to the Stop. The
+    // model rests it all the same, so the read after the session lists it and the pages registry
+    // counts it resting: a stop, LeftResting, marked, reported for the owner's hand cancel
+    // (decision 0005, 0132 item 7).
+    let model = QfexModel {
+        ack_delay: Some(Duration::from_secs(3600)),
+        ack_delay_on: 5,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-awaiting-ack", &primary_only(), |a| a).await;
+    let name = places::Stop::LeftResting.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let run = d.three(0);
+    assert_eq!(run.orders[0].1.outcome.as_deref(), Some("Unknown"));
+    let first = &run.cancels[0];
+    assert_eq!((first.name, first.sent), ("P1", false));
+    assert_eq!(first.not_sent, Some(pager::AWAITING_ACK));
+    assert!(
+        run.session.counted_resting && run.session.resting,
+        "{:?}",
+        run.session
+    );
+    let (report, json) = d.outputs();
+    let said = format!(
+        "- An order resting on the account when the session ended: {}",
+        pager::HAND_CANCEL_PAGES
+    );
+    assert!(report.contains(&said), "{report}");
+    assert_eq!(
+        json["stage_three"][0]["hand_cancel"],
+        pager::HAND_CANCEL_PAGES
+    );
+    assert!(
+        d.printed
+            .contains(&format!("RESTING {}", pager::HAND_CANCEL_PAGES))
+    );
+}
+
+#[tokio::test]
+async fn a_walk_page_repeating_an_earlier_one_ends_the_walk() {
+    // QFEX answers every page from offset 0, whatever offset it names, and answers every cancel
+    // NO_SUCH_ORDER, leaving the orders open: the walk's page 1 lists P1 again, as page 0 did,
+    // so the walk ends there, Repeated, and the orders still resting stop the run.
+    let model = QfexModel {
+        stuck_pages: true,
+        cancel_misses: true,
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-walk-repeated", &primary_only(), |a| a).await;
+    let run = d.three(0);
+    assert_eq!(run.walk, Some(pager::WalkEnd::Repeated), "{}", d.printed);
+    let walked: Vec<u32> = (run.pages.iter())
+        .filter(|p| p.walk)
+        .map(|p| p.offset)
+        .collect();
+    assert_eq!(walked, [0, 1]);
+    assert_eq!(d.ev.stop, Some(places::Stop::LeftResting.name()));
+}
+
+#[tokio::test]
+async fn a_maker_fill_in_stage_three_is_flattened_then_stops() {
+    // As P2's ACK is sent, QFEX fills P2 whole as a maker: a fill of ours other than the taker
+    // IOC's and the flatten IOCs', so, the session still open, the flatten reached from the
+    // pages registry (0151 item 9): P1, the other order of ours, cancelled by venue id and seen
+    // to end, the owner's Flatten into Exit, one reducing limit IOC at the minimum size within
+    // the cap, filled against the bid, REST flat; then the session's Stop and a graceful close,
+    // and the run stops UnexpectedFill, flat. P3 is never placed, and no page follows. The
+    // taker IOC's flatten spent one of the account's --flatten-attempts, so the run gives two.
+    let model = QfexModel {
+        on_ack: Some((6, model::OnAck::MakerFill)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-maker-fill", &primary_only(), attempts("2")).await;
+    let name = places::Stop::UnexpectedFill.name();
+    assert_eq!(d.ev.stop, Some(name), "{}", d.printed);
+    let marker = d.marker().unwrap_or_default();
+    assert!(marker.starts_with(&format!("stop: {name}\n")), "{marker}");
+    let run = d.three(0);
+    let names: Vec<&str> = run.orders.iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, ["P1", "P2"]);
+    assert!(run.pages.is_empty(), "{:?}", run.pages);
+    let session = &run.session;
+    assert_eq!(session.stop, Some(name));
+    let flatten = session.flatten.as_ref().expect("a flatten");
+    assert_flattened(flatten, 1);
+    assert_eq!(flatten.after, flatten::AFTER_FILL);
+    assert_eq!(flatten.sent(), 1);
+    assert_eq!(flatten.iocs[0].side, "sell");
+    // The flatten's cancel of P1 came first; the Stop after it found nothing left.
+    let stop = session.cancels.as_ref().expect("the session's Stop");
+    assert!(stop.ended && !stop.held && stop.sent == 0, "{stop:?}");
+    assert_eq!(session.ended_by, Some(stage::GRACEFUL));
+    let orders = d.venue.model.lock().unwrap().orders.clone();
+    let states: Vec<model::State> = orders.iter().skip(5).map(|o| o.state).collect();
+    assert_eq!(
+        states,
+        [
+            model::State::Cancelled,
+            model::State::Filled,
+            model::State::Filled
+        ]
+    );
+    let after = (d.ev.reads.iter())
+        .find(|r| r.before == refusals::AFTER_PAGES)
+        .expect("the read after the session");
+    assert!(after.flat && after.page_orders == 0, "{after:?}");
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains("#### The flatten (FBC-ou9g; decision 0148 item 5, 0151 item 9)"),
+        "{report}"
+    );
+    assert_eq!(json["stage_three"][0]["flatten"]["rest_flat"], true);
+    assert_eq!(json["stop"], name);
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+    d.venue.assert_served();
+    // With the account's one flatten budget already spent by the taker IOC's flatten, the pages
+    // registry's flatten places no IOC: Flatten(UsedUp), not flat (decision 0148 item 7).
+    let model = QfexModel {
+        on_ack: Some((6, model::OnAck::MakerFill)),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "pages-maker-used-up", &primary_only(), |a| a).await;
+    let used_up = places::Stop::Flatten(places::Flattening::UsedUp);
+    assert_eq!(d.ev.stop, Some(used_up.name()), "{}", d.printed);
+    let flatten = d.three(0).session.flatten.as_ref().expect("a flatten");
+    assert_eq!((flatten.sent(), flatten.flat), (0, false), "{flatten:?}");
+}
+
+#[tokio::test]
+async fn stage_three_runs_only_after_a_passed_verdict_and_an_open_exact_echo_gate() {
+    // Each named account's drop test passed and an ACK echoed our client id byte for byte: on
+    // each account, its stage-three session after its taker IOC session and before the next
+    // account's crossing session (decision 0148 items 1 and 2).
+    let d = dropped(QfexModel::default(), "pages-gated").await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    assert_eq!(d.stage_two().gate, Some(true));
+    let accounts: Vec<&str> = d.ev.stage_three.iter().map(|r| r.session.account).collect();
+    assert_eq!(accounts, ["primary", "subaccount"]);
+    assert!(
+        d.ev.drops
+            .iter()
+            .all(|r| r.verdict.as_ref().is_some_and(|v| v.passed))
+    );
+    for pair in [
+        "VERDICT drop test on primary: passed",
+        "GATE ",
+        "SESSION primary (the taker IOC session): arm outcome Accepted",
+        "SESSION primary (the stage-three session): it arms",
+        "SESSION primary (the stage-three session): arm outcome Accepted",
+        "SESSION subaccount (the crossing session): it arms",
+        "SESSION subaccount (the taker IOC session): arm outcome Accepted",
+        "SESSION subaccount (the stage-three session): it arms",
+    ]
+    .windows(2)
+    {
+        assert!(d.at(pair[0]) < d.at(pair[1]), "{pair:?}: {}", d.printed);
+    }
+    assert_eq!(d.pager_conns().len(), 2);
+    assert_eq!(d.places_by_session()[6..], [3, 1, 2, 3]);
+    // The gate shut, by an upper-cased echo: every account's drop test runs, the run ends
+    // NoEcho, and no pages registry, stage-three session or pager follows.
+    let shut = QfexModel {
+        ack_echo: model::Echo::Upper,
+        ..QfexModel::default()
+    };
+    let d = dropped(shut, "pages-gate-shut").await;
+    assert_eq!(
+        d.ev.stop,
+        Some(places::Stop::NoEcho.name()),
+        "{}",
+        d.printed
+    );
+    assert_none_of_stage_three(&d);
+    // A drop test that failed: the run stops there, and nothing of stage three follows.
+    let failed = QfexModel {
+        cod_on_drop: false,
+        ..QfexModel::default()
+    };
+    let d = dropped_with(failed, "pages-verdict-failed", short_agree).await;
+    assert_eq!(
+        d.ev.stop,
+        Some(places::Stop::DropFailed.name()),
+        "{}",
+        d.printed
+    );
+    assert!(!d.verdict().passed);
+    assert_none_of_stage_three(&d);
+}
+
+/// Asserts `d` ran nothing of stage three: no stage-three record, pages registry, session or
+/// pager.
+fn assert_none_of_stage_three(d: &Dropped) {
+    assert!(d.ev.stage_three.is_empty(), "{:?}", d.ev.stage_three);
+    let pages = |r: &&ledger::PlaceRun| r.step == ledger::Step::Pages;
+    assert_eq!(d.ev.place_registries.iter().filter(pages).count(), 0);
+    assert!(
+        !d.printed.contains("(the stage-three session)"),
+        "{}",
+        d.printed
+    );
+    assert!(d.pager_conns().is_empty());
+}
+
+#[tokio::test]
+async fn each_stage_writes_its_own_scrubbed_slice() {
+    // Stage three's part (FBC-4plj; decision 0148 item 10): its sessions' frames and the pages
+    // its pagers read go in pages-production/, apart from the drop test's and stage two's slices,
+    // each scrubbed as every place-stage frame is and passing the privacy check.
+    let d = dropped(QfexModel::default(), "pages-slice").await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let evidence = d.dir.join("evidence");
+    let listed = |dir: &Path| -> Vec<String> {
+        let names = fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name());
+        let mut names: Vec<String> = names.map(|n| n.to_string_lossy().into_owned()).collect();
+        names.sort();
+        names
+    };
+    let pages = evidence.join(stage::PAGES_SLICE);
+    let files = listed(&pages);
+    for account in ["primary", "subaccount"] {
+        let session = format!("{account}-the-stage-three-session-");
+        assert!(files.iter().any(|f| f.starts_with(&session)), "{files:?}");
+        // The pager's five pages, one file each, in the order read.
+        let pager: Vec<&String> = (files.iter())
+            .filter(|f| f.starts_with(&format!("{account}-the-pager-")))
+            .collect();
+        let want: Vec<String> = (1..=5)
+            .map(|n| format!("{account}-the-pager-{n:02}.json"))
+            .collect();
+        assert_eq!(pager, want.iter().collect::<Vec<_>>());
+    }
+    assert!(
+        files
+            .iter()
+            .all(|f| f == "README.md" || f.ends_with(".json"))
+    );
+    assert!(
+        files
+            .iter()
+            .all(|f| !f.contains("drop-session") && !f.contains("crossing")),
+        "{files:?}"
+    );
+    for (slice, of) in [(stage::DROP_SLICE, "drop"), (stage::PLACES_SLICE, "places")] {
+        let others = listed(&evidence.join(slice));
+        assert!(
+            others
+                .iter()
+                .all(|f| !f.contains("stage-three") && !f.contains("pager")),
+            "{of}: {others:?}"
+        );
+    }
+    let readme = fs::read_to_string(pages.join("README.md")).unwrap();
+    assert!(
+        readme.starts_with("# QFEX trade-socket frames: stage three's pages"),
+        "{readme}"
+    );
+    assert!(
+        readme.contains(
+            "the stage-three session on primary then the stage-three session on subaccount"
+        )
+    );
+    assert!(readme.contains("fixtures/qfex/exec-recorded/pages-production/"));
+    // The first page listed P1: its row scrubbed, every id blanked to 2s, the symbol the
+    // placeholder, every number zeroed, the client id blanked.
+    let first: Value =
+        super::json(&fs::read_to_string(pages.join("primary-the-pager-01.json")).unwrap());
+    let row = &first["all_orders_response"]["orders"][0];
+    let blanked = |v: &Value| {
+        let text = v.as_str().unwrap();
+        !text.is_empty() && text.chars().all(|c| c == '2' || c == '-')
+    };
+    assert!(
+        blanked(&row["order_id"]) && blanked(&row["client_order_id"]),
+        "{row}"
+    );
+    assert!(blanked(&row["user_id"]), "{row}");
+    assert_eq!(row["symbol"], capture::SYMBOL);
+    assert_eq!(
+        (&row["quantity"], &row["price"]),
+        (&super::json("0"), &super::json("0"))
+    );
+    // The last, the walk's, listed nothing.
+    let last: Value =
+        super::json(&fs::read_to_string(pages.join("primary-the-pager-05.json")).unwrap());
+    assert_eq!(last["all_orders_response"]["orders"], super::json("[]"));
+    assert!(d.ev.withheld.is_empty(), "{:?}", d.ev.withheld);
+    assert!(
+        d.ev.fixtures
+            .iter()
+            .any(|f| f == "primary-the-pager-01.json")
+    );
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &pages).unwrap();
+    // No synthetic id reaches it: no order's or client id the model holds.
+    let model = d.venue.model.lock().unwrap();
+    for file in &files {
+        let text = fs::read_to_string(pages.join(file)).unwrap();
+        for order in &model.orders {
+            assert!(
+                !text.contains(&order.id) && !text.contains(&order.cid),
+                "{file}"
+            );
+        }
+        assert!(!text.contains(SYMBOL), "{file}");
+    }
+}
+
+// ----- FBC-4plj: the full report, decision 0132's list for each named account -----
+
+/// The report's list for `account` (`answers::markdown`): from its heading to the next.
+fn list_section<'r>(report: &'r str, account: &str) -> &'r str {
+    let heading = format!("### Decision 0132's list on {account}\n");
+    let start = report
+        .find(&heading)
+        .unwrap_or_else(|| panic!("{heading}: {report}"));
+    let rest = &report[start + heading.len()..];
+    let end = rest.find("\n#").map_or(rest.len(), |n| n + 1);
+    &report[start..start + heading.len() + end]
+}
+
+/// The answer the report gives `item` on `account` (`answers::ITEMS`), as `d`'s list says it.
+fn answer(d: &Dropped, account: &str, item: usize) -> String {
+    let (report, _) = d.outputs();
+    let section = list_section(&report, account);
+    let head = format!("- {}: ", answers::ITEMS[item]);
+    let at = section
+        .find(&head)
+        .unwrap_or_else(|| panic!("{head}: {section}"));
+    let rest = &section[at + head.len()..];
+    rest[..rest.find('\n').unwrap_or(rest.len())].to_owned()
+}
+
+/// The index of `item` in `answers::ITEMS`, found by its first words.
+fn item(starts: &str) -> usize {
+    (answers::ITEMS.iter())
+        .position(|i| i.starts_with(starts))
+        .unwrap_or_else(|| panic!("no item {starts}"))
+}
+
+#[tokio::test]
+async fn place_stages_run_each_named_account_in_turn() {
+    // A whole run on both named accounts: every account's drop test in turn, then on each in
+    // turn its crossing post-only, its taker IOC with the taker IOC's trades read after its
+    // session, and its stage three, then the run's end, ok.
+    let d = dropped(QfexModel::default(), "places-in-turn").await;
+    assert_eq!(
+        (d.ev.stop, d.ev.stopped.as_deref()),
+        (None, None),
+        "{}",
+        d.printed
+    );
+    assert!(d.printed.contains(&format!("FINISHED {}", stage::FINISHED)));
+    assert!(d.printed.contains("DONE ok"), "{}", d.printed);
+    let mut lines: Vec<String> = Vec::new();
+    for account in ["primary", "subaccount"] {
+        lines.extend([
+            format!("SESSION {account} (drop session one)"),
+            format!("SESSION {account} (drop session two)"),
+            format!("VERDICT drop test on {account}: passed"),
+        ]);
+    }
+    lines.push("GATE ".to_owned());
+    for account in ["primary", "subaccount"] {
+        lines.extend([
+            format!("SESSION {account} (the crossing session)"),
+            format!("CROSSED on {account}"),
+            format!("SESSION {account} (the taker IOC session)"),
+            format!("TAKEN on {account}"),
+            format!("READ after the taker IOC session: {account} (take)"),
+            format!("TRADES after the taker IOC session on {account}: 2 rows read since"),
+            format!("SESSION {account} (the stage-three session)"),
+            format!("WALK on {account}"),
+            format!("READ after the stage-three session: {account} (pages)"),
+        ]);
+    }
+    lines.extend(["FINISHED ".to_owned(), "DONE ok".to_owned()]);
+    for pair in lines.windows(2) {
+        assert!(d.at(&pair[0]) < d.at(&pair[1]), "{pair:?}: {}", d.printed);
+    }
+    // The sessions, one after the other, five on each account.
+    let shown = capture::shown(&d.ev);
+    let labels: Vec<(&str, &str)> = shown.iter().map(|r| (r.account, r.label())).collect();
+    let mut expected = Vec::new();
+    for account in ["primary", "subaccount"] {
+        expected.extend([(account, places::DROP_ONE), (account, places::DROP_TWO)]);
+    }
+    for account in ["primary", "subaccount"] {
+        expected.extend([
+            (account, places::CROSS),
+            (account, places::TAKE),
+            (account, places::PAGES),
+        ]);
+    }
+    assert_eq!(labels, expected);
+    // The taker IOC's trades, read on a socket of its own after its session, on each account.
+    for n in 0..2 {
+        let traded = d.take(n).traded.as_ref().unwrap();
+        assert!(traded.trades_whole && traded.historic_whole, "{traded:?}");
+        assert_eq!((traded.trades, traded.naming.as_slice()), (2, &[1, 1][..]));
+        assert_eq!(traded.foreign, 0);
+    }
+    for account in ["primary", "subaccount"] {
+        let label = format!("{account} (the taker IOC and its trades)");
+        let socket = d.ev.read_sockets.iter().find(|r| r.label == label);
+        assert_eq!(
+            socket.map(|r| r.before),
+            Some(refusals::AFTER_TAKE),
+            "{label}"
+        );
+    }
+    assert!(d.ev.drops.iter().all(|r| r.stop.is_none()));
+    assert_eq!(d.ev.stage_three.len(), 2);
+}
+
+#[tokio::test]
+async fn the_report_answers_each_item_for_both_accounts() {
+    let d = dropped(QfexModel::default(), "answers-each").await;
+    assert_eq!(
+        (d.ev.stop, d.ev.stopped.as_deref()),
+        (None, None),
+        "{}",
+        d.printed
+    );
+    let (report, json) = d.outputs();
+    assert!(
+        report.contains(
+            "## Decision 0132's list, for each named account (FBC-4plj, decision 0148 item 10)"
+        ),
+        "{report}"
+    );
+    assert!(report.contains("- The environment: QFEX production, under the probe mode"));
+    let shown = capture::shown(&d.ev);
+    let list = &json["answers_0132"];
+    assert_eq!(list["accounts"], super::json(r#"["primary","subaccount"]"#));
+    for account in ["primary", "subaccount"] {
+        let section = list_section(&report, account);
+        let said = answers::answers(&d.ev, &shown, account);
+        assert_eq!(said.len(), answers::ITEMS.len());
+        for (name, answer) in answers::ITEMS.iter().zip(&said) {
+            assert!(!answer.is_empty(), "{name}");
+            assert!(
+                section.contains(&format!("- {name}: {answer}\n")),
+                "{name}: {section}"
+            );
+            assert_eq!(
+                list["by_account"][account][name],
+                Value::from(answer.as_str())
+            );
+        }
+        // A whole run measures every item a passed run on the model can.
+        let each = |starts: &str| said[item(starts)].clone();
+        let arm = each("What answers an arm");
+        for session in [
+            places::DROP_ONE,
+            places::DROP_TWO,
+            places::CROSS,
+            places::TAKE,
+            places::PAGES,
+        ] {
+            assert!(arm.contains(&format!("{session}: Accepted")), "{arm}");
+        }
+        assert_eq!(
+            each("Whether enabling"),
+            "no: X survived drop session two's arm"
+        );
+        assert!(each("The drop test").starts_with("passed: "), "{account}");
+        assert!(each("The drop test").contains("shown: the drop cancelled X"));
+        assert_eq!(
+            each("Whether a graceful close"),
+            "no: X rested before it and still did after it"
+        );
+        assert_eq!(
+            each("Whether every other"),
+            "yes: every read of every other named account was clean"
+        );
+        let ids = each("Whether QFEX accepts the probe mode's ClientIdFormat");
+        assert!(ids.starts_with(answers::RUN_WIDE), "{ids}");
+        assert!(
+            ids.contains(
+                "16 of the 16 client ids the run sent were the format's full length, 36 \
+                 characters; an ACK echoed one byte for byte, so QFEX accepted the format at its \
+                 full length; the characters: decimal digits: echoed byte for byte by an ACK 0-9"
+            ),
+            "{ids}"
+        );
+        assert!(each("Whether ACK, rejects").contains("ACK: exact, byte for byte (10)"));
+        let acks = each("How long ACK takes");
+        assert!(acks.contains("post-only places: 10 ACKs, from "), "{acks}");
+        assert!(
+            acks.contains(
+                "other places: no ACK heard; against the speed bump's 500 ms hold on a place \
+                 that is not post-only: not measured: no ACK of a place that is not post-only \
+                 was heard"
+            ),
+            "{acks}"
+        );
+        assert!(
+            each("Which statuses").ends_with(
+                "this account's crossing post-only: refused: an order_response CANCELLED before \
+                 any ACK, echoing our client id byte for byte"
+            ),
+            "{account}"
+        );
+        assert_eq!(
+            each("What GET /user/historic-orders"),
+            "X CANCELLED; Y CANCELLED; the taker IOC FILLED; its flatten IOCs 1 of 1 listed; \
+             stage three's orders not read (no historic-orders read follows it)"
+        );
+        assert_eq!(
+            each("What kind of time"),
+            "the timestamp: whole Unix seconds, by its magnitude; whether it is the matching \
+             engine's time its magnitude does not show; the trade_id: the same: each of the 2 \
+             get_user_trades rows naming an order of ours carried a trade_id a fill_response of \
+             ours carried, exactly"
+        );
+        assert!(
+            each("Which side field").starts_with(
+                "carried: side; side is not told apart: on the taker IOC's 1 row (side ours on 1"
+            ),
+            "{account}"
+        );
+        assert!(
+            each("How the pages").starts_with(
+                "5 pages asked at a page size of 1, 5 read, 2 of them full; the order QFEX's \
+                 pages list ours in: oldest first; a page listing an order of ours the streams \
+                 did not show open: no; the walk from offset 0: a short page, its end"
+            ),
+            "{account}"
+        );
+        assert!(
+            each("What open_orders").starts_with(
+                "the open orders the pages list, on every whole read, with an order open"
+            ),
+            "{account}"
+        );
+        assert!(
+            each("The lag").starts_with("12 comparisons: 12 agreed"),
+            "{account}"
+        );
+        assert!(each("Whether QFEX accepted add_order").contains("yes: QFEX acknowledged"));
+        assert!(each("The order of the taker IOC's").starts_with("fill_response first"));
+        assert_eq!(each("The taker fee's sign"), "paid");
+        let resyncs = each("Each resync against");
+        assert!(
+            resyncs.contains(
+                "drop session two: its pages listed 1 order, its GET /user/positions counted \
+                 open_orders 1: they agree"
+            ),
+            "{resyncs}"
+        );
+        assert!(!resyncs.contains("differ"), "{resyncs}");
+        assert!(each("Each resync's full pages").starts_with("drop session one: none"));
+        assert_eq!(each("get_user_trades rows naming"), "none");
+        assert!(each("The provider rate refusals").starts_with("at least 0 on this account's 5"));
+        let ledgers = each("The fill ledgers");
+        for step in ["drop", "cross", "take", "pages"] {
+            assert!(ledgers.contains(&format!("the {step} registry: its bounds held yes")));
+        }
+        // No item a passed run measures says it was not measured, but the speed bump, which no
+        // ACK of a place that is not post-only measured, and stage three's historic orders.
+        for (name, answer) in answers::ITEMS.iter().zip(&said) {
+            let unmeasured = answer.contains("not measured:") || answer.contains("not read (");
+            let allowed = name.starts_with("How long ACK") || name.starts_with("What GET");
+            assert!(!unmeasured || allowed, "{name}: {answer}");
+        }
+    }
+    assert_report_and_evidence_pass_the_privacy_check(&d.dir.join("evidence"));
+}
+
+#[tokio::test]
+async fn an_upper_cased_echo_reads_not_byte_for_byte_on_both_accounts() {
+    // QFEX gives our client id back in upper case on every ACK: the gate stays shut and the run
+    // ends NoEcho after both drop tests, and each account's list says the ACKs were not byte for
+    // byte, nothing of stage two or three measured.
+    let model = QfexModel {
+        ack_echo: model::Echo::Upper,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "answers-upper").await;
+    assert_eq!(
+        d.ev.stop,
+        Some(places::Stop::NoEcho.name()),
+        "{}",
+        d.printed
+    );
+    for account in ["primary", "subaccount"] {
+        let echoes = answer(&d, account, item("Whether ACK, rejects"));
+        assert!(
+            echoes
+                .contains("ACK: 4 not byte for byte: ours, in another case or with a JSON escape"),
+            "{echoes}"
+        );
+        let ids = answer(&d, account, item("Whether QFEX accepts"));
+        assert!(
+            ids.contains("no ACK echoed one byte for byte, so QFEX's acceptance at that length"),
+            "{ids}"
+        );
+        for starts in ["The order of the taker IOC's", "The taker fee's sign"] {
+            let said = answer(&d, account, item(starts));
+            assert_eq!(
+                said,
+                "not measured: no taker IOC was placed on this account"
+            );
+        }
+        let pages = answer(&d, account, item("How the pages"));
+        assert_eq!(
+            pages,
+            "not measured: stage three did not run on this account"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_fee_sign_knob_gives_the_matching_sign_word_on_both_accounts() {
+    for (knob, word) in [
+        (model::FeeSign::Paid, "paid"),
+        (model::FeeSign::Zero, "zero"),
+        (model::FeeSign::Received, "received"),
+    ] {
+        let model = QfexModel {
+            fee_sign: knob,
+            ..QfexModel::default()
+        };
+        let d = dropped(model, "answers-fee").await;
+        assert_eq!(d.ev.stop, None, "{word}: {}", d.printed);
+        for account in ["primary", "subaccount"] {
+            assert_eq!(answer(&d, account, item("The taker fee's sign")), word);
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_graceful_close_knob_gives_the_matching_drop_test_answer() {
+    // QFEX cancels X on drop session one's graceful close: each account's list says the close
+    // cancelled it, and, X no longer open as drop session two armed, that enabling's cancel was
+    // not measured; without the knob X survives the close (the default run's answer).
+    let model = QfexModel {
+        cod_on_close: true,
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "answers-close").await;
+    for account in ["primary", "subaccount"] {
+        let close = answer(&d, account, item("Whether a graceful close"));
+        assert!(
+            close.starts_with("yes: X rested before it, no cancel of ours was sent, and the read"),
+            "{account}: {close}"
+        );
+        let enabling = answer(&d, account, item("Whether enabling"));
+        assert!(
+            enabling.starts_with("not measured: X was not open"),
+            "{enabling}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_ioc_frame_order_knob_gives_the_iocs_frame_order_on_both_accounts() {
+    for (knob, order) in [
+        (
+            model::IocFrameOrder::FillFirst,
+            taker::FrameOrder::FillFirst,
+        ),
+        (
+            model::IocFrameOrder::OrderFirst,
+            taker::FrameOrder::OrderFirst,
+        ),
+    ] {
+        let model = QfexModel {
+            ioc_frame_order: knob,
+            ..QfexModel::default()
+        };
+        let d = dropped(model, "answers-frames").await;
+        assert_eq!(d.ev.stop, None, "{order:?}: {}", d.printed);
+        for account in ["primary", "subaccount"] {
+            let said = answer(&d, account, item("The order of the taker IOC's"));
+            assert_eq!(said, order.says(), "{account}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_report_and_evidence_carry_each_session_and_read_socket() {
+    let d = dropped(QfexModel::default(), "answers-sockets").await;
+    assert_eq!(d.ev.stop, None, "{}", d.printed);
+    let (report, json) = d.outputs();
+    let shown = capture::shown(&d.ev);
+    assert_eq!(shown.len(), 10);
+    let sessions = json["sessions"].as_array().unwrap();
+    let refused = &json["provider_rate_refusals"];
+    assert_eq!(sessions.len(), shown.len());
+    for (n, run) in shown.iter().enumerate() {
+        let heading = format!("### {} ({})\n", run.label(), run.account);
+        assert!(report.contains(&heading), "{heading}");
+        let row = format!("| {} | the session | ", run.label());
+        assert!(report.contains(&row), "{row}");
+        assert_eq!(sessions[n]["session"], run.label());
+        assert_eq!(sessions[n]["account"], run.account);
+        assert_eq!(refused["sessions"][n]["session"], run.label());
+    }
+    let sockets = &d.ev.read_sockets;
+    let listed = refused["read_sockets"].as_array().unwrap();
+    assert_eq!(listed.len(), sockets.len());
+    for (n, socket) in sockets.iter().enumerate() {
+        let row = format!("| {} | read socket: {} | ", socket.before, socket.label);
+        assert!(report.contains(&row), "{row}");
+        assert_eq!(listed[n]["before"], socket.before);
+        assert_eq!(listed[n]["account"], socket.label.as_str());
+    }
+    // Among them, on each account, the pager and the taker IOC's trades read.
+    for account in ["primary", "subaccount"] {
+        for label in [
+            format!("{account} (stage three's pager)"),
+            format!("{account} (the taker IOC and its trades)"),
+        ] {
+            assert!(sockets.iter().any(|r| r.label == label), "{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_whole_evidence_holds_no_synthetic_value() {
+    // A whole run on both accounts: every file of its evidence directory but the journal, which
+    // stays local (decision 0006), holds no synthetic credential, id, amount, symbol or
+    // namespace, and the whole directory, the journal included, passes scripts/privacy-check.sh.
+    let caps = |argv: Argv| {
+        let argv = set(argv, "--resting-cap-usd", "424242.17");
+        let argv = set(argv, "--inventory-cap-usd", "373737.29");
+        set(argv, "--namespace", "61437")
+    };
+    let d = dropped_with(QfexModel::default(), "answers-no-value", caps).await;
+    assert_eq!(
+        (d.ev.stop, d.ev.stopped.as_deref()),
+        (None, None),
+        "{}",
+        d.printed
+    );
+    let model = d.venue.model.lock().unwrap();
+    let (orders, fills) = (model.orders.clone(), model.fills.clone());
+    drop(model);
+    let mut values: Vec<String> = [PUBLIC, SECRET, SUB_PUBLIC, SUB_SECRET, SUB, model::USER_ID]
+        .map(str::to_owned)
+        .to_vec();
+    assert_eq!(orders.len(), 16);
+    for order in &orders {
+        values.extend([order.id.clone(), order.cid.clone(), order.price.to_string()]);
+    }
+    assert!(!fills.is_empty());
+    values.extend(fills.iter().map(|f| f.trade_id.clone()));
+    values.extend(["99.5", "100.1", "0.01", "0.001"].map(str::to_owned));
+    values.extend(["424242", "373737", SYMBOL, "61437"].map(str::to_owned));
+    let evidence = d.dir.join("evidence");
+    let journal = evidence.join("journal");
+    let outputs: Vec<(PathBuf, String)> = (files(&evidence).into_iter())
+        .filter(|(p, _)| !p.starts_with(&journal))
+        .collect();
+    // The report, the evidence, and each slice with its README.
+    for slice in [stage::DROP_SLICE, stage::PLACES_SLICE, stage::PAGES_SLICE] {
+        let readme = evidence.join(slice).join("README.md");
+        assert!(outputs.iter().any(|(p, _)| *p == readme), "{slice}");
+    }
+    assert!(outputs.len() > 10, "{}", outputs.len());
+    for (path, text) in &outputs {
+        for value in &values {
+            assert!(
+                !text.contains(value.as_str()),
+                "{}: {value}",
+                path.display()
+            );
+        }
+    }
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/privacy-check.sh");
+    evidence::privacy_check(&script, &evidence).unwrap();
+}
+
+#[tokio::test]
+async fn a_rate_limited_page_of_the_taker_iocs_trades_stops_the_run() {
+    // The primary account's taker IOC's trades read after its session, the run's fifth
+    // get_user_trades page (after both accounts' drop tests read two each), answered a
+    // RateLimited err: a provider rate refusal on a read socket, the run's stop, marked, before
+    // stage three.
+    let model = QfexModel {
+        rate_limit: Some(model::Limited::TradesPage(4)),
+        ..QfexModel::default()
+    };
+    let d = dropped(model, "take-trades-limited").await;
+    let on = places::RefusedOn::ReadSocket;
+    assert_stopped(&d, places::Stop::RateRefused { on });
+    let stopped = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        stopped.contains("reading the taker IOC's trades after the taker IOC session"),
+        "{stopped}"
+    );
+    let traded = d.take(0).traded.as_ref().unwrap();
+    assert!(!traded.trades_whole, "{traded:?}");
+    assert!(d.ev.stage_three.is_empty(), "{}", d.printed);
+    let socket = (d.ev.read_sockets.iter())
+        .find(|r| r.label == "primary (the taker IOC and its trades)")
+        .unwrap();
+    assert_eq!((socket.refusals.errs, socket.refusals.limiter), (1, 1));
+}
+
+#[tokio::test]
+async fn a_taker_iocs_trades_read_not_made_is_recorded_and_stops_nothing() {
+    // The same page answered an err that is no rate refusal: the read is not made, which is
+    // recorded, and the run goes on to stage three and its end; the list says what it could not
+    // measure.
+    let model = QfexModel {
+        trades_err_page: Some(2),
+        ..QfexModel::default()
+    };
+    let d = dropped_in(model, "take-trades-err", &primary_only(), |a| a).await;
+    assert_eq!(
+        (d.ev.stop, d.ev.stopped.as_deref()),
+        (None, None),
+        "{}",
+        d.printed
+    );
+    let traded = d.take(0).traded.as_ref().unwrap();
+    assert!(!traded.trades_whole && traded.trades == 0, "{traded:?}");
+    let error = traded.error.as_deref().unwrap();
+    assert_eq!(error, "get_user_trades: Err");
+    assert_eq!(d.ev.stage_three.len(), 1);
+    assert_eq!(
+        answer(&d, "primary", item("What kind of time")),
+        "the timestamp: not measured: no get_user_trades row naming an order of ours was read; \
+         the trade_id: not measured: no get_user_trades row naming an order of ours was read"
+    );
+    assert!(
+        answer(&d, "primary", item("What GET /user/historic-orders"))
+            .contains("the taker IOC not read")
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_while_the_taker_iocs_trades_are_read_stops_the_run() {
+    // The owner presses Ctrl-C while the primary account's taker IOC's trades page is held: the
+    // read ends first, then the press is the run's stop, marked, and no stage three runs.
+    let model = QfexModel {
+        hold_trades_page: Some(4),
+        ..QfexModel::default()
+    };
+    let held = |v: &Venue| v.log().iter().any(|e| e.what.ends_with("trades page held"));
+    let d = pressed_once_when(model, "take-trades-press", user(), |a| a, held).await;
+    assert_stopped(&d, places::Stop::Interrupted);
+    let stopped = d.ev.stopped.as_deref().unwrap();
+    assert!(
+        stopped
+            .starts_with("Interrupted reading the taker IOC's trades after the taker IOC session"),
+        "{stopped}"
+    );
+    let traded = d.take(0).traded.as_ref().unwrap();
+    assert!(traded.trades_whole && traded.historic_whole, "{traded:?}");
+    assert!(d.ev.stage_three.is_empty(), "{}", d.printed);
 }

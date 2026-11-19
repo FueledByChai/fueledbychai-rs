@@ -715,13 +715,15 @@ const FENCES: &str = "--production; --sole-trader (decision 0148 item 7); --rest
      --inventory-cap-usd set and positive (decision 0113); --away-bps at least 20; \
      --flatten-cap-bps at least 1 and below --away-bps; --flatten-attempts 1 to 3; \
      --registry-span at most 3600 s and above the drop test's floor; at most 10 reads per \
-     comparison; and every origin a loopback test stub's, until FBC-4plj";
+     comparison; and every origin one the adapter's probe guard admits for production (QFEX \
+     production's three, or all three loopback)";
 
-/// What the place stages do after the preflight, and do not do yet, as the report says it.
-const NOT_BUILT: &str = "After the preflight, decision 0132 item 4's drop test runs on each \
-     named account in turn (FBC-23ch and FBC-77r8), then stage two's crossing post-only and \
-     taker IOC on each in turn (FBC-su9i and FBC-ou9g), and the run ends after the last \
-     account's taker IOC: stage three is not built yet (FBC-4plj builds it)";
+/// What the place stages do after the preflight, as the report says it.
+const THEN: &str = "After the preflight, decision 0132 item 4's drop test runs on each named \
+     account in turn (FBC-23ch and FBC-77r8), then stage two's crossing post-only and taker IOC \
+     on each in turn (FBC-su9i and FBC-ou9g), each followed by that account's stage three \
+     (FBC-4plj), and the run ends after the last account's stage three, its report answering \
+     decision 0132's list for each named account";
 
 /// The report's section on the place stages' preflight.
 pub fn markdown(s: &mut String, pre: &Preflight) {
@@ -736,11 +738,11 @@ pub fn markdown(s: &mut String, pre: &Preflight) {
          anything connected, each as a fence and never a value: {FENCES}. The symbol traded \
          is not shown.\n\n\
          Passed, in order: {passed}.\n\n\
-         {NOT_BUILT}.\n"
+         {THEN}.\n"
     );
 }
 
 /// The evidence's entry for the place stages' preflight.
 pub fn to_json(pre: &Preflight) -> Value {
-    json!({"fences_met": FENCES, "passed": pre.passed, "not_built": NOT_BUILT})
+    json!({"fences_met": FENCES, "passed": pre.passed, "then": THEN})
 }

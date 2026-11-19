@@ -712,6 +712,39 @@ impl PlaceRun {
         self.registry.ends.push(end);
     }
 
+    /// What decision 0132's list for its account says of it (`crate::answers`): its step,
+    /// whether its bounds held, and, at each of its sessions' ends, whether its horizon was
+    /// full and its replay counts, never a time or a value.
+    pub fn said(&self) -> String {
+        let r = &self.registry;
+        let ends: Vec<String> = (r.ends.iter())
+            .map(|e| {
+                let (c, horizon) = (e.replays, horizon_word(e.horizon));
+                format!(
+                    "after {}: horizon {horizon}, {} fill{} held, replays applied {}, duplicate \
+                     {}, before the watermark {}, beyond the horizon {}, untimed {}",
+                    e.session,
+                    e.held,
+                    if e.held == 1 { "" } else { "s" },
+                    c.applied,
+                    c.duplicate,
+                    c.before_watermark,
+                    c.beyond_horizon,
+                    c.untimed
+                )
+            })
+            .collect();
+        let ends = match ends.is_empty() {
+            true => "no session of it ended".to_owned(),
+            false => ends.join("; "),
+        };
+        format!(
+            "the {} registry: its bounds held {}; {ends}",
+            self.step.name(),
+            if r.held() { "yes" } else { "NO" }
+        )
+    }
+
     /// Its bounds and its ledger at each of its sessions' ends, for the tests to read.
     #[cfg(test)]
     pub fn registry_run(&self) -> &RegistryRun {
@@ -827,6 +860,15 @@ fn horizon(h: Horizon) -> String {
         Horizon::Full => "full".to_owned(),
         Horizon::At(exch) => format!("at {} (venue ns)", exch.0),
         Horizon::Lost => "lost".to_owned(),
+    }
+}
+
+/// A horizon as decision 0132's list says it: full, moved (its instant never shown) or lost.
+pub fn horizon_word(h: Horizon) -> &'static str {
+    match h {
+        Horizon::Full => "full",
+        Horizon::At(_) => "moved",
+        Horizon::Lost => "lost",
     }
 }
 

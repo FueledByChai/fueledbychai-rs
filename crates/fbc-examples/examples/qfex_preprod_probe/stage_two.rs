@@ -507,6 +507,140 @@ fn ranges(set: &BTreeSet<char>) -> String {
     said.join(", ")
 }
 
+/// The full length of a client id in `fmt`, in characters: a UUID's 36, a hex id's exact length,
+/// and the most another format takes.
+pub fn full_length(fmt: &ClientIdFormat) -> usize {
+    match *fmt {
+        ClientIdFormat::Uuid => 36,
+        ClientIdFormat::Hex { len } => usize::from(len),
+        ClientIdFormat::Alnum { max_len, .. } => usize::from(max_len),
+        ClientIdFormat::Numeric { max_digits } => usize::from(max_digits),
+    }
+}
+
+/// Whether the run's client ids were written at their format's full length, and whether an
+/// `ACK` echoed one byte for byte (decision 0132's Consequences: whether QFEX accepts the ids the
+/// probe mode's `ClientIdFormat` produces at their full length).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FullLength {
+    /// The format's full length ([`full_length`]).
+    pub length: usize,
+    /// The client ids the run sent, and how many were that long.
+    pub sent: usize,
+    pub full: usize,
+    /// Whether an `ACK` echoed a client id the run sent byte for byte.
+    pub echoed: bool,
+}
+
+impl FullLength {
+    /// What `kept`, the run's tee, shows of the lengths of its client ids in `fmt`.
+    pub fn of(kept: &Kept, fmt: &ClientIdFormat) -> FullLength {
+        let length = full_length(fmt);
+        let lengths = kept.sent_lengths();
+        FullLength {
+            length,
+            sent: lengths.len(),
+            full: lengths.iter().filter(|n| **n == length).count(),
+            echoed: kept.exact_ack(),
+        }
+    }
+
+    /// What the report says of it: counts and the format's length alone.
+    pub fn says(&self) -> String {
+        if self.sent == 0 {
+            return "not measured: no client id was sent".to_owned();
+        }
+        let accepted = match (self.echoed, self.full == self.sent) {
+            (true, true) => {
+                "an ACK echoed one byte for byte, so QFEX accepted the format at its \
+             full length"
+            }
+            (true, false) => {
+                "an ACK echoed one byte for byte, but not every id was at the full \
+             length"
+            }
+            (false, _) => {
+                "no ACK echoed one byte for byte, so QFEX's acceptance at that length \
+             is not shown"
+            }
+        };
+        format!(
+            "{} of the {} client ids the run sent were the format's full length, {} characters; \
+             {accepted}",
+            self.full, self.sent, self.length
+        )
+    }
+}
+
+/// The speed bump's hold on a place that is not post-only, as QFEX's docs state it (decision
+/// 0132's context: "Non-ALO orders wait in a 500 ms speed bump").
+pub const SPEED_BUMP: Duration = Duration::from_millis(500);
+
+/// How long `ACK` took for the run's places, post-only and other, from each `add_order`'s send
+/// to the first `ACK` naming it on the journal's clock (decision 0132's Consequences), and
+/// whether each other place's `ACK` came before or after the speed bump's hold ([`SPEED_BUMP`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Acks {
+    pub post_only: Vec<Duration>,
+    pub other: Vec<Duration>,
+}
+
+impl Acks {
+    /// What `kept`, the run's tee, shows ([`Kept::ack_latencies`]).
+    pub fn of(kept: &Kept) -> Acks {
+        let mut acks = Acks::default();
+        for (post_only, after) in kept.ack_latencies() {
+            match post_only {
+                true => acks.post_only.push(after),
+                false => acks.other.push(after),
+            }
+        }
+        acks
+    }
+
+    /// One kind's `ACK`s as the report says them: how many, and the least and the most time
+    /// each took, in whole milliseconds.
+    fn kind(times: &[Duration]) -> String {
+        let ms = |d: &Duration| d.as_millis();
+        match (times.iter().min(), times.iter().max()) {
+            (Some(least), Some(most)) => format!(
+                "{} ACK{}, from {} ms to {} ms after its send",
+                times.len(),
+                if times.len() == 1 { "" } else { "s" },
+                ms(least),
+                ms(most)
+            ),
+            _ => "no ACK heard".to_owned(),
+        }
+    }
+
+    /// What the report says of the other places' `ACK`s against the speed bump's hold.
+    pub fn bump_said(&self) -> String {
+        let before = self.other.iter().filter(|d| **d < SPEED_BUMP).count();
+        let after = self.other.len() - before;
+        match (before, after) {
+            (0, 0) => "not measured: no ACK of a place that is not post-only was heard".to_owned(),
+            (_, 0) => "every one came before the hold's end, within 500 ms of its send".to_owned(),
+            (0, _) => "every one came after the hold, 500 ms or more after its send".to_owned(),
+            (before, after) => format!(
+                "{before} came before the hold's end, within 500 ms of its send, and {after} after \
+                 it"
+            ),
+        }
+    }
+
+    /// What the report says of them.
+    pub fn says(&self) -> String {
+        format!(
+            "post-only places: {}; other places: {}; against the speed bump's 500 ms hold on a \
+             place that is not post-only: {}",
+            Acks::kind(&self.post_only),
+            Acks::kind(&self.other),
+            self.bump_said()
+        )
+    }
+}
+
 /// Whether QFEX accepted `add_order` as the codec encodes it, with none of `take_profit`,
 /// `stop_loss` and `reduce_only` (FBC-blcw).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -855,8 +989,18 @@ pub fn counted_resting(registry: &Registry, inst: InstrumentId) -> bool {
     total != Some(Lots::ZERO)
 }
 
+/// A place stage's session outside the drop test, for what differs between them: stage two's
+/// crossing session (FBC-su9i) or taker IOC session (FBC-ou9g), or stage three's (FBC-4plj).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Session {
+    Cross,
+    Take,
+    Pages,
+}
+
 /// One named account's crossing session (decision 0132 item 7), as the report and the evidence
 /// show it: names, flags, counts, status names and times alone, never an id, a price or a size.
+/// Stage two's taker IOC sessions and stage three's are recorded as one too.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CrossRun {
     /// The account it ran on, as the configuration names it.
@@ -917,6 +1061,11 @@ pub struct CrossRun {
     /// In a taker IOC session (FBC-ou9g), the taker IOC: how it came back, its fees' signs and
     /// the order of its frames; `None` in a crossing session.
     pub taken: Option<crate::taker::Taken>,
+    /// In a taker IOC session that ended with no stop (FBC-4plj), the `get_user_trades` rows
+    /// since the taker IOC's send and `GET /user/historic-orders`, for the taker IOC and its
+    /// flatten IOCs: what kind of time a trade's `timestamp` is, whether its `trade_id` is the
+    /// fills channel's, and which side field a row carries (decision 0132's Consequences).
+    pub traded: Option<crate::places::Traded>,
 }
 
 /// Stage two (FBC-su9i; decision 0132 item 7, 0148 items 2 and 10), as the report and the
@@ -931,6 +1080,10 @@ pub struct StageTwo {
     /// What the run's frames show, read once the run's sessions ended ([`StageTwo::read`]).
     pub echoes: Echoes,
     pub characters: Option<Characters>,
+    /// The client ids' lengths against the format's full length.
+    pub lengths: Option<FullLength>,
+    /// How long `ACK` took, post-only and other places.
+    pub acks: Acks,
     pub as_encoded: Option<AsEncoded>,
     pub statuses: Statuses,
     /// Each named account's crossing session, in run order.
@@ -938,8 +1091,9 @@ pub struct StageTwo {
     /// Each named account's taker IOC session (FBC-ou9g), in run order: one on each account whose
     /// crossing session did not stop the run.
     pub takes: Vec<CrossRun>,
-    /// Whether every account due to cross ran its crossing and its taker IOC sessions with no
-    /// stop and no error, so the run reached its end, `stage::NOT_BUILT` (FBC-ou9g).
+    /// Whether every account due to cross ran its crossing and its taker IOC sessions and stage
+    /// three with no stop and no error, so the run reached its end, `stage::FINISHED` (FBC-ou9g,
+    /// FBC-4plj).
     pub finished: bool,
 }
 
@@ -950,10 +1104,10 @@ impl StageTwo {
     /// ends.
     pub fn read(&mut self, kept: &Kept) {
         self.echoes = Echoes::of(kept);
-        self.characters = Some(Characters::of(
-            kept,
-            &fbc_venue_qfex::exec::CLIENT_ID_FORMAT,
-        ));
+        let fmt = &fbc_venue_qfex::exec::CLIENT_ID_FORMAT;
+        self.characters = Some(Characters::of(kept, fmt));
+        self.lengths = Some(FullLength::of(kept, fmt));
+        self.acks = Acks::of(kept);
         self.as_encoded = Some(AsEncoded::of(kept));
         self.statuses = Statuses::of(kept);
     }
@@ -988,8 +1142,8 @@ pub const HAND_CANCEL_STAGE_UNREAD: &str = "not known: the account was not read 
 const NOT_READ: &str = "not known: the account was not read after the session; read it on \
      QFEX's site before the next run";
 
-/// The owner's hand cancel after stage-two session `run`, the taker IOC session's when `take`:
-/// the session's own words when a read after it listed an order of ours resting; counted
+/// The owner's hand cancel after `run`, a session of the kind `session` names: the session's
+/// own words when a read after it listed an order of ours resting; counted
 /// resting, never seen resting, when only its registry still counts one; and the account not
 /// read, an order of ours sent there counted resting, when it was not read after the session
 /// (decision 0005, the owner's ruling under 0151 item 6 on FBC-gisx). After the abrupt drop the
@@ -998,11 +1152,13 @@ const NOT_READ: &str = "not known: the account was not read after the session; r
 /// order of ours is counted resting by the registry alone. `None` when a read showed none and
 /// the registry counts none, or nothing was sent on an account not read. The report, the
 /// evidence and the `RESTING` line give the same.
-pub fn hand_cancel(run: &CrossRun, take: bool) -> Option<&'static str> {
+pub fn hand_cancel(run: &CrossRun, session: Session) -> Option<&'static str> {
+    use crate::pager::{HAND_CANCEL_PAGES, HAND_CANCEL_PAGES_COUNTED};
     use crate::taker::{HAND_CANCEL_TAKE, HAND_CANCEL_TAKE_COUNTED};
-    let (seen, counted) = match take {
-        true => (HAND_CANCEL_TAKE, HAND_CANCEL_TAKE_COUNTED),
-        false => (HAND_CANCEL_CROSS, HAND_CANCEL_CROSS_COUNTED),
+    let (seen, counted) = match session {
+        Session::Cross => (HAND_CANCEL_CROSS, HAND_CANCEL_CROSS_COUNTED),
+        Session::Take => (HAND_CANCEL_TAKE, HAND_CANCEL_TAKE_COUNTED),
+        Session::Pages => (HAND_CANCEL_PAGES, HAND_CANCEL_PAGES_COUNTED),
     };
     let dropped = run.ended_by == Some(crate::stage::DROPPED);
     match (run.resting, run.counted_resting, run.read) {
@@ -1014,10 +1170,10 @@ pub fn hand_cancel(run: &CrossRun, take: bool) -> Option<&'static str> {
     }
 }
 
-/// What the report says of an order resting on `run`'s account after a stage-two session, the
-/// taker IOC session's when `take`: [`hand_cancel`]'s, or else whether the account was read.
-fn resting_said(run: &CrossRun, take: bool) -> &'static str {
-    match (hand_cancel(run, take), run.read) {
+/// What the report says of an order resting on `run`'s account after `session`:
+/// [`hand_cancel`]'s, or else whether the account was read.
+pub fn resting_said(run: &CrossRun, session: Session) -> &'static str {
+    match (hand_cancel(run, session), run.read) {
         (Some(hand), _) => hand,
         (None, true) => "no",
         (None, false) => NOT_READ,
@@ -1087,8 +1243,9 @@ fn cross_cancels_said(cancels: Option<&crate::places::Cancels>) -> String {
 }
 
 /// The report's section on stage two: the gate, the run's client ids and statuses, then each
-/// named account's crossing session and, after it, its taker IOC session (FBC-ou9g).
-pub fn markdown(s: &mut String, two: &StageTwo) {
+/// named account's crossing session and, after it, its taker IOC session (FBC-ou9g), which
+/// stage three's session follows on each account of `paged` (FBC-4plj).
+pub fn markdown(s: &mut String, two: &StageTwo, paged: &[&'static str]) {
     use crate::places::{echoes_said, ms, placed_said, yn};
     use std::fmt::Write as _;
     let gate = match two.gate {
@@ -1126,7 +1283,7 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
         echoes.join("\n"),
         two.statuses.says(),
     );
-    for (n, run) in two.crosses.iter().enumerate() {
+    for run in &two.crosses {
         let crossed = match &run.crossed {
             Some(crossed) => crossed.says(),
             None => "not measured: it was not placed".to_owned(),
@@ -1135,7 +1292,7 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
             Some(Crossed::Filled) => format!("; {CROSS_FILLED}"),
             _ => String::new(),
         };
-        let resting = resting_said(run, false);
+        let resting = resting_said(run, Session::Cross);
         let others = match run.others {
             Some(true) => OTHERS_CROSS,
             Some(false) => "none",
@@ -1204,42 +1361,26 @@ pub fn markdown(s: &mut String, two: &StageTwo) {
             crate::flatten::markdown(s, flatten);
         }
         if let Some(take) = take {
-            let next = match (n + 1 < two.crosses.len(), two.finished) {
-                (true, _) => Next::Account,
-                (false, true) => Next::End,
-                (false, false) => Next::Ended,
-            };
-            take_markdown(s, take, next);
+            take_markdown(s, take, paged.contains(&take.account));
         }
     }
 }
 
 /// What the report says follows a session that stopped the run with `stop`.
-fn stopped(stop: &str) -> String {
+pub fn stopped(stop: &str) -> String {
     format!(
         "the run's stop, {stop}: nothing more is placed on this account or any other (decision \
          0132 item 7)"
     )
 }
 
-/// What came after a taker IOC session that did not stop the run itself (FBC-ou9g).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Next {
-    /// The next named account's crossing session ran.
-    Account,
-    /// The run reached its end, `stage::NOT_BUILT`, on the last account to cross.
-    End,
-    /// The run ended first, on a stop or an error that is no stop, before any later session.
-    Ended,
-}
-
-/// The report's section on one named account's taker IOC session (FBC-ou9g), `next` what came
-/// after it.
-fn take_markdown(s: &mut String, run: &CrossRun, next: Next) {
+/// The report's section on one named account's taker IOC session (FBC-ou9g), `paged` whether
+/// its account's stage-three session began after it (FBC-4plj).
+fn take_markdown(s: &mut String, run: &CrossRun, paged: bool) {
     use crate::places::{echoes_said, ms, placed_said, yn};
-    use crate::taker::{LAST_TAKE, NEXT_ACCOUNT, OTHERS_TAKE, RUN_ENDED};
+    use crate::taker::{OTHERS_TAKE, RUN_ENDED, THEN_PAGES};
     use std::fmt::Write as _;
-    let resting = resting_said(run, true);
+    let resting = resting_said(run, Session::Take);
     let others = match run.others {
         Some(true) => OTHERS_TAKE,
         Some(false) => "none",
@@ -1254,11 +1395,10 @@ fn take_markdown(s: &mut String, run: &CrossRun, next: Next) {
             ms(lead)
         )
     });
-    let followed = match (run.stop, next) {
+    let followed = match (run.stop, paged) {
         (Some(stop), _) => stopped(stop),
-        (None, Next::Account) => NEXT_ACCOUNT.to_owned(),
-        (None, Next::End) => LAST_TAKE.to_owned(),
-        (None, Next::Ended) => RUN_ENDED.to_owned(),
+        (None, true) => THEN_PAGES.to_owned(),
+        (None, false) => RUN_ENDED.to_owned(),
     };
     let _ = writeln!(
         s,
@@ -1320,7 +1460,7 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
     let echoes: serde_json::Map<String, serde_json::Value> = (two.echoes.says().into_iter())
         .map(|(kind, said)| (kind.to_owned(), json!(said)))
         .collect();
-    let session = |run: &CrossRun, take: bool| {
+    let session = |run: &CrossRun, session: Session| {
         let compared: Vec<serde_json::Value> = run.compared.iter().map(compared_json).collect();
         let cancels = run.cancels.as_ref().map(|c| {
             json!({"sent": c.sent, "held": c.held, "blocked": c.blocked, "ended": c.ended,
@@ -1335,14 +1475,14 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
             "others_after": run.others, "not_flat_after": run.not_flat_after,
             "owners_position": (run.not_flat_after == Some(true))
                 .then(|| position_said(run.not_flat_after, run.stop)),
-            "hand_cancel": hand_cancel(run, take),
+            "hand_cancel": hand_cancel(run, session),
             "echoes": run.echoes, "add_order_as_encoded": run.as_encoded,
             "error": run.error, "stop": run.stop,
             "flatten": run.flatten.as_ref().map(crate::flatten::to_json)})
     };
     let crosses: Vec<serde_json::Value> = (two.crosses.iter())
         .map(|run| {
-            let mut entry = session(run, false);
+            let mut entry = session(run, Session::Cross);
             entry["crossing_post_only"] = placed_json(&run.placed);
             entry["refused"] = json!(run.crossed.as_ref().map(Crossed::says));
             entry
@@ -1350,7 +1490,7 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
         .collect();
     let takes: Vec<serde_json::Value> = (two.takes.iter())
         .map(|run| {
-            let mut entry = session(run, true);
+            let mut entry = session(run, Session::Take);
             entry["taker_ioc"] = placed_json(&run.placed);
             entry["taken"] = crate::taker::taken_json(run.taken.as_ref());
             entry
@@ -1358,6 +1498,8 @@ pub fn to_json(two: &StageTwo) -> serde_json::Value {
         .collect();
     json!({"exact_echo_gate": two.gate,
         "characters": two.characters.as_ref().map(Characters::says),
+        "client_id_length": two.lengths.as_ref().map(FullLength::says),
+        "ack_latency": two.acks.says(),
         "add_order_as_encoded": two.as_encoded.map(AsEncoded::says),
         "echoes": echoes, "statuses": two.statuses.says(), "crossings": crosses,
         "takes": takes})

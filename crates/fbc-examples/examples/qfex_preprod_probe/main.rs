@@ -17,9 +17,11 @@
 //! program: CI builds it, and its wiring is tested against the conformance stub
 //! (`tests/qfex_preprod_probe.rs`), but nothing runs it against a venue.
 //!
-//! With `--place-stages` (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i and FBC-ou9g, slices of FBC-9sk2;
-//! decisions 0148 and 0151) it runs the place stages on production (`--production`) and, until
-//! FBC-4plj, only against a loopback test stub: a `CAPS` line first, its lease directory opened
+//! With `--place-stages` (FBC-c6kw, FBC-23ch, FBC-77r8, FBC-su9i, FBC-ou9g and FBC-4plj, slices of
+//! FBC-9sk2; decisions 0148 and 0151) it runs the place stages on production (`--production`), on
+//! the origins the adapter's probe guard admits there (QFEX production's three, or all three
+//! loopback for a test stub; decision 0143 item 2): a `CAPS` line first, its lease directory
+//! opened
 //! ([`places`]: tagged production, a stop marker held to `--reconciled`, the namespace lease taken;
 //! 0151 items 1 and 6), the hold first when `--hold-secs` asks, then the traded instrument's spec
 //! from this run's `GET /refdata`, the ledger's count bound against each place registry's ceiling,
@@ -36,8 +38,12 @@
 //! before its session stops; then, in a session of its own, its taker IOC ([`taker`]), one limit
 //! IOC at the minimum size at the far touch, whose fill is flattened through Exit before that
 //! session stops, reporting the taker fee's sign and the order of its frames; with the gate shut
-//! the run ends NoEcho, not a fault. The run ends after the last account's taker IOC, its outcome
-//! not ok, until FBC-4plj builds stage three; a fill of ours other than the taker IOC's and a
+//! the run ends NoEcho, not a fault. Then, on each account after its taker IOC, stage three
+//! ([`pager`]): P1 and P2, each one post-only GTC at the minimum size behind the touch, P3, then
+//! their cancels by venue id, while a pager that never arms asks for `get_user_orders` at a page
+//! size of 1 between them. The run ends after the last account's stage three, and its report
+//! answers decision 0132's list for each named account ([`answers`]); a fill of ours other than
+//! the taker IOC's and a
 //! flatten IOC's is flattened while its session is open ([`flatten`]: the owner's Flatten into
 //! Exit, then reducing limit IOCs within `--flatten-cap-bps` under the account's one budget of
 //! `--flatten-attempts`), and the run then stops, as a taker IOC left open with a fill does, not
@@ -56,8 +62,7 @@
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --production \
 //!     --evidence-dir /abs/new/dir --hold-secs <S> --socks5 <HOST:PORT>
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --production --place-stages \
-//!     --evidence-dir /abs/new/dir --trade-url <LOOPBACK> --rest-url <LOOPBACK> \
-//!     --mds-url <LOOPBACK> --symbol <SYMBOL> --side <buy|sell> --sole-trader \
+//!     --evidence-dir /abs/new/dir --symbol <SYMBOL> --side <buy|sell> --sole-trader \
 //!     --resting-cap-usd <USD> --inventory-cap-usd <USD> --away-bps <BPS> \
 //!     --flatten-cap-bps <BPS> --flatten-attempts <N> --namespace <N> --agree-wait-ms <MS> \
 //!     --read-interval-ms <MS> --touch-max-age-ms <MS> --registry-span <S> \
@@ -65,6 +70,8 @@
 //! cargo run -p fbc-examples --example qfex_preprod_probe -- --help
 //! ```
 
+// Decision 0132's list, answered for each named account from the run's evidence (FBC-4plj).
+mod answers;
 #[path = "../../src/auth_qfex.rs"]
 mod auth_qfex;
 mod capture;
@@ -87,6 +94,9 @@ mod interrupt;
 mod link;
 mod market;
 mod pages;
+// Stage three (FBC-4plj): its interleaving of places, pages and cancels, its pager's records,
+// and the report's section on it.
+mod pager;
 mod places;
 mod probe_args;
 mod refusals;
