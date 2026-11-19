@@ -12400,7 +12400,22 @@ async fn a_position_frame_before_or_after_a_fill_leaves_the_flatten_to_the_regis
                 _ => false,
             })
             .count();
-        assert_eq!(positions, 2, "X's fill and the IOC's: {push:?}");
+        // Each fill's position_response, X's and the IOC's, is pushed with its frames. Before
+        // them, the session reads both, ahead of each fill_response it waits on. After them,
+        // X's comes ahead of the IOC's answer, which the flatten waits on, so it is read; but
+        // the IOC's comes after its order_response, the last frame the session waits on, and
+        // the session may close before reading it. The journal keeps only what the session
+        // read, so it holds 1 or 2 there, and nothing orders the second (FBC-4ptk's third
+        // kind; PR #277's CI run 44483279366 counted 1).
+        match push {
+            model::PositionPush::Before => {
+                assert_eq!(positions, 2, "X's fill and the IOC's: {push:?}")
+            }
+            model::PositionPush::After => assert!(
+                (1..=2).contains(&positions),
+                "X's fill's, and the IOC's if read before the close: {positions} {push:?}"
+            ),
+        }
         assert!(d.ev.errors.is_empty(), "{:?}", d.ev.errors);
     }
 }
