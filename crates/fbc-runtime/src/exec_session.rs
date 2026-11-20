@@ -192,6 +192,32 @@
 //! through the pacing, no sooner than the buckets would admit the arm when they refused it for
 //! now; an arm whose frames never fit ends the session ([`ExecSessionError::ArmNeverFits`]).
 //!
+//! **The resync's deadline (FBC-nwpr, decisions 0013, 0053, 0058).** The resync an epoch asks
+//! must end within the consumer's [`ExecSessionConfig::resync_deadline`], which has no default
+//! (0009), counted from the time of the context the session gives the resync: its `mono`, which
+//! the journal holds in the resync's `EncodeCtx` record. Whatever holds the resync (a lost
+//! snapshot frame, a codec that drops a resync cut short, a resync read that came back
+//! [`HttpFailure::NotSent`](fbc_core::HttpFailure::NotSent) for a reason other than the buckets
+//! and is never asked again), once the deadline has passed with the epoch's `ResyncEnd` not
+//! handed to the handler, the epoch ends as a drop at the end of the turn that finds it so, once
+//! the input being handled and the commands waiting are taken, so a cancel among them goes out;
+//! it is counted ([`ExecCounters::resync_timeouts`]), and the next epoch opens through the
+//! pacing, arms and resyncs again. Until then the epoch takes cancels and control commands and
+//! holds every place and amend, as above. A `ResyncEnd` handed on before that turn ends, from
+//! the input the turn takes (a request's deadline falling due with the resync's, say), ends the
+//! resync, and the epoch stays open. An input that arrives at the very instant of the deadline
+//! is taken first only when the turn's rotation polls its wake before the deadline's, as with the
+//! arm's request deadline; otherwise the epoch ends at its deadline with that input unread, and
+//! either outcome is correct. The deadline runs from the resync, not from the authentication: the
+//! arm's own deadline bounds the arm and this one the read of the venue, and a venue whose
+//! protection outlives a connection, which sends no arm on a later epoch, still bounds its
+//! resync. Its firing calls no codec and hands the handler no event, so it takes no ingest
+//! sequence and has no record of its own (0090 journals the firings that do): what it does, the
+//! epoch's end, is journaled as the epoch's `Closed`, as any drop's is, where decoder replay
+//! ends the epoch (0138), and what the session takes between the two, the commands waiting, is
+//! journaled as any encode is. Decoder replay so needs no deadline of its own to hand the
+//! handler what the live session handed it (0006).
+//!
 //! **Orders resting from an earlier epoch (FBC-nvxn, decision 0080).** An arm may cover only
 //! the orders placed after it. On a venue that does not declare that it covers the orders
 //! already open (`CancelOnDisconnect::PerConnection::covers_open_orders`), every order of ours
@@ -243,6 +269,7 @@ use std::future::{Future, poll_fn};
 use std::pin::pin;
 use std::rc::Rc;
 use std::task::Poll;
+use std::time::Duration;
 
 use fbc_core::{
     AccountKey, CancelOnDisconnect, ConnKey, ConnState, CtxCall, DecodeError, Effect, Effects,
@@ -271,6 +298,7 @@ use crate::in_process::{InProcessStream, Link};
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
 use crate::ratelimit::{RateError, RateLimiter, Refused, Request};
+use crate::resync_deadline::ResyncDeadline;
 use crate::session::SessionError;
 use crate::session_core::{
     Answered, Control, Core, CoreConfig, EpochInputs, IngestClock, TickToWire, close, frame_of,
@@ -420,6 +448,10 @@ pub struct ExecSessionConfig {
     pub limiter: RateLimiter,
     /// The longest one write may wait on a peer that stopped reading (0036).
     pub write_stall: WriteStall,
+    /// The longest an epoch's resync may run (FBC-nwpr): an epoch whose `ResyncEnd` has not
+    /// reached the handler this long after the session asked the codec's resync ends as a drop,
+    /// counted ([`ExecCounters::resync_timeouts`]), and reconnects through `pacing`.
+    pub resync_deadline: ResyncDeadline,
     /// The most response-body bytes an HTTP request the codec asks for may read; a longer
     /// body is [`HttpFailure::Lost`](fbc_core::HttpFailure::Lost) (0027).
     pub http_max_body: usize,
@@ -618,6 +650,9 @@ pub struct ExecCounters {
     /// Epochs ended because their cancel-on-disconnect arm failed: the codec refused it, the
     /// buckets did not admit it, the venue rejected it, or it was unanswered at its deadline.
     pub arm_failures: u64,
+    /// Epochs ended because their resync's `ResyncEnd` had not reached the handler by the
+    /// consumer's resync deadline ([`ExecSessionConfig::resync_deadline`], FBC-nwpr).
+    pub resync_timeouts: u64,
     /// Places, batches of places and amends refused because their epoch was not yet armed and
     /// resynced.
     pub unready_refusals: u64,
@@ -656,6 +691,13 @@ pub struct ExecSession<H: ExecHandler> {
     decode_errors: u64,
     /// Epochs ended by a failed arm.
     arm_failures: u64,
+    /// The consumer's resync deadline (FBC-nwpr).
+    resync_deadline: Duration,
+    /// The epoch whose resync was asked for last, and when its deadline falls due: `None` when
+    /// none was asked for on the open epoch, or its deadline is past the end of the clock.
+    resync_by: Option<(u32, Instant)>,
+    /// Epochs ended because their resync had not ended by its deadline.
+    resync_timeouts: u64,
     /// Places and amends refused on an epoch not yet armed and resynced.
     unready_refusals: u64,
     /// Places and amends refused on a market an order rests unprotected on.
@@ -844,6 +886,7 @@ impl<H: ExecHandler> ExecSession<H> {
             stop,
             conn,
             legs,
+            resync_deadline,
             control,
         } = parts(config, entry)?;
         let session = ExecSession {
@@ -860,6 +903,9 @@ impl<H: ExecHandler> ExecSession<H> {
             rec,
             decode_errors: 0,
             arm_failures: 0,
+            resync_deadline,
+            resync_by: None,
+            resync_timeouts: 0,
             unready_refusals: 0,
             unprotected_refusals: 0,
             in_flight_refusals: 0,
@@ -948,6 +994,7 @@ impl<H: ExecHandler> ExecSession<H> {
             refused_effects: core.refused_effects,
             write_stalls: core.write_stalls,
             arm_failures: self.arm_failures,
+            resync_timeouts: self.resync_timeouts,
             unready_refusals: self.unready_refusals,
             unprotected_refusals: self.unprotected_refusals,
             refused_redactions,
@@ -1087,6 +1134,8 @@ impl<H: ExecHandler> ExecSession<H> {
         self.core.control(|| ControlEvent::Opened(key));
         let end = self.epoch(ws, key).await;
         self.orders.set_ready(None);
+        // The epoch's resync deadline ends with it (FBC-nwpr).
+        self.resync_by = None;
         // What the epoch asked over HTTP comes back to no codec now (decision 0081).
         self.rpcs.ended(key);
         // Cleared before the handler is called, so a handler that panics is never told twice
@@ -1125,7 +1174,9 @@ impl<H: ExecHandler> ExecSession<H> {
             // won. A rotation rather than tokio's random start, so two closed-loop replays of
             // one journal take what is ready on one tick in the same order (decision 0107 item
             // 6; Reviewer B's RB-066n-1 on PR #178).
-            let rpc_due = self.rpcs.next_deadline();
+            // A request's deadline and the epoch's resync deadline wake the turn alike, so the
+            // ways it can wake, and the order it polls them in, stay as they were (FBC-nwpr).
+            let rpc_due = earliest(self.rpcs.next_deadline(), self.resync_due(key));
             // The other endpoints wake the turn too, when there are any (decision 0115).
             let wakes = WAKES + u8::from(!self.legs.is_empty());
             let first = self.turn % wakes;
@@ -1215,6 +1266,13 @@ impl<H: ExecHandler> ExecSession<H> {
             // An epoch whose arm failed ends as a drop, once what waited has gone out.
             if open && self.orders.gate.borrow().failed(key.epoch) {
                 self.arm_failures += 1;
+                open = false;
+            }
+            // So does one whose resync's deadline has passed with its `ResyncEnd` not handed to
+            // the handler, once the input being handled and what waited are taken, a cancel
+            // among them going out (FBC-nwpr).
+            if open && self.resync_due(key).is_some_and(|at| at <= Instant::now()) {
+                self.resync_timeouts += 1;
                 open = false;
             }
         }
@@ -1680,11 +1738,23 @@ impl<H: ExecHandler> ExecSession<H> {
     ) -> Result<bool, ExecSessionError> {
         let (call, rec, clock) = (CtxCall::Resync, &self.rec, &self.clock);
         let ctx = context(&*self.codec, &mut *self.nonces, rec, clock, call, None)?;
+        // Its deadline runs from the time its context holds, which the journal keeps (FBC-nwpr).
+        let started = self.clock.instant(ctx.mono);
+        let due = started.and_then(|at| at.checked_add(self.resync_deadline));
+        self.resync_by = due.map(|at| (key.epoch, at));
         let mut fx = Effects::new();
         self.codec.resync(&ctx, &mut fx);
         self.orders.gate.borrow_mut().resync_asked(key.epoch);
         let never = ExecSessionError::ResyncNeverFits;
         self.execute_together(ws, key, fx, never).await
+    }
+
+    /// When epoch `key`'s resync deadline falls due, while its resync is pending: asked for, its
+    /// `ResyncEnd` not yet handed to the handler (FBC-nwpr).
+    fn resync_due(&self, key: ConnKey) -> Option<Instant> {
+        let (epoch, at) = self.resync_by?;
+        let pending = epoch == key.epoch && self.orders.gate.borrow().resync_pending(epoch);
+        pending.then_some(at)
     }
 
     /// Hands each request whose deadline fell due unanswered to the codec's `on_rpc_timeout`,
@@ -1711,6 +1781,14 @@ impl<H: ExecHandler> ExecSession<H> {
     }
 }
 
+/// The earlier of two instants, either of which may be none.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// What a session is built from, whatever its handler: its order connection's core, its codec
 /// and the venue's caps, the other endpoints' legs and its control. Built in one function for
 /// every handler type, so its checks are one code path (decision 0115).
@@ -1732,6 +1810,7 @@ struct Parts {
     stop: watch::Receiver<()>,
     conn: u16,
     legs: Legs,
+    resync_deadline: Duration,
     control: ExecControl,
 }
 
@@ -1855,6 +1934,7 @@ fn parts(config: ExecSessionConfig, entry: Entry) -> Result<Parts, ExecSessionEr
         stop,
         conn: config.conn,
         legs: Legs::new(legs),
+        resync_deadline: config.resync_deadline.after(),
         control,
     })
 }

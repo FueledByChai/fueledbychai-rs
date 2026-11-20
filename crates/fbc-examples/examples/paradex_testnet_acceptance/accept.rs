@@ -1291,6 +1291,8 @@ impl Run {
             conn: u16::try_from(self.tracker.borrow().phase).unwrap_or(u16::MAX),
             limiter: self.limiter.clone(),
             write_stall: WriteStall::new(Duration::from_secs(10)).expect("a non-zero window"),
+            resync_deadline: fbc_runtime::ResyncDeadline::new(Duration::from_secs(60))
+                .expect("a minute"),
             http_max_body: 1 << 20,
             outbound: fbc_runtime::ReservedBound::new(16, 16).expect("a valid bound"),
             in_flight: fbc_runtime::InFlight::new(

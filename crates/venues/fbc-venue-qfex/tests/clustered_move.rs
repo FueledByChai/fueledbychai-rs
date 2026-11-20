@@ -281,6 +281,7 @@ fn exec_config(cfg: &VenueConfig, clock: &IngestClock) -> ExecSessionConfig {
         conn: EXEC_CONN,
         limiter: RateLimiter::for_user(RateUserKey::new(0xd8c4_0001), &limits, reserve).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(10)).unwrap(),
+        resync_deadline: fbc_runtime::ResyncDeadline::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 1 << 20,
         outbound: bound,
         in_flight: InFlight::new(bound),

@@ -471,6 +471,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     brings under Safety (0078), and each request deadline it fires at its stamp (0090); it
     reserves through `NonceSource::try_reserve`, and a source's refusal ends it with
     `ExecSessionError::NonceRefused`, nothing reserved or written;
+    an epoch whose resync's `ResyncEnd` has not reached the handler by the consumer's
+    `ResyncDeadline` (no default, zero refused) after the session asked it ends as a drop,
+    counted (`ExecCounters::resync_timeouts`), once the commands waiting have gone out, and
+    reconnects through the pacing; its firing calls no codec, so the journal holds only the
+    epoch's `Closed`, where decoder replay ends it (FBC-nwpr, 0013, 0053, 0058;
+    `tests/exec_ready.rs`, `tests/exec_held.rs`, `tests/exec_replay.rs`);
     an account-wide cancel-on-disconnect cap requires explicit authority for that account
     before a session plans or opens its endpoints; once armed, a disconnect cancels that
     account's orders across connections, including orders placed after the arm, and each new

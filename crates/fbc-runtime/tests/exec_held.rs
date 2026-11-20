@@ -4,7 +4,9 @@
 //! with no nonce reserved and no byte written, while a cancel submitted with them goes out; once
 //! the epoch is armed and resynced a place is written; on an epoch whose arm the venue rejected
 //! a place is held and a cancel still goes out before the epoch ends as a drop; and no place or
-//! cancel written before a drop is written again on the epoch after it.
+//! cancel written before a drop is written again on the epoch after it. FBC-nwpr's case is here
+//! too: on an epoch whose resync never ends, a place is held and a cancel goes out until the
+//! resync's deadline ends the epoch as a drop (decisions 0013, 0053, 0058).
 //!
 //! Every order command here is one fbc-oms built and authorized (FBC-afd): a registry armed on
 //! the toy's market after a trustworthy resync that showed one resting order of ours, `V-1`
@@ -26,7 +28,10 @@ use std::sync::Arc;
 use armed_oms::{Oms, Reserved, churn, reconnected, session_config, settle, watermark};
 use common::ScriptedWs;
 use fbc_core::{Envelope, ExecEvent, NotSentReason, RpcId, SubmitHandle, SubmitOutcome};
-use fbc_runtime::{ExecControl, ExecHandler, ExecOrders, ExecSession};
+use fbc_runtime::{
+    ExecControl, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, ResyncDeadline,
+};
+use futures_util::FutureExt;
 
 // ---------------------------------------------------------------------------------------------
 // The session.
@@ -81,6 +86,15 @@ struct Seen {
 fn held_session(url: &str) -> (ExecSession<Keep>, ExecControl, ExecOrders, Seen) {
     let reserved = Reserved::default();
     let config = session_config(url, &reserved);
+    held_session_from(config, reserved)
+}
+
+/// A session built from `config`, whose nonce reservations `reserved` logs, its orders also
+/// its handler's.
+fn held_session_from(
+    config: ExecSessionConfig,
+    reserved: Reserved,
+) -> (ExecSession<Keep>, ExecControl, ExecOrders, Seen) {
     let seen = Seen {
         handles: Handles::default(),
         events: Events::default(),
@@ -286,4 +300,96 @@ async fn on_an_epoch_whose_arm_was_rejected_an_authorized_place_is_held_and_a_ca
     assert_eq!(*seen.reserved.lock().unwrap(), [vec![0], vec![1], vec![2]]);
     assert_eq!(session.counters().unready_refusals, 1);
     assert_eq!(session.counters().arm_failures, 1);
+}
+
+/// The venue accepts the arm and begins the resync but never ends it: until the resync's
+/// deadline an authorized place is held, counted, with no nonce reserved and nothing written,
+/// and an authorized cancel goes out; at the deadline the epoch ends as a drop, counted, and the
+/// epoch after it, armed and resynced, writes neither again (FBC-nwpr).
+#[tokio::test(start_paused = true)]
+async fn on_an_epoch_whose_resync_never_ends_a_cancel_goes_out_until_its_deadline_ends_the_epoch() {
+    let deadline = std::time::Duration::from_secs(2);
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let mut server = ScriptedWs::start().await;
+    let reserved = Reserved::default();
+    let mut config = session_config(&server.url(), &reserved);
+    config.resync_deadline = ResyncDeadline::new(deadline).unwrap();
+    let (mut session, control, orders, seen) = held_session_from(config, reserved);
+    let (heard, watch, oms) = (
+        Rc::clone(&seen.events),
+        Rc::clone(&seen.handles),
+        Rc::clone(&seen.oms),
+    );
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send("auth|ok=1|token=toy-session-token");
+        assert_eq!(peer.recv().await, "cod|rpc=1|on=1");
+        let wm = watermark(&peer.recv().await);
+        peer.send("item|rpc=1|i=0|res=ok");
+        peer.send(&format!("rsbegin|wm={wm}"));
+        settle(|| heard.borrow().len() == 2).await;
+        tokio::time::advance(deadline - std::time::Duration::from_millis(1)).await;
+        churn().await;
+        let (place, cancel) = {
+            let mut oms = oms.borrow_mut();
+            (oms.place(), oms.cancel())
+        };
+        orders.submit(place).unwrap();
+        orders.submit(cancel).unwrap();
+        let written = peer.recv().await;
+        assert!(written.starts_with("cancel|rpc=3|"), "{written}");
+        settle(|| watch.borrow().len() == 2).await;
+        churn().await;
+        assert!(peer.quiet());
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        // At the deadline the epoch ends and its connection closes: read without waiting, so a
+        // connection left open fails the test rather than holds it.
+        let mut closed = None;
+        for _ in 0..100_000 {
+            if let Some(next) = peer.next().now_or_never() {
+                closed = Some(next);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(closed, Some(None));
+        assert!(!orders.may_place());
+
+        let mut next = reconnected(&mut server).await;
+        assert!(next.recv().await.starts_with("auth|ts="));
+        next.send("auth|ok=1|token=toy-session-token");
+        assert_eq!(next.recv().await, "cod|rpc=4|on=1");
+        let wm = watermark(&next.recv().await);
+        next.send("item|rpc=4|i=0|res=ok");
+        next.send(&format!("rsbegin|wm={wm}"));
+        next.send("rsend");
+        settle(|| heard.borrow().contains(&ExecEvent::ResyncEnd)).await;
+        assert!(orders.may_place());
+        churn().await;
+        assert!(next.quiet());
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(thaw);
+
+    let handles = seen.handles.borrow();
+    let [held_place, sent_cancel] = &handles[..] else {
+        panic!("{handles:?}");
+    };
+    let disconnected = Err(NotSentReason::Disconnected);
+    assert_eq!(
+        (held_place.rpc, &held_place.receipt),
+        (RpcId(2), &disconnected)
+    );
+    assert_eq!(sent_cancel.rpc, RpcId(3));
+    assert!(sent_cancel.receipt.is_ok());
+    // Each epoch's arm and the cancel: none for the place.
+    assert_eq!(*seen.reserved.lock().unwrap(), [vec![0], vec![1], vec![2]]);
+    let counters = session.counters();
+    assert_eq!(counters.unready_refusals, 1);
+    assert_eq!(counters.resync_timeouts, 1);
+    assert_eq!(counters.arm_failures, 0);
 }
