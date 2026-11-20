@@ -8,6 +8,14 @@
 //! goes out; a venue declaring cancel-on-disconnect `None` or `DeadMan` is refused when the
 //! session starts, naming it; and nothing written before a drop is written again after it.
 //!
+//! FBC-nwpr's done line is here too (decisions 0013, 0053, 0058): an epoch whose resync has not
+//! ended by the consumer's resync deadline, counted from the resync's asking, ends as a drop,
+//! counted, and reconnects through the pacing, a query still going out until then; that holds
+//! for a resync read that came back `HttpFailure::NotSent` for a reason other than the buckets,
+//! on every epoch; a command waiting as the deadline passes goes out before the epoch ends; one
+//! ended a moment before its deadline, or by the input taken as it passes, stays open; and a
+//! zero deadline is refused.
+//!
 //! The conformance toy declares cancel-on-disconnect per connection, re-armed on reconnect.
 //! The commands submitted here are control commands: an order query, a safety command like a
 //! cancel, which the gate lets through as it does a cancel. That the session refuses a place and
@@ -44,8 +52,8 @@ use fbc_core::{
 use fbc_oms::ControlCommand;
 use fbc_runtime::{
     AccountWideCodAuthority, Connector, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig,
-    ExecSessionError, IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, RpcIds,
-    SafetyReserve, ScopeCounts, SessionError, WriteStall,
+    ExecSessionError, IngestClock, ProxyConfig, RateLimiter, ReconnectPacing, ResyncDeadline,
+    ResyncDeadlineError, RpcIds, SafetyReserve, ScopeCounts, SessionError, WriteStall,
 };
 use tokio::time::advance;
 
@@ -72,6 +80,9 @@ const HTTP_RESYNC: &str = "ready.http_resync";
 /// The URL the HTTP resync reads; by default one never reached.
 const HTTP_RESYNC_URL: &str = "ready.http_resync_url";
 const BOUND_ACCOUNT: &str = "ready.bound_account";
+/// Any value: as each request's deadline passes, the codec ends its resync after reporting the
+/// request, as a codec ending its resync on a read that timed out would.
+const END_RESYNC_ON_TIMEOUT: &str = "ready.end_resync_on_timeout";
 
 const ACCT: AccountKey = AccountKey::new(4);
 
@@ -89,9 +100,13 @@ enum Call {
 
 type Calls = Arc<Mutex<Vec<Call>>>;
 
+/// Each HTTP result the codec was handed: its tag, and why no response came, if none did.
+type HttpResults = Arc<Mutex<Vec<(HttpTag, Option<HttpFailure>)>>>;
+
 #[derive(Default)]
 struct ReadyToy {
     calls: Calls,
+    http: HttpResults,
     caps: AtomicUsize,
     plans: AtomicUsize,
 }
@@ -112,6 +127,10 @@ impl ReadyToy {
             Call::Resync(_) => None,
         };
         self.calls().iter().filter_map(encoded).collect()
+    }
+
+    fn http_results(&self) -> Vec<(HttpTag, Option<HttpFailure>)> {
+        self.http.lock().unwrap().clone()
     }
 
     fn resyncs(&self) -> usize {
@@ -218,6 +237,7 @@ impl VenueFactory for ReadyToy {
         Some(Ok(Box::new(Logged {
             inner: ToyExec::new(Box::new(ToySigner)),
             calls: Arc::clone(&self.calls),
+            http: Arc::clone(&self.http),
             refuse_arm: cfg.get(REFUSE_ARM).is_some(),
             heavy_resync: cfg.get(HEAVY_RESYNC).is_some(),
             heavy_arm: cfg.get(HEAVY_ARM).is_some(),
@@ -227,6 +247,7 @@ impl VenueFactory for ReadyToy {
                     .unwrap_or("https://venue.invalid/orders");
                 (w.parse().unwrap(), url.to_owned())
             }),
+            end_resync_on_timeout: cfg.get(END_RESYNC_ON_TIMEOUT).is_some(),
         })))
     }
 
@@ -239,16 +260,19 @@ impl VenueFactory for ReadyToy {
     }
 }
 
-/// The toy's codec, logging each encode and resync; with `refuse_arm` it refuses to encode an
-/// arm, with `heavy_resync` its resync frame weighs 51 units, with `heavy_arm` its arm frame
-/// does, and with `http_resync` its resync is one HTTP read of that weight from that URL.
+/// The toy's codec, logging each encode, resync and HTTP result; with `refuse_arm` it refuses
+/// to encode an arm, with `heavy_resync` its resync frame weighs 51 units, with `heavy_arm` its
+/// arm frame does, with `http_resync` its resync is one HTTP read of that weight from that URL,
+/// and with `end_resync_on_timeout` it ends its resync as each request's deadline passes.
 struct Logged {
     inner: ToyExec,
     calls: Calls,
+    http: HttpResults,
     refuse_arm: bool,
     heavy_resync: bool,
     heavy_arm: bool,
     http_resync: Option<(u32, String)>,
+    end_resync_on_timeout: bool,
 }
 
 impl ExecCodec for Logged {
@@ -325,6 +349,10 @@ impl ExecCodec for Logged {
         sink: &mut dyn ExecSink,
         fx: &mut Effects,
     ) -> Result<(), DecodeError> {
+        self.http
+            .lock()
+            .unwrap()
+            .push((tag, resp.as_ref().err().copied()));
         self.inner.on_http(tag, resp, scope, specs, sink, fx)
     }
 
@@ -334,6 +362,9 @@ impl ExecCodec for Logged {
 
     fn on_rpc_timeout(&mut self, rpc: RpcId, sink: &mut dyn ExecSink) {
         self.inner.on_rpc_timeout(rpc, sink);
+        if self.end_resync_on_timeout {
+            sink.push(fbc_core::VenueMeta::NONE, ExecEvent::ResyncEnd);
+        }
     }
 
     fn resync(&mut self, ctx: &EncodeCtx, fx: &mut Effects) {
@@ -469,6 +500,7 @@ fn setup(
         conn: CONN,
         limiter: RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
+        resync_deadline: ResyncDeadline::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 4096,
         outbound: fbc_runtime::ReservedBound::new(64, 64).unwrap(),
         in_flight: fbc_runtime::InFlight::new(fbc_runtime::ReservedBound::new(64, 64).unwrap()),
@@ -1559,4 +1591,364 @@ fn a_session_not_yet_connected_takes_no_places() {
     let (config, _) = setup(ReadyToy::leak(), "ws://127.0.0.1:1/exec", &[]);
     let (session, _control) = ExecSession::new(config, |_: Envelope<ExecEvent>| {}).unwrap();
     assert!(!session.orders().may_place());
+}
+
+// ---------------------------------------------------------------------------------------------
+// FBC-nwpr's done line: an epoch whose resync has not ended by the consumer's deadline ends as a
+// drop, counted, and reconnects through the pacing; cancels still go out until then; one that
+// ended a moment before its deadline stays open; and a zero deadline is refused.
+// ---------------------------------------------------------------------------------------------
+
+/// The resync deadline the tests below give their sessions.
+const DEADLINE: Duration = Duration::from_secs(2);
+
+/// [`session`] with no handler's `on_reject`, its resync deadline `deadline` in place of the
+/// hour [`setup`] gives every other test.
+fn session_within(
+    venue: &'static ReadyToy,
+    url: &str,
+    cfg: &[(&'static str, &str)],
+    log: &Log,
+    deadline: Duration,
+) -> (ExecSession<Keep>, fbc_runtime::ExecControl, ExecOrders) {
+    let (mut config, _) = setup(venue, url, cfg);
+    config.resync_deadline = ResyncDeadline::new(deadline).unwrap();
+    let slot = Orders::default();
+    let (session, control) = ExecSession::new(config, Keep::new(log, &slot)).unwrap();
+    let orders = session.orders();
+    *slot.borrow_mut() = Some(orders.clone());
+    (session, control, orders)
+}
+
+/// The venue accepts the arm and begins the resync, but its end never comes (a lost snapshot
+/// frame): a moment before the deadline, counted from the resync's asking, the epoch is open,
+/// still takes no place, and a query (which the gate lets through as it does a cancel) goes
+/// out; at the deadline the epoch ends as a drop, counted, and the next opens through the
+/// pacing, arms and resyncs again, and its deadline, its resync ended, ends nothing.
+#[tokio::test(start_paused = true)]
+async fn a_resync_not_ended_by_its_deadline_ends_the_epoch_as_a_drop_through_the_pacing() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let (mut session, control, orders) = session_within(venue, &server.url(), &[], &log, DEADLINE);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert!(peer.recv().await.starts_with("auth|ts="));
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let resync = peer.recv().await;
+        peer.send(&accepted(1));
+        peer.send(&format!("rsbegin|wm={}", watermark(&resync)));
+        settle(|| outcomes(&watch).len() == 1).await;
+        assert!(!orders.may_place());
+        advance(DEADLINE - ms(1)).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        let asked = orders.submit_control(query()).unwrap();
+        assert_eq!(peer.recv().await, queried(asked));
+        assert!(!orders.may_place());
+        advance(ms(1)).await;
+        settle(|| ends(&watch).len() == 1).await;
+        assert_eq!(peer.next().await, None);
+        assert!(!orders.may_place());
+        // Through the pacing: not before its 10 ms floor.
+        advance(ms(9)).await;
+        churn().await;
+        assert!(server.try_accept().is_none());
+        advance(ms(1)).await;
+        let mut next = server.accept().await;
+        assert!(next.recv().await.starts_with("auth|ts="));
+        next.send(AUTH_ACK);
+        assert_eq!(next.recv().await, arm(3));
+        let resync = next.recv().await;
+        next.send(&accepted(3));
+        next.send_all(resynced(watermark(&resync)));
+        settle(|| resync_ends(&watch) == 1).await;
+        assert!(orders.may_place());
+        advance(DEADLINE).await;
+        churn().await;
+        assert_eq!(ends(&watch).len(), 1);
+        assert!(orders.may_place());
+        drop(control);
+        asked
+    };
+    let (run, asked) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+
+    let sent = SubmitHandle {
+        rpc: asked,
+        receipt: Ok(EncodeReceipt::new()),
+    };
+    assert_eq!(handles(&log), [sent]);
+    assert_eq!(venue.resyncs(), 2);
+    assert_eq!(ends(&log), [key(0), key(1)]);
+    let counters = session.counters();
+    assert_eq!(counters.resync_timeouts, 1);
+    assert_eq!(counters.arm_failures, 0);
+    assert_eq!(counters.attempts, 2);
+}
+
+/// A resync whose end the venue sends a moment before its deadline ends it: the epoch takes
+/// places, and neither the deadline nor any time after it ends the epoch.
+#[tokio::test(start_paused = true)]
+async fn a_resync_ended_a_moment_before_its_deadline_leaves_the_epoch_open() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let (mut session, control, orders) = session_within(venue, &server.url(), &[], &log, DEADLINE);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let resync = peer.recv().await;
+        peer.send(&accepted(1));
+        peer.send(&format!("rsbegin|wm={}", watermark(&resync)));
+        settle(|| outcomes(&watch).len() == 1).await;
+        advance(DEADLINE - ms(1)).await;
+        churn().await;
+        assert!(!orders.may_place());
+        peer.send("rsend");
+        settle(|| resync_ends(&watch) == 1).await;
+        assert!(orders.may_place());
+        advance(ms(1)).await;
+        churn().await;
+        advance(DEADLINE).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        assert!(orders.may_place());
+        assert!(peer.quiet());
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+
+    assert_eq!(ends(&log), [key(0)]);
+    let counters = session.counters();
+    assert_eq!(counters.resync_timeouts, 0);
+    assert_eq!(counters.attempts, 1);
+}
+
+/// A resync read over HTTP that came back `HttpFailure::NotSent` for a reason other than the
+/// buckets, here a request the runtime cannot make (FBC-w19's B7 note), and that the codec never
+/// asks again, leaves the epoch refusing places with no resync under way: its deadline ends the
+/// epoch as a drop, counted, and the next opens through the pacing and resyncs again. Its read
+/// comes back not sent too, and its own deadline, armed afresh, ends it, so a third epoch opens
+/// through the pacing.
+#[tokio::test(start_paused = true)]
+async fn a_resync_read_not_sent_for_a_reason_other_than_the_buckets_ends_the_epoch_at_its_deadline()
+{
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    // A scheme the runtime does not speak: the read is charged with the resync, then not sent.
+    let cfg = [
+        (HTTP_RESYNC, "1"),
+        (HTTP_RESYNC_URL, "ftp://127.0.0.1:9/orders"),
+    ];
+    let (mut session, control, orders) = session_within(venue, &server.url(), &cfg, &log, DEADLINE);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        peer.send(&accepted(1));
+        settle(|| outcomes(&watch).len() == 1).await;
+        advance(DEADLINE - ms(1)).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        assert!(!orders.may_place());
+        advance(ms(1)).await;
+        settle(|| ends(&watch).len() == 1).await;
+        assert_eq!(peer.next().await, None);
+        advance(ms(9)).await;
+        churn().await;
+        assert!(server.try_accept().is_none());
+        advance(ms(1)).await;
+        let mut next = server.accept().await;
+        assert!(next.recv().await.starts_with("auth|ts="));
+        next.send(AUTH_ACK);
+        assert_eq!(next.recv().await, arm(2));
+        next.send(&accepted(2));
+        settle(|| outcomes(&watch).len() == 2).await;
+        advance(DEADLINE - ms(1)).await;
+        churn().await;
+        assert_eq!(ends(&watch).len(), 1);
+        assert!(!orders.may_place());
+        advance(ms(1)).await;
+        settle(|| ends(&watch).len() == 2).await;
+        assert_eq!(next.next().await, None);
+        advance(ms(9)).await;
+        churn().await;
+        assert!(server.try_accept().is_none());
+        advance(ms(1)).await;
+        let mut third = server.accept().await;
+        assert!(third.recv().await.starts_with("auth|ts="));
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+
+    assert_eq!(venue.resyncs(), 2);
+    assert_eq!(resync_ends(&log), 0);
+    let not_sent = (HttpTag(77), Some(HttpFailure::NotSent));
+    assert_eq!(venue.http_results(), [not_sent, not_sent]);
+    assert_eq!(ends(&log), [key(0), key(1), key(2)]);
+    let counters = session.counters();
+    assert_eq!(counters.resync_timeouts, 2);
+    assert_eq!(counters.arm_failures, 0);
+    assert_eq!(counters.attempts, 3);
+    // The toy beneath the logging asked for no HTTP read, so it refuses each result it is
+    // handed as a decode error.
+    assert_eq!(counters.decode_errors, 2);
+}
+
+/// A command waiting as the resync's deadline passes, submitted a moment before it and first
+/// taken by the turn that finds the deadline passed, goes out before that turn ends the epoch.
+#[tokio::test(start_paused = true)]
+async fn a_command_waiting_as_the_resync_deadline_passes_goes_out_before_the_epoch_ends() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let (mut session, control, orders) = session_within(venue, &server.url(), &[], &log, DEADLINE);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        let resync = peer.recv().await;
+        peer.send(&accepted(1));
+        peer.send(&format!("rsbegin|wm={}", watermark(&resync)));
+        settle(|| outcomes(&watch).len() == 1).await;
+        advance(DEADLINE - ms(1)).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        // Nothing awaits between the submission and the clock reaching the deadline, so the
+        // session first sees the query with its deadline passed.
+        let asked = orders.submit_control(query()).unwrap();
+        advance(ms(1)).await;
+        assert_eq!(peer.recv().await, queried(asked));
+        settle(|| ends(&watch).len() == 1).await;
+        assert_eq!(peer.next().await, None);
+        drop(control);
+        asked
+    };
+    let (run, asked) = tokio::join!(session.run(), script);
+    run.unwrap();
+    drop(frozen);
+
+    let sent = SubmitHandle {
+        rpc: asked,
+        receipt: Ok(EncodeReceipt::new()),
+    };
+    assert_eq!(handles(&log), [sent]);
+    assert_eq!(ends(&log), [key(0)]);
+    let counters = session.counters();
+    assert_eq!(counters.resync_timeouts, 1);
+    assert_eq!(counters.attempts, 1);
+}
+
+/// The input the turn that finds the deadline passed takes is handled before the deadline is
+/// judged: here a query's deadline falls due with the resync's, and the codec, told the query
+/// timed out, ends its resync, so the epoch stays open and takes places.
+#[tokio::test(start_paused = true)]
+async fn a_resync_ended_by_the_input_taken_at_its_deadline_leaves_the_epoch_open() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let cfg = [(END_RESYNC_ON_TIMEOUT, "1")];
+    // The resync is asked as the query is sent, so the two deadlines fall due together.
+    let deadline = RPC_TIMEOUT;
+    let (mut session, control, orders) = session_within(venue, &server.url(), &cfg, &log, deadline);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        peer.recv().await;
+        peer.send(&accepted(1));
+        settle(|| outcomes(&watch).len() == 1).await;
+        let asked = orders.submit_control(query()).unwrap();
+        assert_eq!(peer.recv().await, queried(asked));
+        advance(deadline - ms(1)).await;
+        churn().await;
+        assert_eq!(resync_ends(&watch), 0);
+        assert!(!orders.may_place());
+        advance(ms(1)).await;
+        settle(|| resync_ends(&watch) == 1).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        assert!(orders.may_place());
+        assert_eq!(outcomes(&watch)[1], (asked, SubmitOutcome::Unknown));
+        advance(deadline).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        assert!(peer.quiet());
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+
+    assert_eq!(ends(&log), [key(0)]);
+    let counters = session.counters();
+    assert_eq!(counters.resync_timeouts, 0);
+    assert_eq!(counters.attempts, 1);
+}
+
+/// A deadline past the end of the clock never falls due: a resync that never ends leaves the
+/// epoch open, refusing places, as before the deadline was given.
+#[tokio::test(start_paused = true)]
+async fn a_resync_deadline_past_the_end_of_the_clock_never_falls_due() {
+    let frozen = freeze();
+    let mut server = ScriptedWs::start().await;
+    let venue = ReadyToy::leak();
+    let log = Log::default();
+    let forever = Duration::MAX;
+    let (mut session, control, orders) = session_within(venue, &server.url(), &[], &log, forever);
+    let watch = Rc::clone(&log);
+    let script = async move {
+        let mut peer = server.accept().await;
+        peer.recv().await;
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, arm(1));
+        peer.recv().await;
+        peer.send(&accepted(1));
+        settle(|| outcomes(&watch).len() == 1).await;
+        advance(Duration::from_secs(365 * 86_400)).await;
+        churn().await;
+        assert!(ends(&watch).is_empty());
+        assert!(!orders.may_place());
+        drop(control);
+    };
+    let ((), run) = tokio::join!(script, session.run());
+    run.unwrap();
+    drop(frozen);
+    assert_eq!(session.counters().resync_timeouts, 0);
+}
+
+/// A zero resync deadline is refused when it is built, naming the deadline and not its value;
+/// any other is kept as given (0009: there is no default).
+#[test]
+fn a_zero_resync_deadline_is_refused_naming_it() {
+    let refused = ResyncDeadline::new(Duration::ZERO);
+    assert_eq!(refused, Err(ResyncDeadlineError::Zero));
+    assert_eq!(
+        refused.unwrap_err().to_string(),
+        "the resync deadline is zero"
+    );
+    assert_eq!(ResyncDeadline::new(ms(1)).unwrap().after(), ms(1));
 }

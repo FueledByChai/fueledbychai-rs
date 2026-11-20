@@ -62,8 +62,8 @@ use fbc_oms::ControlCommand;
 use fbc_runtime::{
     Connector, ExactReport, ExecControl, ExecHandler, ExecReplay, ExecReplayConfig,
     ExecReplayCounters, ExecSession, ExecSessionConfig, ExecSessionError, IngestClock, Journal,
-    OutboundDiff, ProxyConfig, RateLimiter, ReconnectPacing, ReplayError, RpcIds, SafetyReserve,
-    SessionError, WriteStall,
+    OutboundDiff, ProxyConfig, RateLimiter, ReconnectPacing, ReplayError, ResyncDeadline, RpcIds,
+    SafetyReserve, SessionError, WriteStall,
 };
 use tokio::time::advance;
 
@@ -194,6 +194,7 @@ fn session_config(cfg: VenueConfig) -> ExecSessionConfig {
         conn: CONN,
         limiter: RateLimiter::new(&limits, SafetyReserve::percent(0).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
+        resync_deadline: ResyncDeadline::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 4096,
         outbound: fbc_runtime::ReservedBound::new(64, 64).unwrap(),
         in_flight: fbc_runtime::InFlight::new(fbc_runtime::ReservedBound::new(64, 64).unwrap()),
@@ -680,6 +681,141 @@ async fn a_handler_that_stops_as_its_epoch_places_is_told_no_unprotected_orders(
     assert_eq!(counters.stopped, 0);
     let (standing, _) = stopping_replay(&root, never);
     assert!(told_unprotected(&standing));
+    fs::remove_dir_all(&root).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------
+// An epoch its resync's deadline ended (FBC-nwpr).
+// ---------------------------------------------------------------------------------------------
+
+/// The resync deadline of [`deadline_live`]'s session.
+const RESYNC_DEADLINE: Duration = Duration::from_millis(1_500);
+
+const UNAVAILABLE: &str = "HTTP/1.1 503 Service Unavailable";
+
+/// Runs the toy's session, journaled at `root`, through two epochs: on the first, the venue
+/// accepts the arm and answers both reads of the resync over REST, the first and the one the
+/// codec asks again on its retry timer, with a 503, so the resync never ends, and its deadline,
+/// 1.5 s after it was asked, ends the epoch as a drop; on the second, the resync is answered and
+/// the arm accepted, and the consumer stops the session. What the handler heard, and the epochs
+/// the resync's deadline ended.
+async fn deadline_live(root: &Path) -> (Vec<Heard>, u64) {
+    let config = SinkConfig {
+        budget_bytes: 1 << 20,
+        soft_limit_pct: 85,
+    };
+    let (queue, drain) = journal_queue(config, redaction_key()).unwrap();
+    let writer = JournalWriter::create(root, SHARD, redaction_key()).unwrap();
+    let writer = drain.spawn(writer).unwrap();
+    let results = Rc::new(RefCell::new(0));
+    let sink = Rc::new(RefCell::new(Counted {
+        queue,
+        results: Rc::clone(&results),
+    }));
+    let (mut server, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
+    let mut config = session_config(toy_cfg(&server.url(), &http.url("")));
+    config.resync_deadline = ResyncDeadline::new(RESYNC_DEADLINE).unwrap();
+    let log = Log::default();
+    let (mut session, control) = ExecSession::new(config, log.clone()).unwrap();
+    session.set_journal(Journal::new(sink));
+    let watch = log.clone();
+    let script = async move {
+        let mut peer = server.accept().await;
+        assert!(peer.recv().await.starts_with("auth|ts="));
+        peer.send(AUTH_ACK);
+        assert_eq!(peer.recv().await, "cod|rpc=1|on=1");
+        let first = requested(&mut http).await;
+        peer.send("item|rpc=1|i=0|res=ok");
+        settle(|| watch.any(outcome(RpcId(1)))).await;
+        first.answer(UNAVAILABLE, "").await;
+        settle(|| *results.borrow() == 1).await;
+        advance(RESYNC_RETRY).await;
+        let second = requested(&mut http).await;
+        second.answer(UNAVAILABLE, "").await;
+        settle(|| *results.borrow() == 2).await;
+        assert!(!watch.any(|h| *h == Heard::Ended(key(0))));
+        advance(RESYNC_DEADLINE - RESYNC_RETRY).await;
+        settle(|| watch.any(|h| *h == Heard::Ended(key(0)))).await;
+        assert_eq!(peer.next().await, None);
+
+        let mut next = reconnected(&mut server).await;
+        assert!(next.recv().await.starts_with("auth|ts="));
+        next.send(AUTH_ACK);
+        assert_eq!(next.recv().await, "cod|rpc=2|on=1");
+        let third = requested(&mut http).await;
+        let wm = watermark(&third.line);
+        let body = format!("rsbegin|wm={wm}\nrspos|sym=TOYA-PERP|qty=0\nrsend");
+        third.answer(OK, &body).await;
+        settle(|| watch.events().contains(&ExecEvent::ResyncEnd)).await;
+        next.send("item|rpc=2|i=0|res=ok");
+        settle(|| watch.any(outcome(RpcId(2)))).await;
+        churn().await;
+        drop(control);
+        while next.next().await.is_some() {}
+    };
+    let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || frozen.recv());
+    let (ran, ()) = tokio::join!(session.run(), script);
+    drop(thaw);
+    ran.unwrap();
+    let timeouts = session.counters().resync_timeouts;
+    drop(session);
+    writer.close().unwrap();
+    (log.heard(), timeouts)
+}
+
+/// An epoch its resync's deadline ended is journaled as any drop is: the firing took no stamp
+/// and has no record, and the epoch's `Closed` follows its last input. Its replay ends the epoch
+/// there and hands the handler exactly what the live one heard, on every replay, with no
+/// deadline of its own (FBC-nwpr; decisions 0006, 0090, 0138).
+#[tokio::test(start_paused = true)]
+async fn an_epoch_its_resync_deadline_ended_replays_to_what_the_live_handler_heard() {
+    let root = fresh_dir("exec_replay_resync_deadline");
+    let (live, timeouts) = deadline_live(&root).await;
+    assert_eq!(timeouts, 1);
+    let ended = |key| move |h: &Heard| *h == Heard::Ended(key);
+    let resync_end = |h: &Heard| matches!(h, Heard::Event(env) if env.body == ExecEvent::ResyncEnd);
+    let first_end = live.iter().position(ended(key(0))).unwrap();
+    assert!(!live[..first_end].iter().any(resync_end));
+    assert!(live[first_end..].iter().any(resync_end));
+    assert_eq!(live.last(), Some(&Heard::Ended(key(1))));
+
+    // The first epoch's last input, the second 503, is followed by its `Closed`.
+    let records: Vec<Record> = JournalReader::open(&root, SHARD)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let is_closed = |r: &Record| match r {
+        Record::Control { ev, .. } => *ev == ControlEvent::Closed(key(0)),
+        _ => false,
+    };
+    let at = records.iter().position(is_closed).unwrap();
+    let last_input = &records[at - 1];
+    assert!(
+        matches!(last_input, Record::HttpResult { stamp, .. } if stamp.conn == key(0)),
+        "{last_input:?}"
+    );
+
+    let ws = "ws://127.0.0.1:1/replayed";
+    let rest = "http://127.0.0.1:1";
+    let none = RpcId(u64::MAX);
+    let (first, counters) = replay(&root, toy_cfg(ws, rest), none, none);
+    assert_eq!(first, live);
+    let (second, again) = replay(&root, toy_cfg(ws, rest), none, none);
+    assert_eq!(second, live);
+    assert_eq!(counters, again);
+    assert_eq!(
+        counters,
+        ExecReplayCounters {
+            epochs: 2,
+            frames: 4,
+            http: 3,
+            timers: 1,
+            resyncs: 2,
+            encodes: 2,
+            ..ExecReplayCounters::default()
+        }
+    );
     fs::remove_dir_all(&root).unwrap();
 }
 

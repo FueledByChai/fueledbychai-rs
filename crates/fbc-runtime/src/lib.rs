@@ -143,6 +143,7 @@ mod pacing;
 mod ratelimit;
 mod reconcile;
 mod replay;
+mod resync_deadline;
 mod session;
 mod session_core;
 mod shard;
@@ -207,6 +208,7 @@ pub use reconcile::{ReconcileError, Reconciler, SubscribeCall};
 pub use replay::{
     ClosedLoop, MdReplay, MdReplayConfig, MdReplayCounters, ReplayError, ReplayFailure,
 };
+pub use resync_deadline::{ResyncDeadline, ResyncDeadlineError};
 pub use session::{
     MdControl, MdCounters, MdHandler, MdSession, MdSessionConfig, Outbox, SessionError,
 };

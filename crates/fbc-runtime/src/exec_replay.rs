@@ -28,7 +28,9 @@
 //! - a request deadline's firing (0090) calls `on_rpc_timeout` at its recorded stamp: on the
 //!   order connection's open epoch as the connected session does, the request failing that
 //!   epoch's arm when it is the arm, and otherwise, the session waiting to reconnect then, as the
-//!   waiting session does;
+//!   waiting session does; an epoch the session ended at its resync deadline (FBC-nwpr) ends at
+//!   its `Closed`, as every drop does, since that firing called no codec and took no stamp, so
+//!   the journal holds no record of it and the replay is given no deadline;
 //! - a context journaled with no request id that follows no opening and no timer firing is the
 //!   resync's, asked on the order connection's open epoch (0058, 0138 item 3), and one with a
 //!   request id an encode's (0057): the session's own cancel-on-disconnect arm where the session

@@ -301,6 +301,7 @@ fn wire(stub: &Stub, reg: Registry) -> Wired {
         conn: 0,
         limiter: RateLimiter::new(&caps.limits, SafetyReserve::percent(10).unwrap()).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(10)).unwrap(),
+        resync_deadline: fbc_runtime::ResyncDeadline::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 1 << 20,
         outbound: fbc_runtime::ReservedBound::new(64, 64).unwrap(),
         in_flight: fbc_runtime::InFlight::new(fbc_runtime::ReservedBound::new(64, 64).unwrap()),

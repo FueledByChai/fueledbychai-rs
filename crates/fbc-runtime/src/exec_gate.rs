@@ -11,7 +11,9 @@
 //! Only a final acceptance accepts the arm: a two-phase venue's provisional one leaves it
 //! pending under its deadline, which still stands, since the venue may yet reject it.
 //! Where the venue's protection outlives a connection (`rearm_on_reconnect: false`), the first
-//! accepted arm covers every later epoch, which still resyncs.
+//! accepted arm covers every later epoch, which still resyncs. A resync asked for whose
+//! `ResyncEnd` has not reached the handler is [pending](Gate::resync_pending), and the session
+//! ends an epoch whose resync is still pending when its resync deadline passes (FBC-nwpr).
 //!
 //! **Orders resting from an earlier epoch (FBC-nvxn, decision 0080).** An arm may protect only
 //! the orders placed on its connection after it. Unless the venue declares that an accepted arm
@@ -278,6 +280,12 @@ impl Gate {
     /// `epoch`'s resync was asked for.
     pub(crate) fn resync_asked(&mut self, epoch: u32) {
         self.update(epoch, |e| e.resync = Resync::Asked);
+    }
+
+    /// Whether `epoch`'s resync was asked for and its `ResyncEnd` has not reached the handler,
+    /// so its deadline stands (FBC-nwpr).
+    pub(crate) fn resync_pending(&self, epoch: u32) -> bool {
+        self.of(epoch).is_some_and(|e| e.resync == Resync::Asked)
     }
 
     /// What `ev`, of `epoch`, settles as it is handed to the handler: the answer to the epoch's

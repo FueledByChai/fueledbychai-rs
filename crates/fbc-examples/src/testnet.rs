@@ -824,7 +824,8 @@ impl NonceSource for Counting {
 
 /// The order-entry session's configuration: reconnects paced from 250 ms to 5 s, at most 5
 /// attempts a minute, each given 10 s; normal traffic stopping at 90% of each declared limit; a
-/// write a peer stopped reading ends its connection after 10 s; 16 commands waiting for the
+/// write a peer stopped reading ends its connection after 10 s; a resync not ended a minute
+/// after it was asked ends its connection too (FBC-nwpr); 16 commands waiting for the
 /// connection and 16 requests in flight for places, amends and queries, each with 16 more for
 /// cancels and reducing orders (decision 0105).
 pub fn session_config(
@@ -867,6 +868,8 @@ pub fn session_config(
         conn: 0,
         limiter,
         write_stall: WriteStall::new(Duration::from_secs(10)).expect("a non-zero window"),
+        resync_deadline: fbc_runtime::ResyncDeadline::new(Duration::from_secs(60))
+            .expect("a minute"),
         http_max_body: 1 << 20,
         outbound: fbc_runtime::ReservedBound::new(16, 16).expect("a valid bound"),
         in_flight: fbc_runtime::InFlight::new(

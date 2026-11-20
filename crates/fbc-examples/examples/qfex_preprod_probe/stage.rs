@@ -1965,6 +1965,9 @@ impl Run<'_> {
             conn: u16::try_from(n).expect("one or two sessions"),
             limiter: self.limiter.clone(),
             write_stall: WriteStall::new(Duration::from_secs(10)).expect("a ten-second window"),
+            // Longer than any run, so a session ends as before: the codec's resync bounds its
+            // own pages (FBC-nwpr, decision 0132 item 5).
+            resync_deadline: fbc_runtime::ResyncDeadline::new(DAY).expect("a day"),
             http_max_body: 1 << 20,
             outbound: bound,
             in_flight: InFlight::new(bound),
@@ -3302,6 +3305,9 @@ impl Run<'_> {
             conn,
             limiter: self.limiter.clone(),
             write_stall: WriteStall::new(Duration::from_secs(10)).expect("a ten-second window"),
+            // Longer than any run, so a session ends as before: the codec's resync bounds its
+            // own pages (FBC-nwpr, decision 0132 item 5).
+            resync_deadline: fbc_runtime::ResyncDeadline::new(DAY).expect("a day"),
             http_max_body: 1 << 20,
             outbound: bound,
             in_flight: InFlight::new(bound),

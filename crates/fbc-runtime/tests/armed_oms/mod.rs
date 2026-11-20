@@ -445,6 +445,7 @@ pub fn session_config_for(
         conn: 6,
         limiter: RateLimiter::new(&limits, reserve).unwrap(),
         write_stall: WriteStall::new(Duration::from_secs(3_600)).unwrap(),
+        resync_deadline: fbc_runtime::ResyncDeadline::new(Duration::from_secs(3_600)).unwrap(),
         http_max_body: 4096,
         outbound: fbc_runtime::ReservedBound::new(64, 64).unwrap(),
         in_flight: fbc_runtime::InFlight::new(fbc_runtime::ReservedBound::new(64, 64).unwrap()),

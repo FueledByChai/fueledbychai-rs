@@ -1175,6 +1175,7 @@ impl Account {
             conn: self.conn,
             limiter,
             write_stall: WriteStall::new(Duration::from_secs(3600)).unwrap(),
+            resync_deadline: fbc_runtime::ResyncDeadline::new(Duration::from_secs(3_600)).unwrap(),
             http_max_body: 1 << 20,
             outbound: bound,
             in_flight: InFlight::new(bound),
