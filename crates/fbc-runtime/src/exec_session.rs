@@ -89,8 +89,14 @@
 //! taken on the session's next turn, after the input being handled: one submitted while the
 //! stream had no epoch the codec reported authenticated
 //! ([`ConnState::Authenticated`](fbc_core::ConnState::Authenticated)), or on an epoch that has
-//! since ended, is `NotSent(Disconnected)`. An authorization fbc-oms's check at submit
-//! ([`Authorization::check_at_submit`](fbc_oms::Authorization::check_at_submit), decision
+//! since ended, is `NotSent(Disconnected)`. The session takes an authorization over at its turn
+//! ([`Authorization::hand_over`](fbc_oms::Authorization::hand_over), decision 0152), before it
+//! checks, encodes or reports it, so only what it never took (refused for another account or an
+//! ended session, or still waiting when it ends) and what it took and gave back unencoded on its
+//! nonce source's refusal, unless the shard host keeps it as its own ladder command, is dropped
+//! unspent, releasing its place's or batch's orders or its amend's build. An
+//! authorization fbc-oms's check at submit
+//! ([`Handed::check_at_submit`](fbc_oms::Handed::check_at_submit), decision
 //! 0060) refuses, run here just before the encode and not when it was queued, is
 //! `NotSent(StaleAuthorization)` with no nonce reserved and nothing written: a place, a batch
 //! or an amend whose market's state changed since it was built (the kill switch, a disarm, an
@@ -260,7 +266,7 @@ use crate::bounds::{InFlight, ReservedBound};
 use crate::connector::Connector;
 use crate::epoch::{Admit, EpochError, Epochs, Input};
 use crate::exec_gate::Hold;
-use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Submitted};
+use crate::exec_orders::{ExecOrders, Queued, RpcIds, Rpcs, Shared, Taken};
 use crate::in_process::{InProcessStream, Link};
 use crate::journal::Journal;
 use crate::pacing::ReconnectPacing;
@@ -1473,6 +1479,9 @@ impl<H: ExecHandler> ExecSession<H> {
             rpc,
             receipt: Err(reason),
         };
+        // Taken over before anything checks, encodes or reports it: from here on the handler is
+        // told what became of it, so its drop releases nothing (decision 0152).
+        let item = item.take();
         let cmd = item.command();
         let current = self.orders.ready() == Some(key.epoch) && epoch == Some(key.epoch);
         // No place or amend before the epoch's arm is accepted and its resync has ended
@@ -1498,7 +1507,7 @@ impl<H: ExecHandler> ExecSession<H> {
         // disarm or another change of the market's state may have come since (decisions 0057,
         // 0062; PR #87 Reviewer B B7). A refusal is `NotSent(StaleAuthorization)`, nothing
         // reserved or written. The authorization is spent when this returns.
-        if let Submitted::Authorized(auth) = &item
+        if let Taken::Handed(auth) = &item
             && auth.check_at_submit().is_err()
         {
             self.handler
@@ -1518,13 +1527,15 @@ impl<H: ExecHandler> ExecSession<H> {
         let encoded = self.encode(cmd, class, over_http(&item), rpc, key);
         let encoded = match encoded {
             Ok(encoded) => encoded,
-            // The session ends with nothing of it encoded or reported (0057); the shard host
-            // takes back its own ladder command (decision 0100; Codex P1 r4309350872 on PR #164).
+            // The session ends with nothing of it encoded or reported (0057): its authorization
+            // given back unspent, the shard host takes back its own ladder command (decision
+            // 0100; Codex P1 r4309350872 on PR #164), and any other is dropped and released
+            // (decision 0152).
             Err(e) => {
                 self.rpcs.unsent(rpc);
                 let queued = Queued {
                     rpc,
-                    item,
+                    item: item.unencoded(),
                     epoch,
                     origin,
                 };
@@ -1988,10 +1999,10 @@ impl Unsent {
 /// only a read the consumer submits as a control command, an order query or the fee query.
 /// An order-affecting command stays WebSocket-only until FBC-4nfb (0057), and a consumer's
 /// cancel-on-disconnect arm over HTTP would arm another connection than the session's.
-fn over_http(item: &Submitted) -> bool {
+fn over_http(item: &Taken) -> bool {
     matches!(
         item,
-        Submitted::Control(VenueCommand::Query(_) | VenueCommand::FeeQuery)
+        Taken::Control(VenueCommand::Query(_) | VenueCommand::FeeQuery)
     )
 }
 

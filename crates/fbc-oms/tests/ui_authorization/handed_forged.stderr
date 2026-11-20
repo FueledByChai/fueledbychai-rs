@@ -1,0 +1,25 @@
+error: cannot construct `Handed` with struct literal syntax due to private fields
+ --> tests/ui_authorization/handed_forged.rs:6:5
+  |
+6 |     Handed {}
+  |     ^^^^^^
+
+error[E0308]: mismatched types
+  --> tests/ui_authorization/handed_forged.rs:10:6
+   |
+10 |     (handed.clone(), Clone::clone(handed))
+   |      ^^^^^^^^^^^^^^ expected `Handed`, found `&Handed`
+   |
+note: `Handed` does not implement `Clone`, so `&Handed` was cloned instead
+  --> tests/ui_authorization/handed_forged.rs:10:6
+   |
+10 |     (handed.clone(), Clone::clone(handed))
+   |      ^^^^^^
+
+error[E0277]: the trait bound `Handed: Clone` is not satisfied
+  --> tests/ui_authorization/handed_forged.rs:10:35
+   |
+10 |     (handed.clone(), Clone::clone(handed))
+   |                      ------------ ^^^^^^ the trait `Clone` is not implemented for `Handed`
+   |                      |
+   |                      required by a bound introduced by this call

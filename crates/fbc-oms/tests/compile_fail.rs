@@ -2,6 +2,8 @@
 //! issued only inside `fbc-oms`, for a place, an amend, a batch, a cancel, a cancel-many or an
 //! instrument cancel-all; it cannot be built, converted into, edited, cloned or submitted twice
 //! outside it, and the gateway's unauthorized control path carries no order-affecting command.
+//! Decision 0152: only its handed form, which cannot be built or cloned, runs the check at
+//! submit, and a handed one discarded unused is warned.
 //! Each case is a file under `tests/ui_authorization/` with its expected `.stderr`. Regenerate
 //! the expected output with `TRYBUILD=overwrite cargo test -p fbc-oms --test compile_fail`
 //! only when the pinned toolchain moves (0008).

@@ -236,6 +236,14 @@ fn plan_and_send(
     plan
 }
 
+/// Hands every authorization of `plan` to a gateway, which takes it over: its orders stay
+/// counted until their outcomes (decision 0152).
+fn sent(plan: Plan) {
+    for p in plan.commands {
+        drop(p.auth.hand_over());
+    }
+}
+
 /// Acknowledges the placement of `c` under the venue id `v`: Open.
 fn ack(reg: &mut Registry, c: ClientOrderId, v: &str) {
     let item = ItemRef {
@@ -556,7 +564,14 @@ fn nothing_is_planned_for_a_crossing_intent_while_flat_or_on_the_side_that_adds(
     let mut reg = quoting(10);
     let mut p = planner();
     let full = book().with(Side::Sell, 0, reduce_only(limit(10_010, 10)));
-    plan_and_send(&mut p, &full, &mut reg, &caps, &mut mint, MonoNs(0));
+    sent(plan_and_send(
+        &mut p,
+        &full,
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    ));
     let both = full.with_crossing(Side::Sell, cross(9_900, 5, 1));
     let plan = plan_and_send(&mut p, &both, &mut reg, &caps, &mut mint, LATER);
     assert!(plan.commands.is_empty(), "{:?}", shape(&plan));
@@ -754,7 +769,14 @@ fn a_crossing_intent_is_refused_by_the_resting_cap_and_the_inventory_cap() {
     let mut reg = quoting(40);
     let mut p = planner();
     let asks = book().with(Side::Sell, 0, limit(10_010, 80));
-    plan_and_send(&mut p, &asks, &mut reg, &caps, &mut mint, MonoNs(0));
+    sent(plan_and_send(
+        &mut p,
+        &asks,
+        &mut reg,
+        &caps,
+        &mut mint,
+        MonoNs(0),
+    ));
     let desired = asks.with_crossing(Side::Sell, cross(9_900, 40, 1));
     let plan = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER);
     assert!(plan.commands.is_empty(), "{:?}", shape(&plan));

@@ -1,0 +1,5 @@
+error[E0599]: no method named `check_at_submit` found for reference `&Authorization` in the current scope
+ --> tests/ui_authorization/check_before_hand_over.rs:6:10
+  |
+6 |     auth.check_at_submit().is_ok()
+  |          ^^^^^^^^^^^^^^^ method not found in `&Authorization`

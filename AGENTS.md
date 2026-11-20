@@ -439,9 +439,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     codec's HTTP requests and timers answered only to the epoch that asked, `on_timer` given
     exactly the nonces it asks for, and its keepalive its own timer (0056); commands reach its
     codec only through its `ExecOrders`, as an fbc-oms `Authorization` for its account or a
-    `ControlCommand`, each encoded on its next turn with one reserved nonce per item and
-    reported at most once to `ExecHandler::on_submitted` (sent, or `NotSent` with nothing
-    written: no authenticated epoch, the codec's refusal, effects that do not carry the request,
+    `ControlCommand` (an authorization taken over at its turn or as it is refused for want of
+    room, and dropped unspent, so released, when refused for another account or an ended session
+    or left waiting at the session's end; 0152, `tests/released_authorization.rs`), each encoded
+    on its next turn with one reserved nonce per item and reported at most once to
+    `ExecHandler::on_submitted` (sent, or `NotSent` with nothing written: no authenticated epoch,
+    the codec's refusal, effects that do not carry the request,
     make an HTTP request (except a consumer's order query or fee query carried as exactly one
     HTTP request and no frame, its request and the connection it opens charged with the encode,
     0081) or give it a deadline past the end of the clock, the buckets: every
@@ -547,7 +550,13 @@ holds two of them for one pull request. The rules after the three roles bind all
     and not yet authorized held by its command: withdrawn with it, or released by the
     registry's next mutating call once it is dropped unspent, with no outcome of it by client
     id applied and an accepted or unknown one voiding the command (0082, 0084;
-    `tests/retained.rs`, `tests/held.rs`), and whose
+    `tests/retained.rs`, `tests/held.rs`), and an issued place's, batch's or amend's
+    authorization holding its orders or the amend's build until a gateway takes it over
+    (`Authorization::hand_over`, whose `Handed` alone runs 0060's check at submit, so a gateway
+    keeping 0060 writes only a handed one; `Authorization::command()` stays readable, and a
+    gateway skipping the check could write from it): dropped before then, released by the
+    registry's next mutating call, or at once by `Registry::withdraw`, an order something was
+    reported for since kept (0152; `tests/dropped_authorization.rs`), and whose
     `submit_control` takes a `ControlCommand` that carries no order-affecting command (0045,
     compile-fail cases in `tests/ui_authorization/`); the `Live` and `Cancellable` permits
     the registry gives, through which alone an amend or a cancel is built, each cancel naming

@@ -22,8 +22,8 @@ use crate::ladder;
 use crate::ledger::AcceptedFill;
 use crate::orphans::Orphans;
 use crate::permit::{
-    self, CancelChoice, CancelPlan, Cancellable, DroppedPlaces, Live, PermitRefusal,
-    PermittedCommand, PlacePlan, places_of,
+    self, CancelChoice, CancelPlan, Cancellable, Dropped, Live, PermitRefusal, PermittedCommand,
+    PlacePlan, Release, places_of,
 };
 use crate::planner::PlanRefusal;
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
@@ -74,9 +74,10 @@ pub struct Registry {
     /// ([`Registry::bind_account`]) or
     /// bound by its first authorization; every authorization is for it (decision 0082).
     account: Option<AccountKey>,
-    /// The orders whose place or batch command was dropped while it held them, which the
-    /// registry ends not sent at its next mutating call (decision 0084).
-    dropped: Arc<DroppedPlaces>,
+    /// What the commands it built and the authorizations it issued handed back, dropped while
+    /// they held what their build reserved, which the registry releases at its next mutating
+    /// call (decisions 0084, 0152).
+    dropped: Arc<Dropped>,
     /// The consumer's audit sink and how many raw order events the registry received
     /// (decision 0005, I8; [`Registry::set_audit_sink`]).
     audit: Audit,
@@ -309,6 +310,12 @@ impl Registry {
     /// The pre-trade caps every place, amend and batch item is checked against.
     pub fn caps(&self) -> &PreTradeCaps {
         &self.caps
+    }
+
+    /// Where the commands it builds and the authorizations it issues hand back what they hold
+    /// when dropped holding it (decisions 0084, 0152).
+    pub(crate) fn dropped(&self) -> &Arc<Dropped> {
+        &self.dropped
     }
 
     /// Which of the process's registries this is (decision 0068).
@@ -572,7 +579,9 @@ impl Registry {
         let mut guard = None;
         for place in places {
             debug_assert_eq!(place.origin(), self.instance);
-            let (cmd, built_under) = place.into_parts();
+            // Each place's hold is spent: the batch holds its order from now on.
+            let (cmd, built_under, mut hold) = place.into_parts();
+            hold.spend();
             match cmd {
                 VenueCommand::Place(order) => orders.push(order),
                 other => unreachable!("only places are batched, not {other:?}"),
@@ -1335,22 +1344,71 @@ impl Registry {
         due
     }
 
-    /// Ends not sent ([`NotSentReason::StaleAuthorization`]) each order whose place or batch
-    /// command was dropped while it still held it, neither authorized nor withdrawn, freeing
-    /// what it counted (decision 0084). Every mutating call, the consuming builders included,
-    /// runs it first, so a dropped command's orders count in no build, judgement, plan or event
-    /// after its drop; a read of the registry before its next mutating call still shows them
-    /// held. It applies a trip of the registry's markets to Cancel-only that came since first
-    /// (decision 0139).
+    /// Releases what the commands this registry built and the authorizations it issued handed
+    /// back when they were dropped holding it (decisions 0084, 0152): ends not sent
+    /// ([`NotSentReason::StaleAuthorization`]) each order whose place or batch command was
+    /// dropped while it still held it, neither authorized nor withdrawn, and each whose
+    /// authorization was dropped before a gateway took it over while nothing was reported for
+    /// it since; and withdraws each amend's build whose authorization was dropped so, while it
+    /// is still the build its order holds; freeing what each counted. Every mutating
+    /// call, the consuming builders included, runs it first, so a dropped command's or
+    /// authorization's orders count in no build, judgement, plan or event after its drop; a read
+    /// of the registry before its next mutating call still shows them held. It applies a trip
+    /// of the registry's markets to Cancel-only that came since first (decision 0139).
     pub(crate) fn reap_dropped(&mut self) {
         // A trip of the registry's markets to Cancel-only first (decision 0139): whatever the
         // call does comes after it, so a Start, Flatten or Wind-down made since stands.
         self.entries.apply_trips();
-        for cid in self.dropped.take() {
-            if let Some(rec) = self.orders.get_mut(&cid) {
-                rec.withdraw_place(NotSentReason::StaleAuthorization);
+        for release in self.dropped.take() {
+            self.release_held(release);
+        }
+    }
+
+    /// Releases what `release` names (the [`Release`] variants say how); whether anything was.
+    fn release_held(&mut self, release: Release) -> bool {
+        let mut any = false;
+        match release {
+            Release::Held(cids) => {
+                for cid in cids {
+                    if let Some(rec) = self.orders.get_mut(&cid) {
+                        any |= rec.withdraw_place(NotSentReason::StaleAuthorization);
+                    }
+                }
+            }
+            Release::Issued(cids) => {
+                for cid in cids {
+                    if let Some(rec) = self.orders.get_mut(&cid) {
+                        any |= rec.withdraw_unsent(NotSentReason::StaleAuthorization);
+                    }
+                }
+            }
+            Release::Amend(cid, build) => {
+                if let Some(rec) = self.orders.get_mut(&cid) {
+                    any = rec.withdraw_built(build);
+                }
             }
         }
+        any
+    }
+
+    /// Releases at once what `auth`, an authorization this registry issued and no gateway took
+    /// over, reserved, consuming it, so it can no longer be submitted (decision 0152): each
+    /// order of a place or a batch that nothing was reported for since ends not sent
+    /// ([`NotSentReason::StaleAuthorization`]) and no longer counts, and an amend's build, while
+    /// it is still the one its order holds, is withdrawn, so the order may be amended again.
+    /// True when anything was released; false for a cancel, a cancel-many or an instrument
+    /// cancel-all, which reserve nothing, and for one whose orders or build were released
+    /// already. Another registry's authorization releases nothing here and is dropped, handing
+    /// what it holds back to its own registry. What the shard host hands back unsubmitted, or
+    /// a consumer decides not to submit, is withdrawn this way; dropping it releases the same
+    /// at the registry's next mutating call.
+    pub fn withdraw(&mut self, auth: crate::Authorization) -> bool {
+        self.reap_dropped();
+        if auth.origin() != self.instance {
+            return false;
+        }
+        auth.into_release()
+            .is_some_and(|release| self.release_held(release))
     }
 
     /// Runs `change` on the registered order `cid`, then indexes every venue id it has.
@@ -1409,7 +1467,7 @@ mod tests {
     use super::*;
     use crate::common::{cid, lease_dir, lots, order_caps, placement, symbol};
     use crate::{
-        Authorization, EntryState, LeaseKeys, Leases, MarketCapsConfig, StaleAuthorization,
+        EntryState, Handed, LeaseKeys, Leases, MarketCapsConfig, StaleAuthorization,
         StateGeneration,
     };
 
@@ -1450,8 +1508,8 @@ mod tests {
         reg: &mut Registry,
         quoting: StateGeneration,
         cmd: PermittedCommand,
-    ) -> Authorization {
-        let auth = reg.authorize(ACCT, cmd).unwrap();
+    ) -> Handed {
+        let auth = reg.authorize(ACCT, cmd).unwrap().hand_over();
         let now = reg.entry(INST);
         assert_eq!(now.state(), EntryState::CancelOnly);
         assert_eq!(
@@ -1496,5 +1554,30 @@ mod tests {
         );
         let auth = checked_after_trip(&mut reg, built, plan.command.unwrap());
         assert_eq!(auth.command(), &VenueCommand::PlaceBatch(vec![first]));
+    }
+
+    /// Decisions 0111 and 0152: places merged into one batch hand nothing back, since the batch
+    /// holds their orders from then on, and the batch, dropped, hands them back held. An
+    /// unspent place's hold would hand its order back as issued, which the next mutating call
+    /// finds still held by the batch and leaves: it shows only here, before that call.
+    #[test]
+    fn places_merged_into_a_batch_hand_nothing_back_and_the_batch_holds_their_orders() {
+        let mut reg = quoting();
+        let (first, second) = (placement(cid(), 100, 1), placement(cid(), 99, 1));
+        let places = vec![
+            reg.place(first.clone()).unwrap(),
+            reg.place(second.clone()).unwrap(),
+        ];
+        let batch = reg.merge_places(places);
+        assert_eq!(reg.dropped().take(), Vec::new());
+        assert_eq!(
+            batch.command(),
+            &VenueCommand::PlaceBatch(vec![first.clone(), second.clone()])
+        );
+        drop(batch);
+        assert_eq!(
+            reg.dropped().take(),
+            vec![Release::Held(vec![first.cid, second.cid])]
+        );
     }
 }

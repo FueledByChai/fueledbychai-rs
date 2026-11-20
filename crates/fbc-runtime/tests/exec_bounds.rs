@@ -304,7 +304,8 @@ fn rest(oms: &mut Oms, px: i64, vid: &str) -> ClientOrderId {
         reducing: false,
     };
     let cmd = oms.reg.place(order).unwrap();
-    drop(oms.reg.authorize(armed_oms::ACCT, cmd).unwrap());
+    // Taken over by a gateway, so its drop releases nothing (decision 0152).
+    drop(oms.reg.authorize(armed_oms::ACCT, cmd).unwrap().hand_over());
     let item = ItemRef {
         idx: 0,
         cid: None,
