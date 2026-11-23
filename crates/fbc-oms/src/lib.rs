@@ -104,9 +104,12 @@
 //! [`Registry::resync`] as a [`ResyncSnapshot`]. The first one from a trustworthy snapshot
 //! source seeds each market's position, once per process; every one registers our open orders
 //! it shows on a market not yet seeded that the registry does not hold (an earlier run's, never
-//! amended), so a cancel reaches them. Until its seed a market's position is unknown
-//! ([`Registry::position`]) and nothing is built on it. A fill executed between the request and
-//! the answer counts exactly once, wherever it arrives: the snapshot holds it when it arrived
+//! amended), so a cancel reaches them. None seeds a market on which its snapshot shows an open
+//! order with no client id under a venue id no order of ours had, which nothing counts on the
+//! caps; each such order is reported ([`ResyncReport::without_cid`], decision 0154). Until its
+//! seed a market's position is unknown ([`Registry::position`]) and nothing is built on it. A
+//! fill executed between the request and the answer counts exactly once, wherever it arrives:
+//! the snapshot holds it when it arrived
 //! before the request, its order shows the cumulative fill it brought, or (its order not shown)
 //! it executed by the watermark or its order was at the venue before the request; a fill
 //! nothing places leaves the market unknown. A change the venue made itself is placed by its

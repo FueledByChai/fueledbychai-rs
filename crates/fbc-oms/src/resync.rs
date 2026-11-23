@@ -6,6 +6,10 @@
 //! ([`Registry::resync`]): until then [`Registry::position`] is `None` and the pre-trade caps
 //! admit no place or amend on it. Only a resync from a trustworthy snapshot source seeds; one
 //! that can be stale or incomplete, or none, seeds nothing ([`ResyncReport::untrustworthy`]).
+//! Nor does one seed a market on which its snapshot shows an open order with no client id under
+//! a venue id no order of ours had (an earlier run's the venue lists by venue id alone, or one
+//! placed in the venue's UI): nothing counts it on the caps, so the market waits for a resync
+//! that does not show one, and each is reported ([`ResyncReport::without_cid`], decision 0154).
 //! Every resync registers our namespace's open orders the snapshot shows on a market not
 //! seeded yet that the registry does not hold (an earlier run's; never amended, only
 //! cancelled: their placement is not known), whether or not it seeds the market, so a cancel
@@ -195,6 +199,14 @@ pub struct ResyncReport {
     /// cancel of its orphans starts runs out, and its orphans are cancelled again
     /// ([`Registry::cancel_orphans`](crate::Registry::cancel_orphans)), on each resync.
     pub orphans: Vec<InstrumentId>,
+    /// The open orders the snapshot shows with no client id, under a venue id no order the
+    /// registry holds had, on any market, by instrument then venue id (decision 0154): an
+    /// earlier run's order the venue lists by venue id alone, or one placed in the venue's UI.
+    /// Nothing counts one on the caps, so the resync seeds no market not seeded before it on
+    /// which it shows one; a later resync not showing one there seeds it. On a market seeded
+    /// before, one is reported and, as before, put in the view of orders not ours, and the caps
+    /// still do not count it.
+    pub without_cid: Vec<(InstrumentId, VenueOrderId)>,
     /// The venue's snapshot source is not trustworthy (it can be stale or incomplete, or the
     /// venue offers none): the resync seeded no market, so their positions stay unknown and
     /// nothing is built on them (decision 0055).
@@ -352,7 +364,10 @@ struct SeedRef {
     /// Our orders it showed, with their cumulative fill.
     shown: HashMap<ClientOrderId, Lots>,
     /// Every order it showed, by venue id, with its cumulative fill: an order shown without
-    /// our client id is still shown.
+    /// our client id (under a non-canonical or another namespace's one, or ended with none) is
+    /// still shown. None is open with no client id under a venue id no order of ours had: a
+    /// snapshot showing one seeds nothing there (decision 0154), so a fill of ours is never
+    /// placed against what it showed of such an order.
     shown_vids: HashMap<VenueOrderId, Lots>,
     /// The orders the registry held on the market when it was seeded: any other was placed
     /// after it.
@@ -548,9 +563,11 @@ impl Registry {
             return;
         };
         if r.shown.contains_key(&cid) || r.shown_vids.contains_key(vid) {
-            // The seed showed it, without our client id: what it showed places its fills, as
-            // for an order the seed held (Codex's r4316124604 on PR #171), a fill naming only
-            // our client id included (Codex's r4316366360).
+            // The seed showed it under `vid` without our client id: open under a non-canonical
+            // or another namespace's client id, or ended (one open with none seeds nothing,
+            // decision 0154). What it showed places its fills, as for an order the seed held
+            // (Codex's r4316124604 on PR #171), a fill naming only our client id included
+            // (Codex's r4316366360).
             r.known.insert(cid);
             if let Some(&cum) = r.shown_vids.get(vid) {
                 r.shown.entry(cid).or_insert(cum);
@@ -630,7 +647,9 @@ impl Registry {
     /// source, each market not yet seeded that the caps configure, the snapshot names or a fill
     /// moved is then seeded, unless a fill it holds is unsettled (on a venue whose resync is
     /// separate reads, `caps.snapshot_reads`, every fill not placed by its arrival or time); from any other, none is
-    /// ([`ResyncReport::untrustworthy`]). Each market seeded before is compared.
+    /// ([`ResyncReport::untrustworthy`]). None is seeded on which the snapshot shows an open
+    /// order with no client id under a venue id no order of ours had
+    /// ([`ResyncReport::without_cid`], decision 0154). Each market seeded before is compared.
     /// Refused whole, nothing applied, when the snapshot lists a position or one of our orders
     /// twice, or a seed overflows.
     pub fn resync(
@@ -656,6 +675,7 @@ impl Registry {
             }
         }
         let mut report = ResyncReport {
+            without_cid: self.without_cid(snap),
             untrustworthy: caps.snapshot_source != SnapshotSource::Trustworthy,
             cancel_everything: self.entries.killed(),
             ..ResyncReport::default()
@@ -862,6 +882,22 @@ impl Registry {
         }
     }
 
+    /// The open orders `snap` shows with no client id under a venue id no order of ours had, by
+    /// instrument then venue id, each once ([`ResyncReport::without_cid`], decision 0154).
+    fn without_cid(&self, snap: &ResyncSnapshot) -> Vec<(InstrumentId, VenueOrderId)> {
+        let mut found: Vec<(InstrumentId, VenueOrderId)> = snap
+            .orders
+            .iter()
+            .filter(|o| {
+                o.cid.is_none() && o.state == VenueOrderState::Open && self.cid_of(&o.vid).is_none()
+            })
+            .map(|o| (o.inst, o.vid.clone()))
+            .collect();
+        found.sort_by(|(a, x), (b, y)| (a, x.as_str()).cmp(&(b, y.as_str())));
+        found.dedup();
+        found
+    }
+
     /// Whether a snapshot order is not ours: another namespace's or a non-canonical client id,
     /// or none and a venue id no order of ours had.
     fn not_ours(&self, o: &VenueOrderSnapshot) -> bool {
@@ -902,7 +938,8 @@ impl Registry {
 
     /// The seeds this resync makes from a trustworthy snapshot, decided before anything
     /// applies: each market not yet seeded that the caps configure, the snapshot names or a
-    /// fill moved, whose held fills the snapshot places.
+    /// fill moved, on which it shows no order of `report.without_cid`, whose held fills the
+    /// snapshot places.
     fn plan_seeds(
         &self,
         snap: &ResyncSnapshot,
@@ -928,6 +965,12 @@ impl Registry {
         markets.dedup();
         let mut plans = Vec::new();
         'market: for inst in markets {
+            if report.without_cid.iter().any(|(at, _)| *at == inst) {
+                // An open order nothing counts on the caps rests there (decision 0154): not
+                // seeded, so nothing is built on it, and no fill is placed against what the
+                // snapshot showed of that order.
+                continue;
+            }
             let mut reference = SeedRef {
                 watermark: snap.watermark,
                 requested_at: snap.requested_at,

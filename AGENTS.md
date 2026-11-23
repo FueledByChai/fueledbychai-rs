@@ -581,7 +581,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     never placed or amended again; resyncs (0055; `src/resync.rs`, `tests/resync.rs`): the
     first seeds each market's position once and registers our open orders it shows, the
     position unknown until then, a fill straddling the snapshot counted once, later ones
-    compared and reported, never overwriting the inventory; market states and arming (0012;
+    compared and reported, never overwriting the inventory, and none seeding a market while its
+    snapshot shows an open order with no client id under a venue id no order of ours had, each
+    such order reported (`ResyncReport::without_cid`, 0154); market states and arming (0012;
     `src/entry.rs`, `tests/states.rs`): each market armed or not and Killed, Cancel-only, Exit
     or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
     Start, Flatten and Wind-down arming with the market lease (and the account lease where

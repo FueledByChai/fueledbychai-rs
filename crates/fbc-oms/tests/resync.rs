@@ -963,12 +963,18 @@ fn a_ledger_position_past_a_lot_count_is_reported_as_such() {
 
 #[test]
 fn an_order_shown_without_our_client_id_is_still_shown() {
-    // The venue's snapshot names the order by its venue id only: a fill of it after the read
-    // is not in the snapshot, though no order under its client id is shown.
+    // The venue's snapshot names the order by its venue id only, the venue id the registry
+    // holds it by: a fill of it after the read is not in the snapshot, though no order under
+    // its client id is shown. (An order shown so that the registry does not hold keeps its
+    // market unseeded, decision 0154: the tests below.)
     for before in [true, false] {
         let mut reg = registry();
         let mut l = ledger();
         let a = cid();
+        reg.insert(placement(a, 100, 20)).unwrap();
+        let mut open = update(Some(a), VenueOrderState::Open, 0);
+        open.vid = Some(vid("a"));
+        reg.apply_update(&open, key(0));
         let mut bare = shown(a, "a", 20, 6);
         bare.cid = None;
         let snap = snapshot(vec![bare], &[(INST, 6)]);
@@ -976,16 +982,197 @@ fn an_order_shown_without_our_client_id_is_still_shown() {
         if before {
             apply(&mut reg, &mut l, &f, exec(1_500), 1_100);
             let report = resync(&mut reg, &snap);
-            assert!(report.registered.is_empty());
+            assert!(report.registered.is_empty() && report.without_cid.is_empty());
         } else {
             resync(&mut reg, &snap);
-            assert_eq!(
+            assert!(matches!(
                 apply(&mut reg, &mut l, &f, exec(1_500), 1_100),
-                FillRouted::OursUntracked(a)
-            );
+                FillRouted::Ours(c, _) if c == a
+            ));
         }
         assert_eq!(reg.position(INST), Some(SignedLots(10)), "before: {before}");
     }
+}
+
+/// 0055's rule 2 by venue id alone: a seed that showed an order of ours the registry did not
+/// hold under its venue id but not our client id (open under a non-canonical client id, as a
+/// venue echoing ours upper-cased or escaped shows it, or ended with no client id) still
+/// places a fill of it by what it showed, which decision 0154 leaves as it was.
+#[test]
+fn an_order_the_seed_showed_by_its_venue_id_alone_has_its_fills_placed_by_what_it_showed() {
+    for (shown_cid, state) in [
+        (Some(CidMatch::Unparseable), VenueOrderState::Open),
+        (None, VenueOrderState::Filled),
+    ] {
+        let mut reg = registry();
+        let mut l = ledger();
+        let a = cid();
+        let bare = VenueOrderSnapshot {
+            cid: shown_cid,
+            state: state.clone(),
+            ..shown(a, "a", 20, 6)
+        };
+        let report = resync(&mut reg, &snapshot(vec![bare], &[(INST, 6)]));
+        assert!(report.registered.is_empty() && report.without_cid.is_empty());
+        assert!(report.seeded.contains(&(INST, SignedLots(6))), "{report:?}");
+        // Shown filled 6 and filled to 10 after the read: it moves the seed by 4.
+        assert_eq!(
+            apply(
+                &mut reg,
+                &mut l,
+                &order_fill(a, "a", "x", 4, Some(10)),
+                exec(1_500),
+                1_100
+            ),
+            FillRouted::OursUntracked(a)
+        );
+        assert_eq!(reg.position(INST), Some(SignedLots(10)), "{state:?}");
+    }
+}
+
+/// Our open buy `qty` at 100 as the venue shows it under `v` with no client id, which no order
+/// the registry holds had: an earlier run's order the venue lists by venue id alone, or one
+/// placed in the venue's UI (decision 0154).
+fn without_cid(v: &str, qty: i64) -> VenueOrderSnapshot {
+    VenueOrderSnapshot {
+        cid: None,
+        ..shown(cid(), v, qty, 0)
+    }
+}
+
+/// Reviewer B's RB80-1 on PR #80 (FBC-5orj, decision 0154): an open order without a client id
+/// that the registry does not hold counts on neither cap, so the first trustworthy resync that
+/// shows one seeds nothing on its market, and reports it; the other markets seed, and a later
+/// resync not showing it seeds the market.
+#[test]
+fn a_resync_seeds_no_market_on_which_it_shows_an_open_order_without_a_client_id() {
+    let mut reg = registry();
+    let a = cid();
+    let mut ended = without_cid("e", 5);
+    ended.state = VenueOrderState::Filled;
+    let mut elsewhere = without_cid("w", 1);
+    elsewhere.inst = OTHER;
+    elsewhere.state = common::canceled();
+    let orders = vec![
+        without_cid("u", 5),
+        without_cid("t", 2),
+        without_cid("u", 5),
+        ended,
+        elsewhere,
+        shown(a, "a", 3, 0),
+    ];
+    let pos = [(INST, 0), (OTHER, 2)];
+    let report = resync(&mut reg, &snapshot(orders.clone(), &pos));
+    // Each open one reported once, by instrument then venue id; an ended one is not.
+    assert_eq!(report.without_cid, vec![(INST, vid("t")), (INST, vid("u"))]);
+    // The other market is seeded; ours is still registered, so a cancel reaches it.
+    assert_eq!(report.seeded, vec![(OTHER, SignedLots(2))]);
+    assert_eq!(report.registered, vec![a]);
+    assert!(report.unsettled.is_empty() && report.checks.is_empty());
+    assert_eq!(reg.position(OTHER), Some(SignedLots(2)));
+    assert_eq!(reg.cancel_many(&[a], &order_caps()).commands.len(), 1);
+    // As on any market not seeded: the position is unknown, the owner's Start, Flatten and
+    // Wind-down are refused (decision 0012), so the market stays disarmed and Cancel-only and
+    // a place is refused there, before the caps' own refusal of an unknown position is reached.
+    assert_eq!(reg.position(INST), None);
+    let leases = arm::leases(&reg, INST);
+    assert_eq!(
+        reg.start(INST, leases),
+        Err(ArmRefusal::PositionUnknown(INST))
+    );
+    let leases = arm::leases(&reg, INST);
+    assert_eq!(
+        reg.flatten(INST, leases),
+        Err(ArmRefusal::PositionUnknown(INST))
+    );
+    let leases = arm::leases(&reg, INST);
+    assert_eq!(
+        reg.wind_down(INST, leases),
+        Err(ArmRefusal::PositionUnknown(INST))
+    );
+    assert_eq!(place(&mut reg, placement(cid(), 100, 1)), Err(held()));
+    // It is not ours: no order is registered for it, and it is in view as not ours.
+    assert!(reg.cid_of(&vid("u")).is_none());
+    assert!(reg.foreign_in_view(INST));
+    // Shown again, it keeps the market unseeded.
+    let report = resync(&mut reg, &snapshot_at(2_000, 2_000, orders, &pos));
+    assert!(report.seeded.is_empty());
+    assert_eq!(report.without_cid.len(), 2);
+    assert_eq!(reg.position(INST), None);
+    // A resync not showing it seeds the market, and orders are built on it.
+    let report = resync(
+        &mut reg,
+        &snapshot_at(3_000, 3_000, vec![shown(a, "a", 3, 0)], &pos),
+    );
+    assert!(report.without_cid.is_empty());
+    assert_eq!(report.seeded, vec![(INST, SignedLots(0))]);
+    assert_eq!(reg.position(INST), Some(SignedLots(0)));
+    place(&mut reg, placement(cid(), 100, CAP - 3)).unwrap();
+}
+
+/// Decision 0154: a resync from a source that is not trustworthy seeds nothing anyway, and
+/// still reports such an order.
+#[test]
+fn an_untrustworthy_resync_reports_an_open_order_without_a_client_id_too() {
+    let mut reg = registry();
+    let report = resync_with(
+        &mut reg,
+        SnapshotSource::Untrustworthy,
+        &snapshot(vec![without_cid("u", 5)], &[(INST, 0)]),
+    );
+    assert!(report.untrustworthy && report.seeded.is_empty());
+    assert_eq!(report.without_cid, vec![(INST, vid("u"))]);
+}
+
+/// Decision 0154: a fill of ours naming the venue id of an order shown without a client id is
+/// not placed against what the snapshot showed of that order, since the market is not seeded;
+/// a later resync not showing the order places it as any fill before its seed.
+#[test]
+fn a_fill_naming_an_order_shown_without_a_client_id_is_placed_by_the_seed_that_does_not_show_it() {
+    let mut reg = registry();
+    let mut l = ledger();
+    let a = cid();
+    let mut bare = without_cid("a", 20);
+    bare.cum_filled = lots(6);
+    resync(&mut reg, &snapshot(vec![bare], &[(INST, 6)]));
+    assert_eq!(reg.position(INST), None);
+    // Shown filled 6 and filled to 10 after the read, it would have moved the seed by 4.
+    let f = order_fill(a, "a", "x", 4, Some(10));
+    assert_eq!(
+        apply(&mut reg, &mut l, &f, exec(1_500), 1_100),
+        FillRouted::OursUntracked(a)
+    );
+    assert_eq!(reg.position(INST), None);
+    // The venue's position at the later request holds it: counted once.
+    let report = resync(&mut reg, &snapshot_at(2_000, 2_000, vec![], &[(INST, 10)]));
+    assert_eq!(report.seeded, vec![(INST, SignedLots(10))]);
+    assert_eq!(reg.position(INST), Some(SignedLots(10)));
+}
+
+/// Decision 0154's residual: on a market seeded before, a resync showing such an order reports
+/// it and does nothing else. The caps still do not count it: with the position flat and a bare
+/// bid of `L0` resting, a bid of the whole inventory cap is admitted, a worst case past the cap
+/// by the bare bid's size (Reviewer B's scratch test on PR #80).
+#[test]
+fn on_a_seeded_market_an_open_order_without_a_client_id_is_reported_and_not_counted() {
+    let mut reg = registry();
+    resync(&mut reg, &snapshot(vec![], &[(INST, 0)]));
+    let report = resync(
+        &mut reg,
+        &snapshot_at(2_000, 2_000, vec![without_cid("u", L0)], &[(INST, 0)]),
+    );
+    assert_eq!(report.without_cid, vec![(INST, vid("u"))]);
+    assert!(report.seeded.is_empty() && report.untracked.is_empty());
+    assert_eq!(
+        report.checks,
+        vec![PositionCheck::Agrees {
+            inst: INST,
+            position: SignedLots(0)
+        }]
+    );
+    assert_eq!(reg.position(INST), Some(SignedLots(0)));
+    assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+    place(&mut reg, placement(cid(), 100, CAP)).unwrap();
 }
 
 /// Reviewer B's P1 on PR #80: an order the registry held before the first resync may reach the
