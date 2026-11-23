@@ -989,13 +989,42 @@ impl HighWater {
         }
     }
 
+    /// Keeps `mark` ([`HighWater::write`]) on a thread of its own ([`off_thread_holding`]),
+    /// holding `held` until the write ends, even past its wait, and waits at most `wait` for it.
+    /// Every sample's mint goes through here, so no id goes out before the mark covers it.
+    ///
+    /// In a test build only a write a test holds ([`held_writes::hold`]) is bounded by `wait`,
+    /// the wait the run configured, as every write is in a run. Every other write is waited for
+    /// up to [`held_writes::TEST_WAIT`], which no machine's write of a few bytes reaches, so no
+    /// test depends on how long the machine running it takes to write (FBC-pr6l). A caller with
+    /// waits of its own around the write asks the [`Keeping`] where they end
+    /// ([`Keeping::cut_at`], [`Keeping::after`]).
+    pub fn keep<H: Send + 'static>(&self, mark: u64, wait: Duration, held: H) -> Keeping<H> {
+        let hwm = self.clone();
+        #[cfg(test)]
+        let (plan, bounded) = held_writes::take(&self.path);
+        #[cfg(test)]
+        let wait = match bounded {
+            true => wait,
+            false => held_writes::TEST_WAIT,
+        };
+        let write = off_thread_holding(wait, held, move || {
+            #[cfg(test)]
+            plan.run();
+            hwm.write(mark)
+        });
+        Keeping {
+            write: Box::pin(write),
+            #[cfg(test)]
+            bounded,
+        }
+    }
+
     /// Keeps `mark`: written whole to a file beside it and synced, renamed over the mark, and
     /// the directory synced, so the mark is on the disk when this returns.
     pub fn write(&self, mark: u64) -> Result<(), String> {
         use std::io::Write as _;
         let tmp = self.path.with_extension("tmp");
-        #[cfg(test)]
-        held_writes::wait(&self.path);
         let durable = || -> std::io::Result<()> {
             // The new mark reaches the disk before it replaces the old, and the rename does
             // before the order goes out: a power loss leaves the old mark or the new, never none.
@@ -1015,15 +1044,76 @@ impl HighWater {
     }
 }
 
-/// Test-only: holds the next high-water mark written in a lease directory until the test
-/// releases it, so a test can end a connection while the write is in flight, an event and not
-/// a time (Codex r4244206466 on PR #149). Keyed by the directory, so tests running at once each
-/// hold only their own.
+/// What a write of the high-water mark ends with ([`HighWater::keep`]): `None` when it did not
+/// end within its wait, and otherwise its result and what it held.
+pub type Kept<H> = Option<(Result<(), String>, H)>;
+
+/// A write of the high-water mark under way ([`HighWater::keep`]): a future of what it ends with.
+pub struct Keeping<H> {
+    write: std::pin::Pin<Box<dyn Future<Output = Kept<H>> + Send>>,
+    /// Whether the run's waits bound the write: in a test build, only one a test holds.
+    #[cfg(test)]
+    bounded: bool,
+}
+
+impl<H> Keeping<H> {
+    /// When a caller's wait for this write ends, given `at`, the end its own waits set: `at`,
+    /// as for every write in a run. In a test build a write no test holds is not cut short at
+    /// `at`, and is waited for up to its own wait (FBC-pr6l).
+    pub fn cut_at(&self, at: tokio::time::Instant) -> tokio::time::Instant {
+        #[cfg(test)]
+        if !self.bounded {
+            return at + held_writes::TEST_WAIT;
+        }
+        at
+    }
+
+    /// The deadline of a caller's waits after this write, given the `deadline` they had and
+    /// `since`, when the caller began to wait for the write: `deadline`, as for every write in a
+    /// run. In a test build a write no test holds costs them nothing: the deadline is moved on
+    /// by the time since `since` (FBC-pr6l).
+    pub fn after(
+        &self,
+        deadline: tokio::time::Instant,
+        since: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        #[cfg(test)]
+        if !self.bounded {
+            return deadline + since.elapsed();
+        }
+        let _ = since;
+        deadline
+    }
+}
+
+impl<H> Future for Keeping<H> {
+    type Output = Kept<H>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Kept<H>> {
+        self.write.as_mut().poll(cx)
+    }
+}
+
+/// Test-only: what the next high-water marks written in a lease directory meet, an event and not
+/// a time. A held write waits until the test releases it, so a test can end a connection while
+/// the write is in flight (Codex r4244206466 on PR #149), and so the write outlasts its wait: a
+/// held write alone is bounded by the wait its run configured ([`HighWater::keep`]). A slowed
+/// write takes longer, as on a loaded machine, and is not held (FBC-pr6l). Keyed by the
+/// directory, so tests running at once each meet only their own.
 #[cfg(test)]
 pub mod held_writes {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Condvar, Mutex, OnceLock};
+    use std::time::Duration;
+
+    /// How long a test build waits for a write of the mark no test holds: far beyond any
+    /// machine's write of a few bytes, however loaded, and short of a test hanging for ever on a
+    /// disk that never answers.
+    pub const TEST_WAIT: Duration = Duration::from_secs(300);
 
     #[derive(Default)]
     struct Gate {
@@ -1032,22 +1122,57 @@ pub mod held_writes {
         entered: tokio::sync::Notify,
     }
 
-    fn held() -> &'static Mutex<HashMap<PathBuf, Arc<Gate>>> {
-        static HELD: OnceLock<Mutex<HashMap<PathBuf, Arc<Gate>>>> = OnceLock::new();
-        HELD.get_or_init(Mutex::default)
+    /// What the writes in one directory meet: how much longer each takes, and the one held, after
+    /// how many more writes; and how many have started.
+    #[derive(Default)]
+    struct Writes {
+        slow: Duration,
+        held: Option<(usize, Arc<Gate>)>,
+        started: usize,
     }
 
-    /// The hold of the next write in a directory.
+    fn dirs() -> &'static Mutex<HashMap<PathBuf, Writes>> {
+        static DIRS: OnceLock<Mutex<HashMap<PathBuf, Writes>>> = OnceLock::new();
+        DIRS.get_or_init(Mutex::default)
+    }
+
+    /// The hold of one write in a directory.
     pub struct Hold(Arc<Gate>);
 
     /// Holds the next mark written in `dir` (only that one) until [`Hold::release`].
     pub fn hold(dir: &Path) -> Hold {
+        hold_after(dir, 0)
+    }
+
+    /// Holds the mark written in `dir` after the next `n`, which go on (only that one), until
+    /// [`Hold::release`].
+    pub fn hold_after(dir: &Path, n: usize) -> Hold {
         let gate = Arc::new(Gate::default());
-        held()
+        let mut dirs = dirs().lock().unwrap();
+        let writes = dirs.entry(dir.to_path_buf()).or_default();
+        writes.held = Some((n, Arc::clone(&gate)));
+        Hold(gate)
+    }
+
+    /// Makes every mark written in `dir` from now on take `by` longer before it is written, as
+    /// on a loaded machine. A slowed write is not held, so its wait is [`TEST_WAIT`].
+    pub fn slow(dir: &Path, by: Duration) {
+        dirs()
             .lock()
             .unwrap()
-            .insert(dir.to_path_buf(), Arc::clone(&gate));
-        Hold(gate)
+            .entry(dir.to_path_buf())
+            .or_default()
+            .slow = by;
+    }
+
+    /// How many marks have started to be written in `dir` since a test first held or slowed one
+    /// there.
+    pub fn started(dir: &Path) -> usize {
+        dirs()
+            .lock()
+            .unwrap()
+            .get(dir)
+            .map_or(0, |writes| writes.started)
     }
 
     impl Hold {
@@ -1063,19 +1188,53 @@ pub mod held_writes {
         }
     }
 
-    /// Called by [`super::HighWater::write`] on its thread: waits while the write to `path` is
-    /// held.
-    pub(super) fn wait(path: &Path) {
-        let Some(gate) = path
-            .parent()
-            .and_then(|dir| held().lock().unwrap().remove(dir))
-        else {
-            return;
+    /// What the write about to start meets.
+    pub(super) struct Plan {
+        slow: Duration,
+        gate: Option<Arc<Gate>>,
+    }
+
+    /// Called by [`super::HighWater::keep`] as it starts a write to `path`: what the write meets,
+    /// and whether it is held, so bounded by the wait its run configured.
+    pub(super) fn take(path: &Path) -> (Plan, bool) {
+        let mut dirs = dirs().lock().unwrap();
+        let Some(writes) = path.parent().and_then(|dir| dirs.get_mut(dir)) else {
+            let plan = Plan {
+                slow: Duration::ZERO,
+                gate: None,
+            };
+            return (plan, false);
         };
-        gate.entered.notify_one();
-        let mut released = gate.released.lock().unwrap();
-        while !*released {
-            released = gate.open.wait(released).unwrap();
+        writes.started += 1;
+        let gate = match writes.held.as_mut() {
+            Some((0, _)) => writes.held.take().map(|(_, gate)| gate),
+            Some((ahead, _)) => {
+                *ahead -= 1;
+                None
+            }
+            None => None,
+        };
+        let held = gate.is_some();
+        let plan = Plan {
+            slow: writes.slow,
+            gate,
+        };
+        (plan, held)
+    }
+
+    impl Plan {
+        /// Run on the write's thread before it writes: takes the write's extra time, then waits
+        /// while it is held.
+        pub(super) fn run(self) {
+            std::thread::sleep(self.slow);
+            let Some(gate) = self.gate else {
+                return;
+            };
+            gate.entered.notify_one();
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.open.wait(released).unwrap();
+            }
         }
     }
 }

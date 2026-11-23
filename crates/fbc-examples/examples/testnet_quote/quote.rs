@@ -109,7 +109,6 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
-use std::pin::Pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -137,9 +136,9 @@ use crate::link::{Link, LinkHandler, Note, async_reject, described};
 use crate::mainnet::{MAINNET_CHAIN, chain_refusal, decode_chain, mainnet_guard, trusted};
 use crate::positions::{PositionCheck, Verdict, fills_in};
 use crate::testnet::{
-    ACCOUNT_LABEL, ACCT, HighWater, INST, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads, cap_lots,
-    config, drive_with, inventory_price, off_thread_holding, px_or_none, rest_get,
-    resync_disagreements, session_config, snapshot_max, specs, touch_and_mark, wall_now,
+    ACCOUNT_LABEL, ACCT, HighWater, INST, Keeping, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads,
+    cap_lots, config, drive_with, inventory_price, px_or_none, rest_get, resync_disagreements,
+    session_config, snapshot_max, specs, touch_and_mark, wall_now,
 };
 
 /// The program the refusals name.
@@ -162,7 +161,7 @@ pub const RESERVE: u64 = 1_024;
 
 /// A high-water mark's write off the runtime's thread: whether it was kept, and the mint it
 /// held, once it ends within the step timeout.
-type MarkWrite = Pin<Box<dyn Future<Output = Option<(Result<(), String>, Option<CidMint>)>>>>;
+type MarkWrite = Keeping<Option<CidMint>>;
 
 /// What a run did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2356,8 +2355,10 @@ impl Driver {
     /// The wait for the write is bounded by the book's settling time, `settle` (the pass's
     /// deadline), as every other wait of a pass is: a write that stalls past it Stops the loop
     /// then, never a whole step timeout after a late pass started it (Codex r4289363366 on PR
-    /// #149); the write is kept, holding the mint, as when a cycle ends during it.
-    async fn reserve(&mut self, settle: tokio::time::Instant) -> Result<bool, String> {
+    /// #149); the write is kept, holding the mint, as when a cycle ends during it. In a test
+    /// build a write no test holds is neither cut short by `settle` nor charged to it: `settle`
+    /// moves on by the time it took ([`Keeping::after`], FBC-pr6l).
+    async fn reserve(&mut self, settle: &mut tokio::time::Instant) -> Result<bool, String> {
         let (mark, mut write) = match self.writing.take() {
             Some(writing) => writing,
             None => {
@@ -2374,16 +2375,14 @@ impl Driver {
                 if next <= self.reserved {
                     return Ok(true);
                 }
-                let hwm = self.hwm.clone();
                 let mint = self.mint.take();
                 // The write's own bound is past every deadline that cuts its wait short (the
                 // settling time, --duration): the wait below decides.
                 let bound = self.timeout.saturating_mul(2);
-                let write: MarkWrite =
-                    Box::pin(off_thread_holding(bound, mint, move || hwm.write(mark)));
-                (mark, write)
+                (mark, self.hwm.keep(mark, bound, mint))
             }
         };
+        let (since, cut) = (tokio::time::Instant::now(), write.cut_at(*settle));
         let written = loop {
             let wake = Rc::clone(&self.wake);
             let woken = wake.notified();
@@ -2398,7 +2397,7 @@ impl Driver {
                     self.writing = Some((mark, write));
                     return Ok(false);
                 }
-                () = tokio::time::sleep_until(settle) => {
+                () = tokio::time::sleep_until(cut) => {
                     self.writing = Some((mark, write));
                     return Err(self.timed_out("settle", "the client-id high-water mark's write"));
                 }
@@ -2406,6 +2405,7 @@ impl Driver {
                 () = woken => {}
             }
         };
+        *settle = write.after(*settle, since);
         match written {
             Some((kept, mint)) => {
                 self.mint = mint;
@@ -2468,7 +2468,7 @@ impl Driver {
             }
             // The mark's write and a fresh touch for a moved position are this pass's waits;
             // the notes are read again after them, before anything is planned (below).
-            let mut cut = !self.reserve(deadline).await?;
+            let mut cut = !self.reserve(&mut deadline).await?;
             let inventory = |d: &Driver| d.link.borrow().registry().inventory(INST);
             let mut position = inventory(self);
             // A fresh touch for a moved position, read again until no fill moved it while the

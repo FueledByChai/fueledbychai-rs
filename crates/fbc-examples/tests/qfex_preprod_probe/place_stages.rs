@@ -2417,6 +2417,72 @@ async fn ids_are_minted_under_one_lease_and_the_mark_survives_a_second_run() {
 }
 
 #[tokio::test]
+async fn a_mark_write_slower_than_the_runs_wait_fails_no_test() {
+    // FBC-pr6l: a loaded machine's write of the client-id high-water mark can outlast
+    // --read-wait-ms, the wait a run gives it, which once stopped tests this ticket did not
+    // touch. In a test build only a write a test holds is bounded by that wait. Here every write
+    // takes one and a half times that wait, as on a loaded machine: the mint mints, and a run
+    // ends as it does at full speed.
+    let (dir, _removed) = temp_dir("place-mint-slow");
+    let venue = Venue::start(QfexModel::default()).await;
+    let asked = argv(&dir, &venue);
+    let wait = parsed(&asked).unwrap().0.read_wait;
+    let slower = wait + wait / 2;
+    // The mint alone, at the run's wait: its id goes out, the mark covering it.
+    let (alone, _removed) = temp_dir("place-mint-slow-alone");
+    let ns = Namespace::new(7);
+    testnet::held_writes::slow(&alone, slower);
+    let mut mint = places::Mint::open(&alone, ns, WALL, wait).unwrap();
+    let began = std::time::Instant::now();
+    let ids = mint.mint(1).await.unwrap();
+    assert!(began.elapsed() >= slower, "{:?}", began.elapsed());
+    let mark = testnet::HighWater::at(&alone, ns).read().unwrap();
+    assert_eq!(mark, ids[0].seq());
+    assert_eq!(testnet::held_writes::started(&alone), 1);
+    // A whole run, each of its writes as slow: it ends with no stop.
+    testnet::held_writes::slow(&leases_of(&dir), slower);
+    let (ran, printed) = place_run(&venue, &asked, &environment()).await;
+    let ev = stopped(ran, &printed);
+    assert_eq!(ev.stopped.as_deref(), None, "{printed}");
+    assert!(testnet::held_writes::started(&leases_of(&dir)) >= 1);
+    venue.assert_served();
+}
+
+#[tokio::test]
+async fn a_flatten_whose_mark_write_outlasts_the_runs_wait_stops_refused_and_marked() {
+    // FBC-pr6l: the rule a run keeps, in the run's own configuration. X fills, so drop session
+    // one flattens. X's write of the mark goes on; the flatten IOC's is held past
+    // --read-wait-ms, the wait the run gives it. The mint goes with it: no IOC is built, and the
+    // run stops Flatten(Refused), not flat, marked, the refusal recorded as the flatten's error.
+    let (dir, removed) = temp_dir("flatten-mark-held");
+    let venue = Venue::start(maker_filled(model::IocAnswer::Full)).await;
+    let asked = drop_argv(&dir, &venue);
+    let wait = parsed(&asked).unwrap().0.read_wait;
+    let held = testnet::held_writes::hold_after(&leases_of(&dir), 1);
+    let (ran, printed) = place_run(&venue, &asked, &environment()).await;
+    held.release();
+    let ev = stopped(ran, &printed);
+    let d = Dropped {
+        dir,
+        _removed: removed,
+        venue,
+        ev,
+        printed,
+    };
+    let refused = places::Stop::Flatten(places::Flattening::Refused);
+    let flatten = assert_flatten_stopped(&d, refused, 0);
+    let unkept = format!(
+        "the client-id high-water mark could not be kept (the path is not shown): its write did \
+         not end within {} ms",
+        wait.as_millis()
+    );
+    assert_eq!(flatten.error.as_deref(), Some(unkept.as_str()));
+    assert_eq!((flatten.exit, flatten.iocs.len()), (Some(true), 0));
+    assert_eq!(d.count("add_order"), 1, "{:?}", d.what());
+    assert_eq!(testnet::held_writes::started(&leases_of(&d.dir)), 2);
+}
+
+#[tokio::test]
 async fn a_held_namespace_lease_refuses_a_second_run() {
     let (dir, _removed) = temp_dir("place-ns-held");
     let leases = leases_of(&dir);

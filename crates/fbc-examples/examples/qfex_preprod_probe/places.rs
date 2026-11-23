@@ -62,7 +62,7 @@ use crate::ledger::{FLATTEN, PlaceLists, Step};
 use crate::link::{LinkHandler, Note};
 use crate::probe_args::{Places, Reconciled};
 use crate::taker::FeeSign;
-use crate::testnet::{self, HighWater, off_thread_holding};
+use crate::testnet::{self, HighWater};
 
 /// The file of the lease directory naming the environment its leases are for (0151 item 1).
 pub const ENVIRONMENT: &str = "environment";
@@ -580,8 +580,7 @@ impl Mint {
                 }
             }
         }
-        let (mark, hwm) = (mint.high_water(), self.hwm.clone());
-        let kept = off_thread_holding(self.wait, mint, move || hwm.write(mark)).await;
+        let kept = self.hwm.keep(mint.high_water(), self.wait, mint).await;
         let unkept = "the client-id high-water mark could not be kept (the path is not shown)";
         match kept {
             Some((Ok(()), mint)) => {
