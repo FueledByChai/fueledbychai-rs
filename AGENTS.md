@@ -552,7 +552,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     `Authorization` only `fbc-oms` issues, for one order-affecting command on one market with
     that market's `StateGeneration`, not `Clone` and consumed on submit, issued only by the
     registry that built the command, for the one account that registry is for, a place, batch
-    or amend judged against the caps again at issue and released when refused, a place built
+    or amend judged against the caps again at issue and released when refused, and refused at
+    submit (`StaleAuthorization::PositionMoved`) once a fill or a resync moved its market's
+    position since its issue (since its build, in Exit or under an orphan cooldown; 0066, 0108,
+    0153; `tests/quoting_submit.rs`), a place built
     and not yet authorized held by its command: withdrawn with it, or released by the
     registry's next mutating call once it is dropped unspent, with no outcome of it by client
     id applied and an accepted or unknown one voiding the command (0082, 0084;
