@@ -63,8 +63,9 @@ pub struct Registry {
     /// [`Registry::for_cod_probe`]), Start only while its position is flat under a place stages'
     /// declaration (decision 0148 item 3).
     pub(crate) cod_probe: Option<CodProbeRun>,
-    /// Per market, how many times its inventory moved: an Exit command's authorization is
-    /// refused at submit once it moved since the build (decision 0066).
+    /// Per market, how many times its inventory moved: a place's, a batch's or an amend's
+    /// authorization is refused at submit once it moved since its build in Exit or under an
+    /// orphan cooldown (decisions 0066, 0108), or else since its authorization (decision 0153).
     positions: Counters,
     /// Which of the process's registries this is: the execution planner plans each account
     /// through one registry only (decision 0068), and only this registry authorizes or
@@ -599,7 +600,8 @@ impl Registry {
 
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
     /// checked again at submit (decision 0060), and, in Exit or while an orphan cooldown
-    /// suppresses its adding side, its position revision (0066, 0108).
+    /// suppresses its adding side, its position revision (0066, 0108); any other's
+    /// authorization watches the revision instead ([`Registry::authorize`], decision 0153).
     fn state_guard(&mut self, market: InstrumentId) -> Guard {
         let position = self.sized_position_watch(market);
         Guard::state(self.entries.watch(market), position)
@@ -609,11 +611,18 @@ impl Registry {
     /// while its admission is judged against the position: in Exit (decision 0066) and while
     /// an orphan cooldown suppresses the adding side (decision 0108; Reviewer B's RB840-2 on
     /// PR #171). Such a command is refused at submit once a fill or a resync moved the
-    /// inventory since. `None` otherwise, when the position does not size the build.
+    /// inventory since. `None` otherwise, when the position does not size the build: the
+    /// command's authorization watches it then (decision 0153).
     fn sized_position_watch(&mut self, market: InstrumentId) -> Option<Watch> {
         (self.entries.admits(market) == Ok(Admits::ExitOnly)
             || self.orphans.cooldown(market).is_some())
         .then(|| self.positions.watch(market))
+    }
+
+    /// `market`'s position revision now, watched for a place, a batch or an amend being
+    /// authorized whose build did not watch it ([`Registry::authorize`], decision 0153).
+    pub(crate) fn watch_position(&mut self, market: InstrumentId) -> Watch {
+        self.positions.watch(market)
     }
 
     /// Sets the inventory on `inst` to `pos`, advancing the market's position revision when it

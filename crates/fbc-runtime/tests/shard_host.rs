@@ -4,7 +4,8 @@
 //! are handed to the market-data handler between two of its commands' encodes; a cancel the
 //! handler then submits is written before the ladder's remaining commands; a kill switch the
 //! handler turns on there instead leaves every remaining place and amend unwritten
-//! (`NotSent(StaleAuthorization)`) while the ladder's cancels still go out; and one `Cycle`
+//! (`NotSent(StaleAuthorization)`) while the ladder's cancels still go out, and so does a fill
+//! the handler applies there that moves the market's position (decision 0153); and one `Cycle`
 //! record is journaled per decide pass, after every input stamped before it reached the
 //! handlers.
 //!
@@ -31,11 +32,12 @@ use common::toy::{self, ToyVenue};
 use common::{Peer, ScriptedWs};
 use exec_toy::INST_A;
 use fbc_core::{
-    AccountKey, EndpointPlan, Envelope, ExecEvent, InstrumentId, MdEvent, MdTransport,
-    NotSentReason, RpcId, SubmitHandle, TrafficClass, VenueConfig, WallNs, WireUrl,
+    AccountKey, AssetSym, CidMatch, ClientOrderId, EndpointPlan, Envelope, ExecEvent, FillEvent,
+    FillIdent, FillOrigin, InstrumentId, Liquidity3, Lots, MdEvent, MdTransport, MonoNs,
+    NotSentReason, RpcId, Side, SubmitHandle, Ticks, TrafficClass, VenueConfig, WallNs, WireUrl,
 };
 use fbc_journal::{JournalSink, Record, Recorded};
-use fbc_oms::ControlCommand;
+use fbc_oms::{Admission, ControlCommand, FillLedger, FillRouted, LedgerConfig};
 use fbc_runtime::{
     Changed, Connector, Decide, ExecHandler, ExecOrders, ExecSession, ExecSessionError,
     IngestClock, Journal, Ladder, Liveness, MdSession, MdSessionConfig, MdVenue, MdVenueConfig,
@@ -55,6 +57,8 @@ enum OnReference {
     Cancel,
     /// Turns the kill switch on for the toy's market.
     Kill,
+    /// Applies to the registry a fill that moves the toy's market's position (decision 0153).
+    Fill,
 }
 
 /// A command of the ladder, by kind.
@@ -346,6 +350,14 @@ async fn shard(plan: &[Kind], on_reference: OnReference) -> Shown {
                 OnReference::Kill => {
                     world.oms.reg.kill(INST_A);
                 }
+                OnReference::Fill => {
+                    let amendable = world.oms.amendable;
+                    let routed = fill_of(&mut world.oms, amendable);
+                    assert!(
+                        matches!(routed, FillRouted::Ours(c, _) if c == amendable),
+                        "{routed:?}"
+                    );
+                }
             }
         }
     };
@@ -573,6 +585,75 @@ async fn a_kill_switch_the_handler_turns_on_between_two_ladder_commands_leaves_e
         assert_eq!(*receipt, want, "command {j}, a {kind:?}");
     }
     // Written: the commands before the kill switch, then only the ladder's cancel.
+    let mut written: Vec<RpcId> = ladder[..k].iter().map(|(rpc, _)| *rpc).collect();
+    written.push(ladder[3].0);
+    let heard: Vec<RpcId> = shown.heard.iter().map(|f| rpc_of(f)).collect();
+    assert_eq!(heard, written);
+    assert!(shown.heard.last().unwrap().starts_with("cancel|"));
+}
+
+/// Applies to `oms`'s registry a fill of 3 lots of our resting buy `cid` (`V-2`, placed after the
+/// seed), arriving after the seeding resync's request (`armed_oms`'s, at 1 000), through a fill
+/// ledger of its own: the market's position moves.
+fn fill_of(oms: &mut Oms, cid: ClientOrderId) -> FillRouted {
+    let fill = exec_toy::with_scope(|scope| FillEvent {
+        ident: FillIdent::Venue {
+            fill: scope.fill_id("F-shard").unwrap(),
+            vid: None,
+            cum_after: None,
+        },
+        origin: FillOrigin::Order {
+            cid: Some(CidMatch::Ours(cid)),
+            px: Ticks(130_865),
+        },
+        inst: INST_A,
+        side: Side::Buy,
+        qty: Lots::new(3).unwrap(),
+        liquidity: Liquidity3::Maker,
+        fee: scope.fee(0, AssetSym::new("USDC").unwrap()).unwrap(),
+        realized_pnl: None,
+        realized_funding: None,
+        replay: false,
+    });
+    let config = LedgerConfig {
+        max_age: Duration::from_secs(3_600),
+        max_entries: 10,
+    };
+    let mut ledger = FillLedger::new(config, WallNs(0)).unwrap();
+    match ledger.admit(&fill, None, MonoNs(2_000)) {
+        Admission::Apply(accepted) => oms.reg.apply_fill(accepted).unwrap(),
+        other => panic!("expected the fill accepted, got {other:?}"),
+    }
+}
+
+/// The cost decision 0153 accepts: a fill a handler applies between two of a decide pass's
+/// commands moves the market's position, so every remaining place and amend of the pass is
+/// `NotSent(StaleAuthorization)`, nothing written, while its cancel still goes out.
+#[tokio::test(start_paused = true)]
+async fn a_fill_the_handler_applies_between_two_ladder_commands_leaves_every_remaining_place_and_amend_unwritten_while_the_cancels_go_out()
+ {
+    let plan = [
+        Kind::Place,
+        Kind::Amend,
+        Kind::Place,
+        Kind::Cancel,
+        Kind::Place,
+    ];
+    let shown = shard(&plan, OnReference::Fill).await;
+    one_cycle_per_pass(&shown);
+    let (ladder, k) = ladder_around_reference(&shown);
+    assert_eq!(ladder.len(), plan.len());
+    // Read between two of the ladder's encodes, with its cancel still to come.
+    assert!((1..=3).contains(&k), "{k}");
+    references_between(&shown, k);
+    for (j, ((_, receipt), kind)) in ladder.iter().zip(&plan).enumerate() {
+        let want = match (j < k, kind) {
+            (true, _) | (false, Kind::Cancel) => Ok(()),
+            (false, Kind::Place | Kind::Amend) => Err(NotSentReason::StaleAuthorization),
+        };
+        assert_eq!(*receipt, want, "command {j}, a {kind:?}");
+    }
+    // Written: the commands before the fill, then only the ladder's cancel.
     let mut written: Vec<RpcId> = ladder[..k].iter().map(|(rpc, _)| *rpc).collect();
     written.push(ladder[3].0);
     let heard: Vec<RpcId> = shown.heard.iter().map(|f| rpc_of(f)).collect();

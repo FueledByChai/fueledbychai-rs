@@ -171,8 +171,8 @@
 //! an instrument cancel-all only under the kill switch's guard ([`OrphanCancels`]); no order
 //! not ours is ever one, and no account cancel-all is built.
 //!
-//! Authorizations and their check at submit (decisions 0045, 0060 and 0066;
-//! `tests/authorization.rs`, `tests/exit_submit.rs`):
+//! Authorizations and their check at submit (decisions 0045, 0060, 0066 and 0153;
+//! `tests/authorization.rs`, `tests/exit_submit.rs`, `tests/quoting_submit.rs`):
 //! [`Registry::authorize`] issues the [`Authorization`] for a command this crate built, so a
 //! command the market's state or a cap refused never receives one, and none is ever issued for an
 //! account cancel-all. It carries the market's [`StateGeneration`] at the command's build, and the
@@ -180,11 +180,13 @@
 //! immediately before encoding: a place, a batch or an amend whose market changed state since (the
 //! kill switch, a disarm, an arming call, lease names given again) is refused with nothing written,
 //! and one built in Exit, or during an orphan cooldown, also once a fill or a seed moved its
-//! market's inventory since (its position revision, decisions 0066 and 0108); an instrument
-//! cancel-all only once 0005's I7 guard it was built under moved (the registry's hold of the
-//! market's exclusive lease changed, or an order not ours was seen on the market), never for the
-//! kill switch alone; and a cancel or a cancel-many always goes through. A place's, a batch's or an
-//! amend's authorization holds its orders, or the amend's build, until a gateway takes it over:
+//! market's inventory since (its position revision, decisions 0066 and 0108), and any other once
+//! one moved it since its authorization, where the caps were judged against it (decision 0153);
+//! an instrument cancel-all only once 0005's I7 guard it was built under moved (the registry's
+//! hold of the market's exclusive lease changed, or an order not ours was seen on the market),
+//! never for the kill switch alone; and a cancel or a cancel-many always goes through. A
+//! place's, a batch's or an amend's authorization holds its orders, or the amend's build, until
+//! a gateway takes it over:
 //! dropped before then, they are released at the registry's next mutating call, or at once by
 //! [`Registry::withdraw`], so none is stranded; only the handed form runs the check at submit, so a
 //! gateway that keeps decision 0060 writes only a handed authorization, and its drop releases

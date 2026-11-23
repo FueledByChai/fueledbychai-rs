@@ -100,8 +100,9 @@
 //! 0060) refuses, run here just before the encode and not when it was queued, is
 //! `NotSent(StaleAuthorization)` with no nonce reserved and nothing written: a place, a batch
 //! or an amend whose market's state changed since it was built (the kill switch, a disarm, an
-//! arming call), or an instrument cancel-all whose I7 guard moved; a cancel and a cancel-many
-//! always pass (FBC-j5bw, decision 0062). Otherwise it is encoded with an [`EncodeCtx`]
+//! arming call) or whose market's position a fill the handler applied moved since it was
+//! authorized (decision 0153), or an instrument cancel-all whose I7 guard moved; a cancel and a
+//! cancel-many always pass (FBC-j5bw, decision 0062). Otherwise it is encoded with an [`EncodeCtx`]
 //! holding exactly [`VenueCommand::items`](fbc_core::VenueCommand::items) nonces reserved from
 //! the consumer's [`NonceSource`] and the shard clock's time. What the codec refuses is
 //! `NotSent` for its reason; effects that do not carry the request

@@ -31,8 +31,9 @@
 //! and only then submits the next. A command a handler submits
 //! through `ExecOrders` meanwhile is therefore taken before the ladder's next one, and every
 //! ladder command is re-checked at its encode (`Handed::check_at_submit`, 0060, 0066, 0152): a
-//! kill switch a handler turns on between two commands leaves each remaining place, batch and
-//! amend `NotSent(StaleAuthorization)`, nothing written, while cancels still go out.
+//! kill switch a handler turns on between two commands, or a fill a handler applies there that
+//! moves the market's position (0153), leaves each remaining place, batch and amend
+//! `NotSent(StaleAuthorization)`, nothing written, while cancels still go out.
 //!
 //! **Attribution.** A command a handler submits while it is handed an input's events is
 //! attributed to that input, whichever session takes it (the clock names that input for the

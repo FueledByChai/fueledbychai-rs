@@ -11,7 +11,8 @@
 //! An Exit authorization with no position change since its build still passes; a fill that
 //! moves no inventory (another namespace's) or moves another market's leaves it passing; a
 //! cancel always passes; and an authorization built while Quoting carries no position
-//! revision, so only 0060's state generation holds it back (the caps there are FBC-0d9k's).
+//! revision from its build, but watches it from its authorization, so a fill after that
+//! refuses it too (decision 0153; `tests/quoting_submit.rs`).
 //!
 //! The values are the owner's first test values: a $50 inventory cap on a synthetic market
 //! where one lot is worth $1, so 50 lots; the position each scenario exits is 10 lots, long
@@ -401,10 +402,11 @@ fn on_a_resync_seeded_market_a_fill_refuses_an_exit_built_before_it_and_a_later_
     }
 }
 
-/// Outside Exit the position revision is not part of the guard: a place built while Quoting
-/// passes after a fill moved the position (only 0060's state generation holds it back).
+/// Outside Exit the position revision is not part of the build's guard, but the authorization
+/// watches it from its issue (decision 0153): a place built and authorized while Quoting is
+/// refused once a fill moved the position since.
 #[test]
-fn a_quoting_place_is_not_held_back_by_a_fill() {
+fn a_quoting_place_is_held_back_by_a_fill_after_its_authorization() {
     let mut reg = testnet_run();
     reg.seed_position(INST, SignedLots(POS)).unwrap();
     start(&mut reg, INST);
@@ -413,7 +415,10 @@ fn a_quoting_place_is_not_held_back_by_a_fill() {
     let mut l = ledger();
     apply(&mut reg, &mut l, (INST, cid(), false), Side::Sell, 3, "f-q");
     assert_eq!(reg.inventory(INST), SignedLots(POS - 3));
-    assert_eq!(place.check_at_submit(), Ok(()));
+    assert_eq!(
+        place.check_at_submit(),
+        Err(StaleAuthorization::PositionMoved(INST))
+    );
 }
 
 /// A fill applied while a market was quoting moves the revision, and an Exit command built
