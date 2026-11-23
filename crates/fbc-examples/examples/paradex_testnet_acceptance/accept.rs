@@ -81,7 +81,7 @@ use crate::evidence::{
     Trace,
 };
 use crate::link::{Link, LinkHandler, Note, async_reject, described, shown};
-use crate::testnet::{HighWater, INST, LOGIN_REFUSALS, Out, off_thread_holding, snapshot_max};
+use crate::testnet::{HighWater, INST, LOGIN_REFUSALS, Out, snapshot_max};
 use crate::trade::{self, Priced};
 
 const ACCT: AccountKey = AccountKey::new(1);
@@ -1530,9 +1530,8 @@ impl Run {
             }
         }
         let mark = mint.high_water();
-        let hwm = self.hwm.clone();
         let timeout = Duration::from_secs(self.t().step_timeout_secs);
-        match off_thread_holding(timeout, mint, move || hwm.write(mark)).await {
+        match self.hwm.keep(mark, timeout, mint).await {
             Some((Ok(()), mint)) => {
                 self.mint = Some(mint);
                 Ok(cids)

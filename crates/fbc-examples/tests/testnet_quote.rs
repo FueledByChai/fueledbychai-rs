@@ -4348,6 +4348,40 @@ async fn a_stalled_high_water_write_stops_it_at_the_settle_deadline() {
 }
 
 #[tokio::test]
+async fn a_mark_write_slower_than_the_settling_time_fails_no_test() {
+    // FBC-pr6l: a loaded machine's write of the client-id high-water mark can outlast the book's
+    // settling time, the step timeout, which bounds the write's wait and the pass's waits after
+    // it. In a test build only a write a test holds is bounded by it or charged to it. Here, at
+    // a two-second step timeout, the write takes three seconds: both quotes are placed and the
+    // cycle ends as at full speed.
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(
+        one_connection(&venue, 6 + 1 + 2 + 1),
+        routes(&venue, login_ok()),
+    )
+    .await
+    .unwrap();
+    let mut opts = options(&stub, 1);
+    opts.step_timeout_secs = 2;
+    let wait = Duration::from_secs(opts.step_timeout_secs);
+    testnet::held_writes::slow(&opts.lease_dir, wait + wait / 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(report.ended, "--cycles 1 reached", "{printed}");
+    assert_eq!(report.places_sent, 2, "{printed}");
+    assert!(
+        printed.contains("MARK client-id high-water mark"),
+        "{printed}"
+    );
+    assert_eq!(
+        testnet::held_writes::started(&opts.lease_dir),
+        1,
+        "{printed}"
+    );
+}
+
+#[tokio::test]
 async fn every_rest_read_of_the_loop_is_charged_to_the_venues_rate_limit() {
     // Codex r4289363370 on PR #149: the touch (and mark) reads went out uncounted, so a fast
     // loop could pass Paradex's per-IP limits. On a venue declaring 10 Rest requests a minute

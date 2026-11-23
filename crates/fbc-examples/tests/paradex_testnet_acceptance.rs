@@ -1438,6 +1438,65 @@ async fn the_program_runs_every_step_once_maps_each_to_the_lattice_and_writes_sc
 }
 
 #[tokio::test]
+async fn a_mark_write_slower_than_the_step_timeout_fails_no_test() {
+    // FBC-pr6l: a loaded machine's write of the client-id high-water mark can outlast the step
+    // timeout, the wait a run gives it, which once failed the batch and IOC steps of tests this
+    // ticket did not touch. In a test build only a write a test holds is bounded by that wait.
+    // Here, at a one-second step timeout, every write takes a second and a half: every step
+    // still passes.
+    let venue = new_venue(true, true);
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-slow-mark");
+    let (lease_dir, _l) = temp_dir("lease-slow-mark");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.trade.step_timeout_secs = 1;
+    let wait = Duration::from_secs(opts.trade.step_timeout_secs);
+    testnet::held_writes::slow(&lease_dir, wait + wait / 2);
+    let (outcome, printed) = run_against(&opts).await;
+    let report = fs::read_to_string(&outcome.report).unwrap();
+    stub.finished()
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}\n{printed}\n{report}"));
+    assert!(outcome.ok, "{printed}\n{report}");
+    let ev = &outcome.evidence;
+    for name in ["place", "batch", "ioc", "cod-dropped", "cod-graceful"] {
+        let s = ev.steps.iter().find(|s| s.name == name).unwrap();
+        assert!(s.pass && s.ran == evidence::Ran::Yes, "{name}: {s:?}");
+    }
+    assert!(testnet::held_writes::started(&lease_dir) >= 5, "{printed}");
+}
+
+#[tokio::test]
+async fn a_mark_write_past_the_step_timeout_fails_its_step_and_mints_nothing_more() {
+    // FBC-pr6l: the rule a run keeps, in the run's own configuration. The place step's write of
+    // the mark is held past the step timeout, the wait the run gives it: the step fails, no
+    // order goes out under that id, the mint goes with the write, and the run is not ok.
+    let venue = new_venue(true, true);
+    let stub = stub_for(&venue, MAIN, 0, 0).await;
+    let (evidence_dir, _e) = temp_dir("evidence-held-mark");
+    let (lease_dir, _l) = temp_dir("lease-held-mark");
+    let mut opts = options(&stub, &evidence_dir.join("run"), &lease_dir, 10);
+    opts.trade.step_timeout_secs = 1;
+    let held = testnet::held_writes::hold(&lease_dir);
+    let (outcome, printed) = run_against(&opts).await;
+    held.release();
+    assert!(!outcome.ok, "{printed}");
+    let ev = &outcome.evidence;
+    let place = ev.steps.iter().find(|s| s.name == "place").unwrap();
+    assert!(!place.pass, "{place:?}");
+    assert!(
+        printed.contains("the client-id high-water mark's write did not finish in time"),
+        "{printed}"
+    );
+    let main = methods(&stub, 0);
+    assert!(
+        !main.iter().any(|m| m.starts_with("order.create")),
+        "{main:?}"
+    );
+    assert_eq!(testnet::held_writes::started(&lease_dir), 1, "{printed}");
+}
+
+#[tokio::test]
 async fn a_venue_that_keeps_orders_after_a_disconnect_is_recorded_and_the_next_connection_cancels_them()
  {
     // Paradex keeps the orders: each later connection's resync shows the earlier one's order

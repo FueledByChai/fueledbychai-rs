@@ -91,8 +91,7 @@ use crate::testnet::{
     px_or_none, wall_now,
 };
 use crate::testnet::{
-    HighWater, Out, cap_lots, inventory_price, latest_resync, off_thread_holding,
-    resync_disagreements, snapshot_max,
+    HighWater, Out, cap_lots, inventory_price, latest_resync, resync_disagreements, snapshot_max,
 };
 
 /// The Paradex configuration for `opts`' URLs ([`crate::testnet::config`]).
@@ -1496,15 +1495,14 @@ impl Driver {
             }
         };
         // Kept before the id goes out, so no later run mints it again: written and synced on
-        // a thread of its own ([`off_thread`]), so a slow disk never stalls the runtime the
+        // a thread of its own ([`HighWater::keep`]), so a slow disk never stalls the runtime the
         // session runs on, for at most the step timeout, nor holds up the exit after it.
-        let hwm = self.hwm.clone();
         let mark = mint.high_water();
         // The mint, holding the namespace lease, goes with the write: the lease is held until
         // the write ends, even one that outlives the timeout, so no other run takes the
         // namespace and keeps a newer mark that this late write would then replace. A write
         // that ends in time hands the mint back, kept until the run ends ([`Driver::mint`]).
-        let kept = match off_thread_holding(self.timeout, mint, move || hwm.write(mark)).await {
+        let kept = match self.hwm.keep(mark, self.timeout, mint).await {
             Some((kept, mint)) => {
                 self.mint = Some(mint);
                 kept

@@ -851,6 +851,60 @@ async fn testnet_trade_places_one_post_only_order_and_cancels_it_against_the_stu
 }
 
 #[tokio::test]
+async fn a_mark_write_slower_than_the_step_timeout_fails_no_test() {
+    // FBC-pr6l: a loaded machine's write of the client-id high-water mark can outlast the step
+    // timeout, the wait a run gives it. In a test build only a write a test holds is bounded by
+    // that wait. Here, at a one-second step timeout, the write takes a second and a half: the
+    // order is placed and cancelled as at full speed.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(script(Arc::clone(&placed)), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = 1;
+    let wait = Duration::from_secs(opts.step_timeout_secs);
+    testnet::held_writes::slow(&opts.lease_dir, wait + wait / 2);
+    let (report, printed) = run_against(&opts).await;
+    stub.finished().await.unwrap();
+    assert!(report.ok, "{printed}");
+    assert_eq!(
+        (report.places_sent, report.cancels_sent),
+        (1, 2),
+        "{printed}"
+    );
+    assert!(
+        printed.contains("MARK client-id high-water mark"),
+        "{printed}"
+    );
+    assert_eq!(testnet::held_writes::started(&opts.lease_dir), 1);
+}
+
+#[tokio::test]
+async fn a_mark_write_past_the_step_timeout_places_nothing() {
+    // FBC-pr6l: the rule a run keeps, in the run's own configuration. The write of the mark is
+    // held past the step timeout, the wait the run gives it: nothing is placed, and the run is
+    // not ok.
+    let placed = Arc::new(Mutex::new(Placed::default()));
+    let stub = StubServer::start(script(Arc::clone(&placed)), routes())
+        .await
+        .unwrap();
+    let mut opts = options(&stub, "10");
+    opts.step_timeout_secs = 1;
+    let held = testnet::held_writes::hold(&opts.lease_dir);
+    let (report, printed) = run_against(&opts).await;
+    held.release();
+    assert!(!report.ok, "{printed}");
+    assert!(
+        printed.contains("the high-water mark's write did not finish in time; nothing placed"),
+        "{printed}"
+    );
+    assert_eq!(report.places_sent, 0, "{printed}");
+    let sent = methods(&stub);
+    assert!(!sent.iter().any(|m| m == "order.create"), "{sent:?}");
+    assert!(!printed.contains("MARK client-id"), "{printed}");
+}
+
+#[tokio::test]
 async fn an_unanswered_auth_frame_times_out_the_login_and_stops_with_nothing_placed() {
     // The login answers over HTTP, but the auth frame is never acknowledged.
     let script = WsScript::new(vec![Step::Accept, Step::Read { conn: 0 }]);
