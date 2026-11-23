@@ -1595,12 +1595,10 @@ fn a_lost_order_shown_open_again_by_a_lagging_snapshot_keeps_the_fill_the_venue_
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(3)));
 }
 
-#[test]
-fn an_orphan_whose_venue_id_the_seed_showed_has_its_fills_placed_by_what_the_seed_showed() {
-    // Codex's r4316124604 on PR #171: the seed at 1 000 shows an order `v` with no client id,
-    // 1 filled, and the venue's long 1. A later snapshot shows `v` under our client id o:
-    // an orphan. A delayed, untimed fill of o naming `v` at a cumulative 1 is one the seed's
-    // position already holds (0055's rule 2): it is not counted again.
+/// A named registry whose trustworthy resync at 1 000 showed `v` open with no client id, 1
+/// filled, and the venue long 1 on `INST`: decision 0154 seeds nothing there and reports `v`;
+/// `OTHER` is seeded flat.
+fn refused_by_unnamed() -> Registry {
     let mut reg = arm::named(Registry::with_caps(caps()));
     let mut unnamed = not_ours(None, "v");
     unnamed.cum_filled = lots(1);
@@ -1611,12 +1609,35 @@ fn an_orphan_whose_venue_id_the_seed_showed_has_its_fills_placed_by_what_the_see
         vec![unnamed],
         1,
     );
-    assert_eq!(report.seeded.len(), 2, "{report:?}");
-    let o = cid();
+    assert_eq!(report.seeded, vec![(OTHER, SignedLots(0))], "{report:?}");
+    assert_eq!(report.without_cid, vec![(INST, vid("v"))]);
+    assert_eq!(reg.position(INST), None);
+    reg
+}
+
+/// The trustworthy resync at 2 000 showing `v` under our client id `o`, `cum` filled, and the
+/// venue long `cum`: `o` is registered as an earlier run's order, not an orphan, and the market
+/// is seeded at `cum`.
+fn shown_as_ours(reg: &mut Registry, o: ClientOrderId, cum: i64) {
     let mut shown = ours(o, "v", Side::Buy);
-    shown.cum_filled = lots(1);
-    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 1);
-    assert_eq!(reg.orphans(INST), vec![o]);
+    shown.cum_filled = lots(cum);
+    let report = resync_at(reg, SnapshotSource::Trustworthy, 2_000, vec![shown], cum);
+    assert_eq!(report.registered, vec![o]);
+    assert_eq!(report.seeded, vec![(INST, SignedLots(cum))]);
+    assert!(report.orphans.is_empty() && reg.orphans(INST).is_empty());
+}
+
+#[test]
+fn an_order_a_refused_seed_showed_without_a_client_id_has_its_fills_placed_by_the_seed_showing_it()
+{
+    // Codex's r4316124604 on PR #171, as decision 0154 changes it: the seed at 1 000 would have
+    // shown `v` with no client id; it is refused, so `v` shown under our client id o at 2 000
+    // is registered by the seed there, not an orphan. A delayed, untimed fill of o naming `v`
+    // at a cumulative 1 is one the seed's position already holds (0055's rule 2): it is not
+    // counted again.
+    let mut reg = refused_by_unnamed();
+    let o = cid();
+    shown_as_ours(&mut reg, o, 1);
     let mut l = ledger();
     let routed = fill_at(&mut reg, &mut l, o, "v", Side::Buy, 1, 1, None, 2_500);
     assert_eq!(routed, FillRouted::InSnapshot(o));
@@ -1624,26 +1645,14 @@ fn an_orphan_whose_venue_id_the_seed_showed_has_its_fills_placed_by_what_the_see
 }
 
 #[test]
-fn an_orphan_whose_venue_id_the_seed_showed_has_a_later_fill_naming_only_its_client_id_counted() {
-    // Codex's r4316366360 on PR #171: as above, the seed showed `v`, 1 filled, with no client
-    // id, and a later snapshot shows it under our client id o. A fill of o naming no venue id,
-    // at a cumulative 2, came after the seed: what the seed showed of `v` places it, so it
-    // moves the inventory.
-    let mut reg = arm::named(Registry::with_caps(caps()));
-    let mut unnamed = not_ours(None, "v");
-    unnamed.cum_filled = lots(1);
-    resync_at(
-        &mut reg,
-        SnapshotSource::Trustworthy,
-        1_000,
-        vec![unnamed],
-        1,
-    );
+fn an_order_a_refused_seed_showed_without_a_client_id_has_a_later_fill_naming_only_its_client_id_counted()
+ {
+    // Codex's r4316366360 on PR #171, as decision 0154 changes it: as above. A fill of o naming
+    // no venue id, at a cumulative 2, came after the seed at 2 000: what it showed of o places
+    // it, so it moves the inventory.
+    let mut reg = refused_by_unnamed();
     let o = cid();
-    let mut shown = ours(o, "v", Side::Buy);
-    shown.cum_filled = lots(1);
-    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 1);
-    assert_eq!(reg.orphans(INST), vec![o]);
+    shown_as_ours(&mut reg, o, 1);
     let mut l = ledger();
     let f = fill(
         Some(o),
@@ -1897,32 +1906,135 @@ fn a_snapshot_requested_before_the_resync_that_registered_an_orphan_does_not_shr
 }
 
 #[test]
-fn an_orphan_adopting_a_venue_id_the_seed_showed_places_its_retained_fills_against_what_the_seed_showed()
+fn fills_retained_while_a_refused_seed_showed_an_order_without_a_client_id_are_placed_by_the_next_seed()
  {
-    // Codex's r4317320917 on PR #171: the seed at 1 000 shows `v` with no client id, 1 filled,
-    // the venue long 1. Two untimed fills of our o naming no venue id arrive after the seed's
-    // request, at a cumulative 1 and 2: the seed holds both, only because it showed no order
-    // o. A later snapshot shows `v` under o: what the seed showed of `v` (1 filled) holds the
-    // first, so only the second moves the inventory.
+    // Codex's r4317320917 on PR #171, as decision 0154 changes it: the seed at 1 000 showing
+    // `v` with no client id is refused. Two fills of our o naming no venue id arrive at 1 500
+    // and 1 600, at a cumulative 1 and 2, one of them with neither a cumulative fill nor a
+    // time: the market is not seeded, so they wait for a seed. The seed at 2 000, showing `v`
+    // under o, was requested after both arrived: its position holds them, once.
+    for cums in [[Some(1), Some(2)], [Some(1), None]] {
+        let mut reg = refused_by_unnamed();
+        let o = cid();
+        let mut l = ledger();
+        for (n, (cum, at)) in cums.into_iter().zip([1_500, 1_600]).enumerate() {
+            let f = fill(
+                Some(o),
+                FillIdent::Venue {
+                    fill: fill_id(&format!("v-{n}")),
+                    vid: None,
+                    cum_after: cum.map(lots),
+                },
+                Side::Buy,
+                1,
+                false,
+            );
+            let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(at)) else {
+                panic!("a new fill is admitted");
+            };
+            assert_eq!(
+                reg.apply_fill(accepted).unwrap(),
+                FillRouted::OursUntracked(o)
+            );
+        }
+        assert_eq!(reg.position(INST), None);
+        shown_as_ours(&mut reg, o, 2);
+        assert_eq!(reg.position(INST), Some(SignedLots(2)), "{cums:?}");
+        assert_eq!(reg.get(o).unwrap().cum_fills(), lots(2));
+    }
+}
+
+/// The rows under which a seed shows `v`, 1 filled, without our client id and still seeds the
+/// market (decision 0154 refuses only an open one with none): open under a non-canonical client
+/// id, as a venue echoing ours upper-cased or escaped shows it, and ended with no client id.
+fn v_seeded_not_as_ours() -> [VenueOrderSnapshot; 2] {
+    let mut unparseable = not_ours(Some(CidMatch::Unparseable), "v");
+    unparseable.cum_filled = lots(1);
+    let mut ended = not_ours(None, "v");
+    ended.cum_filled = lots(1);
+    ended.state = VenueOrderState::Filled;
+    [unparseable, ended]
+}
+
+/// A named registry seeded by the trustworthy resync at 1 000 that showed `seen` and the venue
+/// long 1 on `INST`.
+fn seeded_showing(seen: VenueOrderSnapshot) -> Registry {
     let mut reg = arm::named(Registry::with_caps(caps()));
-    let mut unnamed = not_ours(None, "v");
-    unnamed.cum_filled = lots(1);
-    resync_at(
-        &mut reg,
-        SnapshotSource::Trustworthy,
-        1_000,
-        vec![unnamed],
-        1,
-    );
-    let o = cid();
-    let mut l = ledger();
-    for (cum, at) in [(1, 1_500), (2, 1_600)] {
+    let report = resync_at(&mut reg, SnapshotSource::Trustworthy, 1_000, vec![seen], 1);
+    assert_eq!(report.seeded.len(), 2, "{report:?}");
+    assert!(report.without_cid.is_empty(), "{report:?}");
+    reg
+}
+
+/// The trustworthy resync at 2 000 showing our `o` open under `v`, `cum` filled, and the venue
+/// long `pos`: `o` is an orphan on the seeded market.
+fn shown_as_orphan(reg: &mut Registry, o: ClientOrderId, v: &str, cum: i64, pos: i64) {
+    let mut shown = ours(o, v, Side::Buy);
+    shown.cum_filled = lots(cum);
+    resync_at(reg, SnapshotSource::Trustworthy, 2_000, vec![shown], pos);
+    assert_eq!(reg.orphans(INST), vec![o]);
+}
+
+#[test]
+fn an_orphan_whose_venue_id_the_seed_showed_has_its_fills_placed_by_what_the_seed_showed() {
+    // Codex's r4316124604 on PR #171: the seed at 1 000 shows an order `v` without our client
+    // id, 1 filled, and the venue's long 1. A later snapshot shows `v` under our client id o:
+    // an orphan. A delayed, untimed fill of o naming `v` at a cumulative 1 is one the seed's
+    // position already holds (0055's rule 2): it is not counted again.
+    for seen in v_seeded_not_as_ours() {
+        let mut reg = seeded_showing(seen.clone());
+        let o = cid();
+        shown_as_orphan(&mut reg, o, "v", 1, 1);
+        let mut l = ledger();
+        let routed = fill_at(&mut reg, &mut l, o, "v", Side::Buy, 1, 1, None, 2_500);
+        assert_eq!(routed, FillRouted::InSnapshot(o), "{seen:?}");
+        assert_eq!(reg.position(INST), Some(SignedLots(1)));
+    }
+}
+
+#[test]
+fn an_orphan_whose_venue_id_the_seed_showed_has_a_later_fill_naming_only_its_client_id_counted() {
+    // Codex's r4316366360 on PR #171: as above, the seed showed `v`, 1 filled, without our
+    // client id, and a later snapshot shows it under our client id o. A fill of o naming no
+    // venue id, at a cumulative 2, came after the seed: what the seed showed of `v` places it,
+    // so it moves the inventory.
+    for seen in v_seeded_not_as_ours() {
+        let mut reg = seeded_showing(seen.clone());
+        let o = cid();
+        shown_as_orphan(&mut reg, o, "v", 1, 1);
+        let mut l = ledger();
         let f = fill(
             Some(o),
             FillIdent::Venue {
-                fill: fill_id(&format!("v-{cum}")),
+                fill: fill_id("v-2"),
                 vid: None,
-                cum_after: Some(lots(cum)),
+                cum_after: Some(lots(2)),
+            },
+            Side::Buy,
+            1,
+            false,
+        );
+        let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(2_500)) else {
+            panic!("a new fill is admitted");
+        };
+        let routed = reg.apply_fill(accepted).unwrap();
+        assert!(matches!(routed, FillRouted::Ours(..)), "{routed:?}");
+        assert_eq!(reg.position(INST), Some(SignedLots(2)), "{seen:?}");
+    }
+}
+
+/// Two fills of our o naming no venue id, admitted at 1 500 and 1 600 at the cumulative fills
+/// `cums`, untimed, on a market whose seed at 1 000 showed no order o: the seed holds each,
+/// only because it did not show o.
+fn retained(reg: &mut Registry, o: ClientOrderId, cums: [Option<i64>; 2]) {
+    let mut l = ledger();
+    for (n, (cum, at)) in cums.into_iter().zip([1_500, 1_600]).enumerate() {
+        let f = fill(
+            Some(o),
+            FillIdent::Venue {
+                fill: fill_id(&format!("v-{n}")),
+                vid: None,
+                cum_after: cum.map(lots),
             },
             Side::Buy,
             1,
@@ -1934,49 +2046,55 @@ fn an_orphan_adopting_a_venue_id_the_seed_showed_places_its_retained_fills_again
         assert_eq!(reg.apply_fill(accepted).unwrap(), FillRouted::InSnapshot(o));
     }
     assert_eq!(reg.position(INST), Some(SignedLots(1)));
-    let mut shown = ours(o, "v", Side::Buy);
-    shown.cum_filled = lots(2);
-    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 2);
-    assert_eq!(reg.orphans(INST), vec![o]);
-    assert_eq!(reg.position(INST), Some(SignedLots(2)));
+}
+
+#[test]
+fn an_orphan_adopting_a_venue_id_the_seed_showed_places_its_retained_fills_against_what_the_seed_showed()
+ {
+    // Codex's r4317320917 on PR #171: the seed at 1 000 shows `v` without our client id, 1
+    // filled, the venue long 1. Two untimed fills of our o naming no venue id arrive after the
+    // seed's request, at a cumulative 1 and 2: the seed holds both, only because it showed no
+    // order o. A later snapshot shows `v` under o: what the seed showed of `v` (1 filled)
+    // holds the first, so only the second moves the inventory.
+    for seen in v_seeded_not_as_ours() {
+        let mut reg = seeded_showing(seen.clone());
+        let o = cid();
+        retained(&mut reg, o, [Some(1), Some(2)]);
+        shown_as_orphan(&mut reg, o, "v", 2, 2);
+        assert_eq!(reg.position(INST), Some(SignedLots(2)), "{seen:?}");
+    }
 }
 
 #[test]
 fn an_orphan_adopting_a_venue_id_the_seed_showed_with_a_retained_fill_nothing_places_leaves_the_position_unknown()
  {
-    // Codex's r4317320917 on PR #171: as above, but the retained fill states no cumulative fill
-    // and no time. What the seed showed of `v` cannot place it, so once a snapshot shows `v`
-    // under o the market's position is unknown, as for any fill nothing places.
-    let mut reg = arm::named(Registry::with_caps(caps()));
-    let mut unnamed = not_ours(None, "v");
-    unnamed.cum_filled = lots(1);
-    resync_at(
-        &mut reg,
-        SnapshotSource::Trustworthy,
-        1_000,
-        vec![unnamed],
-        1,
-    );
-    let o = cid();
-    let mut l = ledger();
-    let f = fill(
-        Some(o),
-        FillIdent::Venue {
-            fill: fill_id("v-x"),
-            vid: None,
-            cum_after: None,
-        },
-        Side::Buy,
-        1,
-        false,
-    );
-    let Admission::Apply(accepted) = l.admit(&f, None, MonoNs(1_500)) else {
-        panic!("a new fill is admitted");
-    };
-    assert_eq!(reg.apply_fill(accepted).unwrap(), FillRouted::InSnapshot(o));
-    let mut shown = ours(o, "v", Side::Buy);
-    shown.cum_filled = lots(2);
-    resync_at(&mut reg, SnapshotSource::Trustworthy, 2_000, vec![shown], 2);
-    assert_eq!(reg.orphans(INST), vec![o]);
-    assert_eq!(reg.position(INST), None);
+    // Codex's r4317320917 on PR #171: as above, but the second retained fill states no
+    // cumulative fill and no time. What the seed showed of `v` cannot place it, so once a
+    // snapshot shows `v` under o the market's position is unknown, as for any fill nothing
+    // places.
+    for seen in v_seeded_not_as_ours() {
+        let mut reg = seeded_showing(seen.clone());
+        let o = cid();
+        retained(&mut reg, o, [Some(1), None]);
+        shown_as_orphan(&mut reg, o, "v", 2, 2);
+        assert_eq!(reg.position(INST), None, "{seen:?}");
+    }
+}
+
+#[test]
+fn a_fill_the_seed_held_by_the_venue_id_it_showed_is_not_counted_again_for_an_orphan() {
+    // 0108's rule 1: the seed at 1 000 shows `v` without our client id, 1 filled, the venue
+    // long 1. An untimed fill of our o naming `v` at a cumulative 1 arrives after the seed's
+    // request: what the seed showed of `v` holds it, not the seed's not showing o, so it is not
+    // kept to be placed again. A later snapshot shows o open under another venue id `w`, an
+    // orphan opened after the seed read the account: the fill is still not counted.
+    for seen in v_seeded_not_as_ours() {
+        let mut reg = seeded_showing(seen.clone());
+        let o = cid();
+        let mut l = ledger();
+        let routed = fill_at(&mut reg, &mut l, o, "v", Side::Buy, 1, 1, None, 1_500);
+        assert_eq!(routed, FillRouted::InSnapshot(o));
+        shown_as_orphan(&mut reg, o, "w", 1, 1);
+        assert_eq!(reg.position(INST), Some(SignedLots(1)), "{seen:?}");
+    }
 }

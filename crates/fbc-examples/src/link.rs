@@ -112,8 +112,11 @@ use fbc_oms::{
 use fbc_runtime::{ExecHandler, ExecOrders};
 use tokio::sync::Notify;
 
-/// Something the session reported, as the glue saw it.
+/// Something the session reported, as the glue saw it. A resync's report is the largest note;
+/// the notes are a sample's records, kept whole rather than boxed (FBC-5orj grew the report by
+/// the orders shown without a client id).
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Note {
     /// A stream's state changed.
     Conn(ConnState),
