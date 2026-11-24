@@ -2591,7 +2591,14 @@ impl Driver {
                 }
             }
             self.print_cycle(&book, mark, &wanted);
-            let now = self.link.borrow().now().0;
+            // The link was attached to the session before the driver ran, so it reads the
+            // session's shard clock (decision 0155 item 3).
+            let now = self
+                .link
+                .borrow()
+                .now()
+                .ok_or("the link has no session's clock")?
+                .0;
             let plan = {
                 let mut link = self.link.borrow_mut();
                 let mint = self.mint.as_mut().ok_or("no client-id mint")?;

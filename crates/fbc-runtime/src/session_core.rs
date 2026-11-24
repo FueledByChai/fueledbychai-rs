@@ -161,6 +161,12 @@ impl IngestClock {
         self.replayed.is_some()
     }
 
+    /// Whether `other` is this clock or a clone of it, sharing its ingest sequence (decision
+    /// 0155 item 3).
+    pub(crate) fn same(&self, other: &IngestClock) -> bool {
+        Rc::ptr_eq(&self.next, &other.next)
+    }
+
     /// Stamps a replayed record's input, recorded as `recorded`, with the next ingest sequence
     /// (FBC-066n): its kernel receive time, connection and recorded instant on both clocks,
     /// which become the clock's wall-time anchor, moved on to the latest instant stamped when

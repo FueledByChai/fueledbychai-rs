@@ -438,7 +438,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     consumer's `NonceSource`, frames decoded inside `dispatch`, events stamped and handed to the
     consumer's `ExecHandler` inline, a stop ending the epoch at once, reconnects paced; the
     codec's HTTP requests and timers answered only to the epoch that asked, `on_timer` given
-    exactly the nonces it asks for, and its keepalive its own timer (0056); commands reach its
+    exactly the nonces it asks for, and its keepalive its own timer (0056); its `ExecOrders`
+    reads now on the session's shard clock as the session does (`ExecOrders::now`) and says
+    whether another session stamps on the same clock (`ExecOrders::shares_clock`), 0155 item 3,
+    unit-tested in `src/exec_orders.rs`; commands reach its
     codec only through its `ExecOrders`, as an fbc-oms `Authorization` for its account or a
     `ControlCommand` (an authorization taken over at its turn or as it is refused for want of
     room, and dropped unspent, so released, when refused for another account or an ended session
@@ -759,7 +762,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     toy).
   - `crates/fbc-live` (0155): the order-safety glue a live consumer runs beside its order-entry
     sessions, depending on `fbc-core`, `fbc-oms` and `fbc-runtime` only, never on a venue crate
-    (`fbc-conformance` and `fbc-journal` dev-dependencies, its tests on the conformance toy),
+    (`fbc-conformance`, `fbc-journal`, `fbc-sim`, tokio and `rust_decimal` dev-dependencies,
+    its tests on the conformance toy, and its replay test on the runtime's toy venue by path),
     branching on no venue's name (0003), `publish = false`. So far `src/link.rs` (FBC-umqi), moved
     from fbc-examples whole with its behaviour: `Link`, the glue between one account's order-entry
     session and its fbc-oms `Registry` (outcomes and order events routed by request and item, fills
@@ -770,12 +774,20 @@ holds two of them for one pull request. The rules after the three roles bind all
     order of ours a cancel not ours ends is noted, FBC-aoh5; venue text shown through `shown` and
     `described`, whose limits stay fixed, 0155 item 8), the session handler's five entry points
     public methods of it, and `LinkHandler`, which hands each call on and then calls the consumer's
-    wake, a closure. It still times each submission on a std clock of its own (`Link::now`) until
-    FBC-y7lq (0155 item 3). Its tests: `tests/link_epoch_end.rs`, `tests/coverage.rs` and
+    wake, a closure. It reads no clock but its session's shard clock (FBC-y7lq, 0155 item 3): the
+    link times each submission it sends on the `ExecOrders::now` of the session it was last
+    attached to or submitted through (`Link::now`, `None` before either), an `ExecOrders` on
+    another clock noted as a `Note::Problem` and read from then on, its submission still going;
+    its `clippy.toml` disallows the std `Instant` and `SystemTime` reads and
+    `fbc_runtime::SystemWallClock`. Its tests: `tests/link_epoch_end.rs`, `tests/coverage.rs` and
     `tests/shown.rs`, moved from the samples' tests, `tests/handler.rs`, `tests/paths.rs` (the paths
     no sample walks, through a toy `ExecSession`'s `ExecOrders` it never runs), a unit test of the
-    kinds it names, and `tests/manifest.rs`, which holds its normal dependencies to those three
-    (0155 item 1).
+    kinds it names, `tests/manifest.rs`, which holds its normal dependencies to those three
+    (0155 item 1), `tests/link_clock.rs` (sends timed on the session's stamps on a paused
+    runtime against the conformance stub, and a second clock noted), `tests/replay_clock.rs` (two
+    closed-loop replays through a `Link`, on SimVenue, with the same send times and notes; 0155
+    item 4) and `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in
+    its source).
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is

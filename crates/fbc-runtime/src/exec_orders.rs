@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{
-    AccountKey, ConnKey, InstrumentId, NotSentReason, RpcCall, RpcId, Stamp, TrafficClass,
-    VenueCommand, VenueOrderSnapshot,
+    AccountKey, ConnKey, InstrumentId, MonoNs, NotSentReason, RpcCall, RpcId, Stamp, TrafficClass,
+    VenueCommand, VenueOrderSnapshot, WallNs,
 };
 use fbc_journal::{Record, WriteRes};
 use fbc_oms::{Authorization, ControlCommand, Handed};
@@ -483,6 +483,22 @@ impl ExecOrders {
         self.shared.acct
     }
 
+    /// Now on the session's shard clock, its [`IngestClock`], read as the session reads it:
+    /// the monotonic time from the clock's origin and the wall time, a closed-loop replay's
+    /// from its anchor (decision 0155 item 3). An input stamped next is stamped no earlier, so a
+    /// holder of the session's handle times what it submits on the clock its inputs are stamped
+    /// on (decision 0057).
+    pub fn now(&self) -> (MonoNs, WallNs) {
+        self.shared.clock.now()
+    }
+
+    /// Whether `other`'s session stamps on this session's shard clock, one [`IngestClock`] or a
+    /// clone of it (decision 0155 item 3), read through the handle every submitter holds
+    /// (decision 0057).
+    pub fn shares_clock(&self, other: &ExecOrders) -> bool {
+        self.shared.clock.same(&other.shared.clock)
+    }
+
     /// Whether the session holds no command submitted through it (decision 0100).
     pub(crate) fn idle(&self) -> bool {
         self.shared.idle()
@@ -900,6 +916,62 @@ mod tests {
         assert_eq!(taken.class(), TrafficClass::Normal);
         let back = taken.unencoded();
         assert!(matches!(back, Submitted::Control(VenueCommand::FeeQuery)));
+    }
+
+    /// The orders of a session for account 2 stamping on `clock`.
+    fn orders_on(clock: &IngestClock) -> ExecOrders {
+        let shared = Shared::new(
+            AccountKey::new(2),
+            RpcIds::default(),
+            true,
+            false,
+            true,
+            clock.clone(),
+            roomy(),
+        );
+        ExecOrders { shared }
+    }
+
+    /// Decision 0155 item 3: a session's orders read now on its shard clock as the session
+    /// does, so on a paused runtime the time is the runtime's virtual time and the next input
+    /// is stamped at it, never earlier.
+    #[tokio::test(start_paused = true)]
+    async fn now_is_the_sessions_shard_clock_the_next_stamp_reads_on_a_paused_runtime() {
+        let clock = IngestClock::new();
+        let orders = orders_on(&clock);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let (mono, wall) = orders.now();
+        assert_eq!(mono, MonoNs(10_000_000_000));
+        let next = clock.stamp(ConnKey { conn: 0, epoch: 1 }, None);
+        assert_eq!(next.recv_mono, mono);
+        assert!(next.recv_wall >= wall);
+    }
+
+    /// Decision 0155 item 3: on a closed-loop replay's clock the wall time is the anchor's,
+    /// moved on by the monotonic time since it, and the next input is stamped at both.
+    #[tokio::test(start_paused = true)]
+    async fn now_on_a_replayed_clock_reads_its_wall_time_from_the_anchor() {
+        let clock = IngestClock::replayed(WallNs(1_700_000_000_000_000_000));
+        let orders = orders_on(&clock);
+        tokio::time::advance(Duration::from_millis(5)).await;
+        let now = orders.now();
+        assert_eq!(now, (MonoNs(5_000_000), WallNs(1_700_000_000_005_000_000)));
+        let (_, mono, wall) = clock.tick();
+        assert_eq!((mono, wall), now);
+    }
+
+    /// Decision 0155 item 3: sessions built on one shard clock, or on clones of it, share it;
+    /// sessions on two clocks, both started at the same instant, do not.
+    #[tokio::test(start_paused = true)]
+    async fn sessions_on_one_clock_share_it_and_sessions_on_two_clocks_do_not() {
+        let clock = IngestClock::new();
+        let (one, two) = (orders_on(&clock), orders_on(&clock.clone()));
+        assert!(one.shares_clock(&one));
+        assert!(one.shares_clock(&two) && two.shares_clock(&one));
+        let other = orders_on(&IngestClock::new());
+        // The same time on both is not the same clock.
+        assert_eq!(other.now().0, one.now().0);
+        assert!(!one.shares_clock(&other) && !other.shares_clock(&one));
     }
 
     /// Decision 0100: a submission is attributed to the input the shard is handling as it is

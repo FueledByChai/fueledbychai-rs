@@ -13,9 +13,9 @@
 //! crate and branches on no venue's name (decision 0003). It holds nothing that decides what to
 //! quote (decision 0001), and every bound comes from the consumer, with no default (decision
 //! 0009), except the fixed limits of [`shown`](link::shown) and [`described`](link::described),
-//! which keep an echoed credential out of what is printed (decision 0155 item 8). Until
-//! FBC-y7lq, the link still times each submission it sends on a std clock of its own
-//! ([`Link::now`](link::Link::now)), as the samples' link did; decision 0155 item 3 moves it
-//! onto its session's shard clock.
+//! which keep an echoed credential out of what is printed (decision 0155 item 8). It reads no
+//! clock but its session's shard clock (decision 0155 item 3): the link times each submission
+//! it sends on the `IngestClock` of the session it was last attached to or submitted through
+//! ([`Link::now`](link::Link::now)), and the crate's `clippy.toml` refuses a std clock read.
 
 pub mod link;

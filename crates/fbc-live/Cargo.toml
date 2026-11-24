@@ -16,7 +16,13 @@ fbc-oms = { path = "../fbc-oms" }
 fbc-runtime = { path = "../fbc-runtime" }
 
 # The tests run on the conformance toy, which depends on no venue crate; tests/paths.rs builds
-# an order-entry session on it, whose nonce source fbc-journal names.
+# an order-entry session on it, whose nonce source fbc-journal names, and tests/link_clock.rs runs
+# one against the conformance stub on a paused tokio runtime. tests/replay_clock.rs replays a
+# journal (fbc-journal) of the runtime's toy market-data venue, included by path (its specs read
+# rust_decimal), closed-loop through SimVenue (fbc-sim) (decision 0155 item 1).
 [dev-dependencies]
 fbc-conformance = { path = "../fbc-conformance" }
 fbc-journal = { path = "../fbc-journal" }
+fbc-sim = { path = "../fbc-sim" }
+rust_decimal.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "sync", "time", "test-util"] }
