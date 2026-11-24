@@ -1,7 +1,7 @@
 //! paradex_testnet_acceptance's run: FBC-8xr's script on Paradex TESTNET through fbc-oms, in
 //! three phases, each one order-entry session (fbc-runtime's `ExecSession`) over a registry of
 //! its own declared an owner-assisted testnet run (decision 0067), its events routed into the
-//! registry by the shared glue's [`Link`] (`src/link.rs`):
+//! registry by the shared glue's [`Link`] (`fbc_live::link`):
 //!
 //! 1. **main**: place, amend, cancel, batch create, cancel-many, an IOC that expires, with
 //!    `--allow-fill` the fill steps (a take flattened by a reduce-only IOC, and a partly filled
@@ -1251,7 +1251,10 @@ impl Run {
         let handler = Tap {
             inner: LinkHandler {
                 link: Rc::clone(&link),
-                wake: Rc::clone(&wake),
+                wake: Box::new({
+                    let wake = Rc::clone(&wake);
+                    move || wake.notify_waiters()
+                }),
             },
             tracker: Rc::clone(&self.tracker),
         };

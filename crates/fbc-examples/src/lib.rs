@@ -54,10 +54,13 @@
 //!   what answered the arm. Its credentials come from the environment through `src/auth_qfex.rs` (a
 //!   review path), which also hands each signed read to the connector.
 //!
-//! The samples that trade share, by path as well, `src/link.rs` (the ExecHandler-to-Registry
-//! glue) and `src/testnet.rs` (the testnet guard, the market's spec, the session's wiring, the
-//! client-id high-water mark, the touch and mark reads); the mainnet ones `src/mainnet.rs` (the
-//! mainnet guard); `testnet_trade` (and so `mainnet_smoke`) and `testnet_quote` also
+//! The samples that trade route their sessions into fbc-oms through `fbc_live::link`, the
+//! ExecHandler-to-Registry glue in fbc-live (decision 0155): the Paradex samples use it directly,
+//! and `qfex_preprod_probe` through `src/link.rs`, a re-export shim it includes by path, until
+//! FBC-bddu moves it onto the library. They share, by path, `src/testnet.rs` (the testnet
+//! guard, the market's spec, the session's wiring, the client-id high-water mark, the touch and
+//! mark reads); the mainnet ones `src/mainnet.rs` (the mainnet guard); `testnet_trade` (and so
+//! `mainnet_smoke`) and `testnet_quote` also
 //! share `src/positions.rs` (FBC-hpg6: `GET /positions` compared with the registry's position
 //! after the first fill and at Stop, a mismatch the re-read confirms Stopping the run), which
 //! reads through `src/auth_rest.rs`; none is a module of this library target.

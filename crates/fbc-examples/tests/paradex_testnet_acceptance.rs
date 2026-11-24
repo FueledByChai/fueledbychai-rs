@@ -33,9 +33,8 @@ mod auth;
 mod auth_rest;
 #[path = "../examples/paradex_testnet_acceptance/evidence.rs"]
 mod evidence;
-#[allow(dead_code)]
-#[path = "../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 // testnet_trade's round trip, reused by path, holds the position check: unused here.
 #[allow(dead_code)]
 #[path = "../src/positions.rs"]
@@ -2102,8 +2101,9 @@ fn a_session_counts_each_order_method_and_its_arm() {
 
 #[test]
 fn an_asynchronous_reject_the_shared_link_notes_is_a_link_problem_of_the_run() {
-    // FBC-elg7 moved the glue to src/link.rs, which notes an asynchronous reject for its driver
-    // to judge (Note::AsyncReject) instead of as a problem: this run still counts every one.
+    // FBC-elg7 moved the glue to src/link.rs (fbc_live::link since FBC-umqi), which notes an
+    // asynchronous reject for its driver to judge (Note::AsyncReject) instead of as a problem:
+    // this run still counts every one.
     use fbc_core::{Namespace, OpKind, OrderRef, Reject, RejectKind};
     use link::Note;
     let caps = fbc_venue_paradex::factory::caps();

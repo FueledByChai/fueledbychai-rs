@@ -1,0 +1,22 @@
+[package]
+name = "fbc-live"
+description = "The order-safety glue a live consumer runs beside its order-entry sessions (decision 0155): so far the link, which routes every event an order-entry session hands it into the account's fbc-oms registry, through the fill ledger, and is the one path the consumer's commands take to the session, tracking which cancels of ours cover which orders so a cancel not ours is noted. It depends on no venue crate and branches on no venue's name."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# fbc-core, fbc-oms and fbc-runtime only (decision 0155 item 1); scripts/check-deps.sh holds it to
+# no venue crate.
+[dependencies]
+fbc-core = { path = "../fbc-core" }
+fbc-oms = { path = "../fbc-oms" }
+fbc-runtime = { path = "../fbc-runtime" }
+
+# The tests run on the conformance toy, which depends on no venue crate; tests/paths.rs builds
+# an order-entry session on it, whose nonce source fbc-journal names.
+[dev-dependencies]
+fbc-conformance = { path = "../fbc-conformance" }
+fbc-journal = { path = "../fbc-journal" }

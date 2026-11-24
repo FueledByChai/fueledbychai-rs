@@ -1001,7 +1001,10 @@ pub async fn run_on(
     let wake = Rc::new(Notify::new());
     let handler = LinkHandler {
         link: Rc::clone(&link),
-        wake: Rc::clone(&wake),
+        wake: Box::new({
+            let wake = Rc::clone(&wake);
+            move || wake.notify_waiters()
+        }),
     };
     // The position check reads over REST through the limiter the session charges, so its reads
     // and the session's traffic share one count (FBC-hpg6).

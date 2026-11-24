@@ -1,16 +1,12 @@
-//! The samples' glue (`src/link.rs`) reports each order-entry connection epoch's end to the
+//! The link (`fbc_live::link`) reports each order-entry connection epoch's end to the
 //! account's fbc-oms registry (FBC-9svb), at the ended epoch's last envelope's `recv_mono`, so
 //! the registry builds no instrument cancel-all until a trustworthy resync requested after the
 //! end. The handler is driven here as an order-entry session drives it: every envelope of an
 //! epoch, in ingest order, then the epoch's end, then the next epoch's envelopes. On a market
 //! the link's registry holds armed, the kill switch's cancel everything is then explicit from
 //! the end until the next epoch's resync. On a session of several connections, the end reported
-//! is the last envelope of any of them.
-
-// Shared by the samples that trade: this test uses a part of it.
-#[allow(dead_code)]
-#[path = "../src/link.rs"]
-mod link;
+//! is the last envelope of any of them. Moved from fbc-examples with the link (decision 0155
+//! item 9), on the conformance toy's caps in place of Paradex's.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -19,25 +15,31 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use fbc_core::{
-    CancelScope, ConnKey, ConnState, Envelope, ExchTsKind, ExecEvent, InstrumentId, Lots,
-    MarketLease, MonoNs, Stamp, StreamId, VenueCommand, WallNs, dispatch_market_data,
+    AccountLease, CancelScope, ConnKey, ConnState, Envelope, ExchTsKind, ExecEvent, InstrumentId,
+    Lots, MarketLease, MonoNs, OrderCaps, Stamp, StreamId, VenueCommand, WallNs,
+    dispatch_market_data,
 };
+use fbc_live::link::{Link, LinkHandler, Note};
 use fbc_oms::{
     CancelAllRefusal, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
     MarketCapsConfig, PreTradeCaps, Registry,
 };
 use fbc_runtime::ExecHandler;
-use link::{Link, LinkHandler, Note};
-use tokio::sync::Notify;
 
-/// The glue over a fresh registry under Paradex's order caps, whose snapshot is trustworthy.
+/// The conformance toy's order caps, whose snapshot is trustworthy and whose nonces are per
+/// account.
+fn order_caps() -> OrderCaps {
+    fbc_conformance::toy::caps().exec.unwrap().order
+}
+
+/// The glue over a fresh registry under the toy's order caps.
 fn handler() -> LinkHandler {
     handler_over(Registry::new())
 }
 
-/// The glue over `reg` under Paradex's order caps.
+/// The glue over `reg` under the toy's order caps, waking nobody.
 fn handler_over(reg: Registry) -> LinkHandler {
-    let caps = fbc_venue_paradex::exec::exec_caps().order;
+    let caps = order_caps();
     let ledger = FillLedger::new(
         LedgerConfig {
             max_age: Duration::from_secs(3600),
@@ -55,7 +57,7 @@ fn handler_over(reg: Registry) -> LinkHandler {
     .unwrap();
     LinkHandler {
         link: Rc::new(RefCell::new(Link::new(reg, ledger, caps, ladder))),
-        wake: Rc::new(Notify::new()),
+        wake: Box::new(|| {}),
     }
 }
 
@@ -199,10 +201,9 @@ impl Drop for LeaseDir {
 }
 
 /// The kill switch's cancel everything for `INST` on the link's registry, under the link's
-/// Paradex order caps: the refusal that kept it explicit, or `None` for an instrument
-/// cancel-all.
+/// toy order caps: the refusal that kept it explicit, or `None` for an instrument cancel-all.
 fn refusal(h: &LinkHandler) -> Option<CancelAllRefusal> {
-    let caps = fbc_venue_paradex::exec::exec_caps().order;
+    let caps = order_caps();
     match h.link.borrow_mut().reg().cancel_everything(INST, &caps) {
         CancelEverything::CancelAll { command, .. } => {
             assert_eq!(
@@ -217,12 +218,13 @@ fn refusal(h: &LinkHandler) -> Option<CancelAllRefusal> {
 
 #[test]
 fn on_an_armed_market_the_glues_epoch_end_keeps_the_cancel_everything_explicit_until_a_resync() {
-    // A registry named for a test account on Paradex, `INST` its one market under test caps,
-    // whose nonces need no account lease.
-    let caps = fbc_venue_paradex::exec::exec_caps().order;
-    let paradex = fbc_venue_paradex::factory::caps();
-    let symbol = dispatch_market_data(&paradex, |s| s.venue_symbol("SYN-USD-PERP")).unwrap();
-    let keys = LeaseKeys::new("paradex", "test-acct", &caps).with_market(INST, symbol.clone());
+    // A registry named for a test account on the toy, `INST` its one market under test caps,
+    // whose nonces need the account lease too.
+    let caps = order_caps();
+    let toy = fbc_conformance::toy::caps();
+    let symbol =
+        dispatch_market_data(&toy, |s| s.venue_symbol(fbc_conformance::toy::SYMBOL_A)).unwrap();
+    let keys = LeaseKeys::new("toy", "test-acct", &caps).with_market(INST, symbol.clone());
     let config = MarketCapsConfig {
         inventory: Lots::new(10),
         resting: Lots::new(10),
@@ -232,13 +234,14 @@ fn on_an_armed_market_the_glues_epoch_end_keeps_the_cancel_everything_explicit_u
     let dir = LeaseDir::new();
 
     // The first epoch's trustworthy resync seeds `INST` flat and views the account's open
-    // orders; the owner's Start arms it under its market lease.
+    // orders; the owner's Start arms it under its market lease and the account lease.
     epoch(&mut h, 0, 0, 1_000);
-    let lease = MarketLease::acquire(&dir.0, "paradex", "test-acct", &symbol).unwrap();
+    let lease = MarketLease::acquire(&dir.0, "toy", "test-acct", &symbol).unwrap();
+    let acct = AccountLease::acquire(&dir.0, "toy", "test-acct").unwrap();
     h.link
         .borrow_mut()
         .reg()
-        .start(INST, Leases::market(lease))
+        .start(INST, Leases::market(lease).with_account(acct))
         .unwrap();
     assert_eq!(refusal(&h), None);
 

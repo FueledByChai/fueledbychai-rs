@@ -23,10 +23,8 @@ mod auth;
 #[allow(dead_code)]
 #[path = "../../src/auth_rest.rs"]
 mod auth_rest;
-// Shared by the samples that trade: each uses a part of it.
-#[allow(dead_code)]
-#[path = "../../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 // Shared by the samples that can fill: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../../src/positions.rs"]

@@ -38,10 +38,8 @@ mod auth_mainnet;
 #[allow(dead_code)]
 #[path = "../../src/auth_rest.rs"]
 mod auth_rest;
-// Shared by the samples that trade: each uses a part of it.
-#[allow(dead_code)]
-#[path = "../../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 // Shared by the mainnet samples: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../../src/mainnet.rs"]
