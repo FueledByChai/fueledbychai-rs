@@ -22,7 +22,7 @@
 mod accept;
 mod accept_args;
 // testnet_trade's command line and helpers, and the glue and testnet wiring the samples that
-// trade share (`src/link.rs`, `src/testnet.rs`), reused as they are.
+// trade share (`fbc_live::link`, `src/testnet.rs`), reused as they are.
 #[allow(dead_code)]
 #[path = "../testnet_trade/args.rs"]
 mod args;
@@ -31,9 +31,8 @@ mod auth;
 #[path = "../../src/auth_rest.rs"]
 mod auth_rest;
 mod evidence;
-#[allow(dead_code)]
-#[path = "../../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 // testnet_trade's round trip, reused by path, holds the position check: unused here.
 #[allow(dead_code)]
 #[path = "../../src/positions.rs"]

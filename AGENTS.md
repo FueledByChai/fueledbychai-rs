@@ -302,7 +302,8 @@ holds two of them for one pull request. The rules after the three roles bind all
   ingest stamp to write done, off Linux read from the session's journal and labelled so),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
-  from `Secrets` by `src/auth`), and `crates/fbc-examples` with the owner-run samples; the
+  from `Secrets` by `src/auth`), `crates/fbc-live` with its link (`src/link.rs`, the samples'
+  glue moved there, 0155), and `crates/fbc-examples` with the owner-run samples; the
   rest are planned. Members are the `crates/fbc-*` and
   `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -610,7 +611,7 @@ holds two of them for one pull request. The rules after the three roles bind all
     cancel-all only under the held market lease after a trustworthy resync with no order not
     ours in view, the resync requested after the latest order-entry epoch end the consumer
     reports (`Registry::order_entry_epoch_ended`, at the `recv_mono` of the last envelope
-    before it, as the samples' `src/link.rs` does; the orphan escalation alike; FBC-9svb),
+    before it, as fbc-live's link does; the orphan escalation alike; FBC-9svb),
     otherwise our orders cancelled by explicit reference, named again on each
     resync while Killed, never an account cancel-all, and own fills counted once in every state
     while foreign ones are flagged; venue-initiated fills (0120; `tests/venue_fills.rs`): a
@@ -756,6 +757,25 @@ holds two of them for one pull request. The rules after the three roles bind all
     run `ExecSession` against the stub as the setup's `OrderEntryStub` says, on a paused clock
     the check moves, fbc-oms authorizing every order command (0083, 0085), `mixed_batch` reading a refused and an unanswered batch item as the stub's `BatchFailures` declares (0089); still planned: the suite's other checks and the rest of the conformance
     toy).
+  - `crates/fbc-live` (0155): the order-safety glue a live consumer runs beside its order-entry
+    sessions, depending on `fbc-core`, `fbc-oms` and `fbc-runtime` only, never on a venue crate
+    (`fbc-conformance` and `fbc-journal` dev-dependencies, its tests on the conformance toy),
+    branching on no venue's name (0003), `publish = false`. So far `src/link.rs` (FBC-umqi), moved
+    from fbc-examples whole with its behaviour: `Link`, the glue between one account's order-entry
+    session and its fbc-oms `Registry` (outcomes and order events routed by request and item, fills
+    through the `FillLedger`, each fill it refuses for its time kept in `Link::fill_refusals`,
+    resyncs applied at `ResyncEnd`, each epoch's end reported at its last `recv_mono`, FBC-9svb; the
+    one path commands take to the session, `Link::submit`; a Safety cancel for each unprotected
+    order the registry holds open, 0080; `Coverage` of the orders a cancel of ours covers, so an
+    order of ours a cancel not ours ends is noted, FBC-aoh5; venue text shown through `shown` and
+    `described`, whose limits stay fixed, 0155 item 8), the session handler's five entry points
+    public methods of it, and `LinkHandler`, which hands each call on and then calls the consumer's
+    wake, a closure. It still times each submission on a std clock of its own (`Link::now`) until
+    FBC-y7lq (0155 item 3). Its tests: `tests/link_epoch_end.rs`, `tests/coverage.rs` and
+    `tests/shown.rs`, moved from the samples' tests, `tests/handler.rs`, `tests/paths.rs` (the paths
+    no sample walks, through a toy `ExecSession`'s `ExecOrders` it never runs), a unit test of the
+    kinds it names, and `tests/manifest.rs`, which holds its normal dependencies to those three
+    (0155 item 1).
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is
@@ -769,21 +789,21 @@ holds two of them for one pull request. The rules after the three roles bind all
     `examples/testnet_trade/` (FBC-x69b): Paradex TESTNET only (the URLs, exactly the testnet's
     or a loopback stub's at `/v1`, and the chain id checked before anything connects), an
     fbc-oms registry declared an owner-assisted testnet run (decision 0067) behind one
-    `ExecSession`, its events routed into the registry by `src/link.rs` (the ExecHandler-to-Registry
-    glue), one post-only order placed well away from the touch read
+    `ExecSession`, its events routed into the registry by `fbc_live::link` (the
+    ExecHandler-to-Registry glue, 0155), one post-only order placed well away from the touch read
     from `GET /orderbook` (read again just before the place), its size, caps, side, distance and
     client-id namespace all required flags, cancelled, then Stop (`tests/testnet_trade.rs`,
     against a Paradex-shaped conformance stub). Its credentials come from environment variables
     through `src/auth.rs`, a review path included by path, not a module of the empty library
     target. And `examples/paradex_testnet_acceptance/` (FBC-xji8): FBC-8xr's owner-run
-    acceptance run on Paradex TESTNET, reusing testnet_trade's flags and helpers and the shared
-    glue and guard by path: place, amend, cancel, batch create, cancel-many, an IOC expiry,
-    behind `--allow-fill` a take flattened by a reduce-only IOC and a partly filled order's
-    amend (FBC-6fnc), and cancel-on-disconnect on a dropped socket and on a graceful close, each
-    through an fbc-oms authorization, in three phases (a fresh registry and session each); after
-    every step its own authenticated REST reads (`src/auth_rest.rs`, a review path) compare GET
-    /orders and GET /positions with the order stream; it writes `report.md`, `evidence.json`,
-    its journal and a scrubbed fixture slice for `fixtures/paradex/exec-recorded/`
+    acceptance run on Paradex TESTNET, reusing testnet_trade's flags and helpers and, by path, the
+    testnet guard, its sessions routed through `fbc_live::link`: place, amend, cancel, batch create,
+    cancel-many, an IOC expiry, behind `--allow-fill` a take flattened by a reduce-only IOC and a
+    partly filled order's amend (FBC-6fnc), and cancel-on-disconnect on a dropped socket and on a
+    graceful close, each through an fbc-oms authorization, in three phases (a fresh registry and
+    session each); after every step its own authenticated REST reads (`src/auth_rest.rs`, a review
+    path) compare GET /orders and GET /positions with the order stream; it writes `report.md`,
+    `evidence.json`, its journal and a scrubbed fixture slice for `fixtures/paradex/exec-recorded/`
     (`tests/paradex_testnet_acceptance.rs`, against a stub model of the account; how the owner
     runs it, from the deployment box too: `crates/fbc-examples/README.md`).
     And `examples/testnet_quote/` (FBC-elg7): the same testnet guard and wiring, a
@@ -1431,10 +1451,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     alone. The probe's credentials come from the environment through `src/auth_qfex.rs`, a review
     path, which also hands each signed read to the connector; the probe reuses
     `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs` (the caps'
-    conversion to lots and the lease directory) by path. The samples that trade share `src/link.rs`
-    (the glue; `Link::ledger` shows its fill ledger and
-    `Link::fill_refusals` lists each fill that ledger refuses for its time) and `src/testnet.rs`
-    (guard and wiring), and the mainnet ones `src/mainnet.rs` (the mainnet guard), included by path.
+    conversion to lots and the lease directory) by path. The samples that trade route their
+    sessions through fbc-live's link: the Paradex samples through `fbc_live::link`, the probe
+    through `src/link.rs`, a re-export shim it includes by path, with a `LinkHandler` of its own
+    on an `Rc<Notify>` wake, until FBC-bddu moves it onto the library and deletes the shim (0155
+    item 9). They share `src/testnet.rs` (guard and wiring), and the mainnet ones `src/mainnet.rs`
+    (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:

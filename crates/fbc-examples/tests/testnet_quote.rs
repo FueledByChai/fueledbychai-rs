@@ -34,10 +34,8 @@ mod auth_mainnet;
 #[allow(dead_code)]
 #[path = "../src/auth_rest.rs"]
 mod auth_rest;
-// Shared by the samples that trade: each uses a part of it.
-#[allow(dead_code)]
-#[path = "../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 // Shared by the mainnet samples: each uses a part of it.
 #[allow(dead_code)]
 #[path = "../src/mainnet.rs"]
@@ -5419,104 +5417,4 @@ fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() 
         NotOurs::SameEvent
     );
     assert_eq!(seen.on_cancel(d3, buy, None, t0 + s(5)), NotOurs::Repeat);
-}
-
-#[test]
-fn a_cancel_of_ours_covers_its_orders_only_once_the_session_reports_it_sent() {
-    // Codex r4308625182 / RB-aoh5-3 on PR #159: the session decodes a frame waiting in its turn
-    // before it writes what was queued, so a cancel of ours submitted but not yet reported sent
-    // covers nothing (another program's cancel read then is not ours); reported sent, it covers
-    // its orders; reported not sent (Codex r4308561813), it never does. One another request of
-    // ours still covers stays covered.
-    let lease =
-        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
-    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_000_000_000));
-    let mut cid = || mint.mint().unwrap();
-    let (a, b, c) = (cid(), cid(), cid());
-    let mut covered = link::Coverage::default();
-    covered.submitted(RpcId(1), [a]);
-    covered.submitted(RpcId(2), [a, b]);
-    assert!(!covered.covers(a) && !covered.covers(b), "pending: not yet");
-    covered.reported(RpcId(1), true);
-    assert!(covered.covers(a));
-    assert!(!covered.covers(b));
-    // Request 2 never written: b never covered, a still is (request 1).
-    covered.reported(RpcId(2), false);
-    assert!(covered.covers(a));
-    assert!(!covered.covers(b));
-    // A report of no request pending changes nothing.
-    covered.reported(RpcId(2), true);
-    assert!(!covered.covers(b));
-    // Forgotten once ended, pending or covered.
-    covered.submitted(RpcId(3), [b, c]);
-    covered.reported(RpcId(3), true);
-    covered.submitted(RpcId(4), [a, c]);
-    covered.retain(|x| *x == b);
-    assert!(!covered.covers(a) && covered.covers(b) && !covered.covers(c));
-    covered.reported(RpcId(4), true);
-    assert!(
-        !covered.covers(a) && !covered.covers(c),
-        "ended while pending"
-    );
-
-    // Codex r4309154204 / RB-aoh5-4: a cancel the venue refused (for its rate, say) no longer
-    // covers the order it named, while another request of ours still does; a whole request
-    // refused covers nothing it covered; a refusal while pending leaves nothing to cover.
-    let mut covered = link::Coverage::default();
-    covered.submitted(RpcId(5), [a, b]);
-    covered.submitted(RpcId(6), [b]);
-    covered.reported(RpcId(5), true);
-    covered.reported(RpcId(6), true);
-    covered.refused(RpcId(5), Some(a));
-    assert!(!covered.covers(a), "refused for a");
-    covered.refused(RpcId(5), Some(b));
-    assert!(covered.covers(b), "request 6 still covers b");
-    covered.refused(RpcId(6), None);
-    assert!(!covered.covers(b));
-    covered.submitted(RpcId(7), [a, c]);
-    covered.submitted(RpcId(8), [c]);
-    covered.reported(RpcId(8), true);
-    covered.refused(RpcId(7), Some(a));
-    covered.reported(RpcId(7), true);
-    assert!(!covered.covers(a) && covered.covers(c));
-    covered.refused(RpcId(7), None);
-    assert!(covered.covers(c), "request 8 still covers c");
-
-    // Codex r4310042612: an order a user cancel ended while only unanswered requests of ours
-    // covered it is held. Every one refused: released, a cancel not ours; one accepted: ours.
-    let (buy, sell) = (Side::Buy, Side::Sell);
-    let mut covered = link::Coverage::default();
-    covered.submitted(RpcId(9), [a]);
-    covered.submitted(RpcId(10), [a, b]);
-    covered.reported(RpcId(9), true);
-    covered.reported(RpcId(10), true);
-    assert!(covered.hold(a, buy, Some(ExchNs(7))));
-    covered.retain(|_| false);
-    assert!(
-        covered.refused(RpcId(9), Some(a)).is_empty(),
-        "10 still covers a"
-    );
-    assert_eq!(
-        covered.refused(RpcId(10), None),
-        vec![link::Released {
-            cid: a,
-            side: buy,
-            at: Some(ExchNs(7))
-        }]
-    );
-    assert!(covered.refused(RpcId(10), None).is_empty(), "released once");
-    covered.submitted(RpcId(11), [b]);
-    covered.reported(RpcId(11), true);
-    assert!(covered.hold(b, sell, None));
-    covered.accepted(RpcId(11), Some(b));
-    assert!(
-        covered.refused(RpcId(11), Some(b)).is_empty(),
-        "accepted: ours"
-    );
-    // Accepted before the order's end: ours, nothing held.
-    covered.submitted(RpcId(12), [c]);
-    covered.reported(RpcId(12), true);
-    covered.accepted(RpcId(12), None);
-    assert!(!covered.hold(c, buy, None));
-    assert!(!covered.hold(a, buy, None), "covered by nothing");
 }
