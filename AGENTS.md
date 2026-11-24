@@ -302,10 +302,10 @@ holds two of them for one pull request. The rules after the three roles bind all
   ingest stamp to write done, off Linux read from the session's journal and labelled so),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
-  from `Secrets` by `src/auth`), `crates/fbc-live` with its link (`src/link.rs`, the samples'
-  glue moved there, 0155), and `crates/fbc-examples` with the owner-run samples; the
-  rest are planned. Members are the `crates/fbc-*` and
-  `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
+  from `Secrets` by `src/auth`), `crates/fbc-live` with its link and its classifier of cancels
+  not ours (`src/link.rs`, `src/not_ours.rs`, the samples' glue moved there, 0155), and
+  `crates/fbc-examples` with the owner-run samples; the rest are planned. Members are the
+  `crates/fbc-*` and `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
@@ -762,32 +762,43 @@ holds two of them for one pull request. The rules after the three roles bind all
     toy).
   - `crates/fbc-live` (0155): the order-safety glue a live consumer runs beside its order-entry
     sessions, depending on `fbc-core`, `fbc-oms` and `fbc-runtime` only, never on a venue crate
-    (`fbc-conformance`, `fbc-journal`, `fbc-sim`, tokio and `rust_decimal` dev-dependencies,
-    its tests on the conformance toy, and its replay test on the runtime's toy venue by path),
-    branching on no venue's name (0003), `publish = false`. So far `src/link.rs` (FBC-umqi), moved
-    from fbc-examples whole with its behaviour: `Link`, the glue between one account's order-entry
+    (`fbc-conformance`, `fbc-journal`, `fbc-sim`, tokio and `rust_decimal` dev-dependencies, its
+    tests on the conformance toy, and its replay test on the runtime's toy venue by path), branching
+    on no venue's name (0003), `publish = false`. So far `src/link.rs` (FBC-umqi), moved from
+    fbc-examples whole with its behaviour: `Link`, the glue between one account's order-entry
     session and its fbc-oms `Registry` (outcomes and order events routed by request and item, fills
     through the `FillLedger`, each fill it refuses for its time kept in `Link::fill_refusals`,
     resyncs applied at `ResyncEnd`, each epoch's end reported at its last `recv_mono`, FBC-9svb; the
     one path commands take to the session, `Link::submit`; a Safety cancel for each unprotected
     order the registry holds open, 0080; `Coverage` of the orders a cancel of ours covers, so an
-    order of ours a cancel not ours ends is noted, FBC-aoh5; venue text shown through `shown` and
-    `described`, whose limits stay fixed, 0155 item 8), the session handler's five entry points
-    public methods of it, and `LinkHandler`, which hands each call on and then calls the consumer's
-    wake, a closure. It reads no clock but its session's shard clock (FBC-y7lq, 0155 item 3): the
-    link times each submission it sends on the `ExecOrders::now` of the session it was last
-    attached to or submitted through (`Link::now`, `None` before either), an `ExecOrders` on
-    another clock noted as a `Note::Problem` and read from then on, its submission still going;
-    its `clippy.toml` disallows the std `Instant` and `SystemTime` reads and
-    `fbc_runtime::SystemWallClock`. Its tests: `tests/link_epoch_end.rs`, `tests/coverage.rs` and
-    `tests/shown.rs`, moved from the samples' tests, `tests/handler.rs`, `tests/paths.rs` (the paths
-    no sample walks, through a toy `ExecSession`'s `ExecOrders` it never runs), a unit test of the
-    kinds it names, `tests/manifest.rs`, which holds its normal dependencies to those three
-    (0155 item 1), `tests/link_clock.rs` (sends timed on the session's stamps on a paused
-    runtime against the conformance stub, and a second clock noted), `tests/replay_clock.rs` (two
-    closed-loop replays through a `Link`, on SimVenue, with the same send times and notes; 0155
-    item 4) and `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in
-    its source).
+    order of ours a cancel not ours ends is noted, FBC-aoh5, and `Link::cancels_not_ours_seen` true
+    from the first one noted on, never false again, `Link::forget` keeping it, FBC-21g6; venue text
+    shown through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
+    handler's five entry points public methods of it, and `LinkHandler`, which hands each call on
+    and then calls the consumer's wake, a closure. It reads no clock but its session's shard clock
+    (FBC-y7lq, 0155 item 3): the link times each submission it sends on the `ExecOrders::now` of the
+    session it was last attached to or submitted through (`Link::now`, `None` before either), an
+    `ExecOrders` on another clock noted as a `Note::Problem` and read from then on, its submission
+    still going; its `clippy.toml` disallows the std `Instant` and `SystemTime` reads and
+    `fbc_runtime::SystemWallClock`. And `src/not_ours.rs` (FBC-21g6, 0155 item 2), FBC-aoh5's
+    classifier moved from `testnet_quote` with its behaviour: `CancelsNotOurs`, one per market,
+    under the consumer's `NotOursConfig::new(span, window)` (each refused zero, no `Default`), told
+    each order of ours placed, each place that never rested and the orders not ended, and
+    classifying each cancel not ours (`on_cancel`) as `NotOurs::SameEvent`, `First` or `Repeat`,
+    every call taking `now: MonoNs` from its caller; the WARN, the Stop and every text stay the
+    consumer's. Its tests: `tests/link_epoch_end.rs`, `tests/coverage.rs` and `tests/shown.rs`,
+    moved from the samples' tests, `tests/handler.rs`, `tests/paths.rs` (the paths no sample walks,
+    through a toy `ExecSession`'s `ExecOrders` it never runs), a unit test of the kinds it names,
+    `tests/manifest.rs`, which holds its normal dependencies to those three (0155 item 1),
+    `tests/link_clock.rs` (sends timed on the session's stamps on a paused runtime against the
+    conformance stub, and a second clock noted), `tests/replay_clock.rs` (two closed-loop replays
+    through a `Link`, on SimVenue, with the same send times and notes; 0155 item 4),
+    `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in its source)
+    and `tests/not_ours.rs` (the classifier's test moved from `testnet_quote`'s, on `MonoNs`, a
+    venue time absent on either side, a requote that never rested, the consumer's span read on
+    both of its measures, each bound held where it falls, and a zero span or window refused); in
+    `tests/paths.rs` too, `cancels_not_ours_seen` set by a cancel not ours noted at once and by one
+    held until its covering cancel was refused, and kept through `Link::forget`.
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is

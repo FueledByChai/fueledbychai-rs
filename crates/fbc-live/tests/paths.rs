@@ -1,12 +1,13 @@
-//! The link's paths a consumer's session walks that no sample's test reaches on every run: what
-//! it notes for an event out of its place, a venue error after the login, an epoch the codec
-//! closed, a request the link never submitted, an amend reported sent, a request reported twice,
-//! an outcome naming no item of its request, a fill the registry refuses, an unprotected order
-//! it cannot cancel (decision 0155 item 9), and a place reported not sent (FBC-y7lq), which a
-//! sample's test reaches only when it loses its connection at the right moment. Every command
-//! goes through an fbc-oms authorization and a real `ExecSession`'s `ExecOrders`, on the
-//! conformance toy, the session never run: its submissions are queued, and the test hands the
-//! link what the session would report.
+//! The link's paths a consumer's session walks that no sample's test reaches on every run: what it
+//! notes for an event out of its place, a venue error after the login, an epoch the codec closed, a
+//! request the link never submitted, an amend reported sent, a request reported twice, an outcome
+//! naming no item of its request, a fill the registry refuses, an unprotected order it cannot
+//! cancel (decision 0155 item 9), a place reported not sent (FBC-y7lq), which a sample's test
+//! reaches only when it loses its connection at the right moment, and the cancels not ours that
+//! make `Link::cancels_not_ours_seen` hold, through `Link::forget` too (FBC-21g6, decision 0155
+//! item 2). Every command goes through an fbc-oms authorization and a real `ExecSession`'s
+//! `ExecOrders`, on the conformance toy, the session never run: its submissions are queued, and the
+//! test hands the link what the session would report.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -16,13 +17,14 @@ use std::time::Duration;
 
 use fbc_conformance::toy::{EXEC_URL_KEY, INST_A, OWN_NS, REST_URL_KEY, SYMBOL_A, ToyFactory};
 use fbc_core::{
-    AccountKey, AccountLease, AckLevel, AssetSym, Channel, CidMatch, CidMint, ClientOrderId,
-    ConnKey, ConnState, EncodeReceipt, Envelope, ExchNs, ExchTsKind, ExecEvent, FillEvent,
-    FillIdent, FillOrigin, ItemRef, Liquidity3, Lots, MarketLease, ModeScope, MonoNs, Namespace,
-    NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason, OrderCaps, OrderKind,
-    OrderUpdate, RefKind, Reject, RejectKind, RpcId, Secrets, Side, SignedLots, Stamp, StreamId,
-    SubmitHandle, SubmitOutcome, TagSet, Ticks, Tif, VenueCaps, VenueConfig, VenueFactory,
-    VenueMode, VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, dispatch_market_data,
+    AccountKey, AccountLease, AckLevel, AssetSym, CancelReason, Channel, CidMatch, CidMint,
+    ClientOrderId, ConnKey, ConnState, EncodeReceipt, Envelope, ExchNs, ExchTsKind, ExecEvent,
+    FillEvent, FillIdent, FillOrigin, ItemRef, Liquidity3, Lots, MarketLease, ModeScope, MonoNs,
+    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason, OrderCaps,
+    OrderKind, OrderUpdate, RefKind, Reject, RejectKind, RpcId, Secrets, Side, SignedLots, Stamp,
+    StreamId, SubmitHandle, SubmitOutcome, TagSet, Ticks, Tif, VenueCaps, VenueConfig,
+    VenueFactory, VenueMode, VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs,
+    dispatch_market_data,
 };
 use fbc_live::link::{CODEC_CLOSED, Link, LinkHandler, Note};
 use fbc_oms::{
@@ -626,4 +628,111 @@ fn a_place_reported_not_sent_tells_its_order_so_and_is_read_as_its_outcome() {
     assert_eq!(rec.sent_at(), None);
     assert_eq!(rig.link.sent_counts(), (0, 0));
     assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+/// Our order `cid`, venue order `v`, ended by a user cancel (`Canceled(Requested)`), which a
+/// venue may report without saying who sent it.
+fn user_cancelled(cid: ClientOrderId, v: &str) -> ExecEvent {
+    match open(cid, v) {
+        ExecEvent::Order(u) => ExecEvent::Order(OrderUpdate {
+            state: VenueOrderState::Canceled(CancelReason::Requested),
+            ..u
+        }),
+        _ => unreachable!("open builds an order event"),
+    }
+}
+
+/// Our place `rpc` of order `cid` accepted as venue order `v` and shown open, from ingest
+/// sequence `seq`.
+fn accepted_and_open(link: &mut Link, rpc: RpcId, cid: ClientOrderId, v: &str, seq: u64) {
+    link.on_submitted(sent(rpc));
+    let item = ItemRef {
+        idx: 0,
+        cid: Some(cid),
+        vid: Some(vid(v)),
+    };
+    let outcome = SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
+    };
+    link.on_exec(env(
+        seq,
+        2_000 + seq,
+        ExecEvent::Outcome {
+            rpc,
+            item: Some(item),
+            outcome,
+        },
+    ));
+    link.on_exec(env(seq + 1, 2_001 + seq, open(cid, v)));
+}
+
+/// The cancels not ours the link noted, by client id, in order.
+fn not_ours(link: &Link) -> Vec<ClientOrderId> {
+    link.notes()
+        .iter()
+        .filter_map(|n| match n {
+            Note::CancelNotOurs { cid, .. } => Some(*cid),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn cancels_not_ours_seen_holds_from_the_first_cancel_not_ours_on_and_through_forget() {
+    // A user cancel no cancel of ours covers: noted at once, and seen from then on.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    assert!(!rig.link.cancels_not_ours_seen(), "none noted yet");
+    rig.link.on_exec(env(12, 2_100, user_cancelled(a, "v-a")));
+    assert_eq!(not_ours(&rig.link), [a]);
+    assert!(rig.link.cancels_not_ours_seen());
+    // Forgetting every note, the cancel not ours among them, keeps it, as does what follows.
+    let taken = rig.link.forget(rig.link.notes().len());
+    assert!(
+        taken
+            .iter()
+            .any(|n| matches!(n, Note::CancelNotOurs { cid, .. } if *cid == a))
+    );
+    assert!(rig.link.notes().is_empty());
+    assert!(rig.link.cancels_not_ours_seen());
+    let (b, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, b, "v-b", 20);
+    rig.link.forget(rig.link.notes().len());
+    assert!(rig.link.cancels_not_ours_seen(), "never false again");
+
+    // Codex r4310042612: a user cancel while only an unanswered cancel of ours covers the order
+    // is held, and nothing is seen; the venue refusing that cancel makes it a cancel not ours,
+    // seen from then on, through forget too.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let caps = order_caps();
+    let cancel = match rig.link.reg().cancellable(a).unwrap().cancel(&caps) {
+        CancelChoice::Send(cmd) => cmd,
+        CancelChoice::AwaitAck => panic!("the toy cancels by client id"),
+    };
+    let auth = rig.link.reg().authorize(ACCT, cancel).unwrap();
+    let cancel = rig.link.submit(&rig.orders, auth).unwrap();
+    rig.link.on_submitted(sent(cancel));
+    rig.link.on_exec(env(12, 2_100, user_cancelled(a, "v-a")));
+    assert!(not_ours(&rig.link).is_empty(), "held");
+    assert!(!rig.link.cancels_not_ours_seen(), "held, not seen");
+    rig.link.on_exec(env(
+        13,
+        2_101,
+        ExecEvent::Outcome {
+            rpc: cancel,
+            item: Some(ItemRef {
+                idx: 0,
+                cid: Some(a),
+                vid: Some(vid("v-a")),
+            }),
+            outcome: SubmitOutcome::Rejected(reject("no such order")),
+        },
+    ));
+    assert_eq!(not_ours(&rig.link), [a]);
+    assert!(rig.link.cancels_not_ours_seen());
+    rig.link.forget(rig.link.notes().len());
+    assert!(rig.link.cancels_not_ours_seen(), "kept through forget");
 }
