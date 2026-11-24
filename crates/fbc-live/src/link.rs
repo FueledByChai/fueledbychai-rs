@@ -89,17 +89,25 @@
 //!   Each consumer decides what it means.
 //! - **Notes.** Everything the consumer may wait on is appended to [`Link::notes`], in order.
 //!
-//! Times on the shard's monotonic clock are taken from each event's stamp; a submission's send
-//! time, which carries no stamp, from [`Link::now`], a clock started with the session's
-//! [`IngestClock`](fbc_runtime::IngestClock), until FBC-y7lq moves it onto the session's own
-//! clock (decision 0155 item 3). A fill's venue time is its aligned wall time, unadjusted (no
-//! clock-skew estimate yet), which a replayed fill's admission and a fill's placement against a
-//! seed read (fbc-oms's resync; decisions 0055, 0095 and 0155 item 3).
+//! - **The clock** (decision 0155 item 3). The link reads no clock of its own. Times on the
+//!   shard's monotonic clock are taken from each event's stamp; a submission's send time, which
+//!   carries no stamp, from [`Link::now`]: the shard clock, its
+//!   [`IngestClock`](fbc_runtime::IngestClock), of the session whose [`ExecOrders`] the link was
+//!   last attached to ([`Link::attach`]) or submitted through ([`Link::submit`]), read through
+//!   [`ExecOrders::now`] as that session reads it. A submission is timed on the clock last
+//!   taken, since its [`SubmitHandle`] names no session: the reporting session's whenever the
+//!   link's sessions share one clock, as every sample's do. An [`ExecOrders`] on another clock
+//!   is noted as a problem ([`Note::Problem`]) and its clock read from then on; its submission
+//!   still goes, so no cancel is held back. In a closed-loop replay that clock is
+//!   [`IngestClock::replayed`](fbc_runtime::IngestClock::replayed), so two replays of one
+//!   journal record the same send times (decision 0155 item 4). A fill's venue time is its
+//!   aligned wall time, unadjusted (no clock-skew estimate yet), which a replayed fill's
+//!   admission and a fill's placement against a seed read (fbc-oms's resync; decisions 0055,
+//!   0095 and 0155 item 3).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fbc_core::{
     AccountKey, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope,
@@ -515,7 +523,9 @@ pub struct Link {
     epoch_authenticated: bool,
     epoch_closed: bool,
     epoch_error: Option<String>,
-    origin: Instant,
+    /// The orders of the session the link was last attached to or submitted through: whose
+    /// shard clock [`Link::now`] reads.
+    clock: Option<ExecOrders>,
     notes: Vec<Note>,
     /// The places and cancels sent that notes [`Link::forget`] took counted.
     forgotten: (usize, usize),
@@ -533,8 +543,8 @@ pub struct Link {
 
 impl Link {
     /// The glue over `reg`, its fills deduplicated by `ledger`, resyncs applied under the venue's
-    /// order caps `caps` and `ladder`. Build it just before the session's `IngestClock`, so
-    /// [`Link::now`] reads the same monotonic origin to within the build.
+    /// order caps `caps` and `ladder`. It reads no clock until it is attached to a session or
+    /// submits through one ([`Link::now`]).
     pub fn new(reg: Registry, ledger: FillLedger, caps: OrderCaps, ladder: LadderConfig) -> Link {
         Link {
             reg,
@@ -549,7 +559,7 @@ impl Link {
             epoch_authenticated: false,
             epoch_closed: false,
             epoch_error: None,
-            origin: Instant::now(),
+            clock: None,
             notes: Vec::new(),
             forgotten: (0, 0),
             session: None,
@@ -560,9 +570,30 @@ impl Link {
     }
 
     /// Where the Safety cancels of unprotected orders go: the session's `orders`, under the
-    /// account `acct`. Attached before the session runs, so before it tells any.
+    /// account `acct`. Attached before the session runs, so before it tells any. The link times
+    /// its submissions on that session's shard clock from then on ([`Link::now`]).
     pub fn attach(&mut self, orders: ExecOrders, acct: AccountKey) {
+        self.take_clock(&orders);
         self.session = Some((orders, acct));
+    }
+
+    /// Takes the shard clock of the session `orders` submits to, for [`Link::now`]: one other
+    /// than the clock last taken is noted as a problem, and read from then on (decision 0155
+    /// item 3).
+    fn take_clock(&mut self, orders: &ExecOrders) {
+        if self
+            .clock
+            .as_ref()
+            .is_some_and(|last| !last.shares_clock(orders))
+        {
+            self.problem(
+                "a session on another shard clock than the one the link timed its sends on: its \
+                 send times are now on that session's clock, and those before on the other \
+                 (decision 0155 item 3)"
+                    .to_owned(),
+            );
+        }
+        self.clock = Some(orders.clone());
     }
 
     /// The Safety cancel request submitted for our order `cid` when the session told it
@@ -739,19 +770,20 @@ impl Link {
         refused.last().map(|last| (refused.len(), *last))
     }
 
-    /// Now, on the monotonic clock from the glue's origin and on the wall clock.
-    pub fn now(&self) -> (MonoNs, WallNs) {
-        let mono = u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX));
-        (MonoNs(mono), WallNs(wall))
+    /// Now on the shard clock of the session the link was last attached to or submitted
+    /// through, on its monotonic clock from the clock's origin and on the wall clock
+    /// ([`ExecOrders::now`], decision 0155 item 3): `None` before the first attach or submit.
+    /// The link times each request it submits by it; a consumer may read it for what it times
+    /// on the session's clock, such as a planner's pass.
+    pub fn now(&self) -> Option<(MonoNs, WallNs)> {
+        self.clock.as_ref().map(ExecOrders::now)
     }
 
     /// Submits `auth` through `orders`, remembering the order each item names: its request id,
     /// or why it was not submitted (nothing was then remembered). A cancel covers the orders it
     /// names, and a cancel-all every live order of ours on its market now, once the session
-    /// reports it sent (module documentation): until then it is pending.
+    /// reports it sent (module documentation): until then it is pending. The link times its
+    /// sends on `orders`' shard clock from then on ([`Link::now`]).
     pub fn submit(&mut self, orders: &ExecOrders, auth: Authorization) -> Result<RpcId, String> {
         let items = self.items_of(auth.command())?;
         let scope = match auth.command() {
@@ -763,6 +795,7 @@ impl Link {
             VenueCommand::PlaceBatch(os) => os.iter().map(|o| (o.cid, o.inst)).collect(),
             _ => Vec::new(),
         };
+        self.take_clock(orders);
         let rpc = orders.submit(auth).map_err(|e| format!("{e:?}"))?;
         let named = items.iter().filter_map(|item| match item {
             Item::Cancel(cid) => Some(*cid),
@@ -855,7 +888,9 @@ impl Link {
     pub fn on_submitted(&mut self, handle: SubmitHandle) {
         let SubmitHandle { rpc, receipt } = handle;
         let items = self.sent.get(&rpc).cloned().unwrap_or_default();
-        let (mono, wall) = self.now();
+        // Only a request submitted here holds items, and submitting took a clock: before any,
+        // no item is timed, so the clock's origin stands for none.
+        let (mono, wall) = self.now().unwrap_or((MonoNs(0), WallNs(0)));
         for (idx, item) in items.into_iter().enumerate() {
             let (cid, op) = Link::op(item, rpc);
             // An amend the session took is in flight until its outcome resolves it, a not-sent

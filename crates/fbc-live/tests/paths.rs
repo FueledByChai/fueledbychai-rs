@@ -1,10 +1,12 @@
-//! The link's paths a consumer's session walks that no sample's test reaches: what it notes for
-//! an event out of its place, a venue error after the login, an epoch the codec closed, a
-//! request the link never submitted, an amend reported sent, a request reported twice, an
-//! outcome naming no item of its request, a fill the registry refuses, and an unprotected order
-//! it cannot cancel (decision 0155 item 9). Every command goes through an fbc-oms authorization
-//! and a real `ExecSession`'s `ExecOrders`, on the conformance toy, the session never run: its
-//! submissions are queued, and the test hands the link what the session would report.
+//! The link's paths a consumer's session walks that no sample's test reaches on every run: what
+//! it notes for an event out of its place, a venue error after the login, an epoch the codec
+//! closed, a request the link never submitted, an amend reported sent, a request reported twice,
+//! an outcome naming no item of its request, a fill the registry refuses, an unprotected order
+//! it cannot cancel (decision 0155 item 9), and a place reported not sent (FBC-y7lq), which a
+//! sample's test reaches only when it loses its connection at the right moment. Every command
+//! goes through an fbc-oms authorization and a real `ExecSession`'s `ExecOrders`, on the
+//! conformance toy, the session never run: its submissions are queued, and the test hands the
+//! link what the session would report.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -17,10 +19,10 @@ use fbc_core::{
     AccountKey, AccountLease, AckLevel, AssetSym, Channel, CidMatch, CidMint, ClientOrderId,
     ConnKey, ConnState, EncodeReceipt, Envelope, ExchNs, ExchTsKind, ExecEvent, FillEvent,
     FillIdent, FillOrigin, ItemRef, Liquidity3, Lots, MarketLease, ModeScope, MonoNs, Namespace,
-    NamespaceLease, NewOrder, NonceBlock, NonceSource, OrderCaps, OrderKind, OrderUpdate, RefKind,
-    Reject, RejectKind, RpcId, Secrets, Side, SignedLots, Stamp, StreamId, SubmitHandle,
-    SubmitOutcome, TagSet, Ticks, Tif, VenueCaps, VenueConfig, VenueFactory, VenueMode,
-    VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, dispatch_market_data,
+    NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason, OrderCaps, OrderKind,
+    OrderUpdate, RefKind, Reject, RejectKind, RpcId, Secrets, Side, SignedLots, Stamp, StreamId,
+    SubmitHandle, SubmitOutcome, TagSet, Ticks, Tif, VenueCaps, VenueConfig, VenueFactory,
+    VenueMode, VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs, dispatch_market_data,
 };
 use fbc_live::link::{CODEC_CLOSED, Link, LinkHandler, Note};
 use fbc_oms::{
@@ -605,4 +607,23 @@ fn an_unprotected_order_whose_cancel_waits_for_its_ack_is_left_held() {
             if told == &[(a, INST_A)] && rpcs.is_empty() && l == &[left]
     ));
     assert_eq!(rig.link.safety_cancel_of(a), None);
+}
+
+#[test]
+fn a_place_reported_not_sent_tells_its_order_so_and_is_read_as_its_outcome() {
+    let mut rig = Rig::started(order_caps());
+    let (cid, rpc) = rig.place();
+    assert_eq!(rig.link.outcome_of(rpc), None, "unanswered");
+    let not_sent = SubmitHandle {
+        rpc,
+        receipt: Err(NotSentReason::Disconnected),
+    };
+    rig.link.on_submitted(not_sent);
+    let outcome = SubmitOutcome::NotSent(NotSentReason::Disconnected);
+    assert_eq!(rig.link.outcome_of(rpc), Some(outcome));
+    let rec = rig.link.registry().get(cid).unwrap();
+    assert!(rec.state().is_terminal(), "{:?}", rec.state());
+    assert_eq!(rec.sent_at(), None);
+    assert_eq!(rig.link.sent_counts(), (0, 0));
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
 }

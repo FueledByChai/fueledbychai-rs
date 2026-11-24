@@ -576,6 +576,9 @@ dependencies = [
  "fbc-journal",
  "fbc-oms",
  "fbc-runtime",
+ "fbc-sim",
+ "rust_decimal",
+ "tokio",
 ]
 
 [[package]]

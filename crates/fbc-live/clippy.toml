@@ -1,0 +1,24 @@
+# fbc-live reads no clock but its session's shard clock (decision 0155 item 3): the link times
+# each send through ExecOrders::now, and every other piece takes `now` from its caller. These
+# lints miss a read through a tokio Instant fbc-runtime hands out, or inside a dependency's
+# function; review covers both.
+
+[[disallowed-methods]]
+path = "std::time::Instant::now"
+reason = "fbc-live reads no clock but its session's shard clock (decision 0155 item 3)"
+
+[[disallowed-methods]]
+path = "std::time::Instant::elapsed"
+reason = "fbc-live reads no clock but its session's shard clock (decision 0155 item 3)"
+
+[[disallowed-methods]]
+path = "std::time::SystemTime::now"
+reason = "fbc-live reads no clock but its session's shard clock (decision 0155 item 3)"
+
+[[disallowed-methods]]
+path = "std::time::SystemTime::elapsed"
+reason = "fbc-live reads no clock but its session's shard clock (decision 0155 item 3)"
+
+[[disallowed-types]]
+path = "fbc_runtime::SystemWallClock"
+reason = "fbc-live reads no clock but its session's shard clock (decision 0155 item 3)"
