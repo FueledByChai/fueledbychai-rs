@@ -86,7 +86,9 @@
 //!   r4308561813). The session reports a request sent before it writes its first byte, so the
 //!   venue's end of an order by our cancel always comes after its cover. Only the event that
 //!   ends the order counts (a late duplicate of it is not), so one order is noted at most once.
-//!   Each consumer decides what it means.
+//!   Once one is noted, [`Link::cancels_not_ours_seen`] holds for the link's life, through
+//!   [`Link::forget`] too. Each consumer decides what it means; [`crate::not_ours`] classifies
+//!   them under the owner's rule.
 //! - **Notes.** Everything the consumer may wait on is appended to [`Link::notes`], in order.
 //!
 //! - **The clock** (decision 0155 item 3). The link reads no clock of its own. Times on the
@@ -539,6 +541,8 @@ pub struct Link {
     /// The orders of ours a cancel of ours submitted here covers (module documentation): an
     /// order that ends `Canceled(Requested)` outside it was cancelled by someone else.
     covered: Coverage,
+    /// Whether a [`Note::CancelNotOurs`] was ever pushed ([`Link::cancels_not_ours_seen`]).
+    not_ours_seen: bool,
 }
 
 impl Link {
@@ -566,6 +570,7 @@ impl Link {
             safety: HashMap::new(),
             live: HashMap::new(),
             covered: Coverage::default(),
+            not_ours_seen: false,
         }
     }
 
@@ -691,10 +696,19 @@ impl Link {
         counts
     }
 
+    /// Whether the link ever noted a cancel not ours ([`Note::CancelNotOurs`], module
+    /// documentation): true from the first one on, never false again, and kept when
+    /// [`Link::forget`] takes that note. Another program may then be on the account, and an
+    /// instrument cancel-all would cancel its orders too (decision 0155 item 2).
+    pub fn cancels_not_ours_seen(&self) -> bool {
+        self.not_ours_seen
+    }
+
     /// Takes the first `upto` notes out and hands them over, for a consumer that reads each
     /// note once and runs for long: the list then never grows with the run. What
-    /// [`Link::sent_counts`] counts of them is kept; [`Link::outcome_of`],
-    /// [`Link::login_refusals`] and [`Link::told_on`] see only the notes left.
+    /// [`Link::sent_counts`] counts of them is kept, as is [`Link::cancels_not_ours_seen`];
+    /// [`Link::outcome_of`], [`Link::login_refusals`] and [`Link::told_on`] see only the notes
+    /// left.
     pub fn forget(&mut self, upto: usize) -> Vec<Note> {
         let upto = upto.min(self.notes.len());
         let taken: Vec<Note> = self.notes.drain(..upto).collect();
@@ -999,6 +1013,7 @@ impl Link {
         });
         // Orders a user cancel ended while only this refused request covered them: a cancel
         // not ours, its order event read before the refusal (Codex r4310042612 on PR #159).
+        self.not_ours_seen |= !released.is_empty();
         self.notes
             .extend(released.into_iter().map(|r| Note::CancelNotOurs {
                 cid: r.cid,
@@ -1086,6 +1101,7 @@ impl Link {
                     (routed, _) => Note::Order(routed),
                 };
                 self.notes.push(note);
+                self.not_ours_seen |= not_ours.is_some();
                 self.notes.extend(not_ours);
             }
             ExecEvent::Fill(f) => {

@@ -67,7 +67,7 @@ use fbc_conformance::{
     Frame, HttpReply, HttpRouter, PathPattern, Responded, Responder, Step, StubServer, WsScript,
 };
 use fbc_core::{
-    AccountKey, AccountSummary, AssetKey, CidMint, ConfigError, EndpointPlan, ExchNs, ExecCodec,
+    AccountKey, AccountSummary, AssetKey, CidMint, ConfigError, EndpointPlan, ExecCodec,
     ExecEndpoint, FieldSpec, HttpPlan, InstrumentSpecDraft, LimitScope, Lots, MdCodec, Namespace,
     NamespaceLease, OpKind, RpcId, Secret, Secrets, Side, SignedLots, SnapshotSource, SpecTable,
     Subscription, SymbolError, TagSet, Ticks, VenueCaps, VenueConfig, VenueError, VenueFactory,
@@ -5252,169 +5252,35 @@ async fn our_own_cancel_all_whose_order_events_come_before_its_reply_is_never_co
 }
 
 #[test]
-fn cancels_not_ours_of_one_action_are_one_event_and_a_later_action_repeats_it() {
-    use quote::{CancelsNotOurs, EVENT_SPAN, NotOurs};
-    let t0 = tokio::time::Instant::now();
-    let s = Duration::from_secs;
-    // The venue's time on a cancel, `secs` after the first action's.
-    let at = |secs: i64| Some(ExchNs(1_759_500_000_000_000_000 + secs * 1_000_000_000));
-    let lease =
-        NamespaceLease::acquire(&lease_dir(), AccountKey::new(1), Namespace::new(1)).unwrap();
-    let mut mint = CidMint::new(lease, 0, 0, WallNs(1_000_000_000));
-    let mut cid = || mint.mint().unwrap();
-    let (buy, sell) = (Side::Buy, Side::Sell);
-    assert_eq!(EVENT_SPAN, s(1));
-    let mut seen = CancelsNotOurs::new(args::CANCEL_NOT_OURS_WINDOW);
-    assert_eq!(args::CANCEL_NOT_OURS_WINDOW, s(30));
-    // Both sides, placed before it was seen, of one reconcile: one event, even read 1.5 s apart
-    // (split across a cycle); an earlier run's order (placed by no one this run) as well.
-    let (b1, a1, a0, old) = (cid(), cid(), cid(), cid());
-    for (order, side) in [(b1, buy), (a1, sell), (a0, sell)] {
-        seen.placed(order, side, t0);
-    }
-    assert_eq!(seen.on_cancel(b1, buy, at(0), t0 + s(1)), NotOurs::First);
-    let read_later = t0 + Duration::from_millis(2_500);
-    assert_eq!(
-        seen.on_cancel(a1, sell, at(0), read_later),
-        NotOurs::SameEvent
-    );
-    assert_eq!(
-        seen.on_cancel(old, buy, at(0), t0 + s(2)),
-        NotOurs::SameEvent
-    );
-    // RB-aoh5-1 / Codex r4308625185: an order resting since before the first, cancelled by a
-    // later action (the venue's time 10 s on) within 30 s: the repeat.
-    assert_eq!(
-        seen.on_cancel(a0, sell, at(10), t0 + s(11)),
-        NotOurs::Repeat
-    );
-    // A requote placed after it, cancelled within 30 s: the repeat again; its other side,
-    // placed before and cancelled with it, the same event as it.
-    let (b2, a2) = (cid(), cid());
-    seen.placed(b2, buy, t0 + s(12));
-    seen.placed(a2, sell, t0 + s(13));
-    assert_eq!(seen.on_cancel(b2, buy, at(20), t0 + s(21)), NotOurs::Repeat);
-    assert_eq!(
-        seen.on_cancel(a2, sell, at(20), t0 + s(21)),
-        NotOurs::SameEvent
-    );
-    assert_eq!(seen.orders(), 6);
+fn cancels_not_ours_are_classified_under_a_one_second_span_and_a_30_s_window() {
+    // The classifier's test moved to fbc-live's tests/not_ours.rs (FBC-21g6, decision 0155 item
+    // 2), whose instants are chosen around these: the sample's span and the owner's window.
+    assert_eq!(quote::EVENT_SPAN, Duration::from_secs(1));
+    assert_eq!(args::CANCEL_NOT_OURS_WINDOW, Duration::from_secs(30));
+}
 
-    // Codex r4309154208 / RB-aoh5-9: a cycle longer than the window. The loop's requotes of
-    // both sides are placed 40 s after the first event and cancelled 3 s later by another
-    // program's next reconcile: the repeat however long the cycle, the other side the same event.
-    let mut seen = CancelsNotOurs::new(s(30));
-    let (b1, a1) = (cid(), cid());
-    seen.placed(b1, buy, t0);
-    seen.placed(a1, sell, t0);
-    assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
-    assert_eq!(seen.on_cancel(a1, sell, at(0), t0), NotOurs::SameEvent);
-    let (b2, a2) = (cid(), cid());
-    seen.placed(b2, buy, t0 + s(40));
-    seen.placed(a2, sell, t0 + s(40));
-    assert_eq!(seen.on_cancel(b2, buy, at(43), t0 + s(43)), NotOurs::Repeat);
+#[tokio::test]
+async fn a_zero_window_for_cancels_not_ours_is_refused_before_any_connection() {
+    // fbc-live's classifier refuses a zero window (decision 0155 item 8); no flag sets it, so
+    // only a caller of the loop can give one.
+    let venue = venue(vec![b0()]);
+    let stub = StubServer::start(WsScript::new(vec![]), routes(&venue, login_ok()))
+        .await
+        .unwrap();
+    let mut opts = options(&stub, 1);
+    opts.cancel_window = Duration::ZERO;
+    let out: testnet::Out = Rc::new(RefCell::new(Vec::<u8>::new()));
+    let refused = quote::run(&opts, None, creds(), out, std::future::pending())
+        .await
+        .unwrap_err();
     assert_eq!(
-        seen.on_cancel(a2, sell, at(43), t0 + s(43)),
-        NotOurs::SameEvent
+        refused,
+        "cancels not ours: the window over cancels not ours is zero"
     );
-
-    // RB-aoh5-10: a requote place that never rested (refused for its rate, a post-only place
-    // that would cross, or not sent) frees its side's slot, so the place after it, the one that
-    // rests, is the requote: its cancel 3 s after its place is the repeat, 43 s from the first.
-    let mut seen = CancelsNotOurs::new(s(30));
-    let (b1, refused, b2) = (cid(), cid(), cid());
-    seen.placed(b1, buy, t0);
-    assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
-    seen.placed(refused, buy, t0 + s(25));
-    seen.unrested(refused);
-    seen.retain(|c| *c != refused);
-    seen.placed(b2, buy, t0 + s(40));
-    assert_eq!(seen.on_cancel(b2, buy, at(43), t0 + s(43)), NotOurs::Repeat);
-    // A replace that ended unrested frees nothing, nor does the other side's: the requote
-    // that rested stays timed from its place (40 s), so a replace cancelled 32 s after it is
-    // a new first (from the unrested replace's place it would be the repeat).
-    let mut seen = CancelsNotOurs::new(s(30));
-    let (b1, requote, refused, other, replace) = (cid(), cid(), cid(), cid(), cid());
-    seen.placed(b1, buy, t0);
-    assert_eq!(seen.on_cancel(b1, buy, at(0), t0), NotOurs::First);
-    seen.placed(requote, buy, t0 + s(40));
-    seen.placed(other, sell, t0 + s(40));
-    seen.unrested(other);
-    seen.retain(|c| *c != requote);
-    seen.placed(refused, buy, t0 + s(55));
-    seen.unrested(refused);
-    seen.placed(replace, buy, t0 + s(60));
-    assert_eq!(
-        seen.on_cancel(replace, buy, at(72), t0 + s(72)),
-        NotOurs::First
+    assert!(stub.connections().is_empty());
+    assert!(
+        stub.http_requests().is_empty(),
+        "{:?}",
+        stub.http_requests()
     );
-
-    // Past 30 s from the window's first event, a new window: a requote cancelled more than
-    // 30 s after its place; a later requote within 30 s of its place; a replace of a requote
-    // (not the first placed on its side since the event) judged by the window's first only.
-    let mut seen = CancelsNotOurs::new(s(30));
-    assert_eq!(seen.on_cancel(old, buy, at(0), t0), NotOurs::First);
-    let late = cid();
-    seen.placed(late, buy, t0 + s(1));
-    assert_eq!(
-        seen.on_cancel(late, buy, at(32), t0 + s(32)),
-        NotOurs::First
-    );
-    let requote = cid();
-    seen.placed(requote, buy, t0 + s(33));
-    assert_eq!(
-        seen.on_cancel(requote, buy, at(40), t0 + s(40)),
-        NotOurs::Repeat
-    );
-    // Codex r4310042604: a replace of the requote is timed from the requote's place: within
-    // 30 s of it the repeat, past it a new first.
-    let (requote, replace) = (cid(), cid());
-    seen.placed(requote, buy, t0 + s(41));
-    seen.placed(replace, buy, t0 + s(50));
-    seen.retain(|c| *c != requote);
-    assert_eq!(
-        seen.on_cancel(replace, buy, at(63), t0 + s(63)),
-        NotOurs::Repeat
-    );
-    let (requote, replace) = (cid(), cid());
-    seen.placed(requote, buy, t0 + s(64));
-    seen.placed(replace, buy, t0 + s(80));
-    seen.retain(|c| *c != requote);
-    assert_eq!(
-        seen.on_cancel(replace, buy, at(95), t0 + s(95)),
-        NotOurs::First
-    );
-    // A requote that filled: the next order on its side is its replace, timed from its place
-    // (past 30 s from the window's first event, 95 s).
-    let (requote, next) = (cid(), cid());
-    seen.placed(requote, sell, t0 + s(126));
-    seen.retain(|c| *c != requote);
-    seen.placed(next, sell, t0 + s(140));
-    assert_eq!(
-        seen.on_cancel(next, sell, at(150), t0 + s(150)),
-        NotOurs::Repeat
-    );
-    // RB-aoh5-2: an order resting unchanged since before the first, cancelled 10 minutes on.
-    let mut seen = CancelsNotOurs::new(s(30));
-    let (c1, c2) = (cid(), cid());
-    seen.placed(c1, buy, t0);
-    seen.placed(c2, sell, t0);
-    assert_eq!(seen.on_cancel(c1, buy, at(1), t0 + s(1)), NotOurs::First);
-    assert_eq!(
-        seen.on_cancel(c2, sell, at(600), t0 + s(600)),
-        NotOurs::First
-    );
-
-    // With no venue time, when each was seen: within the span one event, later another.
-    let mut seen = CancelsNotOurs::new(s(30));
-    let (d1, d2, d3) = (cid(), cid(), cid());
-    for order in [d1, d2, d3] {
-        seen.placed(order, buy, t0);
-    }
-    assert_eq!(seen.on_cancel(d1, buy, None, t0 + s(1)), NotOurs::First);
-    assert_eq!(
-        seen.on_cancel(d2, buy, None, t0 + Duration::from_millis(1_900)),
-        NotOurs::SameEvent
-    );
-    assert_eq!(seen.on_cancel(d3, buy, None, t0 + s(5)), NotOurs::Repeat);
 }

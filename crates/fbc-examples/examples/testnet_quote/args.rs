@@ -38,7 +38,8 @@ pub const CANCEL_NOT_OURS_WINDOW: Duration = Duration::from_secs(30);
 /// makes one event per cycle. The pause alone does not bound a cycle (its reads, settle and
 /// rate-limit waits add to it), so the Stop does not rest on this bound: a cancel of the
 /// loop's requote within the window of its place is the repeat however long the cycle
-/// (`quote::CancelsNotOurs`, Codex r4309154208). This bound is kept as a conservative limit.
+/// (`fbc_live::not_ours::CancelsNotOurs`, Codex r4309154208). This bound is kept as a
+/// conservative limit.
 pub fn mainnet_interval_max(window: Duration) -> Duration {
     window * 2 / 3
 }

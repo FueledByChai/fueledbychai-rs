@@ -1,6 +1,6 @@
 [package]
 name = "fbc-live"
-description = "The order-safety glue a live consumer runs beside its order-entry sessions (decision 0155): so far the link, which routes every event an order-entry session hands it into the account's fbc-oms registry, through the fill ledger, and is the one path the consumer's commands take to the session, tracking which cancels of ours cover which orders so a cancel not ours is noted. It depends on no venue crate and branches on no venue's name."
+description = "The order-safety glue a live consumer runs beside its order-entry sessions (decision 0155): so far the link, which routes every event an order-entry session hands it into the account's fbc-oms registry, through the fill ledger, and is the one path the consumer's commands take to the session, tracking which cancels of ours cover which orders so a cancel not ours is noted, and the classifier that tells a consumer whether a cancel not ours is a new event or a repeat. It depends on no venue crate and branches on no venue's name."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
