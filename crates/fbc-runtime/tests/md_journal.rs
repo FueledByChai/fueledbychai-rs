@@ -1043,7 +1043,10 @@ async fn a_credentialed_requests_failure_is_journaled() {
     let (mut session, control) = MdSession::new(session(venue, ws.url()), |_| {}).unwrap();
     let sink = Rc::new(RefCell::new(Unbuilt::default()));
     session.set_journal(Journal::new(sink.clone()));
-    let url = format!("http://127.0.0.1:{}/snap", common::closed_port().await);
+    // Held to the test's end, so no server another test starts meanwhile takes the port
+    // (FBC-rq2l).
+    let closed = common::closed_port().await;
+    let url = format!("http://127.0.0.1:{}/snap", closed.port());
     let get = format!("get|tag=1|ms=5000|auth=1|url={url}");
     let frame = get.clone();
     let script = async move {

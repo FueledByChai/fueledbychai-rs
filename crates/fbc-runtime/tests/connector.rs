@@ -161,9 +161,10 @@ async fn an_ip_literal_goes_to_the_proxy_as_an_ipv4_address() {
 
 #[tokio::test]
 async fn a_proxy_that_is_not_listening_fails_at_the_proxy_tcp_step() {
+    let closed = closed_port().await;
     let connector = Connector::new(ProxyConfig::Socks5 {
         host: "127.0.0.1".into(),
-        port: closed_port().await,
+        port: closed.port(),
     });
     let err = connector
         .websocket("ws://ws.venue.test:9/")
@@ -196,7 +197,8 @@ async fn a_proxy_that_wants_authentication_fails_at_the_greeting() {
 
 #[tokio::test]
 async fn a_closed_target_fails_at_the_target_tcp_step_without_quoting_the_url() {
-    let port = closed_port().await;
+    let closed = closed_port().await;
+    let port = closed.port();
     let direct = Connector::new(ProxyConfig::Direct);
     let url = format!("http://user:hunter2@127.0.0.1:{port}/v1/orders?token=sesame");
 
