@@ -1019,7 +1019,9 @@ fn a_cancel_answered_unknown_is_kept_until_its_order_ends() {
     assert_eq!(rig.link.requests_held(), 1, "the cancel's order lives");
     assert!(rig.link.is_cancel_on(cancel, INST_A));
 
-    rig.link.on_exec(env(13, 2_013, user_cancelled(a, "v-a")));
+    // Ended by the venue's own cancel: an end by a user cancel is held on the cancel, and the
+    // cancel kept until it is answered (below, Codex on PR #303).
+    rig.link.on_exec(env(13, 2_013, venue_cancelled(a, "v-a")));
     assert!(rig.link.registry().get(a).unwrap().state().is_terminal());
     forget_twice(&mut rig.link);
     assert_eq!(rig.link.requests_held(), 0);
@@ -1186,5 +1188,210 @@ fn a_sweep_handed_a_rate_refusal_by_forget_reads_it_as_a_cancel_on_its_market() 
     assert!(hold.until().is_some());
     // The next forget drops the refused cancel: the consumer has read its notes.
     rig.link.forget(0);
+    assert!(!rig.link.is_cancel_on(cancel, INST_A));
+}
+
+// Codex on PR #303: a request the link's coverage still waits on is kept through forgets, so its
+// later answer routes as ours and reaches the coverage (Codex r4310042612 on PR #159).
+
+/// Our order `cid`, venue order `v`, ended by the venue's own cancel (`Canceled(Venue)`), which
+/// no cancel of ours is waited on for.
+fn venue_cancelled(cid: ClientOrderId, v: &str) -> ExecEvent {
+    match open(cid, v) {
+        ExecEvent::Order(u) => ExecEvent::Order(OrderUpdate {
+            state: VenueOrderState::Canceled(CancelReason::Venue),
+            ..u
+        }),
+        _ => unreachable!("open builds an order event"),
+    }
+}
+
+/// Whether a note left is an answer to request `rpc` routed as ours.
+fn answered_as_ours(link: &Link, rpc: RpcId) -> bool {
+    link.notes()
+        .iter()
+        .any(|n| matches!(n, Note::Outcome { rpc: r, ours, .. } if *r == rpc && *ours))
+}
+
+/// A cancel of our order `a`, sent and answered `Unknown`, then `a` ended by a user cancel the
+/// link holds on that cancel, and the notes then forgotten by two rounds of `forget_twice`: the
+/// rig, the order and the cancel.
+fn held_on_an_unknown_cancel() -> (Rig, ClientOrderId, RpcId) {
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let cancel = rig.cancel(a);
+    rig.link.on_submitted(sent(cancel));
+    answer_item(&mut rig.link, 12, cancel, 0, a, SubmitOutcome::Unknown);
+    rig.link.on_exec(env(13, 2_013, user_cancelled(a, "v-a")));
+    assert!(rig.link.registry().get(a).unwrap().state().is_terminal());
+    assert!(not_ours(&rig.link).is_empty(), "held on the cancel");
+    forget_twice(&mut rig.link);
+    forget_twice(&mut rig.link);
+    assert_eq!(
+        rig.link.requests_held(),
+        1,
+        "the place dropped, the cancel kept while the order's end is held on it"
+    );
+    assert_eq!(rig.link.cids_of(cancel), [a]);
+    assert!(rig.link.is_cancel_on(cancel, INST_A));
+    (rig, a, cancel)
+}
+
+#[test]
+fn a_cancel_gone_unknown_is_kept_while_its_orders_end_is_held_and_its_refusal_is_noted() {
+    // The venue refuses the cancel after the order's end: a cancel not ours, noted once the
+    // refusal routes as ours, and the request dropped once its notes are forgotten.
+    let (mut rig, a, cancel) = held_on_an_unknown_cancel();
+    let refused = SubmitOutcome::Rejected(reject("no such order"));
+    answer_item(&mut rig.link, 14, cancel, 0, a, refused);
+    assert!(answered_as_ours(&rig.link, cancel));
+    assert_eq!(not_ours(&rig.link), [a]);
+    assert!(rig.link.cancels_not_ours_seen());
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+    forget_twice(&mut rig.link);
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(rig.link.cancels_not_ours_seen());
+}
+
+#[test]
+fn a_cancel_gone_unknown_is_kept_while_its_orders_end_is_held_and_its_acceptance_is_ours() {
+    // The venue accepts the cancel: the order's end was ours, nothing is noted, and the request
+    // is dropped once its notes are forgotten.
+    let (mut rig, a, cancel) = held_on_an_unknown_cancel();
+    answer_item(&mut rig.link, 14, cancel, 0, a, accepted());
+    assert!(answered_as_ours(&rig.link, cancel));
+    assert!(not_ours(&rig.link).is_empty());
+    assert!(!rig.link.cancels_not_ours_seen());
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(!rig.link.cancels_not_ours_seen());
+}
+
+impl Rig {
+    /// Our order `a` placed, accepted and open as venue order `v-a`, its market killed, and a
+    /// cancel-all of the market sent and answered `outcome` by its one item, naming no order.
+    fn cancel_all_answered(&mut self, outcome: SubmitOutcome) -> (ClientOrderId, RpcId) {
+        let (a, place) = self.place();
+        accepted_and_open(&mut self.link, place, a, "v-a", 10);
+        self.link.reg().kill(INST_A);
+        let built = self.link.reg().cancel_everything(INST_A, &order_caps());
+        let CancelEverything::CancelAll { command, .. } = built else {
+            panic!("no cancel-all: {built:?}");
+        };
+        let auth = self.link.reg().authorize(ACCT, command).unwrap();
+        let all = self.link.submit(&self.orders, auth).unwrap();
+        self.link.on_submitted(sent(all));
+        self.answer_all(12, all, outcome);
+        (a, all)
+    }
+
+    /// Cancel-all `all` answered `outcome` by its one item, naming no order, as ingest sequence
+    /// `seq`.
+    fn answer_all(&mut self, seq: u64, all: RpcId, outcome: SubmitOutcome) {
+        let item = ItemRef {
+            idx: 0,
+            cid: None,
+            vid: None,
+        };
+        let body = ExecEvent::Outcome {
+            rpc: all,
+            item: Some(item),
+            outcome,
+        };
+        self.link.on_exec(env(seq, 2_000 + seq, body));
+    }
+}
+
+#[test]
+fn a_cancel_all_gone_unknown_is_kept_while_an_order_it_covers_lives_or_its_end_is_held() {
+    // Its first answer is all fbc-oms reads, but the coverage waits on the cancel-all while an
+    // order it covers lives unanswered: a user cancel ending that order is held on it, and its
+    // refusal, when it comes, makes that end a cancel not ours.
+    let mut rig = Rig::started(order_caps());
+    let (a, all) = rig.cancel_all_answered(SubmitOutcome::Unknown);
+    forget_twice(&mut rig.link);
+    assert_eq!(
+        rig.link.requests_held(),
+        1,
+        "its order lives, covered unanswered"
+    );
+    assert!(rig.link.is_cancel_on(all, INST_A));
+    rig.link.on_exec(env(13, 2_013, user_cancelled(a, "v-a")));
+    assert!(not_ours(&rig.link).is_empty(), "held on the cancel-all");
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 1, "its order's end held on it");
+
+    rig.answer_all(14, all, SubmitOutcome::Rejected(reject("refused")));
+    assert!(answered_as_ours(&rig.link, all));
+    assert_eq!(not_ours(&rig.link), [a]);
+    assert!(rig.link.cancels_not_ours_seen());
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+}
+
+#[test]
+fn a_cancel_all_gone_unknown_is_dropped_once_the_orders_it_covers_end_otherwise() {
+    // The order it covers ends by the venue's own cancel, which nothing is held on: the
+    // cancel-all is dropped once its notes are forgotten, and nothing is noted.
+    let mut rig = Rig::started(order_caps());
+    let (a, all) = rig.cancel_all_answered(SubmitOutcome::Unknown);
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 1);
+    rig.link.on_exec(env(13, 2_013, venue_cancelled(a, "v-a")));
+    assert!(rig.link.registry().get(a).unwrap().state().is_terminal());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(!rig.link.is_cancel_on(all, INST_A));
+    assert!(!rig.link.cancels_not_ours_seen());
+}
+
+#[test]
+fn a_cancel_whose_held_order_end_is_never_answered_is_kept_until_the_consumer_releases_it() {
+    // The wait has no bound: no forget and no epoch end drops the cancel while the order's end
+    // is held on it. Released, its later refusal is the session's own and notes nothing.
+    let (mut rig, a, cancel) = held_on_an_unknown_cancel();
+    rig.link.on_epoch_end(KEY);
+    for _ in 0..5 {
+        forget_twice(&mut rig.link);
+    }
+    assert_eq!(rig.link.requests_held(), 1, "its order's end held on it");
+    assert!(rig.link.is_cancel_on(cancel, INST_A));
+
+    rig.link.release(cancel);
+    assert_eq!(rig.link.requests_held(), 0);
+    let refused = SubmitOutcome::Rejected(reject("no such order"));
+    answer_item(&mut rig.link, 14, cancel, 0, a, refused);
+    assert!(!answered_as_ours(&rig.link, cancel));
+    assert!(not_ours(&rig.link).is_empty(), "the held end left unjudged");
+    assert!(!rig.link.cancels_not_ours_seen());
+}
+
+#[test]
+fn a_cancel_answered_before_it_is_reported_sent_is_kept_until_it_is() {
+    // No session answers a request before reporting it sent, but one so answered for good is
+    // kept until the report, which then finds the request it covers its order for.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let cancel = rig.cancel(a);
+    answer_item(&mut rig.link, 12, cancel, 0, a, accepted());
+    assert!(answered_as_ours(&rig.link, cancel));
+    forget_twice(&mut rig.link);
+    forget_twice(&mut rig.link);
+    assert_eq!(
+        rig.link.requests_held(),
+        1,
+        "the place dropped, the cancel not yet reported"
+    );
+    assert_eq!(rig.link.cids_of(cancel), [a]);
+
+    rig.link.on_submitted(sent(cancel));
+    rig.link.on_exec(env(13, 2_013, venue_cancelled(a, "v-a")));
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
     assert!(!rig.link.is_cancel_on(cancel, INST_A));
 }

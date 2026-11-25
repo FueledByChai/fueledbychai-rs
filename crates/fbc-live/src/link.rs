@@ -79,7 +79,9 @@
 //!   only requests of ours not yet answered cover it is held until they are: one accepted, the
 //!   cancel was ours; all refused (the venue answering `AlreadyTerminal`, `NotFound` or for its
 //!   rate after another program's cancel, its order event read first), it is noted then, after
-//!   the refusal's [`Note::Outcome`] (Codex r4310042612 on PR #159). Submitted but not
+//!   the refusal's [`Note::Outcome`] (Codex r4310042612 on PR #159). An answer to a cancel-all
+//!   for the whole request, or for its item naming no client id, accepts or refuses it for every
+//!   order it covers; one naming an order, for that order alone. Submitted but not
 //!   yet reported sent, it is only pending and covers nothing: the session decodes a frame
 //!   waiting in a turn before it writes what was queued, so another program's cancel read then
 //!   is not ours (Codex r4308625182 on PR #159), and one reported not sent wrote nothing (Codex
@@ -105,7 +107,16 @@
 //!   answer that may follow (a two-phase venue's final acceptance of a place or an amend, decision
 //!   0092; the answer to an amend or a cancel gone Unknown). A request naming no order (a
 //!   cancel-all) is answered in full by its first answer, as fbc-oms reads none. An answer naming
-//!   an item past the request's items answers none. A request whose last note a forget takes is
+//!   an item past the request's items answers none. A request answered in full is still kept
+//!   while the link's coverage of cancels not ours waits on an answer to it
+//!   ([`Coverage::waits_on`]): an order of ours a user cancel ended while it covered the order
+//!   unanswered, held on it, or a live order it covers that the venue has not accepted it for (a
+//!   cancel-all answered `Unknown`), whose end by a user cancel would be. Its later answer then
+//!   still routes as ours and reaches the coverage, so a refusal notes the order's end as a
+//!   cancel not ours (Codex on PR #303). That wait has no bound: a cancel whose held order end
+//!   is never answered (answered `Unknown` at its deadline, say, and its connection then ended)
+//!   is kept for the link's life, as the held end is, unless the consumer releases it. A
+//!   request whose last note a forget takes is
 //!   still held until the next forget, so the consumer reads the notes that forget handed it
 //!   against the link as it was ([`crate::sweep::Sweep::observe`] reads [`Link::is_cancel_on`]
 //!   of a refusal for its rate, which may be its request's last answer). A request with an item
@@ -383,7 +394,8 @@ pub fn described(reject: &Reject) -> String {
 /// cancel ended the order (`AlreadyTerminal`, `NotFound`, or for its rate), its order event read
 /// first. One accepted makes the cancel ours; all refused, the cancel was not ours, and
 /// [`Coverage::refused`] hands the held order back to be noted then (Codex r4310042612 on PR
-/// #159).
+/// #159). The link keeps each request the coverage waits on an answer to ([`Coverage::waits_on`])
+/// through [`Link::forget`], so that answer still reaches it (Codex on PR #303).
 #[derive(Debug, Default)]
 pub struct Coverage {
     /// Each order covered, with the requests covering it and whether each was accepted.
@@ -501,6 +513,23 @@ impl Coverage {
             }
         }
         released
+    }
+
+    /// Whether the coverage still waits on an answer to request `rpc`, so the link must keep
+    /// routing its answers as ours ([`Link::forget`]): an order end held on it
+    /// ([`Coverage::hold`]); an order `live` takes that it covers and the venue has not yet
+    /// accepted it for, whose end by a user cancel would be held on it (a cancel-all answered
+    /// `Unknown`); or not yet reported sent, so the report finds the request it covers for (a
+    /// session reports a request sent before it writes it, so this holds only for a request
+    /// answered before its report). An order end held on it waits for as long as no answer
+    /// comes, with no bound.
+    pub fn waits_on(&self, rpc: RpcId, live: impl Fn(&ClientOrderId) -> bool) -> bool {
+        self.pending.contains_key(&rpc)
+            || self.held.values().any(|h| h.rpcs.contains(&rpc))
+            || self
+                .covered
+                .iter()
+                .any(|(cid, rpcs)| rpcs.get(&rpc) == Some(&false) && live(cid))
     }
 
     /// Whether a request of ours reported sent covers `cid`.
@@ -758,7 +787,9 @@ impl Link {
     /// forgets them releases each request itself. An answer to it that comes later is noted as
     /// the session's own ([`Note::Outcome`] with `ours` false), [`Link::is_cancel_on`] is false
     /// for it, and [`Link::outcome_of`], [`Link::cids_of`] and [`Link::safety_cancel_of`] no
-    /// longer name it.
+    /// longer name it. Releasing a cancel the coverage of cancels not ours waits on an answer to
+    /// ([`Coverage::waits_on`]) leaves an order end held on it unjudged: that answer reaches no
+    /// coverage, so a refusal notes no [`Note::CancelNotOurs`].
     pub fn release(&mut self, rpc: RpcId) {
         self.sent.remove(&rpc);
         self.cancels.remove(&rpc);
@@ -767,8 +798,9 @@ impl Link {
     }
 
     /// How many submitted requests the link still holds the items of: those neither released
-    /// ([`Link::release`]) nor dropped by [`Link::forget`] once answered in full, at the forget
-    /// after the one that took their last note (module documentation).
+    /// ([`Link::release`]) nor dropped by [`Link::forget`] once answered in full and not waited on
+    /// by the coverage, at the forget after the one that took their last note (module
+    /// documentation).
     pub fn requests_held(&self) -> usize {
         self.sent.len()
     }
@@ -803,8 +835,12 @@ impl Link {
     /// [`Link::forget`] took its last note, whose consumer has read it (module documentation).
     /// An item is answered in full by a final answer, to it or to the whole request, or by any
     /// answer once its order has ended in the registry; the one slot of a request naming no
-    /// order (a cancel-all), whose answers fbc-oms reads none of, by any answer. A note naming a
-    /// request is the report that it was or was not sent, or an answer to it; the
+    /// order (a cancel-all), whose answers fbc-oms reads none of, by any answer. A request the
+    /// coverage still waits on an answer to ([`Coverage::waits_on`]) is kept, so that answer
+    /// still routes as ours and reaches [`Coverage::accepted`] or [`Coverage::refused`]. Once one
+    /// is dropped the coverage never waits on it again: reported already, it covers no order
+    /// anew, and an order it covers, accepted for it or ended, is never held on it. A note
+    /// naming a request is the report that it was or was not sent, or an answer to it; the
     /// [`Note::Unprotected`] naming a Safety cancel comes before both.
     fn drop_answered(&mut self) {
         let named: HashSet<RpcId> = self
@@ -815,7 +851,8 @@ impl Link {
                 _ => None,
             })
             .collect();
-        let (sent, reg) = (&self.sent, &self.reg);
+        let (sent, reg, covered) = (&self.sent, &self.reg, &self.covered);
+        let live = |cid: &ClientOrderId| reg.get(*cid).is_some_and(|r| !r.state().is_terminal());
         // Whether the order an item names has ended, or the slot names none.
         let ended = |rpc: RpcId, item: Option<&Item>| {
             item.is_none_or(|it| {
@@ -829,6 +866,7 @@ impl Link {
             .filter(|(rpc, slots)| {
                 let items = sent.get(rpc).map_or(&[][..], Vec::as_slice);
                 !named.contains(rpc)
+                    && !covered.waits_on(**rpc, live)
                     && slots.iter().enumerate().all(|(idx, slot)| match slot {
                         Answered::Final => true,
                         Answered::Open => ended(**rpc, items.get(idx)),
@@ -919,7 +957,10 @@ impl Link {
     /// [`Link::outcome_of`], [`Link::login_refusals`] and [`Link::told_on`] see only the notes
     /// left. Before it takes any, it drops each request answered in full that no note left
     /// names, as [`Link::release`] does (module documentation): every item answered for good, or
-    /// answered once its order has ended. A request whose last note this call takes is held
+    /// answered once its order has ended, and no answer to it waited on by the coverage of
+    /// cancels not ours ([`Coverage::waits_on`]), a wait with no bound: a cancel whose held order
+    /// end is never answered is kept for the link's life, unless the consumer releases it. A
+    /// request whose last note this call takes is held
     /// until the next, so the consumer reads the notes it hands over, with
     /// [`Link::is_cancel_on`] and [`Link::cids_of`], against the link as it was. A consumer that
     /// never calls it keeps every note and every request they name, as before.
@@ -1214,14 +1255,15 @@ impl Link {
                 .collect(),
         };
         // A refused cancel of ours, or one not sent after all, stops covering what it names (a
-        // cancel-all's item: the order it states; the whole request: every order it covers).
-        // An accepted one makes an order it covers that a user cancel ended, held, ours.
+        // cancel-all's item: the order it states, or every order it covers when it states none;
+        // the whole request: every order it covers). An accepted one makes an order it covers
+        // that a user cancel ended, held, ours.
         let scope = match &item {
             None => Some(None),
             Some(named) => match items.get(usize::from(named.idx)) {
                 Some(Item::Cancel(cid)) => Some(Some(*cid)),
                 Some(_) => None,
-                None if items.is_empty() => named.cid.map(Some),
+                None if items.is_empty() => Some(named.cid),
                 None => None,
             },
         };
