@@ -153,7 +153,10 @@ fn fill_at(fill: FillEvent, n: u64, at: MonoNs, exch: Option<i64>) -> Envelope<E
 fn handler(link: &Rc<RefCell<Link>>) -> LinkHandler {
     LinkHandler {
         link: Rc::clone(link),
-        wake: Rc::new(Notify::new()),
+        wake: Box::new({
+            let wake = Rc::new(Notify::new());
+            move || wake.notify_waiters()
+        }),
     }
 }
 

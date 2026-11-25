@@ -16,8 +16,8 @@ publish = false
 fbc-conformance = { path = "../fbc-conformance" }
 fbc-core = { path = "../fbc-core" }
 fbc-journal = { path = "../fbc-journal" }
-# The glue every sample that trades uses (decision 0155): the Paradex samples through
-# `fbc_live::link`, qfex_preprod_probe through the shim at src/link.rs.
+# The glue every sample that trades, qfex_preprod_probe included, uses through `fbc_live::link`
+# (decision 0155).
 fbc-live = { path = "../fbc-live" }
 fbc-oms = { path = "../fbc-oms" }
 fbc-runtime = { path = "../fbc-runtime" }

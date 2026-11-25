@@ -42,7 +42,7 @@
 //! its caps, declared `CodProbeRun::owner_supervised_places` on its one market and never a
 //! testnet run, under its lease names and bound to its account; gives the journal its
 //! `CancelOnlyTrip` ([`PlaceRegistry::trip_on`], decision 0139); and hands the registry and its
-//! one fill ledger to one `Link` (`src/link.rs`) for the registry's life
+//! one fill ledger to one `Link` (`fbc_live::link`) for the registry's life
 //! ([`PlaceRegistry::into_link`]). The `Link` routes every fill of the registry's sessions through
 //! that ledger and lists each one the ledger refuses for its time (`Link::fill_refusals`), and
 //! [`PlaceRun::session_ended`] reads the ledger back from it.

@@ -2101,7 +2101,7 @@ fn a_session_counts_each_order_method_and_its_arm() {
 
 #[test]
 fn an_asynchronous_reject_the_shared_link_notes_is_a_link_problem_of_the_run() {
-    // FBC-elg7 moved the glue to src/link.rs (fbc_live::link since FBC-umqi), which notes an
+    // FBC-elg7 moved the glue to the samples' link (fbc_live::link since FBC-umqi), which notes an
     // asynchronous reject for its driver to judge (Note::AsyncReject) instead of as a problem:
     // this run still counts every one.
     use fbc_core::{Namespace, OpKind, OrderRef, Reject, RejectKind};

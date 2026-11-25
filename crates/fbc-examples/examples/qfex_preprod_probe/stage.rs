@@ -3361,7 +3361,10 @@ impl Run<'_> {
         let handler = PlaceHandler {
             inner: LinkHandler {
                 link: Rc::clone(&link),
-                wake: Rc::clone(&wake),
+                wake: Box::new({
+                    let wake = Rc::clone(&wake);
+                    move || wake.notify_waiters()
+                }),
             },
             watched: Rc::clone(&watched),
             control: Rc::clone(&control),
@@ -5928,7 +5931,10 @@ impl Run<'_> {
         let handler = PlaceHandler {
             inner: LinkHandler {
                 link: Rc::clone(&link),
-                wake: Rc::clone(&wake),
+                wake: Box::new({
+                    let wake = Rc::clone(&wake);
+                    move || wake.notify_waiters()
+                }),
             },
             watched: Rc::clone(&watched),
             control: Rc::clone(&control),

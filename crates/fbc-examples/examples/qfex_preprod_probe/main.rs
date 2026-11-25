@@ -89,9 +89,8 @@ mod ledger;
 mod evidence;
 mod hold;
 mod interrupt;
-#[allow(dead_code)]
-#[path = "../../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 mod market;
 mod pages;
 // Stage three (FBC-4plj): its interleaving of places, pages and cancels, its pager's records,
