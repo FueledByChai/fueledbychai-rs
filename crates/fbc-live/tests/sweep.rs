@@ -11,12 +11,15 @@
 //! Unknown ladder keeping it waiting; at Stop, an end while the market takes no place, once every
 //! request is answered, whatever the answers; the cancels due on an acknowledgement; a cancel not
 //! authorized, not submitted or not sent; and the consumer's rate hold. Nothing but the notes,
-//! handed over with the link, tells the sweep which requests are cancels (`Link::is_cancel`): a
-//! cancel of the consumer's refused for its rate after its order ended, and the link's Safety
-//! cancel so refused, make the cancel of everything due again, and a place so refused does not.
-//! Before places, a refusal of a cancel not the sweep's fails nothing. The explicit cancels keep
-//! the order the link first learnt our orders in through a later resync showing them in another,
-//! name again an order whose cancel came back Unknown, and leave one whose cancel awaits its
+//! handed over with the link, tells the sweep which requests are cancels on its market
+//! (`Link::is_cancel_on`): a cancel of the consumer's refused for its rate after its order ended,
+//! the link's Safety cancel so refused and a consumer's instrument cancel-all of the market so
+//! refused make the cancel of everything due again, and a place so refused does not, nor does a
+//! cancel or a cancel-all on another market. A sweep sends only its own market's cancels due on an
+//! acknowledgement, and at Stop another market's cancel left unanswered does not hold it. Before
+//! places, a refusal of a cancel not the sweep's fails nothing. The explicit cancels keep the
+//! order the link first learnt our orders in through a later resync showing them in another, name
+//! again an order whose cancel came back Unknown, and leave one whose cancel awaits its
 //! acknowledgement to the cancels due.
 
 use std::cell::RefCell;
@@ -28,22 +31,22 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use fbc_conformance::toy::{
-    EXEC_URL_KEY, INST_A, INST_B, OWN_NS, RPC_TIMEOUT, SYMBOL_A, TOY_TOKEN, ToyFactory,
+    EXEC_URL_KEY, INST_A, INST_B, OWN_NS, RPC_TIMEOUT, SYMBOL_A, SYMBOL_B, TOY_TOKEN, ToyFactory,
 };
 use fbc_conformance::{Frame, HttpRouter, Pusher, Responded, Responder, StubServer, WsScript};
 use fbc_core::{
-    AccountKey, AccountLease, Channel, CidMatch, CidMint, ClientOrderId, Lots, MarketLease, MonoNs,
-    NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason, OrderCaps, OrderKind,
-    RejectKind, RpcId, Secrets, Side, SubmitOutcome, Ticks, Tif, VenueConfig, VenueFactory, WallNs,
-    dispatch_market_data, encode_cid,
+    AccountKey, AccountLease, Channel, CidMatch, CidMint, ClientOrderId, InstrumentId, Lots,
+    MarketLease, MonoNs, NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason,
+    OrderCaps, OrderKind, RejectKind, RpcId, Secrets, Side, SubmitOutcome, Ticks, Tif, VenueConfig,
+    VenueFactory, WallNs, dispatch_market_data, encode_cid,
 };
 use fbc_live::link::{Link, LinkHandler, Note};
 use fbc_live::sweep::{
     How, Polled, RateHold, Round, SendError, Sweep, SweepEnd, SweepState, Why, ZeroWait,
 };
 use fbc_oms::{
-    CancelAllRefusal, CancelChoice, FillLedger, Intent, LadderConfig, LeaseKeys, Leases,
-    LedgerConfig, MarketCapsConfig, OrdState, PermittedCommand, PreTradeCaps, Registry,
+    CancelAllRefusal, CancelChoice, CancelEverything, FillLedger, Intent, LadderConfig, LeaseKeys,
+    Leases, LedgerConfig, MarketCapsConfig, OrdState, PermittedCommand, PreTradeCaps, Registry,
 };
 use fbc_runtime::{
     Connector, ExecControl, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig, InFlight,
@@ -143,6 +146,8 @@ enum Answer {
 struct Order {
     cid: String,
     vid: String,
+    /// Its market's venue symbol.
+    sym: String,
     side: String,
     px: String,
     qty: String,
@@ -152,11 +157,18 @@ struct Order {
 }
 
 impl Order {
-    /// The order the place record `line` of request `rpc` asks for, as venue order `vid`.
+    /// The order the place record `line` of request `rpc` asks for, as venue order `vid`, on
+    /// the market it names (`SYMBOL_A` when it names none).
     fn placed(line: &str, vid: String, rpc: String, resting: bool) -> Order {
+        let named = line.split('|').any(|kv| kv.starts_with("sym="));
         Order {
             cid: field(line, "cid"),
             vid,
+            sym: if named {
+                field(line, "sym")
+            } else {
+                SYMBOL_A.to_owned()
+            },
             side: field(line, "side"),
             px: field(line, "px"),
             qty: field(line, "qty"),
@@ -188,6 +200,9 @@ struct Venue {
     outbound: Option<(u32, u32)>,
     /// The resync shows the resting orders last placed first.
     resync_reversed: bool,
+    /// The registry trades `INST_B` beside `INST_A`, and the resync shows a flat position on
+    /// both.
+    two_markets: bool,
 }
 
 type Shared = Arc<Mutex<Venue>>;
@@ -203,8 +218,8 @@ impl Venue {
         let o = &mut self.orders[idx];
         o.resting = false;
         format!(
-            "order|cid={}|vid={}|sym={SYMBOL_A}|side={}|st={state}|cum=0|qty={}|po=1|ro=0|seq={}",
-            o.cid, o.vid, o.side, o.qty, self.seq
+            "order|cid={}|vid={}|sym={}|side={}|st={state}|cum=0|qty={}|po=1|ro=0|seq={}",
+            o.cid, o.vid, o.sym, o.side, o.qty, self.seq
         )
     }
 
@@ -255,16 +270,19 @@ impl Venue {
 }
 
 /// A resync of a flat account at watermark `ts`, showing each order of `orders` that rests, in
-/// that order.
-fn resync<'a>(ts: &str, orders: impl IntoIterator<Item = &'a Order>) -> Vec<String> {
+/// that order, and a flat position on `SYMBOL_A`, and on `SYMBOL_B` too when `two` holds.
+fn resync<'a>(ts: &str, orders: impl IntoIterator<Item = &'a Order>, two: bool) -> Vec<String> {
     let mut records = vec![format!("rsbegin|wm={ts}")];
     for o in orders.into_iter().filter(|o| o.resting) {
         records.push(format!(
-            "rsorder|cid={}|vid={}|sym={SYMBOL_A}|side={}|st=open|px={}|qty={}|cum=0|po=1|ro=0",
-            o.cid, o.vid, o.side, o.px, o.qty
+            "rsorder|cid={}|vid={}|sym={}|side={}|st=open|px={}|qty={}|cum=0|po=1|ro=0",
+            o.cid, o.vid, o.sym, o.side, o.px, o.qty
         ));
     }
     records.push(format!("rspos|sym={SYMBOL_A}|qty=0"));
+    if two {
+        records.push(format!("rspos|sym={SYMBOL_B}|qty=0"));
+    }
     records.push("rsend".to_owned());
     records
 }
@@ -286,8 +304,10 @@ fn respond(venue: &Shared, frame: &Frame) -> Responded {
             v.resync_ts = Some(field(head, "ts"));
             Vec::new()
         }
-        "resync" if v.resync_reversed => resync(&field(head, "ts"), v.orders.iter().rev()),
-        "resync" => resync(&field(head, "ts"), &v.orders),
+        "resync" if v.resync_reversed => {
+            resync(&field(head, "ts"), v.orders.iter().rev(), v.two_markets)
+        }
+        "resync" => resync(&field(head, "ts"), &v.orders, v.two_markets),
         "place" => {
             let (rpc, vid) = (field(head, "rpc"), format!("V-{}", v.orders.len() + 1));
             let resting = !v.hold_acks;
@@ -311,9 +331,11 @@ fn respond(venue: &Shared, frame: &Frame) -> Responded {
         // An amend is left unanswered.
         "amend" => Vec::new(),
         "cancelall" => {
-            v.cancel_all_syms.push(field(head, "sym"));
+            let sym = field(head, "sym");
+            v.cancel_all_syms.push(sym.clone());
             let answer = v.cancel_alls.pop_front().unwrap_or(Answer::Cancel);
-            let resting = (0..v.orders.len()).filter(|i| v.orders[*i].resting);
+            let on = |o: &Order| o.resting && o.sym == sym;
+            let resting = (0..v.orders.len()).filter(|i| on(&v.orders[*i]));
             let item = (answer, resting.collect());
             v.answer(&field(head, "rpc"), &[item])
         }
@@ -401,17 +423,21 @@ fn link_over(reg: Registry, caps: OrderCaps) -> Link {
     Link::new(reg, ledger, caps, ladder)
 }
 
-/// A registry for `ACCT` on the toy under `caps`, `INST_A` its one market under caps of 10
-/// lots, its market and account lease names "toy".
-fn registry(caps: &OrderCaps) -> Registry {
+/// A registry for `ACCT` on the toy under `caps`, `INST_A` its one market, and `INST_B` beside
+/// it when `two` holds, each under caps of 10 lots, its market and account lease names "toy".
+fn registry(caps: &OrderCaps, two: bool) -> Registry {
     let toy = fbc_conformance::toy::caps();
-    let symbol = dispatch_market_data(&toy, |s| s.venue_symbol(SYMBOL_A)).unwrap();
-    let keys = LeaseKeys::new("toy", "test-acct", caps).with_market(INST_A, symbol);
+    let symbol = |sym| dispatch_market_data(&toy, |s| s.venue_symbol(sym)).unwrap();
+    let mut keys = LeaseKeys::new("toy", "test-acct", caps).with_market(INST_A, symbol(SYMBOL_A));
     let config = MarketCapsConfig {
         inventory: Lots::new(10),
         resting: Lots::new(10),
     };
-    let market = PreTradeCaps::new().with_market(INST_A, config).unwrap();
+    let mut market = PreTradeCaps::new().with_market(INST_A, config).unwrap();
+    if two {
+        keys = keys.with_market(INST_B, symbol(SYMBOL_B));
+        market = market.with_market(INST_B, config).unwrap();
+    }
     Registry::with_caps(market).with_lease_keys(keys)
 }
 
@@ -469,19 +495,45 @@ impl Run<'_> {
         self.link.borrow_mut().reg().start(INST_A, leases).unwrap();
     }
 
+    /// The owner's Start on `INST_B` too, once `INST_A` started: its market lease, the account
+    /// lease the registry already holds.
+    fn started_b(&mut self) {
+        let toy = fbc_conformance::toy::caps();
+        let symbol = dispatch_market_data(&toy, |s| s.venue_symbol(SYMBOL_B)).unwrap();
+        let market = MarketLease::acquire(&self.dir.0, "toy", "test-acct", &symbol).unwrap();
+        let leases = Leases::market(market);
+        self.link.borrow_mut().reg().start(INST_B, leases).unwrap();
+    }
+
     /// A post-only order of a lot on `side` at `px` ticks on `INST_A`, authorized and submitted
     /// through the link, once the venue read it and, unless it holds acknowledgements, the
     /// registry holds it open: its client id.
     async fn place(&mut self, side: Side, px: i64) -> ClientOrderId {
+        self.place_on(INST_A, side, px).await
+    }
+
+    /// [`Run::place`] on `inst`.
+    async fn place_on(&mut self, inst: InstrumentId, side: Side, px: i64) -> ClientOrderId {
         let cid = self.mint.mint().unwrap();
-        self.place_as(cid, side, px).await;
+        self.place_as_on(inst, cid, side, px).await;
         cid
     }
 
     /// The place of [`Run::place`] under client id `cid`, minted before: its request id.
     async fn place_as(&mut self, cid: ClientOrderId, side: Side, px: i64) -> RpcId {
+        self.place_as_on(INST_A, cid, side, px).await
+    }
+
+    /// [`Run::place_as`] on `inst`.
+    async fn place_as_on(
+        &mut self,
+        inst: InstrumentId,
+        cid: ClientOrderId,
+        side: Side,
+        px: i64,
+    ) -> RpcId {
         let placed = lock(&self.venue).orders.len() + 1;
-        let rpc = self.submit(|reg| reg.place(new_order(cid, side, px)).unwrap());
+        let rpc = self.submit(|reg| reg.place(new_order_on(inst, cid, side, px)).unwrap());
         self.until("the place read", |r| lock(&r.venue).orders.len() == placed)
             .await;
         if !lock(&self.venue).hold_acks {
@@ -552,7 +604,7 @@ impl Run<'_> {
     async fn resync(&self) {
         let records = {
             let v = lock(&self.venue);
-            resync(v.resync_ts.as_deref().unwrap(), &v.orders)
+            resync(v.resync_ts.as_deref().unwrap(), &v.orders, v.two_markets)
         };
         for record in records {
             self.push(record).await;
@@ -623,9 +675,14 @@ impl Run<'_> {
 
 /// A post-only order of a lot on `side` at `px` ticks on `INST_A`, as our client id `cid`.
 fn new_order(cid: ClientOrderId, side: Side, px: i64) -> NewOrder {
+    new_order_on(INST_A, cid, side, px)
+}
+
+/// [`new_order`] on `inst`.
+fn new_order_on(inst: InstrumentId, cid: ClientOrderId, side: Side, px: i64) -> NewOrder {
     NewOrder {
         cid,
-        inst: INST_A,
+        inst,
         side,
         kind: OrderKind::Limit { px: Ticks(px) },
         qty: Lots::new(1).unwrap(),
@@ -652,6 +709,7 @@ fn play(caps: OrderCaps, venue: Venue, scenario: impl AsyncFnOnce(&mut Run<'_>))
         tokio::task::spawn_blocking(move || frozen.recv());
         let clock = IngestClock::new();
         let outbound = venue.outbound.unwrap_or((64, 64));
+        let two = venue.two_markets;
         let venue: Shared = Arc::new(Mutex::new(venue));
         let served = Arc::clone(&venue);
         let (script, pusher) = WsScript::serving(move |_conn| {
@@ -659,7 +717,7 @@ fn play(caps: OrderCaps, venue: Venue, scenario: impl AsyncFnOnce(&mut Run<'_>))
             Responder::new(move |frame| respond(&venue, frame))
         });
         let server = StubServer::start(script, HttpRouter::new()).await.unwrap();
-        let link = Rc::new(RefCell::new(link_over(registry(&caps), caps)));
+        let link = Rc::new(RefCell::new(link_over(registry(&caps, two), caps)));
         let handler = LinkHandler {
             link: Rc::clone(&link),
             wake: Box::new(|| {}),
@@ -688,6 +746,15 @@ fn play(caps: OrderCaps, venue: Venue, scenario: impl AsyncFnOnce(&mut Run<'_>))
         ran.unwrap();
         assert!(server.failures().is_empty(), "{:?}", server.failures());
     });
+}
+
+/// fbc-oms's instrument cancel-all of `inst` under the toy's caps, the consumer's own.
+fn cancel_all_of(reg: &mut Registry, inst: InstrumentId) -> PermittedCommand {
+    let built = reg.cancel_everything(inst, &order_caps());
+    let CancelEverything::CancelAll { command, .. } = built else {
+        panic!("no cancel-all of {inst:?}: {built:?}");
+    };
+    command
 }
 
 /// `d` in nanoseconds.
@@ -1293,7 +1360,7 @@ fn a_cancel_of_ours_refused_for_its_rate_after_its_order_ended_makes_the_resend_
         run.push(format!("item|rpc={}|i=0|res=rej|code=1006", cancel.0))
             .await;
         run.until("the refusal noted", |r| r.answered(cancel)).await;
-        assert!(run.link.borrow().is_cancel(cancel));
+        assert!(run.link.borrow().is_cancel_on(cancel, INST_A));
         let at = run.now();
         let polled = run.poll(&mut stop);
         let resend_at = Some(MonoNs(at.0 + ns(WAIT)));
@@ -1343,7 +1410,7 @@ fn a_place_refused_for_its_rate_during_a_sweep_makes_nothing_due() {
         lock(&run.venue).hold_acks = true;
         let ask = run.mint.mint().unwrap();
         let place = run.place_as(ask, Side::Sell, 110).await;
-        assert!(!run.link.borrow().is_cancel(place));
+        assert!(!run.link.borrow().is_cancel_on(place, INST_A));
         run.push(format!("item|rpc={}|i=0|res=rej|code=1006", place.0))
             .await;
         run.until("the refusal noted", |r| r.answered(place)).await;
@@ -1397,7 +1464,7 @@ fn a_safety_cancel_the_link_sent_refused_for_its_rate_makes_the_resend_due() {
         run.until("its Safety cancel read", |r| r.kinds() == ["cancels"])
             .await;
         let safety = run.link.borrow().safety_cancel_of(earlier).unwrap();
-        assert!(run.link.borrow().is_cancel(safety));
+        assert!(run.link.borrow().is_cancel_on(safety, INST_A));
         assert!(!run.orders.may_place_on(INST_A));
 
         // The sweep leaves the order out of its explicit cancels: its Safety cancel is in flight.
@@ -1484,10 +1551,10 @@ fn the_link_says_which_requests_it_holds_are_cancels_until_each_is_released() {
 
         let mut link = run.link.borrow_mut();
         for rpc in [place, batch, amend] {
-            assert!(!link.is_cancel(rpc), "request {}", rpc.0);
+            assert!(!link.is_cancel_on(rpc, INST_A), "request {}", rpc.0);
         }
         for rpc in [cancel, many, all] {
-            assert!(link.is_cancel(rpc), "request {}", rpc.0);
+            assert!(link.is_cancel_on(rpc, INST_A), "request {}", rpc.0);
         }
         // A request the link never submitted: the session's own arm, and one never made.
         let arm = link.notes().iter().find_map(|n| match n {
@@ -1497,12 +1564,16 @@ fn the_link_says_which_requests_it_holds_are_cancels_until_each_is_released() {
             _ => None,
         });
         let arm = arm.expect("the arm answered");
-        assert!(!link.is_cancel(arm));
-        assert!(!link.is_cancel(RpcId(999)));
+        assert!(!link.is_cancel_on(arm, INST_A));
+        assert!(!link.is_cancel_on(RpcId(999), INST_A));
         // Released, no request is a cancel any more.
         for rpc in [place, batch, amend, cancel, many, all] {
             link.release(rpc);
-            assert!(!link.is_cancel(rpc), "request {} released", rpc.0);
+            assert!(
+                !link.is_cancel_on(rpc, INST_A),
+                "request {} released",
+                rpc.0
+            );
         }
         assert_eq!(link.requests_held(), 0);
     });
@@ -1861,5 +1932,223 @@ fn a_cancel_awaiting_its_orders_acknowledgement_is_sent_as_due_not_in_the_round(
         assert_eq!(run.poll(&mut stop).state, SweepState::Ended);
         assert_eq!(stop.sweep.rpcs().to_vec(), [due]);
         assert_eq!(run.kinds(), ["place", "place", "cancel"]);
+    });
+}
+
+#[test]
+fn a_sweep_sends_only_its_own_markets_due_cancels_and_another_markets_cancel_holds_nothing() {
+    // Every place's acknowledgement is held. The first cancel is answered and ends its order;
+    // the second is left unanswered.
+    let venue = Venue {
+        hold_acks: true,
+        cancels: VecDeque::from([Answer::Cancel, Answer::Silent]),
+        two_markets: true,
+        ..Venue::default()
+    };
+    let singles = OrderCaps {
+        batch_cancel: None,
+        ..awaiting_caps()
+    };
+    play(awaiting_caps(), venue, async |run| {
+        run.started().await;
+        run.started_b();
+        let ours = run.place(Side::Buy, 100).await;
+        let other = run.place_on(INST_B, Side::Buy, 100).await;
+        // The consumer's cancel of its order on INST_B waits for that order's acknowledgement.
+        let choice = {
+            let mut link = run.link.borrow_mut();
+            let cancellable = link.reg().cancellable(other).unwrap();
+            cancellable.cancel(&awaiting_caps())
+        };
+        assert!(matches!(choice, CancelChoice::AwaitAck));
+        // Stop on INST_A: the instrument cancel-all, the order's own cancel waiting for its
+        // acknowledgement.
+        run.link.borrow_mut().reg().kill(INST_A);
+        let (mut stop, round) = run.start(SweepEnd::AtStop);
+        assert_eq!(round.how, How::CancelAll);
+        assert_eq!(round.sent.len(), 1);
+        let all = round.sent[0].rpc;
+        run.until("the cancel-all answered", |r| r.answered(all))
+            .await;
+        assert!(run.poll(&mut stop).due.is_empty());
+
+        // Both acknowledgements land: each order's cancel is due in the registry.
+        run.ack(0).await;
+        run.ack(1).await;
+        run.until("both acknowledged", |r| {
+            r.state(ours) == OrdState::Open && r.state(other) == OrdState::Open
+        })
+        .await;
+        let due = run.link.borrow().registry().cancels_due(&awaiting_caps());
+        assert_eq!(due, [ours, other]);
+
+        // The sweep sends its own market's alone: the other market's stays due, for the consumer
+        // or that market's own sweep, and the venue reads no cancel of it.
+        let polled = run.poll(&mut stop);
+        assert!(polled.due_failed.is_empty());
+        assert_eq!(polled.due.len(), 1);
+        assert_eq!(polled.due[0].names, [ours]);
+        let due = run.link.borrow().registry().cancels_due(&awaiting_caps());
+        assert_eq!(due, [other]);
+        let mine = polled.due[0].rpc;
+        run.until("the order ended", |r| {
+            r.live().is_empty() && r.answered(mine)
+        })
+        .await;
+        assert_eq!(run.kinds(), ["place", "place", "cancelall", "cancel"]);
+
+        // The consumer sends the other market's cancel, and the venue leaves it unanswered: the
+        // sweep ends all the same, every order of ours on its market ended and every request it
+        // sent answered.
+        let theirs = run.submit(|reg| reg.cancel_many(&[other], &singles).commands.remove(0));
+        run.until("the other market's cancel read", |r| r.kinds().len() == 5)
+            .await;
+        assert_eq!(run.poll(&mut stop).state, SweepState::Ended);
+        assert_eq!(stop.sweep.rpcs().to_vec(), [all, mine]);
+        assert!(!run.answered(theirs));
+        assert_eq!(run.link.borrow().live_on(INST_B), [other]);
+    });
+}
+
+#[test]
+fn a_rate_refusal_makes_the_resend_due_only_for_a_cancel_on_the_sweeps_market() {
+    // Every cancel and cancel-all is held, but the last cancel-all, which ends the order of
+    // ours resting on its market.
+    let venue = Venue {
+        cancels: VecDeque::from([Answer::Silent, Answer::Silent]),
+        cancel_alls: VecDeque::from([Answer::Silent; 4]),
+        two_markets: true,
+        ..Venue::default()
+    };
+    play(order_caps(), venue, async |run| {
+        run.started().await;
+        run.started_b();
+        let ours = run.place(Side::Buy, 100).await;
+        let other = run.place_on(INST_B, Side::Buy, 100).await;
+        let (mut swept, round) = run.start(SweepEnd::BeforePlaces);
+        assert_eq!(round.how, How::CancelAll);
+        let all = round.sent[0].rpc;
+        run.until("the cancel-all read", |r| r.kinds().len() == 3)
+            .await;
+
+        // The consumer's cancel of its order on INST_B and its instrument cancel-all of INST_B,
+        // each refused for its rate: neither is a cancel on the sweep's market, so nothing is
+        // due, then or once the hold passed.
+        let cancel_b = run.cancel(other);
+        let all_b = run.submit(|reg| cancel_all_of(reg, INST_B));
+        run.until("both read", |r| r.kinds().len() == 5).await;
+        for rpc in [cancel_b, all_b] {
+            run.push(format!("item|rpc={}|i=0|res=rej|code=1006", rpc.0))
+                .await;
+            run.until("the refusal noted", |r| r.answered(rpc)).await;
+        }
+        let at = run.now();
+        let polled = run.poll(&mut swept);
+        assert_eq!(run.hold.until(), Some(MonoNs(at.0 + ns(WAIT))));
+        assert_eq!(polled.state, SweepState::Waiting { resend_at: None });
+        assert!(polled.resent.is_none());
+        tokio::time::advance(WAIT).await;
+        let polled = run.poll(&mut swept);
+        assert_eq!(polled.state, SweepState::Waiting { resend_at: None });
+        assert!(polled.resent.is_none());
+        let read = ["place", "place", "cancelall", "cancel", "cancelall"];
+        assert_eq!(run.kinds(), read);
+
+        // The consumer's cancel of its order on INST_A refused for its rate: the cancel of
+        // everything is due again at the consumer's wait, and sent then.
+        let cancel_a = run.cancel(ours);
+        run.until("the cancel read", |r| r.kinds().len() == 6).await;
+        run.push(format!("item|rpc={}|i=0|res=rej|code=1006", cancel_a.0))
+            .await;
+        run.until("the refusal noted", |r| r.answered(cancel_a))
+            .await;
+        let at = run.now();
+        let resend_at = Some(MonoNs(at.0 + ns(WAIT)));
+        assert_eq!(
+            run.poll(&mut swept).state,
+            SweepState::Waiting { resend_at }
+        );
+        tokio::time::advance(WAIT).await;
+        let resent = run.poll(&mut swept).resent.expect("sent again");
+        assert_eq!(resent.how, How::CancelAll);
+        let again = resent.sent[0].rpc;
+        run.until("the resend read", |r| r.kinds().len() == 7).await;
+
+        // The consumer's instrument cancel-all of INST_A, not the sweep's, refused for its rate:
+        // due again, and sent once the hold passed. That one ends the order.
+        let all_a = run.submit(|reg| cancel_all_of(reg, INST_A));
+        run.until("the cancel-all read", |r| r.kinds().len() == 8)
+            .await;
+        run.push(format!("item|rpc={}|i=0|res=rej|code=1006", all_a.0))
+            .await;
+        run.until("the refusal noted", |r| r.answered(all_a)).await;
+        let at = run.now();
+        let resend_at = Some(MonoNs(at.0 + ns(WAIT)));
+        assert_eq!(
+            run.poll(&mut swept).state,
+            SweepState::Waiting { resend_at }
+        );
+        tokio::time::advance(WAIT).await;
+        let resent = run.poll(&mut swept).resent.expect("sent again");
+        assert_eq!(resent.how, How::CancelAll);
+        let last = resent.sent[0].rpc;
+        run.until("the order ended", |r| {
+            r.live().is_empty() && r.answered(last)
+        })
+        .await;
+        assert_eq!(run.poll(&mut swept).state, SweepState::Ended);
+        assert_eq!(swept.sweep.rpcs().to_vec(), [all, again, last]);
+        assert_eq!(run.link.borrow().live_on(INST_B), [other]);
+        let syms = lock(&run.venue).cancel_all_syms.clone();
+        assert_eq!(syms, [SYMBOL_A, SYMBOL_B, SYMBOL_A, SYMBOL_A, SYMBOL_A]);
+    });
+}
+
+#[test]
+fn the_link_says_on_which_market_each_cancel_it_holds_cancels() {
+    // Nothing a cancel names ends by it: each is left unanswered.
+    let venue = Venue {
+        cancels: VecDeque::from([Answer::Silent, Answer::Silent]),
+        cancel_alls: VecDeque::from([Answer::Silent]),
+        two_markets: true,
+        ..Venue::default()
+    };
+    play(order_caps(), venue, async |run| {
+        run.started().await;
+        run.started_b();
+        let ours = run.place(Side::Buy, 100).await;
+        let other = run.mint.mint().unwrap();
+        let place = run.place_as_on(INST_B, other, Side::Buy, 100).await;
+        // A cancel of each, and the consumer's instrument cancel-all of INST_B.
+        let cancel_a = run.cancel(ours);
+        let cancel_b = run.cancel(other);
+        let all_b = run.submit(|reg| cancel_all_of(reg, INST_B));
+        run.until("every request read", |r| r.kinds().len() == 5)
+            .await;
+        assert_eq!(
+            run.kinds(),
+            ["place", "place", "cancel", "cancel", "cancelall"]
+        );
+        // The venue ends the order on INST_B itself: its cancel still names it.
+        run.end_order(1, "expired").await;
+        run.until("the order ended", |r| r.state(other).is_terminal())
+            .await;
+
+        let mut link = run.link.borrow_mut();
+        assert!(link.is_cancel_on(cancel_a, INST_A));
+        assert!(!link.is_cancel_on(cancel_a, INST_B));
+        for rpc in [cancel_b, all_b] {
+            assert!(link.is_cancel_on(rpc, INST_B), "request {}", rpc.0);
+            assert!(!link.is_cancel_on(rpc, INST_A), "request {}", rpc.0);
+        }
+        assert!(!link.is_cancel_on(place, INST_A));
+        assert!(!link.is_cancel_on(place, INST_B));
+        // Released, none is a cancel on either market any more.
+        for rpc in [cancel_a, cancel_b, all_b] {
+            link.release(rpc);
+            for inst in [INST_A, INST_B] {
+                assert!(!link.is_cancel_on(rpc, inst), "request {} released", rpc.0);
+            }
+        }
     });
 }

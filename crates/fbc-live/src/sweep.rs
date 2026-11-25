@@ -12,22 +12,26 @@
 //!   by [`Registry::cancel_many`](fbc_oms::Registry::cancel_many), of each order of ours the link
 //!   holds live on the market ([`Link::live_on`], in the order the link learnt them) with no
 //!   cancel in flight or awaiting its acknowledgement, or gone Unknown. It never sends an account
-//!   cancel-all (decision 0045). Each [`Sweep::poll`] sends the cancels that waited for their
-//!   order's acknowledgement once it landed
-//!   ([`Registry::cancels_due`](fbc_oms::Registry::cancels_due)). A round that stops short at a
-//!   cancel not handed over ([`Round::failed`]) leaves the requests it sent before to the
-//!   consumer: the sweep neither waits on nor lists them ([`Sweep::rpcs`]).
-//! - **Refused for its rate.** A cancel of ours that the venue refuses for its rate makes the
-//!   cancel of everything due again, whatever its order's state and whoever sent it (the sweep,
-//!   the consumer, or the link's Safety cancel of an unprotected order): a poll sends it once the
-//!   consumer's [`RateHold`] no longer holds (Codex r4306449947 on PR #158), so what the sweep
-//!   waits for is sent again rather than waited out while the orders rest. A place's refusal
-//!   makes nothing due. The sweep reads from the link which requests are cancels
-//!   ([`Link::is_cancel`]), and the link forgets a request once the consumer releases it
-//!   ([`Link::release`]), so the consumer hands each note to the sweep before it releases the
-//!   note's request. The hold is the consumer's: it records each refusal for its rate it reads,
-//!   a place's too, which holds for the venue's retry time or, when the venue states none, for
-//!   the consumer's wait ([`RateHold::refused`]).
+//!   cancel-all (decision 0045). Each [`Sweep::poll`] sends the cancels of the market's orders
+//!   that waited for their order's acknowledgement once it landed
+//!   ([`Registry::cancels_due`](fbc_oms::Registry::cancels_due), each order's market as the
+//!   registry records it); another market's stay due in the registry, for the consumer or that
+//!   market's own sweep, since a sweep is of one market (decision 0155 item 5). A round that
+//!   stops short at a cancel not handed over ([`Round::failed`]) leaves the requests it sent
+//!   before to the consumer: the sweep neither waits on nor lists them ([`Sweep::rpcs`]).
+//! - **Refused for its rate.** A cancel of ours on the market that the venue refuses for its rate
+//!   makes the cancel of everything due again, whatever its order's state and whoever sent it
+//!   (the sweep, the consumer, or the link's Safety cancel of an unprotected order): a poll sends
+//!   it once the consumer's [`RateHold`] no longer holds (Codex r4306449947 on PR #158), so what
+//!   the sweep waits for is sent again rather than waited out while the orders rest. A cancel on
+//!   the market is one of the sweep's own, an explicit cancel or cancel-many naming at least one
+//!   order of ours on it, or an instrument cancel-all of it. A place's refusal makes nothing due,
+//!   nor does a refusal of a cancel naming no order on the market. The sweep reads from the link
+//!   which requests are cancels on its market ([`Link::is_cancel_on`]), and the link forgets a
+//!   request once the consumer releases it ([`Link::release`]), so the consumer hands each note
+//!   to the sweep before it releases the note's request. The hold is the consumer's: it records
+//!   each refusal for its rate it reads, a place's too, which holds for the venue's retry time
+//!   or, when the venue states none, for the consumer's wait ([`RateHold::refused`]).
 //! - **How it ends** ([`SweepEnd`]). At Start and after a reconnect
 //!   ([`SweepEnd::BeforePlaces`]), once every order of ours the link holds live on the market has
 //!   ended and the session takes places there ([`ExecOrders::may_place_on`]). A cancel of the
@@ -144,7 +148,8 @@ pub enum SweepEnd {
     /// `AlreadyTerminal` or `NotFound` failing it.
     BeforePlaces,
     /// At Stop: once every order of ours on the market ended and every request the sweep sent
-    /// is answered, whatever the answers.
+    /// is answered, whatever the answers. Its requests are all on its market, so another
+    /// market's cancel, answered or not, never holds it.
     AtStop,
 }
 
@@ -210,7 +215,8 @@ pub enum SweepState {
 /// What one poll sent, and where the sweep stands.
 #[derive(Debug)]
 pub struct Polled {
-    /// The cancels that waited for their order's acknowledgement, sent, in client id order.
+    /// The cancels of the sweep's market's orders that waited for their order's
+    /// acknowledgement, sent, in client id order.
     pub due: Vec<Sent>,
     /// Those of them not handed over.
     pub due_failed: Vec<SendError>,
@@ -259,7 +265,7 @@ pub struct Sweep {
     /// The requests it sent, in order, but a round's that stopped short.
     sent: Vec<RpcId>,
     answers: HashMap<RpcId, Answers>,
-    /// A cancel was refused for its rate since the last cancel of everything.
+    /// A cancel on its market was refused for its rate since the last cancel of everything.
     resend_due: bool,
     /// Before places, the first refusal that failed it.
     failed: Option<Reject>,
@@ -305,10 +311,11 @@ impl Sweep {
 
     /// Takes `note`, read from `link`, into the sweep: an answer to one of its requests, or a
     /// report that one was not sent, is kept; a refusal for its rate of one of them, or of any
-    /// request the link says is a cancel ([`Link::is_cancel`]: the consumer's, or a Safety cancel
-    /// the link sent), makes the cancel of everything due again, and a place's makes nothing due;
-    /// and before places a refusal of one of the sweep's for another reason than that its order
-    /// already ended or is not known fails it. The note's request must not be released yet
+    /// request the link says is a cancel on the sweep's market ([`Link::is_cancel_on`]: the
+    /// consumer's, or a Safety cancel the link sent), makes the cancel of everything due again,
+    /// and a place's, or a cancel's naming no order on the market, makes nothing due; and before
+    /// places a refusal of one of the sweep's for another reason than that its order already
+    /// ended or is not known fails it. The note's request must not be released yet
     /// ([`Link::release`]): the link then no longer says it is a cancel.
     pub fn observe(&mut self, link: &Link, note: &Note) {
         match note {
@@ -347,7 +354,9 @@ impl Sweep {
             return;
         };
         match reject.kind {
-            RejectKind::RateLimited { .. } => self.resend_due |= own || link.is_cancel(rpc),
+            RejectKind::RateLimited { .. } => {
+                self.resend_due |= own || link.is_cancel_on(rpc, self.inst);
+            }
             RejectKind::AlreadyTerminal(_) | RejectKind::NotFound => {}
             _ if own && self.end == SweepEnd::BeforePlaces => {
                 self.failed.get_or_insert_with(|| reject.clone());
@@ -357,8 +366,9 @@ impl Sweep {
     }
 
     /// The sweep at `now` on the shard's monotonic clock, under the consumer's `hold`: the
-    /// cancels due on an acknowledgement sent, the cancel of everything sent again when a
-    /// refusal for its rate made it due and the hold no longer holds, and where it stands. A
+    /// cancels of its market's orders due on an acknowledgement sent, another market's left due
+    /// in the registry, the cancel of everything sent again when a refusal for its rate of a
+    /// cancel on its market made it due and the hold no longer holds, and where it stands. A
     /// sweep that failed sends nothing more.
     pub fn poll(
         &mut self,
@@ -378,7 +388,19 @@ impl Sweep {
             return polled;
         }
         let caps = link.caps().clone();
-        let due = link.registry().cancels_due(&caps);
+        // The sweep's market's alone, by the market the registry records for each order: fbc-oms
+        // lists every market's, and reading them clears nothing, so another market's stay due
+        // for the consumer or that market's own sweep (decision 0155 item 5).
+        let inst = self.inst;
+        let due: Vec<ClientOrderId> = {
+            let reg = link.registry();
+            let on_market =
+                |cid: &ClientOrderId| reg.get(*cid).is_some_and(|r| r.placed().inst == inst);
+            reg.cancels_due(&caps)
+                .into_iter()
+                .filter(on_market)
+                .collect()
+        };
         // Each a single cancel, as the order's cancel permit builds it under the venue's caps: a
         // batch cancel of none of them, which fbc-oms would build under a declared batch. fbc-oms
         // lists an order due once its cancel can name it, so its permit builds the cancel; an
