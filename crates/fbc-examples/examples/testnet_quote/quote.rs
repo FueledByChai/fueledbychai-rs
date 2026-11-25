@@ -54,10 +54,10 @@
 //! told unprotected and Safety-cancelled by the [`Link`] at once (decision 0080). Paradex does
 //! not say an arm covers orders already open, so after every reconnect, once the arm is
 //! accepted and the resync has ended, the loop cancels every other order of ours still open on
-//! the market and waits until all of them ended before it places ([`Driver::sweep`]): an
-//! instrument cancel-all when fbc-oms builds one under 0005's I7 guard, which needs a trustworthy
-//! resync (Paradex's is, decision 0094), otherwise explicit cancels of each order of ours, never
-//! an account cancel-all.
+//! the market and waits until all of them ended before it places ([`Driver::sweep`], through
+//! fbc-live's [`Sweep`]): an instrument cancel-all when fbc-oms builds one under 0005's I7 guard,
+//! which needs a trustworthy resync (Paradex's is, decision 0094), otherwise explicit cancels of
+//! each order of ours, never an account cancel-all.
 //!
 //! **Stop** (kill switch on, every order of ours on the market cancelled, the session closed):
 //! on the interrupt (Ctrl-C), at `--duration` or `--cycles`, and on anything the loop does not
@@ -99,8 +99,7 @@
 //! our orders: one quoter per account"); past the window the next one starts a new window; a
 //! testnet run only warns. Once one was seen, another program may be on the account, so the run's
 //! cancels of everything (a reconnect's sweep, Stop) name our orders explicitly and never send an
-//! instrument cancel-all, which would cancel its orders too ([`Driver::cancel_ours`]). The summary
-//! counts them.
+//! instrument cancel-all, which would cancel its orders too ([`Sweep`]). The summary counts them.
 //!
 //! **Memory.** The link's notes are read once each ([`Driver::absorb`]) and those read are
 //! forgotten every cycle ([`Link::forget`]), so a long run keeps no growing note list.
@@ -122,11 +121,11 @@ use fbc_live::not_ours::{CancelsNotOurs, NotOurs, NotOursConfig};
 use fbc_live::sizing::{
     LeftOut, Market, SideQuote, UsdCaps, admit_minimum, admit_side, at_market, caps_in_lots,
 };
+use fbc_live::sweep::{How, RateHold, Round, SendError, Sent, Sweep, SweepEnd, SweepState, Why};
 use fbc_oms::{
-    Applied, Batching, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
-    FillLedger, Intent, LadderConfig, LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OrdState,
-    PermittedCommand, PlanRefusal, PlanVenue, PlannerConfig, PreTradeCaps, RateView,
-    ReduceFallback, Registry, Routed, Stage, TestnetRun,
+    Applied, Batching, DesiredBook, DesiredQuote, ExecutionPlanner, FillLedger, LadderConfig,
+    LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OrdState, PlanRefusal, PlanVenue,
+    PlannerConfig, PreTradeCaps, RateView, ReduceFallback, Registry, Routed, Stage, TestnetRun,
 };
 use fbc_runtime::{Connector, ExecControl, ExecOrders, ExecSession, RateLimiter};
 use fbc_venue_paradex::ParadexFactory;
@@ -698,6 +697,9 @@ pub async fn run_on(
     // refused zero (decision 0155 item 8), before anything connects.
     let not_ours = NotOursConfig::new(EVENT_SPAN, opts.cancel_window)
         .map_err(|e| format!("cancels not ours: {e}"))?;
+    // The hold a refusal for its rate puts on the loop, under the sample's wait for a venue that
+    // states no retry time, refused zero (decision 0155 item 8).
+    let hold = RateHold::new(RATE_LIMITED_WAIT).map_err(|e| format!("the rate hold: {e}"))?;
     let cfg = venue_config(opts);
     let specs = specs(factory, &cfg, &opts.market, opts.tick, opts.step)?;
     let wait = Duration::from_secs(opts.step_timeout_secs);
@@ -924,8 +926,8 @@ pub async fn run_on(
         positions: Some(positions),
         fill_check_due: false,
         fill_checked: false,
-        retry_at: None,
-        recancel_due: false,
+        hold,
+        sweep: None,
         not_ours: CancelsNotOurs::new(not_ours),
     };
     // The interrupt sets a flag the driver reads at each wake, and wakes it.
@@ -1091,12 +1093,13 @@ struct Driver {
     /// The check after the first fill has run (or was passed over at Stop).
     fill_checked: bool,
     /// Until when nothing is planned: a request of ours refused for its rate (`RateLimited`)
-    /// waits its retry time, or [`RATE_LIMITED_WAIT`] (Codex r4277631500, r4289363361).
-    retry_at: Option<tokio::time::Instant>,
-    /// A cancel of ours was refused for its rate since the last cancel of everything: a sweep
-    /// or Stop sends the cancel of everything of ours again once its retry time passed
-    /// ([`Driver::cancel_again`], Codex r4306449947 on PR #158).
-    recancel_due: bool,
+    /// waits its retry time, or [`RATE_LIMITED_WAIT`] (Codex r4277631500, r4289363361), on the
+    /// session's shard clock ([`Driver::retry_at`]).
+    hold: RateHold,
+    /// The sweep running, a reconnect's or Stop's: it is handed every note read
+    /// ([`Driver::absorb`]), and sends the cancel of everything of ours again once a cancel was
+    /// refused for its rate and the hold passed (Codex r4306449947 on PR #158).
+    sweep: Option<Sweep>,
     /// The cancels not ours seen, under the owner's rule (module documentation, FBC-aoh5),
     /// with when each order of ours the loop placed that has not ended was handed over (with
     /// the venue's times, what tells one event from the next, and each side's requote since
@@ -1279,7 +1282,7 @@ impl Driver {
             // A refusal for its rate's retry time is a wake too: what waits for it (a sweep's or
             // Stop's cancel sent again) is read then, whether or not anything else comes.
             let retry = self
-                .retry_at
+                .retry_at()
                 .filter(|at| *at > tokio::time::Instant::now() && *at < deadline);
             tokio::select! {
                 () = woken => {}
@@ -1308,8 +1311,10 @@ impl Driver {
 
     /// Reads the notes the link appended since the last read, once each: prints what the owner
     /// should see, keeps what the loop needs (outcomes, sends, connection ends), and keeps the
-    /// first reason to Stop ([`Driver::trouble`]). Then the orders of ours: one gone Unknown
-    /// Stops the loop, as does an order not ours in view on the market.
+    /// first reason to Stop ([`Driver::trouble`]), each handed first to the sweep running with
+    /// the link ([`Sweep::observe`]), before [`Driver::compact`] releases its request. Then the
+    /// orders of ours: one gone Unknown Stops the loop, as does an order not ours in view on the
+    /// market.
     fn absorb(&mut self) {
         let notes: Vec<Note> = {
             let mut link = self.link.borrow_mut();
@@ -1317,6 +1322,9 @@ impl Driver {
             link.forget(read)
         };
         for note in notes {
+            if let Some(sweep) = self.sweep.as_mut() {
+                sweep.observe(&self.link.borrow(), &note);
+            }
             self.absorb_one(note);
         }
         self.prune();
@@ -1755,12 +1763,10 @@ impl Driver {
             format!("the cancel of {named}")
         };
         match reject.kind {
-            RejectKind::RateLimited { retry_after } => {
-                self.pace(&what, retry_after);
-                // A sweep or Stop sends it again once the retry time passed; a cycle's planner
-                // builds it again itself (Codex r4306449947 on PR #158).
-                self.recancel_due |= !place;
-            }
+            // A sweep or Stop sends the cancel of everything again once the retry time passed,
+            // having read from the link that the request is a cancel ([`Sweep::observe`]); a
+            // cycle's planner builds it again itself (Codex r4306449947 on PR #158).
+            RejectKind::RateLimited { retry_after } => self.pace(&what, retry_after),
             RejectKind::PostOnlyWouldCross if place => {}
             RejectKind::AlreadyTerminal(_) | RejectKind::NotFound if !place => {}
             kind => self.trouble(format!(
@@ -1779,9 +1785,13 @@ impl Driver {
     /// Nothing is planned until `retry_after` from now (or [`RATE_LIMITED_WAIT`] when the venue
     /// states none): `what` was refused for its rate.
     fn pace(&mut self, what: &str, retry_after: Option<Duration>) {
-        let wait = retry_after.unwrap_or(RATE_LIMITED_WAIT);
-        let until = tokio::time::Instant::now() + wait;
-        self.retry_at = Some(self.retry_at.map_or(until, |at| at.max(until)));
+        // The link was attached to the session before the driver ran, so it reads the
+        // session's shard clock (decision 0155 item 3).
+        let Some((now, _)) = self.link.borrow().now() else {
+            self.trouble("the link has no session's clock".to_owned());
+            return;
+        };
+        let wait = self.hold.refused(retry_after, now);
         self.event(
             "PACE",
             format_args!(
@@ -1793,10 +1803,20 @@ impl Driver {
         );
     }
 
-    /// Whether a refusal for its rate holds the loop now ([`Driver::retry_at`]).
+    /// Whether a refusal for its rate holds the loop now ([`Driver::hold`]).
     fn paced(&self) -> bool {
-        self.retry_at
-            .is_some_and(|at| tokio::time::Instant::now() < at)
+        let now = self.link.borrow().now();
+        now.is_some_and(|(now, _)| self.hold.held(now))
+    }
+
+    /// When the latest refusal for its rate stops holding the loop ([`Driver::hold`]), on tokio's
+    /// clock: the hold's end on the session's shard clock, as far past that clock's now as it
+    /// lies past tokio's.
+    fn retry_at(&self) -> Option<tokio::time::Instant> {
+        let until = self.hold.until()?;
+        let (now, _) = self.link.borrow().now()?;
+        let left = Duration::from_nanos(until.0.saturating_sub(now.0));
+        Some(tokio::time::Instant::now() + left)
     }
 
     /// What came of request `rpc` of ours once every item is answered: the whole request's
@@ -2055,7 +2075,7 @@ impl Driver {
             }
             if self.paced() {
                 // A refusal for its rate: nothing is read or planned before its retry time.
-                let until = self.retry_at.unwrap_or_else(tokio::time::Instant::now);
+                let until = self.retry_at().unwrap_or_else(tokio::time::Instant::now);
                 self.pause_until(until).await;
                 continue;
             }
@@ -2686,28 +2706,31 @@ impl Driver {
 
     /// Cancels every order of ours still open on the market and waits until all of them ended
     /// and the session takes places on the market, before anything is placed (module
-    /// documentation).
+    /// documentation): fbc-live's [`Sweep`] before places, polled at each wake
+    /// ([`Driver::poll_sweep`]).
     async fn sweep(&mut self, label: &str) -> Result<(), String> {
-        // The sweep's cancel covers every cancel refused for its rate before it.
-        self.recancel_due = false;
-        let (rpcs, how) = self.cancel_ours()?;
+        let round = self.start_sweep(SweepEnd::BeforePlaces);
+        let (sent, how) = match self.round(round) {
+            Ok(started) => started,
+            Err(why) => {
+                self.sweep = None;
+                return Err(why);
+            }
+        };
         self.lines.line(format_args!(
             "{label} every order of ours still open on the market is cancelled before any place: \
-             {} cancels sent ({how})",
-            rpcs.len()
+             {sent} cancels sent ({how})"
         ));
-        let orders = self.orders.clone();
         let timeout = self.timeout;
         let done = self
             .wait_for(timeout, true, |d| {
                 if d.trouble.is_some() {
                     return Some(());
                 }
-                d.cancel_due();
-                d.cancel_again();
-                (d.all_ended() && orders.may_place_on(INST)).then_some(())
+                d.poll_sweep()
             })
             .await;
+        self.sweep = None;
         self.ended_unless(
             done,
             "sweep",
@@ -2716,185 +2739,120 @@ impl Driver {
         Ok(())
     }
 
-    /// The cancel of everything of ours sent again ([`Driver::cancel_ours`]) once a cancel was
-    /// refused for its rate during a sweep or Stop and its retry time passed: what they wait for
-    /// is sent again, not waited out while the quotes rest (Codex r4306449947 on PR #158). The
-    /// requests sent.
-    fn cancel_again(&mut self) -> Vec<RpcId> {
-        if !self.recancel_due || self.paced() {
-            return Vec::new();
-        }
-        self.recancel_due = false;
-        match self.cancel_ours() {
-            Ok((rpcs, how)) => {
-                self.note(format_args!(
-                    "a cancel refused for its rate, sent again after its retry time: {} cancels \
-                     sent ({how})",
-                    rpcs.len()
-                ));
-                rpcs
-            }
-            Err(why) => {
-                self.trouble(why);
-                Vec::new()
-            }
-        }
-    }
-
-    /// Whether every order of ours the run knows ended ([`Driver::prune`] then holds none).
-    fn all_ended(&self) -> bool {
-        let link = self.link.borrow();
-        let reg = link.registry();
-        self.owned
-            .iter()
-            .all(|cid| reg.get(*cid).is_none_or(|r| r.state().is_terminal()))
-    }
-
-    /// The cancels of every order of ours still open on the market that has none in flight,
-    /// handed to the session: an instrument cancel-all when fbc-oms builds one (0005's I7) and
-    /// no cancel not ours was seen, otherwise explicit cancels: once one was seen another
-    /// program may be on the account, and Paradex's instrument cancel-all would cancel its
-    /// orders too (FBC-aoh5). The requests, and how it was done.
-    fn cancel_ours(&mut self) -> Result<(Vec<RpcId>, String), String> {
-        let not_ours = self.not_ours.seen();
-        let (cmds, how) = {
+    /// Starts fbc-live's sweep of the market, ending as `end` says, for the run's account: what
+    /// its cancel of everything of ours sent ([`Driver::round`] prints it). Each note read from
+    /// then on is handed to it ([`Driver::absorb`]).
+    fn start_sweep(&mut self, end: SweepEnd) -> Round {
+        let (sweep, round) = {
             let mut link = self.link.borrow_mut();
-            let caps = self.caps.clone();
-            let reg = link.reg();
-            let everything = (!not_ours).then(|| reg.cancel_everything(INST, &caps));
-            let all = match everything {
-                Some(CancelEverything::CancelAll {
-                    command,
-                    unanswered,
-                }) => {
-                    let mut cmds = vec![command];
-                    cmds.extend(unanswered.commands);
-                    Ok((cmds, "an instrument cancel-all".to_owned()))
-                }
-                Some(CancelEverything::Explicit { why, .. }) => Err(why.to_string()),
-                None => Err(
-                    "another program cancelled our orders (a cancel this program did \
-                             not send), and an instrument cancel-all would cancel its orders too"
+            Sweep::start(&mut link, &self.orders, ACCT, INST, end)
+        };
+        self.sweep = Some(sweep);
+        round
+    }
+
+    /// What a cancel of everything of ours sent, each request printed and remembered
+    /// ([`Driver::sent`]): how many requests and how it was done, or why it stopped short.
+    fn round(&mut self, round: Round) -> Result<(usize, String), String> {
+        let count = round.sent.len();
+        for sent in round.sent {
+            self.sent(sent);
+        }
+        if let Some(failed) = &round.failed {
+            return Err(send_failure(failed));
+        }
+        let how = match round.how {
+            How::CancelAll => "an instrument cancel-all".to_owned(),
+            How::Explicit(why) => {
+                let why = match why {
+                    Why::NotOursSeen => "another program cancelled our orders (a cancel this \
+                                         program did not send), and an instrument cancel-all \
+                                         would cancel its orders too"
                         .to_owned(),
-                ),
-            };
-            match all {
-                Ok(all) => all,
-                Err(why) => {
-                    let open: Vec<ClientOrderId> = self
-                        .owned
-                        .iter()
-                        .copied()
-                        .filter(|cid| {
-                            // One whose cancel is in flight is left to it, unless it went
-                            // Unknown (a cancel answered so): cancelled again.
-                            reg.get(*cid).is_some_and(|r| {
-                                let unknown =
-                                    r.state() == OrdState::Unknown || r.unknown_since().is_some();
-                                !r.state().is_terminal()
-                                    && !r.cancel_awaits_ack()
-                                    && (r.intent() == Intent::None || unknown)
-                            })
-                        })
-                        .collect();
-                    let plan = reg.cancel_many(&open, &caps);
-                    if let Some((cid, refusal)) = plan.refused.first() {
-                        return Err(format!(
-                            "no cancel could be built for client id sequence {}: {refusal:?}",
-                            cid.seq()
-                        ));
-                    }
-                    let how = format!(
-                        "explicit cancels of our orders with none in flight or gone Unknown, no \
-                         instrument cancel-all: {why}"
-                    );
-                    (plan.commands, how)
-                }
+                    Why::Refused(why) => why.to_string(),
+                };
+                format!(
+                    "explicit cancels of our orders with none in flight or gone Unknown, no \
+                     instrument cancel-all: {why}"
+                )
             }
         };
-        let mut rpcs = Vec::new();
-        for cmd in cmds {
-            rpcs.push(self.submit_cancel(cmd)?);
-        }
-        Ok((rpcs, how))
+        Ok((count, how))
     }
 
-    /// Authorizes and hands over one cancel fbc-oms built, printing the orders it names.
-    fn submit_cancel(&mut self, cmd: PermittedCommand) -> Result<RpcId, String> {
-        let auth = {
-            let mut link = self.link.borrow_mut();
-            link.reg()
-                .authorize(ACCT, cmd)
-                .map_err(|e| format!("a cancel was not authorized: {e:?}"))?
-        };
-        let cids: Vec<ClientOrderId> = {
-            let link = self.link.borrow();
-            let reg = link.registry();
-            let of = |c: &fbc_core::CancelOrder| {
-                c.target
-                    .client()
-                    .or_else(|| c.target.venue().and_then(|v| reg.cid_of(v)))
-            };
-            match auth.command() {
-                fbc_core::VenueCommand::Cancel(c) => of(c).into_iter().collect(),
-                fbc_core::VenueCommand::CancelMany(cs) => cs.iter().filter_map(of).collect(),
-                _ => Vec::new(),
-            }
-        };
-        let rpc = {
-            let mut link = self.link.borrow_mut();
-            link.submit(&self.orders, auth)
-                .map_err(|e| format!("the session refused a command: {e}"))?
-        };
-        let named: Vec<String> = cids
+    /// One cancel the sweep handed the session: printed with the orders it names, and
+    /// remembered as a request of ours.
+    fn sent(&mut self, sent: Sent) {
+        let named: Vec<String> = sent
+            .names
             .iter()
             .map(|cid| format!("{} #{}", side_name(self.side_of(*cid)), cid.seq()))
             .collect();
         let request = Request {
             place: false,
-            first: cids.first().map(|cid| (self.side_of(*cid), *cid)),
-            items: cids.len().max(1),
+            first: sent.names.first().map(|cid| (self.side_of(*cid), *cid)),
+            items: sent.names.len().max(1),
         };
-        self.ours.insert(rpc, request);
+        self.ours.insert(sent.rpc, request);
         let what = if named.is_empty() {
             "every order of ours on the market (an instrument cancel-all)".to_owned()
         } else {
             named.join(", ")
         };
-        self.event("CANCEL", format_args!("{what} (request {})", rpc.0));
-        Ok(rpc)
+        self.event("CANCEL", format_args!("{what} (request {})", sent.rpc.0));
     }
 
-    /// Sends the cancels that waited for their order's acknowledgement once it landed
-    /// ([`Registry::cancels_due`]): an order of ours placed and not yet acknowledged when a
-    /// sweep or Stop came.
-    fn cancel_due(&mut self) -> Vec<RpcId> {
-        let mut rpcs = Vec::new();
-        let due = {
-            let link = self.link.borrow();
-            link.registry().cancels_due(&self.caps)
+    /// Polls the sweep running at the session's shard clock's now, under the run's rate hold:
+    /// the cancels due on an acknowledgement (an order of ours placed and not yet acknowledged
+    /// when a sweep or Stop came) and the cancel of everything sent again once a cancel was
+    /// refused for its rate and its retry time passed (Codex r4306449947 on PR #158), each
+    /// printed, a send that failed a reason to Stop; `Some` once the sweep ended.
+    fn poll_sweep(&mut self) -> Option<()> {
+        // The link was attached to the session before the driver ran, so it reads the
+        // session's shard clock (decision 0155 item 3).
+        let Some((now, _)) = self.link.borrow().now() else {
+            self.trouble("the link has no session's clock".to_owned());
+            return None;
         };
-        for cid in due {
-            let built = {
-                let mut link = self.link.borrow_mut();
-                let caps = self.caps.clone();
-                link.reg().cancellable(cid).map(|p| p.cancel(&caps))
-            };
-            match built {
-                Ok(CancelChoice::Send(cmd)) => match self.submit_cancel(cmd) {
-                    Ok(rpc) => rpcs.push(rpc),
-                    Err(why) => self.trouble(why),
-                },
-                Ok(CancelChoice::AwaitAck) => {}
-                Err(refusal) => self.trouble(format!("no cancel: {refusal:?}")),
+        let polled = {
+            let sweep = self.sweep.as_mut()?;
+            let mut link = self.link.borrow_mut();
+            sweep.poll(&mut link, &self.orders, &self.hold, now)
+        };
+        for sent in polled.due {
+            self.sent(sent);
+        }
+        for failed in &polled.due_failed {
+            self.trouble(send_failure(failed));
+        }
+        if let Some(round) = polled.resent {
+            match self.round(round) {
+                Ok((sent, how)) => self.note(format_args!(
+                    "a cancel refused for its rate, sent again after its retry time: {sent} \
+                     cancels sent ({how})"
+                )),
+                Err(why) => self.trouble(why),
             }
         }
-        rpcs
+        match polled.state {
+            SweepState::Ended => Some(()),
+            SweepState::Waiting { .. } => None,
+            // The notes read before the poll already hold the refusal that failed it, a reason
+            // to Stop ([`Driver::refused`]).
+            SweepState::Failed(reject) => {
+                self.trouble(format!(
+                    "the sweep's cancel was refused ({:?}: {})",
+                    reject.kind,
+                    described(&reject)
+                ));
+                Some(())
+            }
+        }
     }
 
-    /// Stop: the kill switch, then the cancel of every order of ours on the market
-    /// ([`Driver::cancel_ours`]; those not yet acknowledged once they are), each answered, and
-    /// every order of ours ended, within the step timeout; then the comparison at Stop
+    /// Stop: the kill switch, then fbc-live's sweep at Stop: the cancel of every order of ours
+    /// on the market (those not yet acknowledged once they are), each answered, and every order
+    /// of ours ended, within the step timeout; then the comparison at Stop
     /// ([`Driver::check_at_stop`]) while the market's lease is held, and then the market is
     /// disarmed and its leases released. True when every cancel was built, sent and accepted
     /// and every order of ours ended; and why the run fails when the comparison's mismatch
@@ -2903,24 +2861,21 @@ impl Driver {
         self.link.borrow_mut().reg().kill(INST);
         // Stop's waits are not cut short by the interrupt: it is what started them.
         self.trouble = None;
-        // Stop's cancel covers every cancel refused for its rate before it.
-        self.recancel_due = false;
-        let (mut rpcs, how, mut ok) = match self.cancel_ours() {
-            Ok((rpcs, how)) => (rpcs, how, true),
+        // Stop's sweep covers every cancel refused for its rate before it.
+        let round = self.start_sweep(SweepEnd::AtStop);
+        let (how, mut ok) = match self.round(round) {
+            Ok((_, how)) => (how, true),
             Err(why) => {
                 self.note(format_args!("{why}"));
-                (Vec::new(), "none built".to_owned(), false)
+                ("none built".to_owned(), false)
             }
         };
         let timeout = self.timeout;
-        let ended = self
-            .wait_for(timeout, false, |d| {
-                rpcs.extend(d.cancel_due());
-                rpcs.extend(d.cancel_again());
-                let answered = rpcs.iter().all(|r| d.answer(*r).is_some());
-                (answered && d.all_ended()).then_some(())
-            })
-            .await;
+        let ended = self.wait_for(timeout, false, Driver::poll_sweep).await;
+        let rpcs: Vec<RpcId> = self
+            .sweep
+            .take()
+            .map_or_else(Vec::new, |s| s.rpcs().to_vec());
         if ended.is_none() {
             ok = false;
             self.timed_out(
@@ -2960,6 +2915,14 @@ impl Driver {
             ),
         );
         (ok, compared)
+    }
+}
+
+/// Why a cancel fbc-live's sweep built was not handed to the session.
+fn send_failure(failed: &SendError) -> String {
+    match failed {
+        SendError::Unauthorized(e) => format!("a cancel was not authorized: {e:?}"),
+        SendError::Unsubmitted(e) => format!("the session refused a command: {e}"),
     }
 }
 

@@ -89,6 +89,14 @@
 //!   Once one is noted, [`Link::cancels_not_ours_seen`] holds for the link's life, through
 //!   [`Link::forget`] too. Each consumer decides what it means; [`crate::not_ours`] classifies
 //!   them under the owner's rule.
+//! - **Live orders.** [`Link::live_on`] gives the orders of ours on a market the link holds
+//!   live: placed here, shown open by a resync or told unprotected, and not ended in the
+//!   registry, in the order the link learnt them. They are what a cancel-all of ours covers, and
+//!   what [`crate::sweep`] cancels.
+//! - **Cancels.** [`Link::is_cancel`] says whether a request submitted here and not yet
+//!   released ([`Link::release`]) is a cancel: a cancel, a cancel-many or a cancel-all, a Safety
+//!   cancel of [`ExecHandler::on_unprotected`] included. [`crate::sweep`] reads it of each
+//!   refusal for its rate.
 //! - **Notes.** Everything the consumer may wait on is appended to [`Link::notes`], in order.
 //!
 //! - **The clock** (decision 0155 item 3). The link reads no clock of its own. Times on the
@@ -108,6 +116,7 @@
 //!   0095 and 0155 item 3).
 
 use std::cell::RefCell;
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -536,8 +545,11 @@ pub struct Link {
     /// The Safety cancel request last submitted for each unprotected order.
     safety: HashMap<ClientOrderId, RpcId>,
     /// The orders of ours that have not ended that the link knows (placed here, or shown by a
-    /// resync), with their market: what a cancel-all of ours covers.
-    live: HashMap<ClientOrderId, InstrumentId>,
+    /// resync), with their market and when the link learnt each, counted from 0: what a
+    /// cancel-all of ours covers.
+    live: HashMap<ClientOrderId, (InstrumentId, u64)>,
+    /// How many orders of ours the link has learnt: the next one's count in `live`.
+    learnt: u64,
     /// The orders of ours a cancel of ours submitted here covers (module documentation): an
     /// order that ends `Canceled(Requested)` outside it was cancelled by someone else.
     covered: Coverage,
@@ -569,6 +581,7 @@ impl Link {
             session: None,
             safety: HashMap::new(),
             live: HashMap::new(),
+            learnt: 0,
             covered: Coverage::default(),
             not_ours_seen: false,
         }
@@ -668,7 +681,8 @@ impl Link {
     /// Forgets request `rpc`'s items, for a consumer that has every answer to it it waits for
     /// and whose notes [`Link::forget`] took: the map of submitted requests then
     /// holds those in flight, not the run's history. An answer to it that comes later is noted
-    /// as the session's own ([`Note::Outcome`] with `ours` false).
+    /// as the session's own ([`Note::Outcome`] with `ours` false), and [`Link::is_cancel`] is
+    /// false for it.
     pub fn release(&mut self, rpc: RpcId) {
         self.sent.remove(&rpc);
         self.safety.retain(|_, r| *r != rpc);
@@ -677,6 +691,20 @@ impl Link {
     /// How many submitted requests the link still holds the items of.
     pub fn requests_held(&self) -> usize {
         self.sent.len()
+    }
+
+    /// Whether request `rpc`, submitted through [`Link::submit`] and not yet released
+    /// ([`Link::release`]), is a cancel: it carries an explicit cancel (a cancel or a
+    /// cancel-many) or is a cancel-all, a Safety cancel of [`ExecHandler::on_unprotected`]
+    /// included; a place, a batch place or an amend is not. False for a request the link never
+    /// submitted or has released: a consumer hands each note to a sweep running
+    /// ([`crate::sweep::Sweep::observe`]) before it releases the note's request.
+    pub fn is_cancel(&self, rpc: RpcId) -> bool {
+        // A cancel-all names no order, so it holds no item; fbc-oms authorizes no batch of none.
+        let cancel = |item: &Item| matches!(item, Item::Cancel(_));
+        self.sent
+            .get(&rpc)
+            .is_some_and(|items| items.iter().all(cancel))
     }
 
     /// What [`Link::sent_counts`] counts in `notes`.
@@ -702,6 +730,33 @@ impl Link {
     /// instrument cancel-all would cancel its orders too (decision 0155 item 2).
     pub fn cancels_not_ours_seen(&self) -> bool {
         self.not_ours_seen
+    }
+
+    /// The orders of ours on `inst` the link holds live (decision 0155 item 2): placed through
+    /// [`Link::submit`], shown open by a resync or told unprotected, and not ended in the
+    /// registry, in the order the link learnt them (a resync's in the order it showed them), so
+    /// a sweep's explicit cancels name them in the order the consumer met them. A command the
+    /// consumer handed the session another way is not among them. What a sweep cancels and
+    /// waits on ([`crate::sweep`]).
+    pub fn live_on(&self, inst: InstrumentId) -> Vec<ClientOrderId> {
+        let reg = &self.reg;
+        let live = |cid: &ClientOrderId| reg.get(*cid).is_some_and(|r| !r.state().is_terminal());
+        let mut found: Vec<(u64, ClientOrderId)> = self
+            .live
+            .iter()
+            .filter(|(cid, (market, _))| *market == inst && live(cid))
+            .map(|(cid, (_, learnt))| (*learnt, *cid))
+            .collect();
+        found.sort_unstable();
+        found.into_iter().map(|(_, cid)| cid).collect()
+    }
+
+    /// Our order `cid` on `inst` is live: learnt now, unless the link already knows it.
+    fn learn(&mut self, cid: ClientOrderId, inst: InstrumentId) {
+        if let Entry::Vacant(slot) = self.live.entry(cid) {
+            slot.insert((inst, self.learnt));
+            self.learnt += 1;
+        }
     }
 
     /// Takes the first `upto` notes out and hands them over, for a consumer that reads each
@@ -821,15 +876,17 @@ impl Link {
             let all: Vec<ClientOrderId> = self
                 .live
                 .iter()
-                .filter(|(_, inst)| match scope {
-                    CancelScope::Instrument(market) => **inst == market,
+                .filter(|(_, (inst, _))| match scope {
+                    CancelScope::Instrument(market) => *inst == market,
                     CancelScope::Account => true,
                 })
                 .map(|(cid, _)| *cid)
                 .collect();
             self.covered.submitted(rpc, all);
         }
-        self.live.extend(placed);
+        for (cid, inst) in placed {
+            self.learn(cid, inst);
+        }
         self.sent.insert(rpc, items);
         Ok(rpc)
     }
@@ -1030,7 +1087,7 @@ impl Link {
         let key = OrderKey { venue, ingest };
         for o in &snapshot.orders {
             if let Some(CidMatch::Ours(cid)) = o.cid {
-                self.live.insert(cid, o.inst);
+                self.learn(cid, o.inst);
             }
         }
         match self.reg.resync(&self.ladder, &self.caps, &snapshot, key) {
@@ -1201,7 +1258,9 @@ impl Link {
                 _ => None,
             })
             .collect();
-        self.live.extend(told.iter().copied());
+        for (cid, inst) in &told {
+            self.learn(*cid, *inst);
+        }
         let (open, ended): (Vec<ClientOrderId>, Vec<ClientOrderId>) = told
             .iter()
             .map(|(cid, _)| *cid)
