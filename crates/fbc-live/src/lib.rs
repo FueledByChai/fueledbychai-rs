@@ -20,11 +20,14 @@
 //! - [`sweep`]: the sweep of a market's orders of ours at Start, after each reconnect and at
 //!   Stop. Its [`Sweep`](sweep::Sweep) sends fbc-oms's cancel everything, or explicit cancels of
 //!   the orders of ours the link holds live there ([`Link::live_on`](link::Link::live_on)), never
-//!   an account cancel-all, sends each cancel due on an acknowledgement and, once the consumer's
-//!   [`RateHold`](sweep::RateHold) passes, the cancel of everything again after a refusal for its
-//!   rate of any cancel of ours, as the link says which requests are cancels
-//!   ([`Link::is_cancel`](link::Link::is_cancel)), and says when it ended
-//!   ([`SweepEnd`](sweep::SweepEnd)); it keeps no timeout.
+//!   an account cancel-all, sends each cancel of the market's orders due on an acknowledgement
+//!   and, once the consumer's [`RateHold`](sweep::RateHold) passes, the cancel of everything
+//!   again after a refusal for its rate of any cancel of ours on the market, as the link says
+//!   which requests are cancels on it ([`Link::is_cancel_on`](link::Link::is_cancel_on)), and
+//!   says when it ended ([`SweepEnd`](sweep::SweepEnd)); it keeps no timeout. Another market's
+//!   orders and cancels make nothing due and keep no sweep from ending, but the consumer's hold,
+//!   which records each refusal for its rate the consumer reads, another market's included, still
+//!   delays the resend.
 //!
 //! Its normal dependencies are fbc-core, fbc-oms and fbc-runtime only: it depends on no venue
 //! crate and branches on no venue's name (decision 0003). It holds nothing that decides what to

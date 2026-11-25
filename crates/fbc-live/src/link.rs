@@ -93,10 +93,14 @@
 //!   live: placed here, shown open by a resync or told unprotected, and not ended in the
 //!   registry, in the order the link learnt them. They are what a cancel-all of ours covers, and
 //!   what [`crate::sweep`] cancels.
-//! - **Cancels.** [`Link::is_cancel`] says whether a request submitted here and not yet
-//!   released ([`Link::release`]) is a cancel: a cancel, a cancel-many or a cancel-all, a Safety
-//!   cancel of [`ExecHandler::on_unprotected`] included. [`crate::sweep`] reads it of each
-//!   refusal for its rate.
+//! - **Cancels.** [`Link::is_cancel_on`] says whether a request submitted here and not yet
+//!   released ([`Link::release`]) is a cancel on a market: a cancel or a cancel-many naming an
+//!   order of ours on it, each order's market as fbc-oms built the cancel from its record, or a
+//!   cancel-all of it, a Safety cancel of [`ExecHandler::on_unprotected`] included.
+//!   [`crate::sweep`] reads it of each refusal for its rate, so another market's cancels make
+//!   nothing due in a sweep of one market, though the consumer's hold, which records each refusal
+//!   for its rate the consumer reads, another market's included, still delays its resend (decision
+//!   0155 item 5).
 //! - **Notes.** Everything the consumer may wait on is appended to [`Link::notes`], in order.
 //!
 //! - **The clock** (decision 0155 item 3). The link reads no clock of its own. Times on the
@@ -504,6 +508,29 @@ enum Item {
     },
 }
 
+/// What a cancel submitted here cancels ([`Link::is_cancel_on`]).
+#[derive(Clone, Debug)]
+enum Cancels {
+    /// Explicit cancels (a cancel or a cancel-many): the market of each order they name, as
+    /// fbc-oms built the cancel from its record.
+    Orders(Vec<InstrumentId>),
+    /// A cancel-all of this scope.
+    All(CancelScope),
+}
+
+impl Cancels {
+    /// Whether they cancel on `inst`. fbc-oms authorizes no account cancel-all (decision 0045);
+    /// one would cancel on every market.
+    fn on(&self, inst: InstrumentId) -> bool {
+        match self {
+            Cancels::Orders(markets) => markets.contains(&inst),
+            Cancels::All(scope) => {
+                [CancelScope::Account, CancelScope::Instrument(inst)].contains(scope)
+            }
+        }
+    }
+}
+
 /// A fill the ledger refused for its time ([`Link::fill_refusals`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FillRefusal {
@@ -523,6 +550,8 @@ pub struct Link {
     ladder: LadderConfig,
     /// The items of each request submitted here.
     sent: HashMap<RpcId, Vec<Item>>,
+    /// What each cancel submitted here cancels, until it is released ([`Link::is_cancel_on`]).
+    cancels: HashMap<RpcId, Cancels>,
     /// The resync being collected, from `ResyncBegin` to `ResyncEnd`.
     collecting: Option<ResyncSnapshot>,
     /// When the socket was last reported authenticated.
@@ -569,6 +598,7 @@ impl Link {
             caps,
             ladder,
             sent: HashMap::new(),
+            cancels: HashMap::new(),
             collecting: None,
             authenticated_at: None,
             last_recv: None,
@@ -681,10 +711,11 @@ impl Link {
     /// Forgets request `rpc`'s items, for a consumer that has every answer to it it waits for
     /// and whose notes [`Link::forget`] took: the map of submitted requests then
     /// holds those in flight, not the run's history. An answer to it that comes later is noted
-    /// as the session's own ([`Note::Outcome`] with `ours` false), and [`Link::is_cancel`] is
-    /// false for it.
+    /// as the session's own ([`Note::Outcome`] with `ours` false), and [`Link::is_cancel_on`]
+    /// is false for it.
     pub fn release(&mut self, rpc: RpcId) {
         self.sent.remove(&rpc);
+        self.cancels.remove(&rpc);
         self.safety.retain(|_, r| *r != rpc);
     }
 
@@ -694,17 +725,15 @@ impl Link {
     }
 
     /// Whether request `rpc`, submitted through [`Link::submit`] and not yet released
-    /// ([`Link::release`]), is a cancel: it carries an explicit cancel (a cancel or a
-    /// cancel-many) or is a cancel-all, a Safety cancel of [`ExecHandler::on_unprotected`]
-    /// included; a place, a batch place or an amend is not. False for a request the link never
-    /// submitted or has released: a consumer hands each note to a sweep running
+    /// ([`Link::release`]), is a cancel on market `inst`: an explicit cancel (a cancel or a
+    /// cancel-many) naming at least one order of ours on `inst`, whether that order ended since
+    /// or not, each order's market as fbc-oms built the cancel from its record, or a cancel-all
+    /// of `inst`, a Safety cancel of [`ExecHandler::on_unprotected`] included. A place, a batch
+    /// place or an amend is not, nor a cancel naming no order on `inst`. False for a request the
+    /// link never submitted or has released: a consumer hands each note to a sweep running
     /// ([`crate::sweep::Sweep::observe`]) before it releases the note's request.
-    pub fn is_cancel(&self, rpc: RpcId) -> bool {
-        // A cancel-all names no order, so it holds no item; fbc-oms authorizes no batch of none.
-        let cancel = |item: &Item| matches!(item, Item::Cancel(_));
-        self.sent
-            .get(&rpc)
-            .is_some_and(|items| items.iter().all(cancel))
+    pub fn is_cancel_on(&self, rpc: RpcId, inst: InstrumentId) -> bool {
+        self.cancels.get(&rpc).is_some_and(|c| c.on(inst))
     }
 
     /// What [`Link::sent_counts`] counts in `notes`.
@@ -859,6 +888,14 @@ impl Link {
             VenueCommand::CancelAll(scope) => Some(*scope),
             _ => None,
         };
+        // Each market a cancel cancels on, from the command fbc-oms authorized.
+        let cancels = match auth.command() {
+            VenueCommand::Cancel(c) => Some(Cancels::Orders(vec![c.inst])),
+            VenueCommand::CancelMany(cs) => {
+                Some(Cancels::Orders(cs.iter().map(|c| c.inst).collect()))
+            }
+            _ => scope.map(Cancels::All),
+        };
         let placed: Vec<(ClientOrderId, InstrumentId)> = match auth.command() {
             VenueCommand::Place(o) => vec![(o.cid, o.inst)],
             VenueCommand::PlaceBatch(os) => os.iter().map(|o| (o.cid, o.inst)).collect(),
@@ -888,6 +925,9 @@ impl Link {
             self.learn(cid, inst);
         }
         self.sent.insert(rpc, items);
+        if let Some(cancels) = cancels {
+            self.cancels.insert(rpc, cancels);
+        }
         Ok(rpc)
     }
 

@@ -778,7 +778,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     order of ours a cancel not ours ends is noted, FBC-aoh5, and `Link::cancels_not_ours_seen` true
     from the first one noted on, never false again, `Link::forget` keeping it, FBC-21g6;
     `Link::live_on`, the orders of ours on a market it holds live in the order it learnt them, and
-    `Link::is_cancel`, whether a request it holds is a cancel, a cancel-many or a cancel-all, its
+    `Link::is_cancel_on(rpc, inst)`, whether a request it holds is a cancel on that market (a
+    cancel or a cancel-many naming an order of ours on it, ended since or not, by the market
+    fbc-oms built the cancel from, or a cancel-all of it, which the link records at submit), its
     Safety cancels included, false once released, FBC-132g; venue text shown
     through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
     handler's five entry points public methods of it, and `LinkHandler`, which hands each call on
@@ -804,9 +806,11 @@ holds two of them for one pull request. The rules after the three roles bind all
     no cancel-all or `cancels_not_ours_seen` holds, never an account cancel-all (0012, 0045), a
     round stopped short at a cancel not handed over leaving what it sent to the consumer;
     `Sweep::observe` takes each note the consumer reads, with the link, before it releases the
-    note's request, and `Sweep::poll` sends each cancel due on an acknowledgement and, once a
-    request the link says is a cancel (the sweep's, the consumer's or a Safety cancel) was refused
-    for its rate, whatever its order's state, a place's making nothing due, and the consumer's
+    note's request, and `Sweep::poll` sends each cancel due on an acknowledgement of an order on its
+    market (another market's left due in the registry) and, once one of its own requests or a
+    request the link says is a cancel on its market (the consumer's or a Safety cancel) was refused
+    for its rate, whatever its order's state, a place's or another market's cancel's making nothing
+    due, and the consumer's
     `RateHold::new(wait)` (zero refused, no `Default`) no longer holds, the cancel of everything
     again, at the `now` its caller passes; it keeps no timeout and reads no clock, and its module
     gives Stop's order, which the consumer runs. Its tests: `tests/link_epoch_end.rs`,
@@ -824,9 +828,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     learnt the orders, which a later resync showing them in another order leaves, an order whose
     cancel came back Unknown cancelled again and one whose cancel awaits its acknowledgement left
     to the cancels due, a round stopped short, the resend at the consumer's wait or a venue's
-    retry time, for a cancel of the consumer's whose order already ended while another rests and
-    for a Safety cancel, never for a place, the cancels due, `Link::is_cancel`, and the rate
-    hold) and
+    retry time, for a cancel of the consumer's whose order already ended while another rests, for
+    a Safety cancel and for a consumer's cancel-all of the market, never for a place or a cancel
+    or cancel-all on another market, the cancels due, another market's never sent and its cancel
+    unanswered holding no Stop, `Link::is_cancel_on`, and the rate hold) and
     `tests/not_ours.rs` (the classifier's test moved from `testnet_quote`'s, on `MonoNs`, a
     venue time absent on either side, a requote that never rested, the consumer's span read on
     both of its measures, each bound held where it falls, and a zero span or window refused); in
