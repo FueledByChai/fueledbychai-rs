@@ -302,10 +302,12 @@ holds two of them for one pull request. The rules after the three roles bind all
   ingest stamp to write done, off Linux read from the session's journal and labelled so),
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
-  from `Secrets` by `src/auth`), `crates/fbc-live` with its link and its classifier of cancels
-  not ours (`src/link.rs`, `src/not_ours.rs`, the samples' glue moved there, 0155), and
-  `crates/fbc-examples` with the owner-run samples; the rest are planned. Members are the
-  `crates/fbc-*` and `crates/venues/fbc-*` globs, and `fixtures/` is excluded from the workspace:
+  from `Secrets` by `src/auth`), `crates/fbc-live` with its link, its classifier of cancels not
+  ours, its sizing and its sweep (`src/link.rs`, `src/not_ours.rs`, `src/sizing.rs`,
+  `src/sweep.rs`, the samples' glue moved there, 0155), and `crates/fbc-examples` with the
+  owner-run samples; the rest are planned.
+  Members are the `crates/fbc-*` and `crates/venues/fbc-*` globs, and `fixtures/` is excluded
+  from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
@@ -774,8 +776,11 @@ holds two of them for one pull request. The rules after the three roles bind all
     one path commands take to the session, `Link::submit`; a Safety cancel for each unprotected
     order the registry holds open, 0080; `Coverage` of the orders a cancel of ours covers, so an
     order of ours a cancel not ours ends is noted, FBC-aoh5, and `Link::cancels_not_ours_seen` true
-    from the first one noted on, never false again, `Link::forget` keeping it, FBC-21g6; venue text
-    shown through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
+    from the first one noted on, never false again, `Link::forget` keeping it, FBC-21g6;
+    `Link::live_on`, the orders of ours on a market it holds live in the order it learnt them, and
+    `Link::is_cancel`, whether a request it holds is a cancel, a cancel-many or a cancel-all, its
+    Safety cancels included, false once released, FBC-132g; venue text shown
+    through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
     handler's five entry points public methods of it, and `LinkHandler`, which hands each call on
     and then calls the consumer's wake, a closure. It reads no clock but its session's shard clock
     (FBC-y7lq, 0155 item 3): the link times each submission it sends on the `ExecOrders::now` of the
@@ -788,15 +793,41 @@ holds two of them for one pull request. The rules after the three roles bind all
     each order of ours placed, each place that never rested and the orders not ended, and
     classifying each cancel not ours (`on_cancel`) as `NotOurs::SameEvent`, `First` or `Repeat`,
     every call taking `now: MonoNs` from its caller; the WARN, the Stop and every text stay the
-    consumer's. Its tests: `tests/link_epoch_end.rs`, `tests/coverage.rs` and `tests/shown.rs`,
+    consumer's. And `src/sweep.rs` (FBC-132g, 0155 items 2, 5 and 8), `testnet_quote`'s sweep and
+    its rate-limited resend (PR #158) moved with their behaviour: `Sweep::start` for one market and
+    account, ending as `SweepEnd::BeforePlaces` (every order of ours `live_on` the market ended and
+    `ExecOrders::may_place_on` holds; a refusal of one of its own cancels other than for its
+    rate, `AlreadyTerminal` or `NotFound` failing it) or `SweepEnd::AtStop` (every such order
+    ended and every request it sent answered, no refusal ending it), sends fbc-oms's
+    `cancel_everything`, or explicit cancels of
+    the orders of ours `live_on` the market with none in flight or gone Unknown when fbc-oms builds
+    no cancel-all or `cancels_not_ours_seen` holds, never an account cancel-all (0012, 0045), a
+    round stopped short at a cancel not handed over leaving what it sent to the consumer;
+    `Sweep::observe` takes each note the consumer reads, with the link, before it releases the
+    note's request, and `Sweep::poll` sends each cancel due on an acknowledgement and, once a
+    request the link says is a cancel (the sweep's, the consumer's or a Safety cancel) was refused
+    for its rate, whatever its order's state, a place's making nothing due, and the consumer's
+    `RateHold::new(wait)` (zero refused, no `Default`) no longer holds, the cancel of everything
+    again, at the `now` its caller passes; it keeps no timeout and reads no clock, and its module
+    gives Stop's order, which the consumer runs. Its tests: `tests/link_epoch_end.rs`,
+    `tests/coverage.rs` and `tests/shown.rs`,
     moved from the samples' tests, `tests/handler.rs`, `tests/paths.rs` (the paths no sample walks,
     through a toy `ExecSession`'s `ExecOrders` it never runs), a unit test of the kinds it names,
     `tests/manifest.rs`, which holds its normal dependencies to those three (0155 item 1),
     `tests/link_clock.rs` (sends timed on the session's stamps on a paused runtime against the
     conformance stub, and a second clock noted), `tests/replay_clock.rs` (two closed-loop replays
     through a `Link`, on SimVenue, with the same send times and notes; 0155 item 4),
-    `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in its source)
-    and `tests/not_ours.rs` (the classifier's test moved from `testnet_quote`'s, on `MonoNs`, a
+    `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in its source),
+    `tests/sweep.rs` (the sweep and `live_on` on a paused runtime against the conformance stub's
+    serving script: each end, each refusal, one of a cancel not the sweep's failing nothing, a
+    batch's and a whole request's answer, the cancel-all or explicit cancels in the order the link
+    learnt the orders, which a later resync showing them in another order leaves, an order whose
+    cancel came back Unknown cancelled again and one whose cancel awaits its acknowledgement left
+    to the cancels due, a round stopped short, the resend at the consumer's wait or a venue's
+    retry time, for a cancel of the consumer's whose order already ended while another rests and
+    for a Safety cancel, never for a place, the cancels due, `Link::is_cancel`, and the rate
+    hold) and
+    `tests/not_ours.rs` (the classifier's test moved from `testnet_quote`'s, on `MonoNs`, a
     venue time absent on either side, a requote that never rested, the consumer's span read on
     both of its measures, each bound held where it falls, and a zero span or window refused); in
     `tests/paths.rs` too, `cancels_not_ours_seen` set by a cancel not ours noted at once and by one
@@ -846,9 +877,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     PLUMBING TEST, NOT A STRATEGY: one post-only order a side a fixed offset behind the touch,
     requoted through fbc-oms's `ExecutionPlanner` given Paradex's caps with no amend
     (cancel-and-replace only), every order of ours still open cancelled after each reconnect
-    before any place, Stop on Ctrl-C, `--duration`, `--cycles`, a resync mismatch, any Unknown
-    order, a refused login or a permanent refusal of a place or cancel, every touch read with
-    the mark price and charged to the session's rate limiter (`tests/testnet_quote.rs`); with
+    before any place and at Stop, both through fbc-live's sweep, Stop on Ctrl-C, `--duration`,
+    `--cycles`, a resync mismatch, any Unknown order, a refused login or a permanent refusal of a
+    place or cancel, every touch read with the mark price and charged to the session's rate
+    limiter (`tests/testnet_quote.rs`); with
     `--mainnet` (FBC-tyft) a supervised Paradex MAINNET session behind `--mainnet` and
     `--sole-trader`: mainnet's URLs and chain, the mainnet-only credentials, the operator's own
     positive caps (required, no defaults, no ceiling: FBC-thks), offsets of at least 20 bps,

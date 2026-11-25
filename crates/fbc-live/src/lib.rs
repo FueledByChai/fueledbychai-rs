@@ -17,6 +17,14 @@
 //! - [`sizing`]: mark-aware sizing. The operator's caps in lots ([`UsdCaps`](sizing::UsdCaps),
 //!   positive with no ceiling), the inventory cap at no less than the consumer's mark, and why
 //!   one side's quote is left out ([`LeftOut`](sizing::LeftOut)); it reads no venue.
+//! - [`sweep`]: the sweep of a market's orders of ours at Start, after each reconnect and at
+//!   Stop. Its [`Sweep`](sweep::Sweep) sends fbc-oms's cancel everything, or explicit cancels of
+//!   the orders of ours the link holds live there ([`Link::live_on`](link::Link::live_on)), never
+//!   an account cancel-all, sends each cancel due on an acknowledgement and, once the consumer's
+//!   [`RateHold`](sweep::RateHold) passes, the cancel of everything again after a refusal for its
+//!   rate of any cancel of ours, as the link says which requests are cancels
+//!   ([`Link::is_cancel`](link::Link::is_cancel)), and says when it ended
+//!   ([`SweepEnd`](sweep::SweepEnd)); it keeps no timeout.
 //!
 //! Its normal dependencies are fbc-core, fbc-oms and fbc-runtime only: it depends on no venue
 //! crate and branches on no venue's name (decision 0003). It holds nothing that decides what to
@@ -30,3 +38,4 @@
 pub mod link;
 pub mod not_ours;
 pub mod sizing;
+pub mod sweep;
