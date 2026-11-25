@@ -303,8 +303,9 @@ holds two of them for one pull request. The rules after the three roles bind all
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), `crates/fbc-live` with its link, its classifier of cancels not
-  ours, its sizing, its sweep and its positions comparison (`src/link.rs`, `src/not_ours.rs`,
-  `src/sizing.rs`, `src/sweep.rs`, `src/positions.rs`, the samples' glue moved there, 0155), and
+  ours, its sizing, its sweep, its positions comparison and its stream check (`src/link.rs`,
+  `src/not_ours.rs`, `src/sizing.rs`, `src/sweep.rs`, `src/positions.rs`, `src/reconcile.rs`, the
+  samples' glue moved there, 0155), and
   `crates/fbc-examples` with the owner-run samples; the rest are planned.
   Members are the `crates/fbc-*` and `crates/venues/fbc-*` globs, and `fixtures/` is excluded
   from the workspace:
@@ -860,7 +861,19 @@ holds two of them for one pull request. The rules after the three roles bind all
     the consumer's: it reads no venue and no clock. Its test, `tests/positions.rs`, holds each
     verdict, an unread answer first and on the re-read, the re-read's time, a zero wait refused,
     `shown`, the notes' counts and `resync_disagreements` on each `PositionCheck` and an
-    unsettled fill.
+    unsettled fill. And `src/reconcile.rs` (FBC-1awz, 0094's condition, 0155 items 2 and 3),
+    `testnet_quote`'s stream check moved with its behaviour: `unreconciled(registry, streamed,
+    inventory, watched, ended)` says `Unreconciled::Position` for a position the venue's stream
+    reported (`None` before any) other than the inventory's (Codex r4244080127 on PR #149), and
+    otherwise `Unreconciled::Fills` for the first order of ours in `watched`, then in `ended`,
+    whose cumulative fill on an order event is above the fills read (`fills_behind`, `cum_venue`
+    above `cum_fills`; Codex r4244145969), trimming `ended`, the consumer's list of orders that
+    ended so, to those the registry still holds behind once the positions agree, their order
+    kept; it keeps no clock and no timeout, and the consumer's hold, its text and its Stop stay
+    the consumer's. Its test, `tests/reconcile.rs`, holds a streamed position that differs, none
+    streamed yet, an order's fills behind until both fills are read, the watched orders before
+    the ended ones, each ended one dropped once not behind or not held, and the list left as it
+    is while the positions differ.
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is

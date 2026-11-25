@@ -20,6 +20,11 @@
 //!   mismatch or an unread answer once more after the consumer's wait, then says whether it
 //!   cleared or persists ([`Verdict`](positions::Verdict)); the read and what follows a verdict
 //!   are the consumer's.
+//! - [`reconcile`]: the stream check (the owner's condition in decision 0094). It says whether a
+//!   position the venue's stream reported differs from the inventory, or an order of ours has
+//!   fills the venue reported on an order event that the fill stream has not brought, and if so
+//!   what differs ([`Unreconciled`](reconcile::Unreconciled)); it keeps no clock and no timeout,
+//!   and holding the consumer's planning while they differ, and when to Stop, are the consumer's.
 //! - [`sizing`]: mark-aware sizing. The operator's caps in lots ([`UsdCaps`](sizing::UsdCaps),
 //!   positive with no ceiling), the inventory cap at no less than the consumer's mark, and why
 //!   one side's quote is left out ([`LeftOut`](sizing::LeftOut)); it reads no venue.
@@ -47,5 +52,6 @@
 pub mod link;
 pub mod not_ours;
 pub mod positions;
+pub mod reconcile;
 pub mod sizing;
 pub mod sweep;
