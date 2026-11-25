@@ -785,9 +785,11 @@ holds two of them for one pull request. The rules after the three roles bind all
     Safety cancels included, false once released or dropped, FBC-132g; each request's items held
     until `Link::release`, or dropped by `Link::forget` once every item is answered for good
     (accepted at `Final`, refused or not sent) or answered once its order ended (a cancel-all by
-    any answer), at the forget after the one that took the request's last note, so the notes a
-    forget hands over are read against the link as it was, a consumer that never forgets its
-    notes keeping them and the requests they name, FBC-mu68; venue text shown
+    any answer) and the `Coverage` waits on no answer to it (`Coverage::waits_on`: no order end
+    held on it and no live order it covers unaccepted; until then it is kept, so its later answer
+    still routes as ours), at the forget after the one that took the request's last note, so the
+    notes a forget hands over are read against the link as it was, a consumer that never forgets
+    its notes keeping them and the requests they name, FBC-mu68; venue text shown
     through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
     handler's five entry points public methods of it, and `LinkHandler`, which hands each call on
     and then calls the consumer's wake, a closure. It reads no clock but its session's shard clock
