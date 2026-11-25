@@ -85,7 +85,7 @@ use crate::args::{
     Options, OrderSide, TESTNET_CHAIN, Target, direct_to_stub, hosts, sole, testnet_guard,
 };
 use crate::link::{Link, LinkHandler, Note, async_reject};
-use crate::positions::{PositionCheck, fill_seen, fills_in};
+use crate::positions::{PositionCheck, failure, fill_seen, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, INST, LOGIN_REFUSALS, Lines, REFUSAL_CAUSES, VENUE, drive_with,
     px_or_none, wall_now,
@@ -1093,7 +1093,7 @@ impl Driver {
         let when = "after the first fill";
         let verdict = check.check(when, &self.lines, self.registry_now()).await;
         self.positions.set(Some(check));
-        if let Some(why) = verdict.failure(when) {
+        if let Some(why) = failure(&verdict, when) {
             self.halt.replace(Some(why));
         }
         true
@@ -1125,7 +1125,7 @@ impl Driver {
         };
         let verdict = check.check(when, &self.lines, self.registry_now()).await;
         self.positions.set(Some(check));
-        match verdict.failure(when) {
+        match failure(&verdict, when) {
             Some(why) => {
                 self.note(format_args!("{why}"));
                 false

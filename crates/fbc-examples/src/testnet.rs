@@ -36,7 +36,7 @@ use fbc_core::{
     UnderlyingId, VenueConfig, VenueFactory, VenueId, WallNs, dispatch_market_data,
 };
 use fbc_journal::NonceSourceId;
-use fbc_oms::{PositionCheck, ResyncReport, ResyncSnapshot};
+use fbc_oms::{ResyncReport, ResyncSnapshot};
 use fbc_runtime::http::{Bytes, Method, Request};
 use fbc_runtime::{
     Connector, ExecSession, ExecSessionConfig, IngestClock, ProxyConfig, RateLimiter,
@@ -909,31 +909,11 @@ pub fn snapshot_max(snapshot: &ResyncSnapshot) -> u64 {
         .unwrap_or(0)
 }
 
-/// What the resyncs after the first (a reconnect's) found wrong with the positions the
-/// registry holds: a market whose venue position differs from its inventory (`Desync`), or
-/// could not be compared (`Stale`, `Unsettled`), or a fill the resync could not place. A later
-/// resync never overwrites the inventory, so the run cannot go on from it.
-pub fn resync_disagreements(notes: &[Note]) -> Vec<String> {
-    notes
-        .iter()
-        .filter_map(|n| match n {
-            Note::Resynced { report, .. } => Some(report),
-            _ => None,
-        })
-        .flat_map(|report| {
-            let checks = report
-                .checks
-                .iter()
-                .filter(|c| !matches!(c, PositionCheck::Agrees { .. }))
-                .map(|c| format!("{c:?}"));
-            let unsettled = report
-                .unsettled
-                .iter()
-                .map(|(inst, _)| format!("Unsettled fill on instrument {}", inst.get()));
-            checks.chain(unsettled).collect::<Vec<_>>()
-        })
-        .collect()
-}
+// What the resyncs after the first (a reconnect's) found wrong with the registry's positions
+// moved into fbc-live's positions (FBC-rujq, decision 0155 item 2), its results unchanged; named
+// here as the samples have always named it; each includer uses a part of it.
+#[allow(unused_imports)]
+pub use fbc_live::positions::resync_disagreements;
 
 /// The client-id mint's high-water mark, kept in a file of the lease directory across runs, so
 /// a run whose wall clock stepped back never mints an id an earlier run used (the namespace
