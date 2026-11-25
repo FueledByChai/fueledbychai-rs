@@ -772,7 +772,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     on no venue's name (0003), `publish = false`. So far `src/link.rs` (FBC-umqi), moved from
     fbc-examples whole with its behaviour: `Link`, the glue between one account's order-entry
     session and its fbc-oms `Registry` (outcomes and order events routed by request and item, fills
-    through the `FillLedger`, each fill it refuses for its time kept in `Link::fill_refusals`,
+    through the `FillLedger`, each fill it refuses for its time kept in `Link::fill_refusals`
+    until `Link::take_fill_refusals` hands it over, in order, one refused after a take held for
+    the next and every one kept by a link never taken, FBC-2dr2, `tests/fill_refusals.rs`;
     resyncs applied at `ResyncEnd`, each epoch's end reported at its last `recv_mono`, FBC-9svb; the
     one path commands take to the session, `Link::submit`; a Safety cancel for each unprotected
     order the registry holds open, 0080; `Coverage` of the orders a cancel of ours covers, so an
@@ -830,6 +832,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     conformance stub, and a second clock noted), `tests/replay_clock.rs` (two closed-loop replays
     through a `Link`, on SimVenue, with the same send times and notes; 0155 item 4),
     `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in its source),
+    `tests/fill_refusals.rs` (`Link::take_fill_refusals` in order, a refusal after a take held
+    for the next, a link never taken keeping all; FBC-2dr2),
     `tests/sweep.rs` (the sweep and `live_on` on a paused runtime against the conformance stub's
     serving script: each end, each refusal, one of a cancel not the sweep's failing nothing, a
     batch's and a whole request's answer, the cancel-all or explicit cancels in the order the link

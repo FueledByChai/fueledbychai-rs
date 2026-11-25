@@ -24,7 +24,10 @@
 //!   through the [`FillLedger`] and, accepted, to [`Registry::apply_fill`], and one the ledger
 //!   refuses for its time (`BeyondHorizon` or `Untimed`: it may have applied the fill and
 //!   forgotten it, or nothing shows the fill newer than its watermark) is also kept in
-//!   [`Link::fill_refusals`], for a consumer that stops on one (decision 0132 item 7). The
+//!   [`Link::fill_refusals`], for a consumer that stops on one (decision 0132 item 7), until
+//!   [`Link::take_fill_refusals`] hands it over (FBC-2dr2): a consumer that runs for long takes
+//!   them as it reads them, so the list holds only the refusals since its last take and does not
+//!   grow with the run's length, and one that never takes keeps every refusal, as before. The
 //!   `Resync*` events are collected into one [`ResyncSnapshot`] and applied at `ResyncEnd`
 //!   ([`Registry::resync`]); its `requested_at` is the receive time of the event reporting the
 //!   socket authenticated, which comes before the session asks for the resync. A snapshot the
@@ -597,7 +600,7 @@ enum Answered {
     Final,
 }
 
-/// A fill the ledger refused for its time ([`Link::fill_refusals`]).
+/// A fill the ledger refused for its time ([`Link::fill_refusals`], [`Link::take_fill_refusals`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FillRefusal {
     /// The ledger's admission, by its name: `BeyondHorizon` or `Untimed`.
@@ -610,7 +613,8 @@ pub struct FillRefusal {
 pub struct Link {
     reg: Registry,
     ledger: FillLedger,
-    /// Each fill the ledger refused for its time, in order.
+    /// Each fill the ledger refused for its time, in order, since [`Link::take_fill_refusals`]
+    /// last took them.
     fill_refusals: Vec<FillRefusal>,
     caps: OrderCaps,
     ladder: LadderConfig,
@@ -762,9 +766,22 @@ impl Link {
     }
 
     /// Each fill the ledger refused for its time, in order: every one it did not apply but a
-    /// duplicate or one before its watermark, which the position already holds.
+    /// duplicate or one before its watermark, which the position already holds. Those
+    /// [`Link::take_fill_refusals`] took are gone from it, so its length counts every refusal only
+    /// for a consumer that never takes them; one that never does keeps every refusal for the
+    /// link's life.
     pub fn fill_refusals(&self) -> &[FillRefusal] {
         &self.fill_refusals
+    }
+
+    /// Takes every fill refusal [`Link::fill_refusals`] holds out and hands them over, in order,
+    /// for a consumer that reads each refusal once and runs for long: the list then holds only
+    /// the refusals since its last take and does not grow with the run's length (FBC-2dr2,
+    /// decision 0155 items 2 and 8; no bound, so no configuration). No refusal is lost before it
+    /// is read: one the ledger makes after this call is held for the next. [`Link::ledger`]'s
+    /// replay counts still count every refusal.
+    pub fn take_fill_refusals(&mut self) -> Vec<FillRefusal> {
+        std::mem::take(&mut self.fill_refusals)
     }
 
     /// Everything noted so far, in order.
