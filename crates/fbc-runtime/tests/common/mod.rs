@@ -367,11 +367,53 @@ pub async fn scripted(reply: &'static [u8]) -> SocketAddr {
     addr
 }
 
-/// A 127.0.0.1 port nothing listens on (bound, then released).
-pub async fn closed_port() -> u16 {
-    let (listener, addr) = listen().await;
-    drop(listener);
-    addr.port()
+/// A 127.0.0.1 port that refuses every connection for as long as this is held, and that no
+/// listener of these tests can take meanwhile (FBC-rq2l). A port bound and then released is free
+/// again at once: a server another test of the same binary started next could take it, and a
+/// request meant to be refused would reach that server instead.
+///
+/// The port is the local end of a connection this holds open to a listener it also holds, which
+/// never accepts it. A connection attempt to the port matches no listener, so it is refused. A
+/// socket bound to the port and never listening would hold it too, but macOS drops a connection
+/// attempt to such a socket unanswered, so the attempt would time out there instead.
+///
+/// The connecting socket is bound to its port before it connects, and neither socket sets
+/// `SO_REUSEADDR`. On Linux a port a connect chose for itself may be chosen again by another
+/// connect to a different address, so a connect to the port could choose the port itself and
+/// connect to itself; a connect never chooses a port a bind took. On Linux no bind can take the
+/// port while it is held. On macOS a bind to port 0 never chooses it, with `SO_REUSEADDR` set or
+/// not, and only an explicit bind to the port that sets `SO_REUSEADDR` could take it; no listener
+/// of these tests binds a port other than 0.
+pub struct ClosedPort {
+    _held: (std::net::TcpStream, std::net::TcpListener),
+    port: u16,
+}
+
+impl ClosedPort {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+}
+
+/// A [`ClosedPort`] on an ephemeral port. The caller keeps it for as long as it uses the port.
+pub async fn closed_port() -> ClosedPort {
+    // `TcpSocket::new_v4` sets no `SO_REUSEADDR`, which `TcpListener::bind` sets.
+    let listener = tokio::net::TcpSocket::new_v4().unwrap();
+    listener.bind(SocketAddr::new(LOCAL, 0)).unwrap();
+    let listener = listener.listen(128).unwrap();
+    let client = tokio::net::TcpSocket::new_v4().unwrap();
+    // Bound before it connects, so that no connect chooses its port.
+    client.bind(SocketAddr::new(LOCAL, 0)).unwrap();
+    // Completed in the listener's backlog: nothing need accept it.
+    let held = client
+        .connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let port = held.local_addr().unwrap().port();
+    ClosedPort {
+        _held: (held.into_std().unwrap(), listener.into_std().unwrap()),
+        port,
+    }
 }
 
 /// A WebSocket server whose connections the test drives one by one, each as a [`Peer`].

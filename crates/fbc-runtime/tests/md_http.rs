@@ -144,7 +144,8 @@ async fn an_unanswered_request_times_out_and_a_refused_or_lost_one_says_so() {
     let (mut ws, mut http) = (ScriptedWs::start().await, ScriptedHttp::start().await);
     let venue = ToyVenue::leak();
     let (mut session, control) = MdSession::new(session(venue, socket(ws.url())), |_| {}).unwrap();
-    let closed = format!("http://127.0.0.1:{}/x", closed_port().await);
+    let refusing = closed_port().await;
+    let closed = format!("http://127.0.0.1:{}/x", refusing.port());
     let script = async move {
         let mut peer = ws.accept().await;
         assert_eq!(peer.recv().await, "hello|codec=0|plan=1");
@@ -470,8 +471,9 @@ async fn a_poll_endpoint_opens_no_socket_delivers_what_it_polls_and_refuses_fram
 #[tokio::test]
 async fn a_poll_session_whose_control_has_dropped_builds_no_codec_and_asks_for_nothing() {
     let venue = ToyVenue::leak();
+    let closed = closed_port().await;
     let poll = MdTransport::Poll {
-        base_url: WireUrl::plain(format!("http://127.0.0.1:{}", closed_port().await)),
+        base_url: WireUrl::plain(format!("http://127.0.0.1:{}", closed.port())),
     };
     let (mut session, control) = MdSession::new(session(venue, poll), |_| {}).unwrap();
     // Dropped before the session first runs, as when a venue drains a session it has just
