@@ -93,10 +93,32 @@
 //!   live: placed here, shown open by a resync or told unprotected, and not ended in the
 //!   registry, in the order the link learnt them. They are what a cancel-all of ours covers, and
 //!   what [`crate::sweep`] cancels.
+//! - **Requests held** (FBC-mu68, decision 0155 items 2 and 5). The link holds the items of each
+//!   request submitted here, and what each cancel cancels, so later answers route to its orders.
+//!   It drops a request when the consumer releases it ([`Link::release`]), or at a
+//!   [`Link::forget`] once every item of it is answered in full and an earlier forget took the
+//!   last note naming it: each forget first drops every request so answered that no note left
+//!   names, then takes its notes. An item is answered in full by a final answer to it or to the
+//!   whole request (accepted at `AckLevel::Final`, refused, or a report that it was not sent), or
+//!   by any answer once its order has ended in the registry: an acceptance at
+//!   `AckLevel::Provisional` or `Unknown` keeps it while its order lives, since fbc-oms reads the
+//!   answer that may follow (a two-phase venue's final acceptance of a place or an amend, decision
+//!   0092; the answer to an amend or a cancel gone Unknown). A request naming no order (a
+//!   cancel-all) is answered in full by its first answer, as fbc-oms reads none. An answer naming
+//!   an item past the request's items answers none. A request whose last note a forget takes is
+//!   still held until the next forget, so the consumer reads the notes that forget handed it
+//!   against the link as it was ([`crate::sweep::Sweep::observe`] reads [`Link::is_cancel_on`]
+//!   of a refusal for its rate, which may be its request's last answer). A request with an item
+//!   not answered in full is kept, and so is every request while a note naming it is left: a
+//!   consumer that never forgets its notes keeps them, and the requests they name, until it
+//!   releases them. A later answer to a dropped request is noted as the session's own, as after
+//!   a release ([`Note::Outcome`] with `ours` false, which a consumer tells from its session's
+//!   cancel-on-disconnect arm by the request ids [`Link::submit`] gave it).
 //! - **Cancels.** [`Link::is_cancel_on`] says whether a request submitted here and not yet
-//!   released ([`Link::release`]) is a cancel on a market: a cancel or a cancel-many naming an
-//!   order of ours on it, each order's market as fbc-oms built the cancel from its record, or a
-//!   cancel-all of it, a Safety cancel of [`ExecHandler::on_unprotected`] included.
+//!   released ([`Link::release`]) or dropped ([`Link::forget`]) is a cancel on a market: a
+//!   cancel or a cancel-many naming an order of ours on it, each order's market as fbc-oms built
+//!   the cancel from its record, or a cancel-all of it, a Safety cancel of
+//!   [`ExecHandler::on_unprotected`] included.
 //!   [`crate::sweep`] reads it of each refusal for its rate, so another market's cancels make
 //!   nothing due in a sweep of one market, though the consumer's hold, which records each refusal
 //!   for its rate the consumer reads, another market's included, still delays its resend (decision
@@ -125,10 +147,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use fbc_core::{
-    AccountKey, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState, Envelope,
-    ExchNs, ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason, OpKind, OrderCaps,
-    OrderRef, Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks, VenueCommand,
-    VenueOrderId, VenueOrderSnapshot, WallNs,
+    AccountKey, AckLevel, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState,
+    Envelope, ExchNs, ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason, OpKind,
+    OrderCaps, OrderRef, Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks,
+    VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
     Admission, Applied, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrdState,
@@ -144,8 +166,10 @@ use fbc_runtime::{ExecHandler, ExecOrders};
 pub enum Note {
     /// A stream's state changed.
     Conn(ConnState),
-    /// The outcome of a request: `ours` when submitted through [`Link::submit`], otherwise the
-    /// session's own request (its cancel-on-disconnect arm).
+    /// The outcome of a request: `ours` when submitted through [`Link::submit`] and still held
+    /// ([`Link::release`], [`Link::forget`]), otherwise the session's own request (its
+    /// cancel-on-disconnect arm) or a later answer to one of ours the link no longer holds, which
+    /// a consumer tells apart by the request ids [`Link::submit`] gave it, not by its releases.
     Outcome {
         rpc: RpcId,
         /// The item it answers, `None` for the whole request.
@@ -531,6 +555,19 @@ impl Cancels {
     }
 }
 
+/// How far one item of a request submitted here was answered ([`Link::forget`]), each answer
+/// raising it, never lowering it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Answered {
+    /// No answer yet.
+    Not,
+    /// An answer fbc-oms may read a later one after: an acceptance at `AckLevel::Provisional`
+    /// (a two-phase venue's final acceptance, or an amend's, may follow) or `Unknown`.
+    Open,
+    /// Answered for good: accepted at `AckLevel::Final`, refused or not sent.
+    Final,
+}
+
 /// A fill the ledger refused for its time ([`Link::fill_refusals`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FillRefusal {
@@ -550,8 +587,12 @@ pub struct Link {
     ladder: LadderConfig,
     /// The items of each request submitted here.
     sent: HashMap<RpcId, Vec<Item>>,
-    /// What each cancel submitted here cancels, until it is released ([`Link::is_cancel_on`]).
+    /// What each cancel submitted here cancels, until it is released or dropped
+    /// ([`Link::is_cancel_on`]).
     cancels: HashMap<RpcId, Cancels>,
+    /// How far each item of each request submitted here was answered (one for a request naming
+    /// no order): what [`Link::forget`] reads to drop a request once its notes are gone.
+    answered: HashMap<RpcId, Vec<Answered>>,
     /// The resync being collected, from `ResyncBegin` to `ResyncEnd`.
     collecting: Option<ResyncSnapshot>,
     /// When the socket was last reported authenticated.
@@ -599,6 +640,7 @@ impl Link {
             ladder,
             sent: HashMap::new(),
             cancels: HashMap::new(),
+            answered: HashMap::new(),
             collecting: None,
             authenticated_at: None,
             last_recv: None,
@@ -645,7 +687,8 @@ impl Link {
     }
 
     /// The Safety cancel request submitted for our order `cid` when the session told it
-    /// unprotected, if one was.
+    /// unprotected, if one was, until that request is released ([`Link::release`]) or dropped
+    /// ([`Link::forget`], module documentation).
     pub fn safety_cancel_of(&self, cid: ClientOrderId) -> Option<RpcId> {
         self.safety.get(&cid).copied()
     }
@@ -708,30 +751,112 @@ impl Link {
         (self.forgotten.0 + places, self.forgotten.1 + cancels)
     }
 
-    /// Forgets request `rpc`'s items, for a consumer that has every answer to it it waits for
-    /// and whose notes [`Link::forget`] took: the map of submitted requests then
-    /// holds those in flight, not the run's history. An answer to it that comes later is noted
-    /// as the session's own ([`Note::Outcome`] with `ours` false), and [`Link::is_cancel_on`]
-    /// is false for it.
+    /// Forgets request `rpc`'s items at once, for a consumer that has every answer to it it
+    /// waits for: the map of submitted requests then holds those in flight, not the run's
+    /// history. [`Link::forget`] drops a request answered in full without it (module
+    /// documentation), so a consumer that forgets its notes need not release; one that never
+    /// forgets them releases each request itself. An answer to it that comes later is noted as
+    /// the session's own ([`Note::Outcome`] with `ours` false), [`Link::is_cancel_on`] is false
+    /// for it, and [`Link::outcome_of`], [`Link::cids_of`] and [`Link::safety_cancel_of`] no
+    /// longer name it.
     pub fn release(&mut self, rpc: RpcId) {
         self.sent.remove(&rpc);
         self.cancels.remove(&rpc);
+        self.answered.remove(&rpc);
         self.safety.retain(|_, r| *r != rpc);
     }
 
-    /// How many submitted requests the link still holds the items of.
+    /// How many submitted requests the link still holds the items of: those neither released
+    /// ([`Link::release`]) nor dropped by [`Link::forget`] once answered in full, at the forget
+    /// after the one that took their last note (module documentation).
     pub fn requests_held(&self) -> usize {
         self.sent.len()
     }
 
+    /// Request `rpc`, submitted here, was answered `outcome` for item `item` (`None`: the whole
+    /// request). An index past the request's items answers none of them. A request naming no
+    /// order (a cancel-all) has one slot, which any answer answers.
+    fn answer(&mut self, rpc: RpcId, item: Option<u16>, outcome: &SubmitOutcome) {
+        let items = self.sent.get(&rpc).map_or(0, Vec::len);
+        let slots = items.max(1);
+        let level = match outcome {
+            SubmitOutcome::Accepted {
+                ack: AckLevel::Provisional,
+            }
+            | SubmitOutcome::Unknown => Answered::Open,
+            _ => Answered::Final,
+        };
+        let range = match item.map(usize::from) {
+            Some(idx) if items > 0 => idx..idx + 1,
+            _ => 0..slots,
+        };
+        let answered = self
+            .answered
+            .entry(rpc)
+            .or_insert_with(|| vec![Answered::Not; slots]);
+        for slot in answered.get_mut(range).into_iter().flatten() {
+            *slot = (*slot).max(level);
+        }
+    }
+
+    /// Drops each request answered in full that no note left names: an earlier
+    /// [`Link::forget`] took its last note, whose consumer has read it (module documentation).
+    /// An item is answered in full by a final answer, to it or to the whole request, or by any
+    /// answer once its order has ended in the registry; the one slot of a request naming no
+    /// order (a cancel-all), whose answers fbc-oms reads none of, by any answer. A note naming a
+    /// request is the report that it was or was not sent, or an answer to it; the
+    /// [`Note::Unprotected`] naming a Safety cancel comes before both.
+    fn drop_answered(&mut self) {
+        let named: HashSet<RpcId> = self
+            .notes
+            .iter()
+            .filter_map(|note| match note {
+                Note::Submitted { rpc, .. } | Note::Outcome { rpc, .. } => Some(*rpc),
+                _ => None,
+            })
+            .collect();
+        let (sent, reg) = (&self.sent, &self.reg);
+        // Whether the order an item names has ended, or the slot names none.
+        let ended = |rpc: RpcId, item: Option<&Item>| {
+            item.is_none_or(|it| {
+                let cid = Link::op(*it, rpc).0;
+                reg.get(cid).is_none_or(|r| r.state().is_terminal())
+            })
+        };
+        let done: Vec<RpcId> = self
+            .answered
+            .iter()
+            .filter(|(rpc, slots)| {
+                let items = sent.get(rpc).map_or(&[][..], Vec::as_slice);
+                !named.contains(rpc)
+                    && slots.iter().enumerate().all(|(idx, slot)| match slot {
+                        Answered::Final => true,
+                        Answered::Open => ended(**rpc, items.get(idx)),
+                        Answered::Not => false,
+                    })
+            })
+            .map(|(rpc, _)| *rpc)
+            .collect();
+        for rpc in done {
+            self.release(rpc);
+        }
+        debug_assert!(
+            self.answered.keys().all(|rpc| self.sent.contains_key(rpc)),
+            "the link records answers only of requests it holds"
+        );
+    }
+
     /// Whether request `rpc`, submitted through [`Link::submit`] and not yet released
-    /// ([`Link::release`]), is a cancel on market `inst`: an explicit cancel (a cancel or a
-    /// cancel-many) naming at least one order of ours on `inst`, whether that order ended since
-    /// or not, each order's market as fbc-oms built the cancel from its record, or a cancel-all
-    /// of `inst`, a Safety cancel of [`ExecHandler::on_unprotected`] included. A place, a batch
-    /// place or an amend is not, nor a cancel naming no order on `inst`. False for a request the
-    /// link never submitted or has released: a consumer hands each note to a sweep running
-    /// ([`crate::sweep::Sweep::observe`]) before it releases the note's request.
+    /// ([`Link::release`]) or dropped ([`Link::forget`]), is a cancel on market `inst`: an
+    /// explicit cancel (a cancel or a cancel-many) naming at least one order of ours on `inst`,
+    /// whether that order ended since or not, each order's market as fbc-oms built the cancel
+    /// from its record, or a cancel-all of `inst`, a Safety cancel of
+    /// [`ExecHandler::on_unprotected`] included. A place, a batch place or an amend is not, nor
+    /// a cancel naming no order on `inst`. False for a request the link never submitted, has
+    /// released, or has dropped: a consumer hands each note to a sweep running
+    /// ([`crate::sweep::Sweep::observe`]) before it releases the note's request, and before its
+    /// next [`Link::forget`], which drops a request answered in full whose last note the forget
+    /// before took (module documentation).
     pub fn is_cancel_on(&self, rpc: RpcId, inst: InstrumentId) -> bool {
         self.cancels.get(&rpc).is_some_and(|c| c.on(inst))
     }
@@ -792,8 +917,14 @@ impl Link {
     /// note once and runs for long: the list then never grows with the run. What
     /// [`Link::sent_counts`] counts of them is kept, as is [`Link::cancels_not_ours_seen`];
     /// [`Link::outcome_of`], [`Link::login_refusals`] and [`Link::told_on`] see only the notes
-    /// left.
+    /// left. Before it takes any, it drops each request answered in full that no note left
+    /// names, as [`Link::release`] does (module documentation): every item answered for good, or
+    /// answered once its order has ended. A request whose last note this call takes is held
+    /// until the next, so the consumer reads the notes it hands over, with
+    /// [`Link::is_cancel_on`] and [`Link::cids_of`], against the link as it was. A consumer that
+    /// never calls it keeps every note and every request they name, as before.
     pub fn forget(&mut self, upto: usize) -> Vec<Note> {
+        self.drop_answered();
         let upto = upto.min(self.notes.len());
         let taken: Vec<Note> = self.notes.drain(..upto).collect();
         self.prune_ended();
@@ -806,7 +937,9 @@ impl Link {
     /// What became of request `rpc`, submitted here, once every item is answered: not sent;
     /// the whole request's outcome; or, item by item, `Accepted` (at the first item's level)
     /// when every item was accepted and otherwise the first item's outcome that was not. `None`
-    /// while an item is unanswered, so a batch is never judged by its first item alone.
+    /// while an item is unanswered, so a batch is never judged by its first item alone, and once
+    /// the request is released ([`Link::release`]) or dropped ([`Link::forget`], module
+    /// documentation).
     pub fn outcome_of(&self, rpc: RpcId) -> Option<SubmitOutcome> {
         let items = self.sent.get(&rpc)?.len().max(1);
         let mut by_item: HashMap<u16, &SubmitOutcome> = HashMap::new();
@@ -844,7 +977,8 @@ impl Link {
         })
     }
 
-    /// The orders request `rpc`, submitted here, names.
+    /// The orders request `rpc`, submitted here, names, until it is released ([`Link::release`])
+    /// or dropped ([`Link::forget`], module documentation): none after.
     pub fn cids_of(&self, rpc: RpcId) -> Vec<ClientOrderId> {
         let items = self.sent.get(&rpc).map_or(&[][..], Vec::as_slice);
         items.iter().map(|it| Link::op(*it, rpc).0).collect()
@@ -1034,6 +1168,11 @@ impl Link {
             }
         }
         let sent = receipt.map(|_| ());
+        if let Err(reason) = sent
+            && self.sent.contains_key(&rpc)
+        {
+            self.answer(rpc, None, &SubmitOutcome::NotSent(reason));
+        }
         self.covered.reported(rpc, sent.is_ok());
         self.notes.push(Note::Submitted { rpc, sent });
     }
@@ -1102,9 +1241,11 @@ impl Link {
                 self.problem(format!("request {}: {e:?}", rpc.0));
             }
         }
+        let item = item.map(|i| i.idx);
+        self.answer(rpc, item, &outcome);
         self.notes.push(Note::Outcome {
             rpc,
-            item: item.map(|i| i.idx),
+            item,
             outcome,
             ours: true,
         });

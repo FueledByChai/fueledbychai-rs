@@ -5,9 +5,14 @@
 //! cancel (decision 0155 item 9), a place reported not sent (FBC-y7lq), which a sample's test
 //! reaches only when it loses its connection at the right moment, and the cancels not ours that
 //! make `Link::cancels_not_ours_seen` hold, through `Link::forget` too (FBC-21g6, decision 0155
-//! item 2). Every command goes through an fbc-oms authorization and a real `ExecSession`'s
-//! `ExecOrders`, on the conformance toy, the session never run: its submissions are queued, and the
-//! test hands the link what the session would report.
+//! item 2), and the requests answered in full that `Link::forget` drops with no call to
+//! `Link::release`, at the forget after the one that took their last note, so a sweep still
+//! reads the notes a forget handed over against them, and those it keeps: an item unanswered,
+//! or answered provisionally or `Unknown` while its order lives (FBC-mu68, decision 0155 items 2
+//! and 5).
+//! Every command goes through an fbc-oms authorization and a real `ExecSession`'s `ExecOrders`,
+//! on the conformance toy, the session never run: its submissions are queued, and the test hands
+//! the link what the session would report.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -27,9 +32,10 @@ use fbc_core::{
     dispatch_market_data,
 };
 use fbc_live::link::{CODEC_CLOSED, Link, LinkHandler, Note};
+use fbc_live::sweep::{RateHold, Sweep, SweepEnd, SweepState};
 use fbc_oms::{
-    CancelChoice, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig, MarketCapsConfig,
-    PreTradeCaps, Registry,
+    CancelChoice, CancelEverything, FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig,
+    MarketCapsConfig, PreTradeCaps, Registry,
 };
 use fbc_runtime::{
     Connector, ExecControl, ExecOrders, ExecSession, ExecSessionConfig, InFlight, IngestClock,
@@ -735,4 +741,450 @@ fn cancels_not_ours_seen_holds_from_the_first_cancel_not_ours_on_and_through_for
     assert!(rig.link.cancels_not_ours_seen());
     rig.link.forget(rig.link.notes().len());
     assert!(rig.link.cancels_not_ours_seen(), "kept through forget");
+}
+
+// FBC-mu68 (decision 0155 items 2 and 5): the link drops a request answered in full at the
+// `Link::forget` after the one that took its last note, with no call to `Link::release`.
+
+/// Our place `rpc`'s item `idx` (order `cid`) answered `outcome`, as ingest sequence `seq`.
+fn answer_item(
+    link: &mut Link,
+    seq: u64,
+    rpc: RpcId,
+    idx: u16,
+    cid: ClientOrderId,
+    outcome: SubmitOutcome,
+) {
+    let item = ItemRef {
+        idx,
+        cid: Some(cid),
+        vid: None,
+    };
+    let body = ExecEvent::Outcome {
+        rpc,
+        item: Some(item),
+        outcome,
+    };
+    link.on_exec(env(seq, 2_000 + seq, body));
+}
+
+fn accepted() -> SubmitOutcome {
+    SubmitOutcome::Accepted {
+        ack: AckLevel::Final,
+    }
+}
+
+/// Every note forgotten twice: the first takes them, the second drops each request answered in
+/// full whose notes the first took.
+fn forget_twice(link: &mut Link) {
+    link.forget(link.notes().len());
+    link.forget(0);
+}
+
+impl Rig {
+    /// A batch of `n` post-only buys of a lot at 100 ticks on `INST_A`, authorized and
+    /// submitted: their client ids and the request id.
+    fn place_batch(&mut self, n: usize) -> (Vec<ClientOrderId>, RpcId) {
+        let cids: Vec<ClientOrderId> = (0..n).map(|_| self.mint.mint().unwrap()).collect();
+        let orders = cids
+            .iter()
+            .map(|cid| NewOrder {
+                cid: *cid,
+                inst: INST_A,
+                side: Side::Buy,
+                kind: OrderKind::Limit { px: Ticks(100) },
+                qty: Lots::new(1).unwrap(),
+                tif: Tif::Gtc,
+                channel: Channel::Public,
+                post_only: true,
+                reduce_only: false,
+                reducing: false,
+            })
+            .collect();
+        let plan = self.link.reg().place_batch(orders).unwrap();
+        let auth = self
+            .link
+            .reg()
+            .authorize(ACCT, plan.command.unwrap())
+            .unwrap();
+        (cids, self.link.submit(&self.orders, auth).unwrap())
+    }
+
+    /// A cancel of our order `cid`, authorized and submitted: its request id.
+    fn cancel(&mut self, cid: ClientOrderId) -> RpcId {
+        let caps = order_caps();
+        let cancel = match self.link.reg().cancellable(cid).unwrap().cancel(&caps) {
+            CancelChoice::Send(cmd) => cmd,
+            CancelChoice::AwaitAck => panic!("the toy cancels by client id"),
+        };
+        let auth = self.link.reg().authorize(ACCT, cancel).unwrap();
+        self.link.submit(&self.orders, auth).unwrap()
+    }
+}
+
+#[test]
+fn a_request_answered_in_full_is_dropped_by_the_forget_after_the_one_that_took_its_notes() {
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let cancel = rig.cancel(a);
+    rig.link.on_submitted(sent(cancel));
+    answer_item(&mut rig.link, 12, cancel, 0, a, accepted());
+
+    // Answered, its notes left: outcome_of answers each, the cancel reads as one on its market.
+    assert_eq!(rig.link.requests_held(), 2);
+    assert_eq!(rig.link.outcome_of(place), Some(accepted()));
+    assert_eq!(rig.link.outcome_of(cancel), Some(accepted()));
+    assert!(rig.link.is_cancel_on(cancel, INST_A));
+
+    // The forget that takes their last notes keeps them, so the consumer reads those notes
+    // against the link as it was; outcome_of sees only the notes left, as before.
+    let taken = rig.link.forget(rig.link.notes().len());
+    assert!(!taken.is_empty());
+    assert_eq!(rig.link.requests_held(), 2);
+    assert!(rig.link.is_cancel_on(cancel, INST_A));
+    assert_eq!(rig.link.cids_of(cancel), [a]);
+    assert_eq!(rig.link.outcome_of(place), None);
+
+    // The next forget drops both, with no call to release.
+    rig.link.forget(0);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(!rig.link.is_cancel_on(cancel, INST_A));
+    assert!(rig.link.cids_of(cancel).is_empty());
+    assert_eq!(rig.link.sent_counts(), (1, 1));
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn a_batch_answered_item_by_item_is_dropped_once_its_notes_are_forgotten() {
+    let mut rig = Rig::started(order_caps());
+    let (cids, batch) = rig.place_batch(2);
+    rig.link.on_submitted(sent(batch));
+    answer_item(&mut rig.link, 10, batch, 0, cids[0], accepted());
+    assert_eq!(rig.link.outcome_of(batch), None, "an item unanswered");
+    answer_item(&mut rig.link, 11, batch, 1, cids[1], accepted());
+    assert_eq!(rig.link.outcome_of(batch), Some(accepted()));
+    assert_eq!(rig.link.cids_of(batch), cids);
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(rig.link.cids_of(batch).is_empty());
+}
+
+#[test]
+fn a_whole_request_reject_and_a_not_sent_report_each_answer_a_request_in_full() {
+    let mut rig = Rig::started(order_caps());
+    // A batch refused whole, by an outcome naming no item.
+    let (_, batch) = rig.place_batch(2);
+    rig.link.on_submitted(sent(batch));
+    let refused = SubmitOutcome::Rejected(reject("refused"));
+    let body = ExecEvent::Outcome {
+        rpc: batch,
+        item: None,
+        outcome: refused.clone(),
+    };
+    rig.link.on_exec(env(10, 2_010, body));
+    // A place reported not sent.
+    let (_, place) = rig.place();
+    rig.link.on_submitted(SubmitHandle {
+        rpc: place,
+        receipt: Err(NotSentReason::Disconnected),
+    });
+    assert_eq!(rig.link.outcome_of(batch), Some(refused));
+    let not_sent = SubmitOutcome::NotSent(NotSentReason::Disconnected);
+    assert_eq!(rig.link.outcome_of(place), Some(not_sent.clone()));
+    assert_eq!(rig.link.requests_held(), 2);
+    // A forget that takes no note drops neither: the not-sent report is the place's one note.
+    rig.link.forget(0);
+    assert_eq!(rig.link.requests_held(), 2);
+    assert_eq!(rig.link.outcome_of(place), Some(not_sent));
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+}
+
+#[test]
+fn a_request_with_an_item_unanswered_is_kept_through_a_forget() {
+    let mut rig = Rig::started(order_caps());
+    let (cids, batch) = rig.place_batch(2);
+    rig.link.on_submitted(sent(batch));
+    answer_item(&mut rig.link, 10, batch, 0, cids[0], accepted());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 1, "item 1 unanswered");
+    assert_eq!(rig.link.cids_of(batch), cids);
+
+    // Item 1's answer still routes as ours, and the request goes once its note is forgotten.
+    answer_item(&mut rig.link, 11, batch, 1, cids[1], accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, item: Some(1), ours: true, .. }) if *rpc == batch
+    ));
+    rig.link.forget(rig.link.notes().len());
+    assert_eq!(
+        rig.link.requests_held(),
+        1,
+        "its last note taken by this forget"
+    );
+    rig.link.forget(0);
+    assert_eq!(rig.link.requests_held(), 0);
+}
+
+fn provisional() -> SubmitOutcome {
+    SubmitOutcome::Accepted {
+        ack: AckLevel::Provisional,
+    }
+}
+
+#[test]
+fn a_place_accepted_provisionally_is_kept_until_its_final_acceptance_routes_as_ours() {
+    // A two-phase venue's place (decision 0092): its provisional acceptance is not an answer for
+    // good, so the request is kept through forgets while its order lives, and its final
+    // acceptance is ours. A later answer to the request once dropped is the session's own.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    rig.link.on_submitted(sent(place));
+    answer_item(&mut rig.link, 10, place, 0, a, provisional());
+    rig.link.on_exec(env(11, 2_011, open(a, "v-a")));
+    forget_twice(&mut rig.link);
+    assert_eq!(
+        rig.link.requests_held(),
+        1,
+        "its order lives, provisionally accepted"
+    );
+
+    answer_item(&mut rig.link, 12, place, 0, a, accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, ours: true, .. }) if *rpc == place
+    ));
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+
+    answer_item(&mut rig.link, 13, place, 0, a, accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, ours: false, .. }) if *rpc == place
+    ));
+    assert_eq!(rig.link.outcome_of(place), None);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn an_amend_accepted_provisionally_is_kept_until_its_final_acceptance_reaches_the_registry() {
+    // fbc-oms reads an amend answered only at its final acceptance: the link keeps the amend
+    // through forgets after its provisional one, so the final one reaches the registry.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let caps = order_caps();
+    let amend = rig
+        .link
+        .reg()
+        .live(a)
+        .unwrap()
+        .amend(&caps, Ticks(99), Lots::new(1).unwrap(), false)
+        .unwrap();
+    let auth = rig.link.reg().authorize(ACCT, amend).unwrap();
+    let amend = rig.link.submit(&rig.orders, auth).unwrap();
+    rig.link.on_submitted(sent(amend));
+    answer_item(&mut rig.link, 12, amend, 0, a, provisional());
+    forget_twice(&mut rig.link);
+    assert_eq!(
+        rig.link.requests_held(),
+        1,
+        "the place dropped, the amend kept"
+    );
+    assert!(rig.link.registry().get(a).unwrap().amend_unconfirmed());
+
+    answer_item(&mut rig.link, 13, amend, 0, a, accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, ours: true, .. }) if *rpc == amend
+    ));
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn a_cancel_answered_unknown_is_kept_until_its_order_ends() {
+    // An answer that is not for good (`Unknown`, or a provisional acceptance) keeps the request
+    // while its order lives; once the order has ended, that answer is enough.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let cancel = rig.cancel(a);
+    rig.link.on_submitted(sent(cancel));
+    answer_item(&mut rig.link, 12, cancel, 0, a, SubmitOutcome::Unknown);
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 1, "the cancel's order lives");
+    assert!(rig.link.is_cancel_on(cancel, INST_A));
+
+    rig.link.on_exec(env(13, 2_013, user_cancelled(a, "v-a")));
+    assert!(rig.link.registry().get(a).unwrap().state().is_terminal());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(!rig.link.is_cancel_on(cancel, INST_A));
+}
+
+#[test]
+fn an_answer_naming_an_item_past_the_requests_items_answers_none_of_them() {
+    // A one-item place answered for an item it does not have: its one item is still unanswered,
+    // so the request is kept and that item's answer, when it comes, reaches the registry.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    rig.link.on_submitted(sent(place));
+    answer_item(&mut rig.link, 10, place, 1, a, accepted());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 1, "item 0 unanswered");
+
+    answer_item(&mut rig.link, 11, place, 0, a, accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, item: Some(0), ours: true, .. }) if *rpc == place
+    ));
+    assert!(rig.link.registry().get(a).unwrap().acknowledged());
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+}
+
+#[test]
+fn a_cancel_all_is_dropped_once_answered_provisionally() {
+    // A request naming no order: fbc-oms reads none of its answers, so its first is enough.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    rig.link.reg().kill(INST_A);
+    let built = rig.link.reg().cancel_everything(INST_A, &order_caps());
+    let CancelEverything::CancelAll { command, .. } = built else {
+        panic!("no cancel-all: {built:?}");
+    };
+    let auth = rig.link.reg().authorize(ACCT, command).unwrap();
+    let all = rig.link.submit(&rig.orders, auth).unwrap();
+    rig.link.on_submitted(sent(all));
+    let body = ExecEvent::Outcome {
+        rpc: all,
+        item: Some(ItemRef {
+            idx: 0,
+            cid: None,
+            vid: None,
+        }),
+        outcome: provisional(),
+    };
+    rig.link.on_exec(env(12, 2_012, body));
+    assert!(rig.link.is_cancel_on(all, INST_A));
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert!(!rig.link.is_cancel_on(all, INST_A));
+}
+
+#[test]
+fn sent_counts_counts_the_notes_of_requests_dropped_after_their_forget() {
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let (b, other) = rig.place();
+    accepted_and_open(&mut rig.link, other, b, "v-b", 20);
+    let cancel = rig.cancel(a);
+    rig.link.on_submitted(sent(cancel));
+    answer_item(&mut rig.link, 30, cancel, 0, a, accepted());
+    assert_eq!(rig.link.sent_counts(), (2, 1));
+
+    // Taken in two parts: the first place's notes, then the rest.
+    rig.link.forget(3);
+    assert_eq!(rig.link.sent_counts(), (2, 1));
+    rig.link.forget(rig.link.notes().len());
+    assert_eq!(rig.link.sent_counts(), (2, 1));
+    rig.link.forget(0);
+    assert_eq!(rig.link.requests_held(), 0);
+    assert_eq!(rig.link.sent_counts(), (2, 1));
+}
+
+#[test]
+fn release_still_drops_at_once_and_forget_drops_what_was_not_released() {
+    let mut rig = Rig::started(order_caps());
+    let (a, released) = rig.place();
+    let (b, place) = rig.place();
+    assert_eq!(rig.link.requests_held(), 2);
+    // Released unanswered, with its notes left: gone at once, a later answer the session's own.
+    rig.link.release(released);
+    assert_eq!(rig.link.requests_held(), 1);
+    rig.link.on_submitted(sent(released));
+    answer_item(&mut rig.link, 10, released, 0, a, accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, ours: false, .. }) if *rpc == released
+    ));
+    // The other, answered and forgotten, is dropped with no release.
+    rig.link.on_submitted(sent(place));
+    answer_item(&mut rig.link, 11, place, 0, b, accepted());
+    assert_eq!(rig.link.requests_held(), 1);
+    forget_twice(&mut rig.link);
+    assert_eq!(rig.link.requests_held(), 0);
+}
+
+#[test]
+fn a_safety_cancel_answered_is_dropped_with_its_entry_once_its_notes_are_forgotten() {
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    rig.link.attach(rig.orders.clone(), ACCT);
+    rig.link
+        .on_unprotected(&[snapshot(Some(CidMatch::Ours(a)), "v-a")]);
+    let safety = rig.link.safety_cancel_of(a).expect("a Safety cancel");
+    rig.link.on_submitted(sent(safety));
+    answer_item(&mut rig.link, 12, safety, 0, a, accepted());
+    rig.link.forget(rig.link.notes().len());
+    assert_eq!(rig.link.safety_cancel_of(a), Some(safety));
+    assert!(rig.link.is_cancel_on(safety, INST_A));
+    rig.link.forget(0);
+    assert_eq!(rig.link.safety_cancel_of(a), None);
+    assert!(!rig.link.is_cancel_on(safety, INST_A));
+    assert_eq!(rig.link.requests_held(), 0);
+}
+
+#[test]
+fn a_sweep_handed_a_rate_refusal_by_forget_reads_it_as_a_cancel_on_its_market() {
+    // The consumer's cancel of the bid is refused for its rate, its last answer; the consumer
+    // takes the notes with forget, records the refusal on its hold and hands each to the sweep
+    // (as testnet_quote does). The link still says the request is a cancel on the market, so
+    // the cancel of everything is due again once the hold passes.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let cancel = rig.cancel(a);
+    rig.link.on_submitted(sent(cancel));
+    rig.link.reg().kill(INST_A);
+    let (mut sweep, _round) =
+        Sweep::start(&mut rig.link, &rig.orders, ACCT, INST_A, SweepEnd::AtStop);
+    let limited = Reject {
+        kind: RejectKind::RateLimited { retry_after: None },
+        venue_code: None,
+        raw: "slow down".into(),
+    };
+    answer_item(
+        &mut rig.link,
+        12,
+        cancel,
+        0,
+        a,
+        SubmitOutcome::Rejected(limited),
+    );
+    let now = MonoNs(5_000);
+    let mut hold = RateHold::new(Duration::from_secs(1)).unwrap();
+    hold.refused(None, now);
+    let taken = rig.link.forget(rig.link.notes().len());
+    for note in &taken {
+        sweep.observe(&rig.link, note);
+    }
+    let polled = sweep.poll(&mut rig.link, &rig.orders, &hold, now);
+    assert_eq!(
+        polled.state,
+        SweepState::Waiting {
+            resend_at: hold.until()
+        }
+    );
+    assert!(hold.until().is_some());
+    // The next forget drops the refused cancel: the consumer has read its notes.
+    rig.link.forget(0);
+    assert!(!rig.link.is_cancel_on(cancel, INST_A));
 }

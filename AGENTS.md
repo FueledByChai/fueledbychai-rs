@@ -782,7 +782,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     `Link::is_cancel_on(rpc, inst)`, whether a request it holds is a cancel on that market (a
     cancel or a cancel-many naming an order of ours on it, ended since or not, by the market
     fbc-oms built the cancel from, or a cancel-all of it, which the link records at submit), its
-    Safety cancels included, false once released, FBC-132g; venue text shown
+    Safety cancels included, false once released or dropped, FBC-132g; each request's items held
+    until `Link::release`, or dropped by `Link::forget` once every item is answered for good
+    (accepted at `Final`, refused or not sent) or answered once its order ended (a cancel-all by
+    any answer), at the forget after the one that took the request's last note, so the notes a
+    forget hands over are read against the link as it was, a consumer that never forgets its
+    notes keeping them and the requests they name, FBC-mu68; venue text shown
     through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
     handler's five entry points public methods of it, and `LinkHandler`, which hands each call on
     and then calls the consumer's wake, a closure. It reads no clock but its session's shard clock
@@ -837,7 +842,15 @@ holds two of them for one pull request. The rules after the three roles bind all
     venue time absent on either side, a requote that never rested, the consumer's span read on
     both of its measures, each bound held where it falls, and a zero span or window refused); in
     `tests/paths.rs` too, `cancels_not_ours_seen` set by a cancel not ours noted at once and by one
-    held until its covering cancel was refused, and kept through `Link::forget`. And
+    held until its covering cancel was refused, and kept through `Link::forget`; and, there too
+    (FBC-mu68), a single request, a batch answered item by item, a whole-request reject, a report
+    of a place not sent, a Safety cancel and a cancel-all each dropped once answered and
+    forgotten, held through the forget that took their last note, a batch with an item
+    unanswered kept, as is a place or an amend accepted provisionally until its final acceptance
+    routes as ours, a cancel gone Unknown until its order ends and a request answered only for an
+    item it does not have, a later answer to a dropped request the session's own, `sent_counts`
+    across the drops, `Link::release` still dropping at once, and a sweep reading a rate refusal a
+    forget handed over as a cancel on its market. And
     `src/sizing.rs` (FBC-6r81, 0155 items 2, 6 and 8), mark-aware sizing moved from the samples
     with its results: `cap_lots` and `inventory_price` (`testnet.rs` re-exporting both),
     `at_market`, the operator's `UsdCaps::new(resting, inventory)` (each cap refused when not
