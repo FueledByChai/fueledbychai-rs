@@ -1,8 +1,8 @@
 //! The position check of the samples that can fill (FBC-hpg6, the owner's condition in decision
 //! 0094: positions follow fills). Included by path by `testnet_trade` (whose round trip
 //! `mainnet_smoke` runs) and `testnet_quote`, and by their tests, beside
-//! [`link`](crate::link) and [`testnet`](crate::testnet); it is not a module of this crate's
-//! library target, which stays empty.
+//! [`link`](crate::link) and [`testnet`](crate::testnet), and by `paradex_testnet_acceptance`,
+//! which runs none of it; it is not a module of this crate's library target, which stays empty.
 //!
 //! A session resyncs once per connection, so a session with fills and no reconnect never reads
 //! `GET /positions` after a fill. The samples therefore read it themselves, through
@@ -15,14 +15,17 @@
 //! the one a resync would seed. The market's size, in lots, is compared exactly with the
 //! registry's position for it, read as the answer lands.
 //!
-//! **A mismatch** (or a read that failed) is read once more after the step timeout, and both
-//! readings are printed with their times since the start, the venue's size, the registry's and
-//! the fills applied, so `GET /positions` lagging the fill stream (FBC-8xr's runs saw the REST
-//! snapshot trail the stream by up to 3.5 s) is told apart from a real disagreement (RB155-2 on
-//! PR #155). A re-read that agrees is printed and the run goes on ([`Verdict::Cleared`]); one
-//! that still disagrees ([`Verdict::Persists`]) Stops the run (kill switch + cancel all,
-//! nothing placed after) and fails it, saying to check the position by hand ([`HAND_CHECK`]).
-//! What Stops it is each sample's: this module reads, compares and prints.
+//! **The comparison is fbc-live's** ([`fbc_live::positions`], decision 0155 items 2 and 7): each
+//! reading is a [`Reading`], and its [`PositionWatch`] says whether the first agrees or when to
+//! read once more. **A mismatch** (or a read that failed) is read once more after the step
+//! timeout, and both readings are printed with their times since the start, the venue's size, the
+//! registry's and the fills applied, so `GET /positions` lagging the fill stream (FBC-8xr's runs
+//! saw the REST snapshot trail the stream by up to 3.5 s) is told apart from a real disagreement
+//! (RB155-2 on PR #155). A re-read that agrees is printed and the run goes on
+//! ([`Verdict::Cleared`]); one that still disagrees ([`Verdict::Persists`]) Stops the run (kill
+//! switch + cancel all, nothing placed after) and fails it, saying to check the position by hand
+//! ([`HAND_CHECK`], in the text [`failure`] gives). What Stops it is each sample's: this module
+//! reads and prints, and fbc-live compares.
 //!
 //! **Other markets** ([`PositionCheck::elsewhere`], `testnet_quote --mainnet`, FBC-tyft): before
 //! the order socket connects, one `GET /positions` read lists the account's open positions on
@@ -36,91 +39,38 @@
 use std::time::{Duration, Instant};
 
 use fbc_core::{
-    ExecEvent, Secrets, SignedLots, SpecTable, VenueCaps, VenueConfig, WallNs, dispatch_market_data,
+    ExecEvent, MonoNs, Secrets, SignedLots, SpecTable, VenueCaps, VenueConfig, WallNs,
+    dispatch_market_data,
 };
+// The comparison, its re-read rule and the notes' counts are fbc-live's (FBC-rujq, decision 0155
+// item 2), named here as the samples have always named them; each includer uses a part of it.
+use fbc_live::positions::{Next, PositionWatch};
+#[allow(unused_imports)]
+pub use fbc_live::positions::{Reading, Verdict, fill_seen, fills_in};
 use fbc_runtime::{Connector, RateLimiter};
 use fbc_venue_paradex::exec::{decode_resync, positions_request};
 
 use crate::auth_rest::{RestAnswer, RestReader};
-use crate::link::Note;
 use crate::testnet::{INST, Lines};
 
 /// What a run that Stops on a persisting mismatch says to do.
 pub const HAND_CHECK: &str = "check the position by hand";
 
-/// One reading: when (milliseconds since the start), what `GET /positions` said of the market
-/// (in lots, or why it could not be read), and what the registry held as the answer landed:
-/// its position and how many fills of ours it had applied.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Reading {
-    pub at_ms: u128,
-    pub venue: Result<SignedLots, String>,
-    pub registry: SignedLots,
-    pub fills: usize,
-}
+/// The read each [`Reading`] names as it is printed.
+const READ: &str = "GET /positions";
 
-impl Reading {
-    /// Whether the venue's size was read and is exactly the registry's.
-    pub fn agrees(&self) -> bool {
-        self.venue.as_ref().is_ok_and(|v| *v == self.registry)
+/// Why the run Stops, naming both readings, when `verdict` says it must (a mismatch that
+/// persists through the re-read) `when` (`after the first fill`, `at Stop`).
+pub fn failure(verdict: &Verdict, when: &str) -> Option<String> {
+    match verdict {
+        Verdict::Persists(first, second) => Some(format!(
+            "GET /positions disagreed with the registry's position {when} and again on the \
+             re-read after the step timeout (first {}; re-read {}): {HAND_CHECK}",
+            first.shown(READ),
+            second.shown(READ)
+        )),
+        _ => None,
     }
-
-    /// The reading as the run prints it.
-    pub fn shown(&self) -> String {
-        let venue = match &self.venue {
-            Ok(lots) => format!("GET /positions {} lots", lots.0),
-            Err(why) => format!("GET /positions unread ({why})"),
-        };
-        format!(
-            "+{}ms {venue}, the registry {} lots ({} fills applied)",
-            self.at_ms, self.registry.0, self.fills
-        )
-    }
-}
-
-/// What a check came to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// The first reading agreed.
-    Agrees(Reading),
-    /// The first reading disagreed (or was unread) and the re-read after the step timeout
-    /// agreed: `GET /positions` lagged.
-    Cleared(Reading, Reading),
-    /// Both readings disagreed (or were unread): the run Stops and fails.
-    Persists(Reading, Reading),
-}
-
-impl Verdict {
-    /// Whether the run must Stop and fail.
-    pub fn persists(&self) -> bool {
-        matches!(self, Verdict::Persists(..))
-    }
-
-    /// Why the run Stops, naming both readings, when it must.
-    pub fn failure(&self, when: &str) -> Option<String> {
-        match self {
-            Verdict::Persists(first, second) => Some(format!(
-                "GET /positions disagreed with the registry's position {when} and again on the \
-                 re-read after the step timeout (first {}; re-read {}): {HAND_CHECK}",
-                first.shown(),
-                second.shown()
-            )),
-            _ => None,
-        }
-    }
-}
-
-/// How many fills of ours `notes` show applied to the inventory.
-pub fn fills_in(notes: &[Note]) -> usize {
-    notes
-        .iter()
-        .filter(|n| matches!(n, Note::Fill { ours: true, .. }))
-        .count()
-}
-
-/// Whether `notes` hold a fill of any kind: the session saw one.
-pub fn fill_seen(notes: &[Note]) -> bool {
-    notes.iter().any(|n| matches!(n, Note::Fill { .. }))
 }
 
 /// The market's position as a `GET /positions` answer `body` states it, decoded by the Paradex
@@ -193,6 +143,8 @@ pub struct PositionCheck {
     /// The step timeout: how long a read may take, and how long after a mismatch the re-read
     /// comes.
     wait: Duration,
+    /// The re-read rule, after the step timeout: each check judges its readings on a copy.
+    watch: PositionWatch,
 }
 
 impl PositionCheck {
@@ -200,7 +152,7 @@ impl PositionCheck {
     /// Paradex configuration: its REST base, chain id and timings) and the venue's `caps`,
     /// reading through `connector` and charging `limiter` (the session's), each read bounded by
     /// `wait` and a mismatch re-read after it. Refused naming a missing or invalid key, never a
-    /// value.
+    /// value, or a zero `wait`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cfg: &VenueConfig,
@@ -214,6 +166,7 @@ impl PositionCheck {
     ) -> Result<PositionCheck, String> {
         let rest = RestReader::new(cfg, creds, connector, limiter.clone())
             .map_err(|e| format!("the position check: {e}"))?;
+        let watch = PositionWatch::new(wait).map_err(|e| format!("the position check: {e}"))?;
         Ok(PositionCheck {
             rest,
             limiter,
@@ -221,6 +174,7 @@ impl PositionCheck {
             specs,
             caps,
             wait,
+            watch,
         })
     }
 
@@ -270,7 +224,8 @@ impl PositionCheck {
     }
 
     /// One reading: `GET /positions`, then `registry` (the registry's position and the fills
-    /// of ours applied) as the answer landed.
+    /// of ours applied) as the answer landed, at the time since the start as it landed
+    /// ([`since`]).
     async fn reading(
         &mut self,
         lines: &Lines,
@@ -279,7 +234,7 @@ impl PositionCheck {
         let venue = self.venue_position().await;
         let (lots, fills) = registry();
         Reading {
-            at_ms: lines.t0.elapsed().as_millis(),
+            at: since(lines.t0),
             venue,
             registry: lots,
             fills,
@@ -287,45 +242,99 @@ impl PositionCheck {
     }
 
     /// The check `when` (`after the first fill`, `at Stop`): a reading, and on a mismatch or an
-    /// unread answer a second one after the step timeout, each printed on a `POSITION` line.
+    /// unread answer a second one when fbc-live's watch asks for it, one step timeout after the
+    /// first, each printed on a `POSITION` line.
     pub async fn check(
         &mut self,
         when: &str,
         lines: &Lines,
         registry: impl Fn() -> (SignedLots, usize),
     ) -> Verdict {
-        let first = self.reading(lines, &registry).await;
-        if first.agrees() {
+        let mut watch = self.watch.clone();
+        let mut reading = self.reading(lines, &registry).await;
+        loop {
+            let first = reading.shown(READ);
+            let again = match watch.judge(reading) {
+                Next::Done(verdict) => {
+                    self.print(&verdict, when, lines);
+                    return verdict;
+                }
+                Next::ReadAgainAt(again) => again,
+            };
             lines.line(format_args!(
-                "POSITION {when}: {}: they agree",
-                first.shown()
+                "POSITION {when}: {first}: they DIFFER; GET /positions is read once more in {} s \
+                 (it may lag the fills)",
+                self.wait.as_secs()
             ));
-            return Verdict::Agrees(first);
+            tokio::time::sleep_until(at(lines.t0, again)).await;
+            reading = self.reading(lines, &registry).await;
         }
-        lines.line(format_args!(
-            "POSITION {when}: {}: they DIFFER; GET /positions is read once more in {} s (it may \
-             lag the fills)",
-            first.shown(),
-            self.wait.as_secs()
-        ));
-        tokio::time::sleep(self.wait).await;
-        let second = self.reading(lines, &registry).await;
-        if second.agrees() {
-            lines.line(format_args!(
+    }
+
+    /// The `POSITION` line of `verdict` `when`.
+    fn print(&self, verdict: &Verdict, when: &str, lines: &Lines) {
+        match verdict {
+            Verdict::Agrees(first) => lines.line(format_args!(
+                "POSITION {when}: {}: they agree",
+                first.shown(READ)
+            )),
+            Verdict::Cleared(first, second) => lines.line(format_args!(
                 "POSITION re-read {when}: {}: they agree now (GET /positions lagged the fills; \
                  first {}); the run goes on",
-                second.shown(),
-                first.shown()
-            ));
-            Verdict::Cleared(first, second)
-        } else {
-            lines.line(format_args!(
+                second.shown(READ),
+                first.shown(READ)
+            )),
+            Verdict::Persists(first, second) => lines.line(format_args!(
                 "POSITION re-read {when}: {}: they STILL DIFFER (first {}): the run fails; \
                  {HAND_CHECK}",
-                second.shown(),
-                first.shown()
-            ));
-            Verdict::Persists(first, second)
+                second.shown(READ),
+                first.shown(READ)
+            )),
         }
+    }
+}
+
+/// The time since `t0` (the run's start), on tokio's clock, as each [`Reading`] states it: on a
+/// clock that is not paused it is `t0.elapsed()`, and on a paused one it moves only as tokio's
+/// does, so a re-read at [`at`] comes one wait after the reading on either (review of FBC-rujq).
+fn since(t0: Instant) -> MonoNs {
+    let now = tokio::time::Instant::now();
+    let elapsed = now.saturating_duration_since(tokio::time::Instant::from_std(t0));
+    MonoNs(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The instant on tokio's clock that `time`, a time since `t0` as [`since`] states it, names.
+fn at(t0: Instant, time: MonoNs) -> tokio::time::Instant {
+    tokio::time::Instant::from_std(t0) + Duration::from_nanos(time.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// On a paused clock moved past the wait, a re-read the watch asks for comes exactly one
+    /// wait after the reading it follows, and not at once: the reading's time and the re-read's
+    /// instant are both on tokio's clock (review of FBC-rujq).
+    #[tokio::test(start_paused = true)]
+    async fn a_re_read_on_a_paused_clock_comes_one_wait_after_its_reading() {
+        let wait = Duration::from_secs(2);
+        let t0 = Instant::now();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let landed = tokio::time::Instant::now();
+        let first = since(t0);
+        assert!(first.0 > 9_000_000_000, "{first:?}");
+        let mut watch = PositionWatch::new(wait).unwrap();
+        let reading = Reading {
+            at: first,
+            venue: Ok(SignedLots(1)),
+            registry: SignedLots(0),
+            fills: 1,
+        };
+        let Next::ReadAgainAt(again) = watch.judge(reading) else {
+            panic!("a mismatch is read again");
+        };
+        assert_eq!(at(t0, again), landed + wait);
+        tokio::time::sleep_until(at(t0, again)).await;
+        assert_eq!(tokio::time::Instant::now(), landed + wait);
     }
 }

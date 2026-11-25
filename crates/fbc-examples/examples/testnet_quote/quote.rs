@@ -137,7 +137,7 @@ use tokio::sync::Notify;
 use crate::args::{Options, confirmed, hosts, testnet_guard};
 use crate::link::{Link, LinkHandler, Note, async_reject, described};
 use crate::mainnet::{MAINNET_CHAIN, chain_refusal, decode_chain, mainnet_guard, trusted};
-use crate::positions::{PositionCheck, Verdict, fills_in};
+use crate::positions::{PositionCheck, Verdict, failure, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, HighWater, INST, Keeping, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads,
     config, drive_with, inventory_price, px_or_none, rest_get, resync_disagreements,
@@ -1184,7 +1184,7 @@ impl Driver {
             self.fill_check_due = true;
             return false;
         };
-        if let Some(why) = verdict.failure(when) {
+        if let Some(why) = failure(&verdict, when) {
             self.trouble(why);
         }
         true
@@ -1234,7 +1234,7 @@ impl Driver {
         let mut check = self.positions.take()?;
         let verdict = check.check(when, &self.lines, self.registry_now()).await;
         self.positions = Some(check);
-        let failed = verdict.failure(when)?;
+        let failed = failure(&verdict, when)?;
         self.note(format_args!("{failed}"));
         Some(failed)
     }

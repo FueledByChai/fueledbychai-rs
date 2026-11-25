@@ -303,9 +303,9 @@ holds two of them for one pull request. The rules after the three roles bind all
   `crates/venues/fbc-venue-hibachi` with its market-data-only factory, discovery, caps,
   `/ws/market` codec (0129) and status poll (0130) and its offline signer (`src/sign`, built
   from `Secrets` by `src/auth`), `crates/fbc-live` with its link, its classifier of cancels not
-  ours, its sizing and its sweep (`src/link.rs`, `src/not_ours.rs`, `src/sizing.rs`,
-  `src/sweep.rs`, the samples' glue moved there, 0155), and `crates/fbc-examples` with the
-  owner-run samples; the rest are planned.
+  ours, its sizing, its sweep and its positions comparison (`src/link.rs`, `src/not_ours.rs`,
+  `src/sizing.rs`, `src/sweep.rs`, `src/positions.rs`, the samples' glue moved there, 0155), and
+  `crates/fbc-examples` with the owner-run samples; the rest are planned.
   Members are the `crates/fbc-*` and `crates/venues/fbc-*` globs, and `fixtures/` is excluded
   from the workspace:
   - `crates/fbc-core`: the contract. Time, units, price grids and exact prices, sealed ids and
@@ -847,7 +847,20 @@ holds two of them for one pull request. The rules after the three roles bind all
     than the mark; the mark is the consumer's argument, and it reads no venue and no clock. Its
     test, `tests/sizing.rs`, holds the samples' two moved tests, each `LeftOut`, a side refused at
     the mark alone, `None` and zero minimums, `at_market` and `cap_lots`'s results as before it
-    converted with `i64::try_from`, on fbc-core's `Decimal`.
+    converted with `i64::try_from`, on fbc-core's `Decimal`. And `src/positions.rs` (FBC-rujq,
+    0155 items 2, 7 and 8), the samples' positions comparison and its re-read rule (FBC-hpg6,
+    0094's condition) moved with its behaviour: a `Reading` (when the consumer's read landed, as
+    `MonoNs`, the venue's size in lots or why it was unread, the registry's position and the fills
+    of ours applied) agreeing only when read and exactly the registry's, `shown(read)` its text
+    with the consumer's read named, and `PositionWatch::new(reread_after)` (zero refused,
+    `ZeroReread`, no `Default`), whose `judge` says `Next::Done` with a `Verdict` (`Agrees`, or
+    `Cleared` or `Persists` after the re-read, naming no reaction) or `Next::ReadAgainAt` the
+    first reading's time plus the wait for a mismatch or an unread answer; `fills_in`, `fill_seen`
+    and `resync_disagreements` (`testnet.rs` re-exporting it) over the link's notes. The read is
+    the consumer's: it reads no venue and no clock. Its test, `tests/positions.rs`, holds each
+    verdict, an unread answer first and on the re-read, the re-read's time, a zero wait refused,
+    `shown`, the notes' counts and `resync_disagreements` on each `PositionCheck` and an
+    unsettled fill.
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is
@@ -1528,8 +1541,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     sessions through fbc-live's link: the Paradex samples through `fbc_live::link`, the probe
     through `src/link.rs`, a re-export shim it includes by path, with a `LinkHandler` of its own
     on an `Rc<Notify>` wake, until FBC-bddu moves it onto the library and deletes the shim (0155
-    item 9). They share `src/testnet.rs` (guard and wiring), and the mainnet ones `src/mainnet.rs`
-    (the mainnet guard), included by path.
+    item 9). They share `src/testnet.rs` (guard and wiring), `testnet_trade`, `testnet_quote` and
+    `mainnet_smoke` `src/positions.rs` (`PositionCheck`, their own `GET /positions` read over
+    `src/auth_rest.rs` after the first fill and at Stop, judged by fbc-live's `PositionWatch`, and
+    the other-markets refusal, `other_markets`; the `POSITION` lines, `HAND_CHECK` and the Stop
+    text, `failure`, stay theirs; FBC-rujq; `paradex_testnet_acceptance` includes it and runs none
+    of it), and the mainnet ones `src/mainnet.rs` (the mainnet guard), included by path.
   - `crates/venues/fbc-venues` (the registry, the only crate with a normal dependency on a
     concrete venue; `crates/fbc-examples` reaches them only as dev-dependencies),
     `crates/venues/fbc-venue-binance-usdm` (market data only:

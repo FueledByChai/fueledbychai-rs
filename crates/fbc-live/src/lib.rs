@@ -14,6 +14,12 @@
 //!   ([`NotOursConfig`](not_ours::NotOursConfig)), tells a cancel of the same event as the one
 //!   before from the first of a new window and from a repeat; the warning and the Stop these
 //!   lead to stay the consumer's.
+//! - [`positions`]: the positions comparison and its re-read rule (FBC-hpg6). A
+//!   [`Reading`](positions::Reading) of the market's position the consumer read is compared
+//!   exactly with the registry's, and a [`PositionWatch`](positions::PositionWatch) reads a
+//!   mismatch or an unread answer once more after the consumer's wait, then says whether it
+//!   cleared or persists ([`Verdict`](positions::Verdict)); the read and what follows a verdict
+//!   are the consumer's.
 //! - [`sizing`]: mark-aware sizing. The operator's caps in lots ([`UsdCaps`](sizing::UsdCaps),
 //!   positive with no ceiling), the inventory cap at no less than the consumer's mark, and why
 //!   one side's quote is left out ([`LeftOut`](sizing::LeftOut)); it reads no venue.
@@ -40,5 +46,6 @@
 
 pub mod link;
 pub mod not_ours;
+pub mod positions;
 pub mod sizing;
 pub mod sweep;
