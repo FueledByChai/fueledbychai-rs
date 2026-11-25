@@ -28,10 +28,12 @@
 //!   order of ours on it, or an instrument cancel-all of it. A place's refusal makes nothing due,
 //!   nor does a refusal of a cancel naming no order on the market. The sweep reads from the link
 //!   which requests are cancels on its market ([`Link::is_cancel_on`]), and the link forgets a
-//!   request once the consumer releases it ([`Link::release`]), so the consumer hands each note
-//!   to the sweep before it releases the note's request. The hold is the consumer's: it records
-//!   each refusal for its rate it reads, a place's too, which holds for the venue's retry time
-//!   or, when the venue states none, for the consumer's wait ([`RateHold::refused`]).
+//!   request once the consumer releases it ([`Link::release`]), or at the consumer's next
+//!   [`Link::forget`] after the one that took the last note of a request answered in full
+//!   (FBC-mu68), so the consumer hands each note to the sweep before it releases the note's
+//!   request and before it forgets notes again. The hold is the consumer's: it records each
+//!   refusal for its rate it reads, a place's too, which holds for the venue's retry time or,
+//!   when the venue states none, for the consumer's wait ([`RateHold::refused`]).
 //! - **How it ends** ([`SweepEnd`]). At Start and after a reconnect
 //!   ([`SweepEnd::BeforePlaces`]), once every order of ours the link holds live on the market has
 //!   ended and the session takes places there ([`ExecOrders::may_place_on`]). A cancel of the
@@ -45,8 +47,8 @@
 //!   answered, `may_place_on` unread: no refusal ends it early, and the consumer judges each
 //!   answer ([`Sweep::outcome`]).
 //! - **The consumer's part.** While a sweep runs it hands the sweep every note it reads from the
-//!   link, and the link with it, before it releases the note's request ([`Sweep::observe`]), and
-//!   polls it at each wake and once the hold has passed
+//!   link, and the link with it, before it releases the note's request or forgets notes again
+//!   ([`Sweep::observe`]), and polls it at each wake and once the hold has passed
 //!   ([`SweepState::Waiting`]). It places nothing on the market before a `BeforePlaces` sweep
 //!   ended. The sweep keeps no timeout and reads no clock: each poll takes `now` from its caller,
 //!   on the shard's monotonic clock ([`Link::now`], decision 0155 item 3), and the consumer bounds
@@ -316,7 +318,8 @@ impl Sweep {
     /// and a place's, or a cancel's naming no order on the market, makes nothing due; and before
     /// places a refusal of one of the sweep's for another reason than that its order already
     /// ended or is not known fails it. The note's request must not be released yet
-    /// ([`Link::release`]): the link then no longer says it is a cancel.
+    /// ([`Link::release`]), nor the link's notes forgotten again since the [`Link::forget`] that
+    /// handed the note over: the link then no longer says it is a cancel.
     pub fn observe(&mut self, link: &Link, note: &Note) {
         match note {
             Note::Submitted {
