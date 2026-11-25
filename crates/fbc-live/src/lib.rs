@@ -14,6 +14,9 @@
 //!   ([`NotOursConfig`](not_ours::NotOursConfig)), tells a cancel of the same event as the one
 //!   before from the first of a new window and from a repeat; the warning and the Stop these
 //!   lead to stay the consumer's.
+//! - [`sizing`]: mark-aware sizing. The operator's caps in lots ([`UsdCaps`](sizing::UsdCaps),
+//!   positive with no ceiling), the inventory cap at no less than the consumer's mark, and why
+//!   one side's quote is left out ([`LeftOut`](sizing::LeftOut)); it reads no venue.
 //!
 //! Its normal dependencies are fbc-core, fbc-oms and fbc-runtime only: it depends on no venue
 //! crate and branches on no venue's name (decision 0003). It holds nothing that decides what to
@@ -26,3 +29,4 @@
 
 pub mod link;
 pub mod not_ours;
+pub mod sizing;

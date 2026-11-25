@@ -779,36 +779,11 @@ pub fn px_or_none(px: Option<Decimal>) -> String {
     px.map_or_else(|| "none".to_owned(), |px| px.to_string())
 }
 
-/// The price the inventory cap is converted at: the highest of the order's price `px` and the
-/// touch's sides that rest, so a position is never worth more than the cap at the market. A
-/// buy's own price is below the bid, so on a book with no asks the bid is the market's price
-/// (Codex r4226246459 on PR #114).
-pub fn inventory_price(px: Decimal, bid: Option<Decimal>, ask: Option<Decimal>) -> Decimal {
-    [bid, ask].into_iter().flatten().fold(px, Decimal::max)
-}
-
-/// A cap of `usd` in lots of `step` at `price`, floored. The caps are the operator's own, with
-/// no ceiling (FBC-thks, decision 0113), so a cap past what a lot count holds (or a decimal
-/// holds, once divided) is the largest lot count, never zero and never a panic (Codex
-/// r4320205456 on PR #184); fbc-oms's checked arithmetic then bounds every order as at any
-/// large cap. A lot whose own cost does not fit a decimal costs more than any cap, so it gives
-/// no lot (Codex r4320317907), and a re-check at such a price never admits an order; so does a
-/// price, a step or a cap that is not positive.
-pub fn cap_lots(usd: Decimal, price: Decimal, step: Decimal) -> Lots {
-    use rust_decimal::prelude::ToPrimitive;
-    let per_lot = match price.checked_mul(step) {
-        Some(per) if per > Decimal::ZERO => per,
-        _ => return Lots::ZERO,
-    };
-    if usd <= Decimal::ZERO {
-        return Lots::ZERO;
-    }
-    let lots = usd
-        .checked_div(per_lot)
-        .and_then(|n| n.floor().to_i64())
-        .unwrap_or(i64::MAX);
-    Lots::new(lots).unwrap_or(Lots::ZERO)
-}
+// The inventory cap's price and the caps' conversion to lots moved into fbc-live's sizing
+// (FBC-6r81, decision 0155 item 2), with their results unchanged; named here as the samples and
+// the QFEX probe have always named them; each includer uses a part of it.
+#[allow(unused_imports)]
+pub use fbc_live::sizing::{cap_lots, inventory_price};
 
 /// Nonces counted up from 1: Paradex asks for none, but the session reserves one per item and
 /// per arm as the contract says.

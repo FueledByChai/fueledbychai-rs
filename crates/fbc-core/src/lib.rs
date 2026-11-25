@@ -90,6 +90,10 @@ pub use resolve::{
     AliasError, AliasTable, AssetKey, InstrumentResolver, InstrumentSpecDraft, Listing,
     ResolveError, SymbolError, common_symbol_parts,
 };
+/// `rust_decimal`'s decimal, which this crate's API hands out (`InstrumentSpec::multiplier`,
+/// `SizeStep::get`, `PxExact::to_decimal`), re-exported so a crate that depends on this one can
+/// name it without a dependency of its own (decision 0155 item 1).
+pub use rust_decimal::Decimal;
 pub use scope::{DecodeScope, dispatch, dispatch_market_data};
 pub use stamps::{PathEdge, PathMark, PathRecorder, PathStage, PathStamps};
 pub use time::{ConnKey, ExchNs, ExchTsKind, KernelRxNs, MonoNs, Stamp, WallNs};
