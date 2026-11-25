@@ -119,6 +119,9 @@ use fbc_core::{
     VenueFactory, VenueMode,
 };
 use fbc_live::not_ours::{CancelsNotOurs, NotOurs, NotOursConfig};
+use fbc_live::sizing::{
+    LeftOut, Market, SideQuote, UsdCaps, admit_minimum, admit_side, at_market, caps_in_lots,
+};
 use fbc_oms::{
     Applied, Batching, CancelChoice, CancelEverything, DesiredBook, DesiredQuote, ExecutionPlanner,
     FillLedger, Intent, LadderConfig, LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, OrdState,
@@ -138,7 +141,7 @@ use crate::mainnet::{MAINNET_CHAIN, chain_refusal, decode_chain, mainnet_guard, 
 use crate::positions::{PositionCheck, Verdict, fills_in};
 use crate::testnet::{
     ACCOUNT_LABEL, ACCT, HighWater, INST, Keeping, Lines, Out, TESTNET_CHAIN, VENUE, admit_reads,
-    cap_lots, config, drive_with, inventory_price, px_or_none, rest_get, resync_disagreements,
+    config, drive_with, inventory_price, px_or_none, rest_get, resync_disagreements,
     session_config, snapshot_max, specs, touch_and_mark, wall_now,
 };
 
@@ -305,7 +308,7 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot, mark: Decimal) -> Result<S
     let qty = opts
         .order_usd
         .checked_div(at * opts.step)
-        .and_then(|n| n.floor().to_i64())
+        .and_then(|n| i64::try_from(n.floor()).ok())
         .ok_or_else(|| {
             format!(
                 "--order-usd ${} at {at} does not fit a lot count",
@@ -325,32 +328,40 @@ pub fn size(opts: &Options, book: &OrderbookSnapshot, mark: Decimal) -> Result<S
         .map(|t| px_of(opts, *t))
         .min()
         .unwrap_or(at);
-    let notional = Decimal::from(qty.get()) * opts.step * lowest;
-    if notional < opts.min_notional {
-        return Err(format!(
-            "a quote's notional ${} ({} lots at {lowest}) is below the market's minimum ${}; \
-             raise --order-usd",
-            notional.round_dp(4),
-            qty.get(),
-            opts.min_notional
-        ));
+    match admit_minimum(qty, opts.step, lowest, Some(mark), Some(opts.min_notional)) {
+        Err(LeftOut::BelowMinimum) => {
+            let notional = Decimal::from(qty.get()) * opts.step * lowest;
+            return Err(format!(
+                "a quote's notional ${} ({} lots at {lowest}) is below the market's minimum ${}; \
+                 raise --order-usd",
+                notional.round_dp(4),
+                qty.get(),
+                opts.min_notional
+            ));
+        }
+        // The only other side admit_minimum leaves out: below the minimum at the mark.
+        Err(_) => {
+            let at_mark = Decimal::from(qty.get()) * opts.step * mark;
+            return Err(format!(
+                "a quote's notional at the mark price {mark} is ${} ({} lots), below the market's \
+                 minimum ${}: Paradex judges the minimum at the mark and refuses the order after \
+                 accepting it; raise --order-usd",
+                at_mark.round_dp(4).normalize(),
+                qty.get(),
+                opts.min_notional
+            ));
+        }
+        Ok(()) => {}
     }
-    let at_mark = Decimal::from(qty.get()) * opts.step * mark;
-    if at_mark < opts.min_notional {
-        return Err(format!(
-            "a quote's notional at the mark price {mark} is ${} ({} lots), below the market's \
-             minimum ${}: Paradex judges the minimum at the mark and refuses the order after \
-             accepting it; raise --order-usd",
-            at_mark.round_dp(4).normalize(),
-            qty.get(),
-            opts.min_notional
-        ));
-    }
+    // The caps have no ceiling: one past a lot count is the largest ([`cap_lots`]); the
+    // inventory cap at no less than the mark.
+    let caps = UsdCaps::new(opts.resting_cap_usd, opts.inventory_cap_usd)
+        .map_err(|refused| refused.to_string())?;
+    let lots = caps_in_lots(&caps, at, at_market(at, None, None, Some(mark)), opts.step);
     Ok(Sizing {
         qty,
-        // The caps have no ceiling: one past a lot count is the largest ([`cap_lots`]).
-        resting: cap_lots(opts.resting_cap_usd, at, opts.step),
-        inventory: cap_lots(opts.inventory_cap_usd, at.max(mark), opts.step),
+        resting: lots.resting,
+        inventory: lots.inventory,
         at,
         mark,
     })
@@ -420,7 +431,7 @@ pub fn desired(
 ) -> Wanted {
     let (bid, ask) = quote_prices(opts, book);
     let mkt = market_px(opts, book, &[&bid, &ask]).map(|px| px.max(mark));
-    let at_mark = Decimal::from(qty.get()) * opts.step * mark;
+    let caps = UsdCaps::new(opts.resting_cap_usd, opts.inventory_cap_usd);
     let mut wanted = Wanted {
         book: DesiredBook::new(INST),
         bid: None,
@@ -436,41 +447,64 @@ pub fn desired(
             }
         };
         let price = px_of(opts, px);
-        let notional = Decimal::from(qty.get()) * opts.step * price;
-        let after = match side {
-            Side::Buy => position.0.saturating_add(qty.get()),
-            Side::Sell => position.0.saturating_sub(qty.get()),
+        let caps = match &caps {
+            Ok(caps) => caps,
+            Err(refused) => {
+                wanted.skipped.push(format!("{name}: {refused}"));
+                continue;
+            }
         };
-        let worth = Decimal::from(after.unsigned_abs()) * opts.step * mkt.unwrap_or(price);
-        let why = if notional > opts.resting_cap_usd {
-            Some(format!(
+        let market = Market {
+            step: opts.step,
+            mark,
+            inventory_at: mkt.unwrap_or(price),
+            min_notional: Some(opts.min_notional),
+        };
+        let judged = admit_side(
+            caps,
+            &market,
+            SideQuote {
+                side,
+                qty,
+                px: price,
+            },
+            position,
+        );
+        let notional = || Decimal::from(qty.get()) * opts.step * price;
+        let why = match judged {
+            Ok(()) => None,
+            Err(LeftOut::AboveRestingCap) => Some(format!(
                 "its notional ${} at {price} is above --resting-cap-usd ${}",
-                notional.round_dp(4),
+                notional().round_dp(4),
                 opts.resting_cap_usd
-            ))
-        } else if notional < opts.min_notional {
-            Some(format!(
+            )),
+            Err(LeftOut::BelowMinimum) => Some(format!(
                 "its notional ${} at {price} is below the market's minimum ${}",
-                notional.round_dp(4),
+                notional().round_dp(4),
                 opts.min_notional
-            ))
-        } else if at_mark < opts.min_notional {
-            Some(format!(
+            )),
+            Err(LeftOut::BelowMinimumAtMark) => Some(format!(
                 "its notional ${} at the mark {mark} is below the market's minimum ${} \
                  (Paradex judges the minimum at the mark)",
-                at_mark.round_dp(4).normalize(),
+                (Decimal::from(qty.get()) * opts.step * mark)
+                    .round_dp(4)
+                    .normalize(),
                 opts.min_notional
-            ))
-        } else if worth > opts.inventory_cap_usd {
-            Some(format!(
-                "a fill would take the position to {after} lots, ${} at {}, past \
-                 --inventory-cap-usd ${}",
-                worth.round_dp(4),
-                mkt.unwrap_or(price),
-                opts.inventory_cap_usd
-            ))
-        } else {
-            None
+            )),
+            Err(LeftOut::PastInventoryCap) => {
+                let after = match side {
+                    Side::Buy => position.0.saturating_add(qty.get()),
+                    Side::Sell => position.0.saturating_sub(qty.get()),
+                };
+                let worth = Decimal::from(after.unsigned_abs()) * opts.step * mkt.unwrap_or(price);
+                Some(format!(
+                    "a fill would take the position to {after} lots, ${} at {}, past \
+                     --inventory-cap-usd ${}",
+                    worth.round_dp(4),
+                    mkt.unwrap_or(price),
+                    opts.inventory_cap_usd
+                ))
+            }
         };
         if let Some(why) = why {
             wanted.skipped.push(format!("{name}: {why}"));

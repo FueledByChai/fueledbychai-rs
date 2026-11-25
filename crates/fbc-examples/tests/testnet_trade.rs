@@ -3931,6 +3931,35 @@ fn a_buy_needs_only_the_bid_side_and_a_sell_only_the_ask_side() {
     assert!(err.contains("no ask"), "{err}");
 }
 
+#[test]
+fn at_mark_judges_the_minimum_at_the_mark_alone() {
+    // FBC-6r81's review: `at_mark` judges the order's notional at the mark only, as before it
+    // called fbc-live's sizing; `price` judged it at the order's own price. 16 lots on the
+    // 0.00001 step are $9.92 at 62000, below the $10 minimum, and $11.20 at a mark of 70000.
+    let Ok(Parsed::Trade(opts)) = args::parse(strings(&MARKET_ARGS)) else {
+        panic!("the market flags parse");
+    };
+    let order = || trade::Priced {
+        bid: Some(Decimal::from(62_001)),
+        ask: None,
+        ticks: fbc_core::Ticks(620_000),
+        px: Decimal::from(62_000),
+        qty: fbc_core::Lots::new(16).unwrap(),
+        size: Decimal::from_str("0.00016").unwrap(),
+        notional: Decimal::from_str("9.92").unwrap(),
+        mark_notional: None,
+        resting: fbc_core::Lots::new(17).unwrap(),
+        inventory: fbc_core::Lots::new(80).unwrap(),
+    };
+    let high = trade::at_mark(&opts, order(), Some(Decimal::from(70_000))).unwrap();
+    assert_eq!(high.mark_notional, Some(Decimal::from_str("11.2").unwrap()));
+    // At a mark of 60000 it is $9.60: refused at the mark.
+    let err = trade::at_mark(&opts, order(), Some(Decimal::from(60_000)))
+        .err()
+        .unwrap();
+    assert!(err.contains("at the mark price 60000 is $9.6"), "{err}");
+}
+
 #[tokio::test]
 async fn a_buy_on_a_book_with_no_asks_places_and_cancels_as_on_a_full_book() {
     let placed = Arc::new(Mutex::new(Placed::default()));
@@ -3959,30 +3988,6 @@ async fn a_buy_on_a_book_with_no_asks_places_and_cancels_as_on_a_full_book() {
         (report.places_sent, report.cancels_sent),
         (1, 2),
         "{printed}"
-    );
-}
-
-#[test]
-fn the_inventory_cap_is_at_the_highest_of_the_orders_price_and_the_touch() {
-    let d = |v: &str| Decimal::from_str(v).unwrap();
-    // A buy below a bid with no ask: the bid (Codex r4226246459).
-    assert_eq!(
-        testnet::inventory_price(d("104.5"), Some(d("110")), None),
-        d("110")
-    );
-    // A buy on a full book: the ask.
-    assert_eq!(
-        testnet::inventory_price(d("104.5"), Some(d("110")), Some(d("110.1"))),
-        d("110.1")
-    );
-    // A sell above the ask, with or without a bid: its own price.
-    assert_eq!(
-        testnet::inventory_price(d("115.6"), None, Some(d("110.1"))),
-        d("115.6")
-    );
-    assert_eq!(
-        testnet::inventory_price(d("115.6"), Some(d("110")), Some(d("110.1"))),
-        d("115.6")
     );
 }
 

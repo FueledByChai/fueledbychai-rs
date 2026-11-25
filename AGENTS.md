@@ -310,6 +310,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     the canonical client-id codec, `Fee`/`FeeBook`, `InstrumentSpec`, `VenueCaps`, events,
     commands, the codec and factory traits, `DecodeScope` and `EncodeCtx` (0003, 0004), and
     `PathStamps`, whose marks reach the runtime's `PathRecorder` and give back no time (0034).
+    It re-exports `rust_decimal::Decimal`, which its API hands out, so a crate depending on it
+    names the type with no dependency of its own (0155 item 1).
     A spec states `signing: Option<SigningParams>` (`AssetDecimals { underlying, settlement }`,
     its contract id kept in `native_id`) and `sessions: Option<SessionCalendar>`
     (`src/calendar.rs`: an earliest open, a close that never reopens, dated `ClosedWindow`s (a
@@ -798,7 +800,18 @@ holds two of them for one pull request. The rules after the three roles bind all
     venue time absent on either side, a requote that never rested, the consumer's span read on
     both of its measures, each bound held where it falls, and a zero span or window refused); in
     `tests/paths.rs` too, `cancels_not_ours_seen` set by a cancel not ours noted at once and by one
-    held until its covering cancel was refused, and kept through `Link::forget`.
+    held until its covering cancel was refused, and kept through `Link::forget`. And
+    `src/sizing.rs` (FBC-6r81, 0155 items 2, 6 and 8), mark-aware sizing moved from the samples
+    with its results: `cap_lots` and `inventory_price` (`testnet.rs` re-exporting both),
+    `at_market`, the operator's `UsdCaps::new(resting, inventory)` (each cap refused when not
+    positive, no ceiling, no `Default`, 0113) with `caps_in_lots`, and `admit_minimum` (the
+    minimum the venue's, as the spec's `min_notional` or the consumer's own reading, `None` or zero
+    admitting) and `admit_side`, which leave a side out as `LeftOut::AboveRestingCap`,
+    `BelowMinimum`, `BelowMinimumAtMark` or `PastInventoryCap`, the inventory cap judged at no less
+    than the mark; the mark is the consumer's argument, and it reads no venue and no clock. Its
+    test, `tests/sizing.rs`, holds the samples' two moved tests, each `LeftOut`, a side refused at
+    the mark alone, `None` and zero minimums, `at_market` and `cap_lots`'s results as before it
+    converted with `i64::try_from`, on fbc-core's `Decimal`.
   - `crates/fbc-examples`: sample programs the owner runs by hand, never CI (FBC-u4so). Its
     library target is empty and every dependency is a dev-dependency, so it is outside
     `crates/venues/` yet wires concrete venues without a normal dependency on one; each sample is

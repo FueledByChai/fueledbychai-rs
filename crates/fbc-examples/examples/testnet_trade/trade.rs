@@ -93,6 +93,10 @@ use crate::testnet::{
 use crate::testnet::{
     HighWater, Out, cap_lots, inventory_price, latest_resync, resync_disagreements, snapshot_max,
 };
+// The price the inventory cap is converted at: `inventory_price` of the order's price and the
+// touch, or the mark when it is higher; and the minimum and the caps, from fbc-live's sizing.
+pub use fbc_live::sizing::at_market;
+use fbc_live::sizing::{LotCaps, UsdCaps, admit_minimum, caps_in_lots};
 
 /// The Paradex configuration for `opts`' URLs ([`crate::testnet::config`]).
 pub fn config(opts: &Options) -> VenueConfig {
@@ -507,21 +511,11 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
             .checked_div(at * opts.step)
             .ok_or("an amount does not fit")?
             .floor();
-        Lots::new(n.to_i64().ok_or("an amount does not fit")?)
+        Lots::new(i64::try_from(n).map_err(|_| "an amount does not fit")?)
             .ok_or_else(|| "a negative amount".to_owned())
     };
     let order_usd = opts.order_usd;
     let qty = lots_for(order_usd, px)?;
-    // The resting cap at the order's price, where it rests; the inventory cap at the highest
-    // of that, the bid and the ask, so a position is never worth more than the cap at the
-    // market.
-    // The caps have no ceiling: one past a lot count is the largest ([`cap_lots`]).
-    let resting = cap_lots(opts.resting_cap_usd, px, opts.step);
-    let inventory = cap_lots(
-        opts.inventory_cap_usd,
-        inventory_price(px, bid, ask),
-        opts.step,
-    );
     let size = Decimal::from(qty.get()) * opts.step;
     let notional = size * px;
     if qty.get() == 0 {
@@ -530,7 +524,7 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
             opts.step
         ));
     }
-    if notional < opts.min_notional {
+    if admit_minimum(qty, opts.step, px, None, Some(opts.min_notional)).is_err() {
         return Err(format!(
             "the order's notional ${} (--order-usd ${order_usd} at {px}, {size} on the {} step) \
              is below the market's minimum ${}; refused",
@@ -539,6 +533,14 @@ pub fn price(opts: &Options, book: &OrderbookSnapshot) -> Result<Priced, String>
             opts.min_notional
         ));
     }
+    // The resting cap at the order's price, where it rests; the inventory cap at the highest
+    // of that, the bid and the ask, so a position is never worth more than the cap at the
+    // market.
+    // The caps have no ceiling: one past a lot count is the largest ([`cap_lots`]).
+    let caps = UsdCaps::new(opts.resting_cap_usd, opts.inventory_cap_usd)
+        .map_err(|refused| refused.to_string())?;
+    let LotCaps { resting, inventory } =
+        caps_in_lots(&caps, px, inventory_price(px, bid, ask), opts.step);
     Ok(Priced {
         bid,
         ask,
@@ -562,7 +564,10 @@ pub fn at_mark(opts: &Options, order: Priced, mark: Option<Decimal>) -> Result<P
         return Ok(order);
     };
     let at_mark = order.size * mark;
-    if at_mark < opts.min_notional {
+    // The minimum at the mark alone, the mark as the price judged: `price` judged it at the
+    // order's own price.
+    let judged = admit_minimum(order.qty, opts.step, mark, None, Some(opts.min_notional));
+    if judged.is_err() {
         return Err(format!(
             "the order's notional at the mark price {mark} is ${} ({} on the {} step), below \
              the market's minimum ${}: Paradex judges the minimum at the mark and refuses the \
@@ -581,18 +586,6 @@ pub fn at_mark(opts: &Options, order: Priced, mark: Option<Decimal>) -> Result<P
         inventory,
         ..order
     })
-}
-
-/// The price the inventory cap is converted at: [`inventory_price`] of the order's price and
-/// the touch, or the mark when it is higher.
-pub fn at_market(
-    px: Decimal,
-    bid: Option<Decimal>,
-    ask: Option<Decimal>,
-    mark: Option<Decimal>,
-) -> Decimal {
-    mark.into_iter()
-        .fold(inventory_price(px, bid, ask), Decimal::max)
 }
 
 /// What the touch's second read needs: the command line and the market's spec.
