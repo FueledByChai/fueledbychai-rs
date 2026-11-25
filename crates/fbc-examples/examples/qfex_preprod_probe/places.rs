@@ -1051,7 +1051,7 @@ impl PlaceHandler {
 
     /// Reads what the `Link` noted since the last call into [`Watched`], then wakes the driver.
     /// `expected_fill` is whether the event just handed on was a fill of an expected order.
-    fn judge(&self, expected_fill: bool) {
+    fn judge(&mut self, expected_fill: bool) {
         {
             let link = self.inner.link.borrow();
             let mut w = self.watched.borrow_mut();
@@ -1090,7 +1090,7 @@ impl PlaceHandler {
             }
             w.refused = refusals.len();
         }
-        self.inner.wake.notify_waiters();
+        (self.inner.wake)();
     }
 }
 

@@ -4112,7 +4112,10 @@ pub(super) fn handled(max_entries: usize) -> (places::PlaceHandler, Rc<RefCell<l
     let handler = places::PlaceHandler {
         inner: link::LinkHandler {
             link: Rc::clone(&link),
-            wake: Rc::new(tokio::sync::Notify::new()),
+            wake: Box::new({
+                let wake = Rc::new(tokio::sync::Notify::new());
+                move || wake.notify_waiters()
+            }),
         },
         watched: Rc::default(),
         control: Rc::default(),
@@ -9232,7 +9235,10 @@ fn a_later_session_watches_only_what_follows_it() {
     let mut next = places::PlaceHandler {
         inner: link::LinkHandler {
             link: Rc::clone(&link),
-            wake: Rc::new(tokio::sync::Notify::new()),
+            wake: Box::new({
+                let wake = Rc::new(tokio::sync::Notify::new());
+                move || wake.notify_waiters()
+            }),
         },
         watched: Rc::clone(&watched),
         control: Rc::default(),

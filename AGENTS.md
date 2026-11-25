@@ -1537,11 +1537,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     alone. The probe's credentials come from the environment through `src/auth_qfex.rs`, a review
     path, which also hands each signed read to the connector; the probe reuses
     `paradex_testnet_acceptance`'s privacy patterns by path, and `src/testnet.rs` (the caps'
-    conversion to lots and the lease directory) by path. The samples that trade route their
-    sessions through fbc-live's link: the Paradex samples through `fbc_live::link`, the probe
-    through `src/link.rs`, a re-export shim it includes by path, with a `LinkHandler` of its own
-    on an `Rc<Notify>` wake, until FBC-bddu moves it onto the library and deletes the shim (0155
-    item 9). They share `src/testnet.rs` (guard and wiring), `testnet_trade`, `testnet_quote` and
+    conversion to lots and the lease directory) by path. Every sample that trades, the probe
+    included, routes its sessions through `fbc_live::link` and its `LinkHandler`, whose wake is a
+    boxed closure; the re-export shim the probe included by path is gone (FBC-bddu, 0155 item 9).
+    They share `src/testnet.rs` (guard and wiring), `testnet_trade`, `testnet_quote` and
     `mainnet_smoke` `src/positions.rs` (`PositionCheck`, their own `GET /positions` read over
     `src/auth_rest.rs` after the first fill and at Stop, judged by fbc-live's `PositionWatch`, and
     the other-markets refusal, `other_markets`; the `POSITION` lines, `HAND_CHECK` and the Stop

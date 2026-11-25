@@ -135,9 +135,8 @@ mod hold;
 mod interrupt;
 #[path = "../examples/qfex_preprod_probe/ledger.rs"]
 mod ledger;
-#[allow(dead_code)]
-#[path = "../src/link.rs"]
-mod link;
+// The ExecHandler-to-Registry glue, in fbc-live (decision 0155).
+use fbc_live::link;
 #[path = "../examples/qfex_preprod_probe/market.rs"]
 mod market;
 // The QFEX model's pinging MDS relay (FBC-kllr), declared by path as `model` is.
