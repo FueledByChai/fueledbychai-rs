@@ -118,6 +118,7 @@ use fbc_core::{
     VenueFactory, VenueMode,
 };
 use fbc_live::not_ours::{CancelsNotOurs, NotOurs, NotOursConfig};
+use fbc_live::reconcile::{Unreconciled, fills_behind, unreconciled};
 use fbc_live::sizing::{
     LeftOut, Market, SideQuote, UsdCaps, admit_minimum, admit_side, at_market, caps_in_lots,
 };
@@ -1864,12 +1865,9 @@ impl Driver {
             match link.registry().get(cid) {
                 None => None,
                 Some(r) => match r.state() {
-                    OrdState::Terminal(kind) => Some((
-                        kind,
-                        r.filled(),
-                        r.placed().side,
-                        r.cum_venue() > r.cum_fills(),
-                    )),
+                    OrdState::Terminal(kind) => {
+                        Some((kind, r.filled(), r.placed().side, fills_behind(r)))
+                    }
                     _ => return,
                 },
             }
@@ -2552,32 +2550,35 @@ impl Driver {
     /// What the venue reported that the inventory does not hold yet, if anything: a position
     /// other than `position`, or fills of an order of ours that the fill stream has not
     /// brought (its cumulative fill on an order update above the fills read).
+    ///
+    /// The check is fbc-live's (`fbc_live::reconcile`), over [`Driver::owned`] and then
+    /// [`Driver::unfilled`], which it trims; the text and what follows it are the loop's.
     fn unreconciled(&mut self, position: SignedLots) -> Option<String> {
         let venue = self.venue_position.map(|(qty, _)| qty);
-        if let Some(venue) = venue.filter(|v| *v != position) {
-            return Some(format!(
-                "the venue's position ({} lots) and the inventory ({} lots)",
-                venue.0, position.0
-            ));
-        }
         let link = Rc::clone(&self.link);
         let link = link.borrow();
-        let reg = link.registry();
-        let behind =
-            |cid: &ClientOrderId| reg.get(*cid).is_some_and(|r| r.cum_venue() > r.cum_fills());
-        self.unfilled.retain(behind);
-        let cid = self
-            .owned
-            .iter()
-            .chain(&self.unfilled)
-            .find(|c| behind(c))?;
-        let r = reg.get(*cid)?;
-        Some(format!(
-            "the venue's fills of #{} ({} lots) and the fills read ({} lots)",
-            cid.seq(),
-            r.cum_venue().get(),
-            r.cum_fills().get()
-        ))
+        let what = unreconciled(
+            link.registry(),
+            venue,
+            position,
+            &self.owned,
+            &mut self.unfilled,
+        )?;
+        Some(match what {
+            Unreconciled::Position {
+                streamed,
+                inventory,
+            } => format!(
+                "the venue's position ({} lots) and the inventory ({} lots)",
+                streamed.0, inventory.0
+            ),
+            Unreconciled::Fills { cid, venue, read } => format!(
+                "the venue's fills of #{} ({} lots) and the fills read ({} lots)",
+                cid.seq(),
+                venue.get(),
+                read.get()
+            ),
+        })
     }
 
     /// Reads the notes and says whether a pass must not plan: `Err` for a reason to Stop, or
