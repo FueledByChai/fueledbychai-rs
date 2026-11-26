@@ -9,7 +9,9 @@
 //! `Link::release`, at the forget after the one that took their last note, so a sweep still
 //! reads the notes a forget handed over against them, and those it keeps: an item unanswered,
 //! or answered provisionally or `Unknown` while its order lives (FBC-mu68, decision 0155 items 2
-//! and 5).
+//! and 5), and the placement nonces a receipt names that the link records for a place's or a
+//! batch place item's order, none for a place not sent, an amend or a cancel, and a refusal noted
+//! (FBC-o0f0, decisions 0057 and 0155).
 //! Every command goes through an fbc-oms authorization and a real `ExecSession`'s `ExecOrders`,
 //! on the conformance toy, the session never run: its submissions are queued, and the test hands
 //! the link what the session would report.
@@ -23,9 +25,9 @@ use std::time::Duration;
 use fbc_conformance::toy::{EXEC_URL_KEY, INST_A, OWN_NS, REST_URL_KEY, SYMBOL_A, ToyFactory};
 use fbc_core::{
     AccountKey, AccountLease, AckLevel, AssetSym, CancelReason, Channel, CidMatch, CidMint,
-    ClientOrderId, ConnKey, ConnState, EncodeReceipt, Envelope, ExchNs, ExchTsKind, ExecEvent,
-    FillEvent, FillIdent, FillOrigin, ItemRef, Liquidity3, Lots, MarketLease, ModeScope, MonoNs,
-    Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason, OrderCaps,
+    ClientOrderId, ConnKey, ConnState, EncodeCtx, EncodeReceipt, Envelope, ExchNs, ExchTsKind,
+    ExecEvent, FillEvent, FillIdent, FillOrigin, ItemRef, Liquidity3, Lots, MarketLease, ModeScope,
+    MonoNs, Namespace, NamespaceLease, NewOrder, NonceBlock, NonceSource, NotSentReason, OrderCaps,
     OrderKind, OrderUpdate, RefKind, Reject, RejectKind, RpcId, Secrets, Side, SignedLots, Stamp,
     StreamId, SubmitHandle, SubmitOutcome, TagSet, Ticks, Tif, VenueCaps, VenueConfig,
     VenueFactory, VenueMode, VenueOrderId, VenueOrderSnapshot, VenueOrderState, WallNs,
@@ -1394,4 +1396,126 @@ fn a_cancel_answered_before_it_is_reported_sent_is_kept_until_it_is() {
     forget_twice(&mut rig.link);
     assert_eq!(rig.link.requests_held(), 0);
     assert!(!rig.link.is_cancel_on(cancel, INST_A));
+}
+
+/// Sent, its receipt naming the nonce `nonces[i]` reserved for item `i` for each item in `named`
+/// alone, taken as a codec takes it, from the encode's context (`EncodeReceipt::use_nonce`).
+fn sent_with(rpc: RpcId, nonces: &[u64], named: &[u16]) -> SubmitHandle {
+    let ctx = EncodeCtx {
+        wall: WallNs(0),
+        mono: MonoNs(0),
+        nonces: NonceBlock::new(nonces.to_vec()),
+    };
+    let mut receipt = EncodeReceipt::new();
+    for item in named {
+        assert!(receipt.use_nonce(&ctx, *item).is_some(), "item {item}");
+    }
+    SubmitHandle {
+        rpc,
+        receipt: Ok(receipt),
+    }
+}
+
+/// The placement nonce the registry holds for our order `cid`.
+fn placement_nonce(link: &Link, cid: ClientOrderId) -> Option<u64> {
+    link.registry().get(cid).unwrap().placement_nonce()
+}
+
+#[test]
+fn a_places_nonce_from_its_receipt_is_recorded_once_the_session_reports_it_sent() {
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    assert_eq!(placement_nonce(&rig.link, a), None, "not yet reported");
+    rig.link.on_submitted(sent_with(place, &[41], &[0]));
+    assert_eq!(placement_nonce(&rig.link, a), Some(41));
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+
+    // A place whose receipt names no nonce records none.
+    let (b, place) = rig.place();
+    rig.link.on_submitted(sent(place));
+    assert_eq!(placement_nonce(&rig.link, b), None);
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn each_batch_place_item_records_the_nonce_its_receipt_names_for_that_item() {
+    // The receipt names items 2 and 0, in that order, and none for item 1: each order gets its
+    // own item's nonce, and item 1's order none.
+    let mut rig = Rig::started(order_caps());
+    let (cids, batch) = rig.place_batch(3);
+    rig.link
+        .on_submitted(sent_with(batch, &[51, 52, 53], &[2, 0]));
+    let recorded: Vec<Option<u64>> = cids
+        .iter()
+        .map(|c| placement_nonce(&rig.link, *c))
+        .collect();
+    assert_eq!(recorded, [Some(51), None, Some(53)]);
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn a_place_reported_not_sent_records_no_nonce() {
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    rig.link.on_submitted(SubmitHandle {
+        rpc: place,
+        receipt: Err(NotSentReason::Disconnected),
+    });
+    assert_eq!(placement_nonce(&rig.link, a), None);
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn an_amend_and_a_cancel_record_no_nonce_their_receipts_name() {
+    // Two orders placed with no nonce named, accepted and open; an amend of the first and a
+    // cancel of the second, each reported sent with a receipt naming item 0's nonce: neither is
+    // a placement, so neither order records it.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, a, "v-a", 10);
+    let (b, place) = rig.place();
+    accepted_and_open(&mut rig.link, place, b, "v-b", 20);
+    let caps = order_caps();
+    let amend = rig
+        .link
+        .reg()
+        .live(a)
+        .unwrap()
+        .amend(&caps, Ticks(99), Lots::new(1).unwrap(), false)
+        .unwrap();
+    let auth = rig.link.reg().authorize(ACCT, amend).unwrap();
+    let amend = rig.link.submit(&rig.orders, auth).unwrap();
+    rig.link.on_submitted(sent_with(amend, &[61], &[0]));
+    let cancel = rig.cancel(b);
+    rig.link.on_submitted(sent_with(cancel, &[71], &[0]));
+    assert_eq!(placement_nonce(&rig.link, a), None, "the amended order");
+    assert_eq!(placement_nonce(&rig.link, b), None, "the cancelled order");
+    assert_eq!(problems(&rig.link), Vec::<String>::new());
+}
+
+#[test]
+fn a_placement_nonce_the_registry_refuses_is_noted_as_a_problem_and_the_first_kept() {
+    // Reported sent twice, its receipts naming two nonces: the registry keeps the first and
+    // refuses the second, which the link notes by the order and the refusal's kind alone.
+    let mut rig = Rig::started(order_caps());
+    let (a, place) = rig.place();
+    rig.link.on_submitted(sent_with(place, &[41], &[0]));
+    rig.link.on_submitted(sent_with(place, &[42], &[0]));
+    assert_eq!(placement_nonce(&rig.link, a), Some(41));
+    // The second report's send time is the registry's to refuse too (SentRecorded, as above);
+    // the nonce's refusal is the last problem.
+    assert_eq!(
+        problems(&rig.link).last(),
+        Some(&format!(
+            "request {}: placement nonce not recorded: NonceRecorded({a:?})",
+            place.0
+        ))
+    );
+
+    // The link goes on: the place's answer still reaches its order.
+    answer_item(&mut rig.link, 10, place, 0, a, accepted());
+    assert!(matches!(
+        rig.link.notes().last(),
+        Some(Note::Outcome { rpc, ours: true, .. }) if *rpc == place
+    ));
 }
