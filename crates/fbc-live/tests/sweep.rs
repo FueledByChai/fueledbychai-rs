@@ -81,12 +81,22 @@ fn single_caps() -> OrderCaps {
     }
 }
 
-/// The toy's order caps with no cancel before an order's acknowledgement: a cancel of an order
-/// the venue has not acknowledged waits for it, and is due once it lands.
+/// The toy's order caps with no cancel before an order's acknowledgement, and a batch cancel
+/// naming an order by the venue's id alone: a cancel of an order the venue has not acknowledged
+/// waits for it, and is due once it lands. The toy's batch cancel also names the placement
+/// nonce, which fbc-oms takes before the acknowledgement (design §4.9) and the link records
+/// (FBC-o0f0), so under the toy's own batch references a sweep names such an order by it at
+/// once. A single cancel tries our client id before the nonce, so it waits whatever a batch
+/// names.
 fn awaiting_caps() -> OrderCaps {
+    let caps = order_caps();
     OrderCaps {
         cancel_before_ack: false,
-        ..order_caps()
+        batch_cancel: caps.batch_cancel.map(|batch| fbc_core::CancelBatch {
+            refs: fbc_core::TagSet::of(&[fbc_core::RefKind::Venue]),
+            ..batch
+        }),
+        ..caps
     }
 }
 
@@ -1178,6 +1188,138 @@ fn a_cancel_that_waited_for_its_orders_acknowledgement_is_sent_once_it_landed() 
         assert_eq!(run.poll(&mut swept).state, SweepState::Ended);
         assert_eq!(swept.sweep.rpcs().to_vec(), [all, due]);
         assert_eq!(run.kinds(), ["place", "cancelall", "cancel"]);
+    });
+}
+
+#[test]
+fn a_sweep_names_an_order_the_venue_has_not_acknowledged_by_its_placement_nonce_at_once() {
+    // The toy's batch cancel names an order by its placement nonce, which fbc-oms takes before
+    // the acknowledgement (design §4.9) once the link has recorded it from the place's receipt
+    // (FBC-o0f0): the first round names the bid by it in a batch cancel beside the instrument
+    // cancel-all. With no nonce recorded the batch cannot name it, and the round names it in a
+    // single cancel by our client id instead. The test's venue knows its orders by venue id and
+    // client id, so in front of it the test keeps each place's nonce and client id, and reads a
+    // batch cancel item naming a nonce as naming that place's order. This is `play` with that
+    // responder; no nonce's value is printed.
+    fn held<T>(shared: &Mutex<T>) -> MutexGuard<'_, T> {
+        shared.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let dir = Dir::new();
+    // Each place's nonce and client id, and each batch cancel item as the session wrote it.
+    let placed: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+    let items: Arc<Mutex<Vec<String>>> = Arc::default();
+    rt.block_on(async {
+        let (thaw, frozen) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || frozen.recv());
+        let clock = IngestClock::new();
+        let venue = Venue {
+            hold_acks: true,
+            ..Venue::default()
+        };
+        let venue: Shared = Arc::new(Mutex::new(venue));
+        let served = (Arc::clone(&venue), Arc::clone(&placed), Arc::clone(&items));
+        let (script, pusher) = WsScript::serving(move |_conn| {
+            let (venue, placed, items) = (
+                Arc::clone(&served.0),
+                Arc::clone(&served.1),
+                Arc::clone(&served.2),
+            );
+            Responder::new(move |frame| {
+                let Frame::Text(text) = frame else {
+                    return respond(&venue, frame);
+                };
+                let mut lines = text.lines();
+                let head = lines.next().unwrap_or_default();
+                match head.split('|').next().unwrap_or_default() {
+                    "place" => {
+                        let place = (field(head, "nonce"), field(head, "cid"));
+                        held(&placed).push(place);
+                        respond(&venue, frame)
+                    }
+                    "cancels" => {
+                        let mut read = vec![head.to_owned()];
+                        for line in lines {
+                            held(&items).push(line.to_owned());
+                            let mut line = line.to_owned();
+                            for (nonce, cid) in held(&placed).iter() {
+                                line = line
+                                    .replace(&format!("|pnonce={nonce}|"), &format!("|cid={cid}|"));
+                            }
+                            read.push(line);
+                        }
+                        respond(&venue, &Frame::Text(read.join("\n")))
+                    }
+                    _ => respond(&venue, frame),
+                }
+            })
+        });
+        let server = StubServer::start(script, HttpRouter::new()).await.unwrap();
+        let link = Rc::new(RefCell::new(link_over(
+            registry(&order_caps(), false),
+            order_caps(),
+        )));
+        let handler = LinkHandler {
+            link: Rc::clone(&link),
+            wake: Box::new(|| {}),
+        };
+        let url = server.ws_url("/exec");
+        let (mut session, control) = session(&url, &clock, handler);
+        link.borrow_mut().attach(session.orders(), ACCT);
+        let lease = NamespaceLease::acquire(&dir.0, ACCT, OWN_NS).unwrap();
+        let mut run = Run {
+            link,
+            orders: session.orders(),
+            clock,
+            pusher,
+            venue,
+            mint: CidMint::new(lease, 0, 0, WallNs(1_000_000_000)),
+            dir: &dir,
+            hold: RateHold::new(WAIT).unwrap(),
+            retry_after: None,
+        };
+        let driven = async {
+            let run = &mut run;
+            run.started().await;
+            let bid = run.place(Side::Buy, 100).await;
+            assert_eq!(run.state(bid), OrdState::PendingNew);
+            let (mut swept, round) = run.start(SweepEnd::BeforePlaces);
+            assert_eq!(round.how, How::CancelAll);
+            assert!(round.failed.is_none());
+            // The cancel-all, then the batch cancel naming the bid, both in the first round.
+            assert_eq!(round.sent.len(), 2);
+            assert!(round.sent[0].names.is_empty());
+            assert_eq!(round.sent[1].names, [bid]);
+            let (all, by_nonce) = (round.sent[0].rpc, round.sent[1].rpc);
+            run.until("the bid ended", |r| {
+                r.live().is_empty() && r.answered(all) && r.answered(by_nonce)
+            })
+            .await;
+            let polled = run.poll(&mut swept);
+            assert!(polled.due.is_empty() && polled.due_failed.is_empty());
+            assert_eq!(polled.state, SweepState::Ended);
+            assert_eq!(swept.sweep.rpcs().to_vec(), [all, by_nonce]);
+            assert_eq!(run.kinds(), ["place", "cancelall", "cancels"]);
+            // Its one item named the bid by the nonce its place was sent with, and by nothing
+            // else.
+            let items = held(&items);
+            assert_eq!(items.len(), 1);
+            let (nonce, _) = &held(&placed)[0];
+            assert!(
+                items[0].contains(&format!("|pnonce={nonce}|")),
+                "the item names the bid's placement nonce"
+            );
+            assert!(!items[0].contains("|vid=") && !items[0].contains("|cid="));
+            drop(control);
+        };
+        let (ran, ()) = tokio::join!(session.run(), driven);
+        drop(thaw);
+        ran.unwrap();
+        assert!(server.failures().is_empty(), "{:?}", server.failures());
     });
 }
 

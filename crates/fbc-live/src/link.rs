@@ -16,7 +16,12 @@
 //!   time ([`Registry::placement_sent`]), the cancel in flight ([`Registry::cancel_sent`]) or the
 //!   amend in flight ([`Registry::amend_sent`]) is recorded; not sent, every item's order is told
 //!   `NotSent` for its reason (an amend's after it is recorded in flight, as fbc-oms asks of an
-//!   amend a gateway took).
+//!   amend a gateway took). A place's nonce, and each batch place item's, that the receipt names
+//!   for its item is recorded as its order's placement nonce
+//!   ([`Registry::placement_nonce_used`], FBC-o0f0, decisions 0057 and 0155), so that, on a venue
+//!   that cancels or queries by it, the order can be named by it; an item the receipt names no
+//!   nonce for, a place not sent, an amend and a cancel record none, and a refusal is noted as a
+//!   problem ([`Note::Problem`]) naming the order and the refusal's kind, never the nonce.
 //! - **Events.** A request's outcome goes to the order each of its items names
 //!   ([`Registry::on_outcome`]); an outcome naming a request not submitted here is the session's
 //!   own (its cancel-on-disconnect arm) and is only noted. An order event is applied under the
@@ -162,9 +167,9 @@ use std::rc::Rc;
 
 use fbc_core::{
     AccountKey, AckLevel, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState,
-    Envelope, ExchNs, ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason, OpKind,
-    OrderCaps, OrderRef, Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome, Ticks,
-    VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
+    EncodeReceipt, Envelope, ExchNs, ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason,
+    OpKind, OrderCaps, OrderRef, Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome,
+    Ticks, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
 };
 use fbc_oms::{
     Admission, Applied, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrdState,
@@ -1224,6 +1229,9 @@ impl Link {
             if let Err(e) = done {
                 self.problem(format!("request {}: {e:?}", rpc.0));
             }
+            if let (Ok(used), Item::Place(_)) = (&receipt, item) {
+                self.placement_nonce(rpc, idx, cid, used);
+            }
         }
         let sent = receipt.map(|_| ());
         if let Err(reason) = sent
@@ -1233,6 +1241,32 @@ impl Link {
         }
         self.covered.reported(rpc, sent.is_ok());
         self.notes.push(Note::Submitted { rpc, sent });
+    }
+
+    /// Records the nonce `used` names for item `idx` of request `rpc`, a place of `cid`, as its
+    /// order's placement nonce: nothing when it names none for the item; a refusal (another
+    /// nonce already recorded, or no such order) noted as a problem by its kind and order, the
+    /// nonce never written (0009).
+    fn placement_nonce(
+        &mut self,
+        rpc: RpcId,
+        idx: usize,
+        cid: ClientOrderId,
+        used: &EncodeReceipt,
+    ) {
+        let named = used
+            .nonces()
+            .iter()
+            .find(|(item, _)| usize::from(*item) == idx);
+        let Some(&(_, nonce)) = named else {
+            return;
+        };
+        if let Err(e) = self.reg.placement_nonce_used(cid, nonce) {
+            self.problem(format!(
+                "request {}: placement nonce not recorded: {e:?}",
+                rpc.0
+            ));
+        }
     }
 
     fn on_outcome(

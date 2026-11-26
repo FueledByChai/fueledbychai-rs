@@ -776,10 +776,16 @@ holds two of them for one pull request. The rules after the three roles bind all
     until `Link::take_fill_refusals` hands it over, in order, one refused after a take held for
     the next and every one kept by a link never taken, FBC-2dr2, `tests/fill_refusals.rs`;
     resyncs applied at `ResyncEnd`, each epoch's end reported at its last `recv_mono`, FBC-9svb; the
-    one path commands take to the session, `Link::submit`; a Safety cancel for each unprotected
-    order the registry holds open, 0080; `Coverage` of the orders a cancel of ours covers, so an
-    order of ours a cancel not ours ends is noted, FBC-aoh5, and `Link::cancels_not_ours_seen` true
-    from the first one noted on, never false again, `Link::forget` keeping it, FBC-21g6;
+    one path commands take to the session, `Link::submit`; each place's and batch place item's
+    nonce its send receipt names for its item recorded as its order's placement nonce
+    (`Registry::placement_nonce_used`), none for a place not sent, an amend or a cancel, a refusal
+    a `Note::Problem` naming the order and its kind, never the nonce, so on a venue whose caps
+    name that reference (the conformance toy's batch cancel and query) fbc-oms names an order by
+    it before its acknowledgement, FBC-o0f0, 0057, 0155, `tests/paths.rs` and `tests/sweep.rs`;
+    a Safety cancel for each unprotected order the registry holds open, 0080; `Coverage` of the
+    orders a cancel of ours covers, so an order of ours a cancel not ours ends is noted,
+    FBC-aoh5, and `Link::cancels_not_ours_seen` true from the first one noted on, never false
+    again, `Link::forget` keeping it, FBC-21g6;
     `Link::live_on`, the orders of ours on a market it holds live in the order it learnt them, and
     `Link::is_cancel_on(rpc, inst)`, whether a request it holds is a cancel on that market (a
     cancel or a cancel-many naming an order of ours on it, ended since or not, by the market
@@ -839,11 +845,13 @@ holds two of them for one pull request. The rules after the three roles bind all
     batch's and a whole request's answer, the cancel-all or explicit cancels in the order the link
     learnt the orders, which a later resync showing them in another order leaves, an order whose
     cancel came back Unknown cancelled again and one whose cancel awaits its acknowledgement left
-    to the cancels due, a round stopped short, the resend at the consumer's wait or a venue's
-    retry time, for a cancel of the consumer's whose order already ended while another rests, for
-    a Safety cancel and for a consumer's cancel-all of the market, never for a place or a cancel
-    or cancel-all on another market, the cancels due, another market's never sent and its cancel
-    unanswered holding no Stop, `Link::is_cancel_on`, and the rate hold) and
+    to the cancels due, a batch cancel naming an order the venue has not acknowledged by its
+    placement nonce in the first round (FBC-o0f0), a round stopped short, the resend at the
+    consumer's wait or a venue's retry time, for a cancel of the consumer's whose order already
+    ended while another rests, for a Safety cancel and for a consumer's cancel-all of the market,
+    never for a place or a cancel or cancel-all on another market, the cancels due, another
+    market's never sent and its cancel unanswered holding no Stop, `Link::is_cancel_on`, and the
+    rate hold) and
     `tests/not_ours.rs` (the classifier's test moved from `testnet_quote`'s, on `MonoNs`, a
     venue time absent on either side, a requote that never rested, the consumer's span read on
     both of its measures, each bound held where it falls, and a zero span or window refused); in
