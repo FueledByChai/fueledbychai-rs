@@ -41,7 +41,8 @@
 //!   `NotFound`) waits for that end; one refused for any other reason but its rate fails the
 //!   sweep ([`SweepState::Failed`]). A refusal of a request not the sweep's fails nothing: the
 //!   consumer judges its own. An order fbc-oms puts on the Unknown ladder, as it does on
-//!   any `NotFound`, may never end here, since the sweep queries no order (FBC-2cv0). No resync
+//!   any `NotFound`, ends here only once the ladder resolves it: the sweep queries no order, and
+//!   the consumer runs the ladder on its timer ([`Link::ladder`], FBC-2cv0). No resync
 //!   holds it past the session's resync deadline, which ends the epoch (FBC-nwpr). At Stop
 //!   ([`SweepEnd::AtStop`]), once every such order has ended and every request the sweep sent is
 //!   answered, `may_place_on` unread: no refusal ends it early, and the consumer judges each

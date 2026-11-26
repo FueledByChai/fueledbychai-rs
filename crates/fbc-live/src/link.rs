@@ -66,9 +66,42 @@
 //!   by the registry's [`Registry::cancel_many`] through each order's cancel permit, authorized
 //!   and submitted through the session's [`ExecOrders`] ([`Link::attach`]), and the request
 //!   remembered for the order ([`Link::safety_cancel_of`]). One the registry holds ended or
-//!   not at all is not cancelled: decision 0080 queries it, and no order query is built here
-//!   yet (FBC-m8vm), so its market stays held, which is safe. [`Note::Unprotected`] says what
-//!   was done.
+//!   not at all is not cancelled: decision 0080 queries it (FBC-2cv0), through the same
+//!   session as one control command ([`ExecOrders::submit_control`]; decision 0081 lets a
+//!   venue's query go as one HTTP request), by its client id and the venue id the session
+//!   showed it under, and its placement nonce where the registry holds one, the venue's codec
+//!   choosing the reference its `query_refs` declare. The Safety cancels of a notice are
+//!   submitted before its queries, so the session sends them first. Its market stays held
+//!   until the answer shows it ended: the session's gate reads that answer and releases the
+//!   market ([`ExecOrders::may_place_on`]); an answer showing it open, or none, leaves it held.
+//!   Where the venue's caps declare no reference the query carries, none is sent and the market
+//!   stays held, which is safe. [`Note::Unprotected`] says what was done, each order not cancelled
+//!   among its `left` with why, and the link notes each query sent ([`LadderNote::Query`]).
+//! - **The Unknown ladder** (FBC-2cv0, decisions 0005's I5 and I9, 0109). The consumer runs
+//!   [`Link::ladder`] on its own timer with the timer's time: one pass of fbc-oms's
+//!   [`Registry::ladder`] under the [`LadderConfig`] given to [`Link::new`], the one its
+//!   resyncs apply. Each query it plans goes to the session as a control command, recorded
+//!   with [`Registry::query_sent`] ([`LadderNote::Query`]); each tombstone cancel, by client
+//!   id, goes through the registry's authorization and [`Link::submit`] like any cancel of
+//!   ours, and is recorded with [`Registry::tombstone_sent`] once the session reports it sent
+//!   ([`LadderNote::Tombstone`]). What could not be sent is noted with why
+//!   ([`LadderNote::Unsent`]), and a resync the ladder wants is said in
+//!   [`LadderPass::resync_wanted`]: the link starts none. An order on the ladder is never
+//!   placed or amended again and counts as resting until resolved (fbc-oms holds both).
+//! - **Query answers.** A query's answer ([`ExecEvent::QueryResult`]), its request's outcome,
+//!   or the session's report that it was not sent goes to [`Registry::on_query_answer`] or
+//!   [`Registry::on_query_outcome`] for a ladder query; an unprotected order's is only read.
+//!   Each is noted ([`LadderNote::QueryAnswer`]) with what the venue showed and, for the
+//!   ladder, what it resolved. A tombstone's outcome that ends its order is noted
+//!   ([`LadderNote::TombstoneResolved`]); an order a resync ends Lost is in
+//!   [`Note::Resynced`]'s report. A query is kept until it is answered or the consumer
+//!   releases it; one the venue acknowledged, which leaves its answer to come and may never
+//!   bring it, is forgotten at a [`Link::ladder`] pass once fbc-oms no longer awaits it (a
+//!   ladder query) or the intent timeout has passed since it was sent (an unprotected order's),
+//!   so a late answer is not read. A tombstone is a cancel the link keeps as its others.
+//!   These [`LadderNote`]s are kept apart from [`Link::notes`] ([`Link::ladder_notes`],
+//!   until [`Link::take_ladder_notes`] takes them), so a consumer's match on every [`Note`]
+//!   keeps compiling; the tombstone's report that it was sent and its answer are ordinary notes.
 //! - **Undecodable input** ([`ExecHandler::on_decode_error`]): noted as a problem as it is
 //!   read, so a consumer stops trading on what it may have missed.
 //! - **Cancels not ours** (FBC-aoh5, the owner's 2026-10-18 mainnet session: a Java instance on
@@ -168,12 +201,14 @@ use std::rc::Rc;
 use fbc_core::{
     AccountKey, AckLevel, CancelReason, CancelScope, CidMatch, ClientOrderId, ConnKey, ConnState,
     EncodeReceipt, Envelope, ExchNs, ExecEvent, InstrumentId, ItemRef, Lots, MonoNs, NotSentReason,
-    OpKind, OrderCaps, OrderRef, Reject, RpcId, Side, SignedLots, SubmitHandle, SubmitOutcome,
-    Ticks, VenueCommand, VenueOrderId, VenueOrderSnapshot, WallNs,
+    OpKind, OrderCaps, OrderRef, QueryAnswer, QueryOrder, Reject, RpcId, Side, SignedLots,
+    SubmitHandle, SubmitOutcome, Ticks, VenueCommand, VenueOrderId, VenueOrderSnapshot,
+    VenueOrderState, WallNs,
 };
 use fbc_oms::{
-    Admission, Applied, Authorization, FillLedger, FillRouted, FillTime, LadderConfig, OrdState,
-    OrderKey, OrderOp, Registry, ResyncReport, ResyncSnapshot, Routed, TerminalKind,
+    Admission, Applied, Authorization, ControlCommand, FillLedger, FillRouted, FillTime,
+    LadderConfig, LadderResolution, LadderStep, OrdState, OrderKey, OrderOp, OutcomeApplied,
+    Registry, ResyncReport, ResyncSnapshot, Routed, TerminalKind,
 };
 use fbc_runtime::{ExecHandler, ExecOrders};
 
@@ -262,6 +297,102 @@ pub enum Note {
         side: Side,
         at: Option<ExchNs>,
     },
+}
+
+/// What the link sent for fbc-oms's Unknown ladder and for the query of an unprotected order,
+/// and what answered it ([`Link::ladder_notes`], module documentation), apart from
+/// [`Link::notes`] so that a consumer's match on every [`Note`] keeps compiling.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LadderNote {
+    /// A query of our order `cid` was submitted under `rpc`, for the Unknown ladder or an
+    /// unprotected order (module documentation).
+    Query {
+        cid: ClientOrderId,
+        rpc: RpcId,
+        of: Queried,
+    },
+    /// The query `rpc` of our order `cid` was answered: what the venue showed, or the request's
+    /// outcome; for a ladder query, what fbc-oms's ladder did with it (`None` for an unprotected
+    /// order's, whose market the session's gate releases on an answer showing it ended).
+    QueryAnswer {
+        cid: ClientOrderId,
+        rpc: RpcId,
+        of: Queried,
+        read: QueryRead,
+        resolution: Option<LadderResolution>,
+    },
+    /// The Unknown ladder's tombstone cancel of our order `cid` was submitted under `rpc`.
+    Tombstone { cid: ClientOrderId, rpc: RpcId },
+    /// The tombstone cancel `rpc` of our order `cid` was answered and ended it, in `state`:
+    /// Canceled once accepted for good, Lost once refused as already ended.
+    TombstoneResolved {
+        cid: ClientOrderId,
+        rpc: RpcId,
+        state: OrdState,
+    },
+    /// What a ladder pass planned for our order `cid` and could not send, and why.
+    Unsent {
+        cid: ClientOrderId,
+        what: LadderCommand,
+        why: String,
+    },
+}
+
+/// What a query the link sent is for (module documentation).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Queried {
+    /// The Unknown ladder's query of an order on it ([`Link::ladder`]).
+    Ladder,
+    /// An unprotected order the registry holds ended or not at all ([`Link::on_unprotected`]).
+    Unprotected,
+}
+
+/// What answered a query ([`LadderNote::QueryAnswer`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryRead {
+    /// The venue showed the order in this state.
+    Shown(VenueOrderState),
+    /// The venue does not know the order.
+    NotFound,
+    /// The request's outcome with no answer: not sent, refused, accepted with the answer still
+    /// to come, or unanswered (`Unknown`, never sent again).
+    Outcome(SubmitOutcome),
+}
+
+/// A command of a ladder pass ([`LadderNote::Unsent`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LadderCommand {
+    Query,
+    Tombstone,
+}
+
+/// What one pass of the Unknown ladder ([`Link::ladder`]) did, each order by client id.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LadderPass {
+    /// The orders this pass put on the ladder: a placement or a command in flight past the
+    /// intent timeout.
+    pub escalated: Vec<ClientOrderId>,
+    /// The queries submitted, with their requests.
+    pub queries: Vec<(ClientOrderId, RpcId)>,
+    /// The tombstone cancels submitted, with their requests.
+    pub tombstones: Vec<(ClientOrderId, RpcId)>,
+    /// What was planned and not submitted, and why, each also noted
+    /// ([`LadderNote::Unsent`]): a query or tombstone the session refused, a tombstone the
+    /// registry did not authorize, or one the venue's single cancel cannot name by client id.
+    pub unsent: Vec<(ClientOrderId, LadderCommand, String)>,
+    /// An order on the ladder waits for a resync: the link starts none, so the consumer asks
+    /// for one.
+    pub resync_wanted: bool,
+}
+
+/// A query the link sent ([`LadderNote::Query`]): its order, what for, when it was sent on the
+/// session's shard clock, and whether the venue acknowledged it with its answer still to come.
+#[derive(Copy, Clone, Debug)]
+struct Query {
+    cid: ClientOrderId,
+    of: Queried,
+    sent: Option<MonoNs>,
+    accepted: bool,
 }
 
 /// Why a connection ended when the session reported no venue error with it: its codec
@@ -663,6 +794,13 @@ pub struct Link {
     covered: Coverage,
     /// Whether a [`Note::CancelNotOurs`] was ever pushed ([`Link::cancels_not_ours_seen`]).
     not_ours_seen: bool,
+    /// The queries submitted here, until answered or released.
+    queries: HashMap<RpcId, Query>,
+    /// What the link sent for the ladder and the queries, and what answered it, in order, since
+    /// [`Link::take_ladder_notes`] last took them.
+    ladder_notes: Vec<LadderNote>,
+    /// The tombstone cancels among the requests submitted here.
+    tombstones: HashSet<RpcId>,
 }
 
 impl Link {
@@ -694,6 +832,9 @@ impl Link {
             learnt: 0,
             covered: Coverage::default(),
             not_ours_seen: false,
+            queries: HashMap::new(),
+            ladder_notes: Vec::new(),
+            tombstones: HashSet::new(),
         }
     }
 
@@ -794,6 +935,20 @@ impl Link {
         &self.notes
     }
 
+    /// What the link sent for the Unknown ladder and the queries of unprotected orders, and what
+    /// answered it, in order (module documentation): every [`LadderNote`] since
+    /// [`Link::take_ladder_notes`] last took them, so a consumer that never takes them keeps them
+    /// all.
+    pub fn ladder_notes(&self) -> &[LadderNote] {
+        &self.ladder_notes
+    }
+
+    /// Takes every [`LadderNote`] out and hands them over, in order, for a consumer that reads
+    /// each once and runs for long: one the link notes after this call is held for the next.
+    pub fn take_ladder_notes(&mut self) -> Vec<LadderNote> {
+        std::mem::take(&mut self.ladder_notes)
+    }
+
     /// How many places (requests whose items are placements) and cancels (cancels,
     /// cancel-manys, cancel-alls) submitted here the session reported sent, those in notes
     /// [`Link::forget`] took included; an amend is neither.
@@ -811,12 +966,17 @@ impl Link {
     /// for it, and [`Link::outcome_of`], [`Link::cids_of`] and [`Link::safety_cancel_of`] no
     /// longer name it. Releasing a cancel the coverage of cancels not ours waits on an answer to
     /// ([`Coverage::waits_on`]) leaves an order end held on it unjudged: that answer reaches no
-    /// coverage, so a refusal notes no [`Note::CancelNotOurs`].
+    /// coverage, so a refusal notes no [`Note::CancelNotOurs`]. A query released
+    /// ([`LadderNote::Query`]) is forgotten: its answer reaches neither the registry nor a
+    /// [`LadderNote::QueryAnswer`], and fbc-oms's ladder gives a ladder query up for resyncs
+    /// once its intent timeout passes.
     pub fn release(&mut self, rpc: RpcId) {
         self.sent.remove(&rpc);
         self.cancels.remove(&rpc);
         self.answered.remove(&rpc);
         self.safety.retain(|_, r| *r != rpc);
+        self.queries.remove(&rpc);
+        self.tombstones.remove(&rpc);
     }
 
     /// How many submitted requests the link still holds the items of: those neither released
@@ -1128,6 +1288,156 @@ impl Link {
         Ok(rpc)
     }
 
+    /// One pass of fbc-oms's Unknown ladder at `now`, the consumer's timer's time on the
+    /// session's shard clock ([`Link::now`], or a consumer timer's `at`), under the
+    /// [`LadderConfig`] given to [`Link::new`] (module documentation). Each query it plans is
+    /// submitted through `orders` as a control command and recorded with
+    /// [`Registry::query_sent`]; each tombstone cancel is authorized for `orders`' account and
+    /// submitted through [`Link::submit`], and recorded with [`Registry::tombstone_sent`] once
+    /// the session reports it sent. A query the session refuses was not recorded, so fbc-oms's
+    /// ladder gives it up for resyncs once its intent timeout passes; a tombstone not sent is
+    /// built again a maximum time later. Before it sends anything, it forgets each query
+    /// acknowledged whose answer is no longer awaited (module documentation). The link reads no
+    /// clock and keeps no timer: the consumer calls it on its own.
+    pub fn ladder(&mut self, orders: &ExecOrders, now: MonoNs) -> LadderPass {
+        let plan = self.reg.ladder(&self.ladder, &self.caps, now);
+        self.forget_unawaited(now);
+        let mut pass = LadderPass {
+            escalated: plan.escalated,
+            resync_wanted: plan.resync,
+            ..LadderPass::default()
+        };
+        for (cid, cmd) in plan.queries {
+            self.take_clock(orders);
+            match orders.submit_control(cmd) {
+                Ok(rpc) => {
+                    // The ladder plans a query only for an order the registry holds.
+                    let refused = self.reg.query_sent(cid, rpc).err();
+                    let problem = |e| Note::Problem(format!("request {}: {e:?}", rpc.0));
+                    self.notes.extend(refused.map(problem));
+                    self.queried(cid, rpc, Queried::Ladder, Some(now));
+                    pass.queries.push((cid, rpc));
+                }
+                Err(e) => pass
+                    .unsent
+                    .push((cid, LadderCommand::Query, format!("{e:?}"))),
+            }
+        }
+        let acct = orders.account();
+        for (cid, cmd) in plan.tombstones {
+            let submitted = self
+                .reg
+                .authorize(acct, cmd)
+                .map_err(|e| format!("{e:?}"))
+                .and_then(|auth| self.submit(orders, auth));
+            match submitted {
+                Ok(rpc) => {
+                    self.tombstones.insert(rpc);
+                    self.ladder_notes.push(LadderNote::Tombstone { cid, rpc });
+                    pass.tombstones.push((cid, rpc));
+                }
+                Err(e) => pass.unsent.push((cid, LadderCommand::Tombstone, e)),
+            }
+        }
+        for cid in plan.no_tombstone {
+            let why = "the venue's single cancel cannot name a client id".to_owned();
+            pass.unsent.push((cid, LadderCommand::Tombstone, why));
+        }
+        self.ladder_notes.extend(
+            pass.unsent
+                .iter()
+                .map(|(cid, what, why)| LadderNote::Unsent {
+                    cid: *cid,
+                    what: *what,
+                    why: why.clone(),
+                }),
+        );
+        pass
+    }
+
+    /// The query of `cid` for `of` was submitted under `rpc` at `sent`: kept until answered,
+    /// and noted.
+    fn queried(&mut self, cid: ClientOrderId, rpc: RpcId, of: Queried, sent: Option<MonoNs>) {
+        let query = Query {
+            cid,
+            of,
+            sent,
+            accepted: false,
+        };
+        self.queries.insert(rpc, query);
+        self.ladder_notes.push(LadderNote::Query { cid, rpc, of });
+    }
+
+    /// Forgets at `now` each query acknowledged whose answer is no longer awaited, since the
+    /// answer may never come: a ladder query once fbc-oms's ladder no longer waits on its order's
+    /// query (it gave the query up for resyncs, or the order left the ladder), an unprotected
+    /// order's once the intent timeout has passed since it was sent, as fbc-oms gives a ladder
+    /// query up. One not acknowledged stays until its outcome, which its deadline brings.
+    fn forget_unawaited(&mut self, now: MonoNs) {
+        let reg = &self.reg;
+        let timeout = self.ladder.intent_timeout();
+        self.queries.retain(|_, q| {
+            !q.accepted
+                || match q.of {
+                    Queried::Ladder => reg
+                        .get(q.cid)
+                        .is_some_and(|r| r.ladder_step() == Some(LadderStep::Querying)),
+                    Queried::Unprotected => q.sent.is_some_and(|sent| now < sent + timeout),
+                }
+        });
+    }
+
+    /// The answer to a query held here: a ladder query's applied to the registry under `key`
+    /// ([`Registry::on_query_answer`]), and noted.
+    fn on_query_result(&mut self, answer: &QueryAnswer, key: OrderKey) {
+        let rpc = answer.rpc();
+        let Some(Query { cid, of, .. }) = self.queries.remove(&rpc) else {
+            return;
+        };
+        let resolution = match of {
+            Queried::Ladder => Some(self.reg.on_query_answer(&self.caps, answer, key)),
+            Queried::Unprotected => None,
+        };
+        let read = match answer.found() {
+            Some(found) => QueryRead::Shown(found.state.clone()),
+            None => QueryRead::NotFound,
+        };
+        self.ladder_notes.push(LadderNote::QueryAnswer {
+            cid,
+            rpc,
+            of,
+            read,
+            resolution,
+        });
+    }
+
+    /// The outcome of query `rpc` held here, or the session's report that it was not sent: a
+    /// ladder query's applied ([`Registry::on_query_outcome`]), and noted. Any outcome but an
+    /// acceptance answers it; an acceptance leaves its answer to come, until
+    /// [`Link::ladder`] forgets it.
+    fn on_query_outcome(&mut self, rpc: RpcId, outcome: SubmitOutcome) {
+        let Some(query) = self.queries.get_mut(&rpc) else {
+            return;
+        };
+        let Query { cid, of, .. } = *query;
+        if matches!(outcome, SubmitOutcome::Accepted { .. }) {
+            query.accepted = true;
+        } else {
+            self.queries.remove(&rpc);
+        }
+        let resolution = match of {
+            Queried::Ladder => Some(self.reg.on_query_outcome(rpc, &outcome)),
+            Queried::Unprotected => None,
+        };
+        self.ladder_notes.push(LadderNote::QueryAnswer {
+            cid,
+            rpc,
+            of,
+            read: QueryRead::Outcome(outcome),
+            resolution,
+        });
+    }
+
     /// Forgets the orders of ours the registry holds ended (or not at all) from what a cancel
     /// of ours covers and from the live orders: only the event that ends an order is judged, so
     /// neither keeps the run's history.
@@ -1211,6 +1521,10 @@ impl Link {
             let done = match &receipt {
                 Ok(_) => match item {
                     Item::Place(_) => self.reg.placement_sent(cid, mono, wall),
+                    // The ladder's tombstone, recorded as one so its outcome resolves the order.
+                    Item::Cancel(_) if self.tombstones.contains(&rpc) => {
+                        self.reg.tombstone_sent(cid, rpc, mono).map(|_| ())
+                    }
                     Item::Cancel(_) => self.reg.cancel_sent(cid, rpc, mono).map(|_| ()),
                     Item::Amend { .. } => Ok(()),
                 },
@@ -1240,7 +1554,12 @@ impl Link {
             self.answer(rpc, None, &SubmitOutcome::NotSent(reason));
         }
         self.covered.reported(rpc, sent.is_ok());
+        let unsent = sent.err();
         self.notes.push(Note::Submitted { rpc, sent });
+        // A query not sent is answered so: the ladder's then leaves its order to resyncs.
+        if let Some(reason) = unsent {
+            self.on_query_outcome(rpc, SubmitOutcome::NotSent(reason));
+        }
     }
 
     /// Records the nonce `used` names for item `idx` of request `rpc`, a place of `cid`, as its
@@ -1276,6 +1595,10 @@ impl Link {
         outcome: SubmitOutcome,
         now: MonoNs,
     ) {
+        if self.queries.contains_key(&rpc) {
+            self.on_query_outcome(rpc, outcome);
+            return;
+        }
         let Some(items) = self.sent.get(&rpc).cloned() else {
             self.notes.push(Note::Outcome {
                 rpc,
@@ -1328,10 +1651,17 @@ impl Link {
                 _ => {}
             }
         }
+        let mut resolved = Vec::new();
         for (it, named) in targets {
             let (cid, op) = Link::op(it, rpc);
-            if let Err(e) = self.reg.on_outcome(cid, op, &named, &outcome, now) {
-                self.problem(format!("request {}: {e:?}", rpc.0));
+            match self.reg.on_outcome(cid, op, &named, &outcome, now) {
+                Ok(OutcomeApplied::TombstoneResolved) => {
+                    let state = self.reg.get(cid).map(|r| r.state());
+                    let note = |state| LadderNote::TombstoneResolved { cid, rpc, state };
+                    resolved.extend(state.map(note));
+                }
+                Ok(_) => {}
+                Err(e) => self.problem(format!("request {}: {e:?}", rpc.0)),
             }
         }
         let item = item.map(|i| i.idx);
@@ -1342,6 +1672,7 @@ impl Link {
             outcome,
             ours: true,
         });
+        self.ladder_notes.extend(resolved);
         // Orders a user cancel ended while only this refused request covered them: a cancel
         // not ours, its order event read before the refusal (Codex r4310042612 on PR #159).
         self.not_ours_seen |= !released.is_empty();
@@ -1487,6 +1818,7 @@ impl Link {
                 None => self.problem("ResyncPosition outside a resync".to_owned()),
             },
             ExecEvent::ResyncEnd => self.on_resync_end(env.stamp.ingest_seq, env.venue_seq),
+            ExecEvent::QueryResult(answer) => self.on_query_result(&answer, key),
             ExecEvent::Conn { state, .. } => {
                 match state {
                     ConnState::Authenticated => {
@@ -1516,14 +1848,16 @@ impl Link {
                     self.notes.push(Note::LoginRefused(why));
                 }
             }
-            // The account's balances, funding, modes, query answers and fee rates move nothing
-            // the registry holds here.
+            // The account's balances, funding, modes and fee rates move nothing the registry
+            // holds here.
             _ => {}
         }
     }
 
     /// The orders of ours the session told unprotected ([`ExecHandler::on_unprotected`], module
-    /// documentation): each the registry holds open gets a Safety cancel at once.
+    /// documentation): each the registry holds open gets a Safety cancel at once, and each it
+    /// holds ended or not at all a query through the attached session, where the venue's caps
+    /// declare a reference for queries the query carries.
     pub fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
         let told: Vec<(ClientOrderId, InstrumentId)> = orders
             .iter()
@@ -1535,32 +1869,43 @@ impl Link {
         for (cid, inst) in &told {
             self.learn(*cid, *inst);
         }
-        let (open, ended): (Vec<ClientOrderId>, Vec<ClientOrderId>) = told
+        let held_open =
+            |reg: &Registry, cid| reg.get(cid).is_some_and(|r| !r.state().is_terminal());
+        let open: Vec<ClientOrderId> = told
             .iter()
             .map(|(cid, _)| *cid)
-            .partition(|cid| self.reg.get(*cid).is_some_and(|r| !r.state().is_terminal()));
-        let mut left: Vec<String> = ended
+            .filter(|cid| held_open(&self.reg, *cid))
+            .collect();
+        // Each the registry holds ended or not at all, named by both our client id and the
+        // venue id it was shown under, and its placement nonce where the registry holds one:
+        // the codec chooses what its venue's queries declare.
+        let queries: Vec<(ClientOrderId, QueryOrder)> = orders
             .iter()
-            .map(|cid| {
-                format!(
-                    "client id sequence {}: the registry holds it ended or not at all, and no \
-                     order query is built here (FBC-m8vm), so its market stays held",
-                    cid.seq()
-                )
+            .filter_map(|o| match o.cid {
+                Some(CidMatch::Ours(cid)) if !held_open(&self.reg, cid) => Some((cid, o)),
+                _ => None,
+            })
+            .map(|(cid, o)| {
+                let query = QueryOrder {
+                    target: OrderRef::Both(cid, o.vid.clone()),
+                    inst: o.inst,
+                    placement_nonce: self.reg.get(cid).and_then(|r| r.placement_nonce()),
+                };
+                (cid, query)
             })
             .collect();
+        // The Safety cancels go to the session first, so it encodes them before any query
+        // (decision 0080: at once); the texts keep the queries' first.
         let plan = self.reg.cancel_many(&open, &self.caps);
         let unbuilt = plan.refused.iter().map(|(cid, r)| (*cid, format!("{r:?}")));
         let waiting = plan
             .awaiting_ack
             .iter()
             .map(|cid| (*cid, "awaits its ack".to_owned()));
-        for (cid, why) in unbuilt.chain(waiting) {
-            left.push(format!(
-                "client id sequence {}: no cancel built: {why}",
-                cid.seq()
-            ));
-        }
+        let mut cancels_left: Vec<String> = unbuilt
+            .chain(waiting)
+            .map(|(cid, why)| format!("client id sequence {}: no cancel built: {why}", cid.seq()))
+            .collect();
         let mut rpcs = Vec::new();
         let session = self.session.clone();
         for cmd in plan.commands {
@@ -1581,10 +1926,43 @@ impl Link {
                     }
                     rpcs.push(rpc);
                 }
-                Err(e) => left.push(format!("a Safety cancel was not submitted: {e}")),
+                Err(e) => cancels_left.push(format!("a Safety cancel was not submitted: {e}")),
             }
         }
+        let (mut left, mut queried) = (Vec::new(), Vec::new());
+        for (cid, query) in queries {
+            let what = if query.reference(self.caps.query_refs).is_none() {
+                "the venue's caps declare no reference for queries that it carries, so no query is \
+                 sent"
+                    .to_owned()
+            } else {
+                let submitted = session
+                    .as_ref()
+                    .ok_or_else(|| "no session attached".to_owned())
+                    .and_then(|(orders, _)| {
+                        self.take_clock(orders);
+                        let cmd = ControlCommand::Query(query);
+                        orders.submit_control(cmd).map_err(|e| format!("{e:?}"))
+                    });
+                match submitted {
+                    Ok(rpc) => {
+                        queried.push((cid, rpc, self.now().map(|(mono, _)| mono)));
+                        format!("it is queried (request {})", rpc.0)
+                    }
+                    Err(e) => format!("its query was not submitted: {e}"),
+                }
+            };
+            left.push(format!(
+                "client id sequence {}: the registry holds it ended or not at all, so no cancel \
+                 is built; {what}; its market stays held until a query's answer shows it ended",
+                cid.seq()
+            ));
+        }
+        left.extend(cancels_left);
         self.notes.push(Note::Unprotected { told, rpcs, left });
+        for (cid, rpc, sent) in queried {
+            self.queried(cid, rpc, Queried::Unprotected, sent);
+        }
     }
 
     /// Connection epoch `key` ended ([`ExecHandler::on_epoch_end`]): reported to the registry at

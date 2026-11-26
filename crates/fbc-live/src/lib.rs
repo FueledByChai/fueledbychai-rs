@@ -8,7 +8,11 @@
 //!   fill ledger, and is the one path the consumer's commands take to the session; its
 //!   [`LinkHandler`](link::LinkHandler) is a session's handler that hands each call to the link
 //!   and then calls the consumer's wake, a closure. Once the link notes a cancel not ours,
-//!   [`Link::cancels_not_ours_seen`](link::Link::cancels_not_ours_seen) holds for good.
+//!   [`Link::cancels_not_ours_seen`](link::Link::cancels_not_ours_seen) holds for good. The
+//!   consumer runs fbc-oms's Unknown ladder through it on its own timer
+//!   ([`Link::ladder`](link::Link::ladder)), which queries each order on the ladder and sends
+//!   each tombstone cancel due, and it queries an unprotected order the registry holds ended or
+//!   not at all, so the session releases its market once the answer shows it ended.
 //! - [`not_ours`]: FBC-aoh5's classifier of cancels not ours, one per market. Its
 //!   [`CancelsNotOurs`](not_ours::CancelsNotOurs), under the consumer's span and window
 //!   ([`NotOursConfig`](not_ours::NotOursConfig)), tells a cancel of the same event as the one
