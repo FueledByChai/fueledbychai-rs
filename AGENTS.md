@@ -797,7 +797,21 @@ holds two of them for one pull request. The rules after the three roles bind all
     held on it and no live order it covers unaccepted; until then it is kept, so its later answer
     still routes as ours), at the forget after the one that took the request's last note, so the
     notes a forget hands over are read against the link as it was, a consumer that never forgets
-    its notes keeping them and the requests they name, FBC-mu68; venue text shown
+    its notes keeping them and the requests they name, FBC-mu68; `Link::ladder(orders, now)`,
+    one pass of fbc-oms's Unknown ladder on the consumer's timer under the `LadderConfig` given to
+    `Link::new`, each query it plans sent as a control command and recorded with `query_sent`,
+    each tombstone, by client id, authorized and sent as a cancel of ours and recorded with
+    `tombstone_sent` once reported sent, what it could not send kept in its `LadderPass` with why
+    and a resync it wants said there, none started; an unprotected order the registry holds ended
+    or not at all queried through the attached session by client id and venue id where the caps'
+    `query_refs` name one, after the notice's Safety cancels, its market held until the session's
+    gate reads an answer showing it ended; each answer routed to `on_query_answer` or
+    `on_query_outcome` for a ladder query; a query acknowledged and left unanswered forgotten at a
+    pass once fbc-oms no longer awaits it, or, an unprotected order's, the intent timeout after it
+    was sent; what was sent and what answered it noted as `LadderNote`s apart from `Link::notes`,
+    until `Link::take_ladder_notes`, so a consumer's match on every `Note` compiles, while each
+    request's report of being sent, a tombstone's answer and a problem recording a query stay
+    ordinary notes, FBC-2cv0; venue text shown
     through `shown` and `described`, whose limits stay fixed, 0155 item 8), the session
     handler's five entry points public methods of it, and `LinkHandler`, which hands each call on
     and then calls the consumer's wake, a closure. It reads no clock but its session's shard clock
@@ -840,6 +854,15 @@ holds two of them for one pull request. The rules after the three roles bind all
     `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in its source),
     `tests/fill_refusals.rs` (`Link::take_fill_refusals` in order, a refusal after a take held
     for the next, a link never taken keeping all; FBC-2dr2),
+    `tests/ladder.rs` (on a paused runtime against the conformance stub's serving script, an
+    unprotected order a lagging resync shows after our cancel ended it, and one the registry never
+    held, queried by its venue id and its market released by an answer showing it ended, held on
+    one showing it open or on none, none sent where the caps declare no query reference, and a
+    notice's Safety cancel sent before its query; an Unknown order queried by its placement nonce
+    and resolved by the answer; a tombstone sent once by client id and ended by its acceptance;
+    on a session never run, each query or tombstone not sent noted with why, and an acknowledged
+    query never answered forgotten as said; and no text in its source naming FBC-m8vm;
+    FBC-2cv0),
     `tests/sweep.rs` (the sweep and `live_on` on a paused runtime against the conformance stub's
     serving script: each end, each refusal, one of a cancel not the sweep's failing nothing, a
     batch's and a whole request's answer, the cancel-all or explicit cancels in the order the link
