@@ -95,6 +95,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 use fbc_core::{
@@ -778,7 +779,13 @@ impl<'a> Out<'a> {
                 VenueCommand::CancelMany(cancels)
             }
         };
-        let cmd = PermittedCommand::cancel(cmd, reg.instance());
+        // A share of each order's handle: every order a cancel names is held mid-pass, and the
+        // cancel keeps it so (decision 0157 item 3d).
+        let names = std::iter::once(first.cid)
+            .chain(more.iter().map(|item| item.cid))
+            .filter_map(|cid| reg.get(cid).map(OrderRecord::handle))
+            .collect();
+        let cmd = PermittedCommand::cancel(cmd, reg.instance(), names);
         self.push(reg, acct, Stage::Cancel, first, more, cmd);
     }
 
@@ -817,9 +824,12 @@ impl<'a> Out<'a> {
 }
 
 /// The order the planner holds at a level.
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Slot {
     cid: ClientOrderId,
+    /// A share of the order's handle, held for its drop alone: until the planner frees the slot
+    /// or is dropped, a retention pass keeps the order (decision 0157 item 3e).
+    _handle: Arc<()>,
     /// When the planner last placed or amended it.
     changed_at: MonoNs,
     /// It is cancelled to be replaced, or its cancel waited for the acknowledgement when the
@@ -1462,10 +1472,13 @@ impl ExecutionPlanner {
                                 .map(|cmd| (cid, cmd))
                         })
                         .map(|(cid, cmd)| {
+                            let handle =
+                                reg.get(cid).expect("the place just registered it").handle();
                             slots.insert(
                                 at,
                                 Slot {
                                     cid,
+                                    _handle: handle,
                                     changed_at: now,
                                     replacing: false,
                                     cancels_sent: 0,

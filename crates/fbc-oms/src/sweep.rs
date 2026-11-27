@@ -24,7 +24,8 @@
 //! (`src/orphans.rs`, decision 0108), so the explicit cancels reach them too.
 //!
 //! **In view.** An order not ours (another namespace's, a non-canonical client id, or one
-//! nothing attributes: no client id and a venue id no order of ours had) is in view on its
+//! nothing attributes: no client id and a venue id no order the registry holds had, a
+//! forgotten order of ours included, decision 0157) is in view on its
 //! market from the moment an order event, a fill or a resync's snapshot shows it open, under
 //! its venue id, and leaves the view only when an order event ends it under that id
 //! (cancelled, filled, rejected or expired; an amend under a new id moves it there). A later

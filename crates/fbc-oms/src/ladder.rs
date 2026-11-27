@@ -219,7 +219,8 @@ impl Registry {
     /// Records when the placement of `cid` was sent: `at` on the shard's monotonic clock (the
     /// intent timeout runs from it) and `wall` on the wall clock snapshot watermarks are
     /// aligned to (the settle time runs from it). The same instants again change nothing;
-    /// others are refused.
+    /// others are refused. For a client id within the span of the orders a retention pass
+    /// forgot, nothing is recorded and nothing refused (decision 0157 item 6).
     pub fn placement_sent(
         &mut self,
         cid: ClientOrderId,
@@ -227,6 +228,9 @@ impl Registry {
         wall: WallNs,
     ) -> Result<(), OmsError> {
         self.reap_dropped();
+        if self.forgot_any(cid) {
+            return Ok(());
+        }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         match rec.sent_at() {
             Some(known) if known != (at, wall) => Err(OmsError::SentRecorded(cid)),
@@ -285,9 +289,13 @@ impl Registry {
     }
 
     /// Records the request the ladder's query for `cid` was sent under, which its answer or
-    /// outcome names.
+    /// outcome names. For a client id within the span of the orders a retention pass forgot,
+    /// nothing is recorded: the order has left the ladder (decision 0157 item 6).
     pub fn query_sent(&mut self, cid: ClientOrderId, rpc: RpcId) -> Result<(), OmsError> {
         self.reap_dropped();
+        if self.forgot_any(cid) {
+            return Ok(());
+        }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         rec.set_query_rpc(Some(rpc));
         self.queries.insert(rpc, cid);
@@ -462,7 +470,9 @@ impl Registry {
     /// Records the tombstone cancel of `cid` the ladder built, sent at `now` under `rpc`, as
     /// [`Registry::cancel_sent`] records a cancel: its outcome then resolves the order
     /// ([`OutcomeApplied::TombstoneResolved`](crate::OutcomeApplied::TombstoneResolved)).
-    /// False once the order is terminal.
+    /// False once the order is terminal, and for a client id within the span of the orders a
+    /// retention pass forgot (decision 0157 item 6). Whatever the order's state, its record then
+    /// owes the request's outcome, which a retention pass keeps it for (item 3d).
     pub fn tombstone_sent(
         &mut self,
         cid: ClientOrderId,
@@ -470,7 +480,11 @@ impl Registry {
         now: MonoNs,
     ) -> Result<bool, OmsError> {
         self.reap_dropped();
+        if self.forgot_any(cid) {
+            return Ok(false);
+        }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        rec.owe(rpc);
         Ok(rec.tombstone_sent(rpc, now))
     }
 

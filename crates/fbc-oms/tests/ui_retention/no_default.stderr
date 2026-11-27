@@ -1,0 +1,15 @@
+error[E0599]: no associated function or constant named `default` found for struct `RetentionConfig` in the current scope
+ --> tests/ui_retention/no_default.rs:6:30
+  |
+6 |     let _ = RetentionConfig::default();
+  |                              ^^^^^^^ associated function or constant not found in `RetentionConfig`
+  |
+note: if you're trying to build a new `RetentionConfig`, consider using `RetentionConfig::new` which returns `Result<RetentionConfig, RetentionConfigError>`
+ --> src/retain.rs
+  |
+  | /     pub fn new(
+  | |         max_ended: usize,
+  | |         max_age: Duration,
+  | |         resync_within: Duration,
+  | |     ) -> Result<RetentionConfig, RetentionConfigError> {
+  | |______________________________________________________^

@@ -1201,6 +1201,60 @@ fn a_crossing_order_never_sent_leaves_its_attempt_to_be_planned_again() {
     }
 }
 
+/// Decisions 0110 and 0157 item 3e: a crossing order that ended never sent is kept by its
+/// planner slot through a retention pass at or past its floor before the planner's next plan,
+/// which then sees it ended never sent, frees its slot and plans the attempt again; the pass
+/// after that may forget it.
+#[test]
+fn crossing_not_sent_re_arms_after_retention() {
+    let caps = OrderCaps {
+        snapshot_lag_bound: Duration::from_millis(200),
+        ..ioc_venue(&[])
+    };
+    let keep =
+        fbc_oms::RetentionConfig::new(1_000, Duration::from_millis(1), Duration::from_millis(300))
+            .unwrap();
+    let mut reg = quoting(10);
+    let mut mint = mint();
+    let mut p = planner();
+    let desired = book().with_crossing(Side::Sell, cross(9_900, 10, 1));
+    let plan = p
+        .plan(
+            &desired,
+            &mut reg,
+            &venue::of(&caps),
+            ACCT,
+            &mut mint,
+            MonoNs(0),
+        )
+        .unwrap();
+    let mut commands = plan.commands;
+    let c = commands[0].cid;
+    drop(commands.pop());
+    let item = ItemRef {
+        idx: 0,
+        cid: Some(c),
+        vid: None,
+    };
+    let not_sent = SubmitOutcome::NotSent(fbc_core::NotSentReason::Disconnected);
+    reg.on_outcome(c, OrderOp::Place, &item, &not_sent, MonoNs(1))
+        .unwrap();
+    assert!(reg.get(c).unwrap().state().is_terminal());
+    // Stamped at the first pass; the second is past its floor and keeps it for its slot.
+    assert!(reg.retain_ended(&keep, &caps, LATER).forgotten.is_empty());
+    let kept = reg.retain_ended(&keep, &caps, LATER2);
+    assert_eq!((kept.pinned.named, kept.forgotten.len()), (1, 0));
+    assert_eq!(p.crossing_order(ACCT, INST, Side::Sell), Some(c));
+    let again = plan_and_send(&mut p, &desired, &mut reg, &caps, &mut mint, LATER2);
+    assert_eq!(
+        shape(&again),
+        vec![(Stage::Reducing, "place", Side::Sell, CROSSING_LEVEL, true)]
+    );
+    assert_ne!(again.commands[0].cid, c);
+    sent(again);
+    assert_eq!(reg.retain_ended(&keep, &caps, LATER3).forgotten, vec![c]);
+}
+
 #[test]
 fn a_crossing_attempt_already_built_or_older_than_the_last_built_is_never_planned_again() {
     // Codex r4317142569: attempts 1, 2, then 1 again, each order terminal before the next: the

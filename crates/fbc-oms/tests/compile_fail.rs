@@ -27,6 +27,15 @@ fn a_probe_declaration_is_made_only_by_its_constructor_and_never_copied() {
     cases.compile_fail("tests/ui_cod_probe/*.rs");
 }
 
+/// Decision 0157 item 2: the retention's count, age and resync bound are the consumer's, with
+/// no default, and built only through `RetentionConfig::new`, which refuses zero. Cases under
+/// `tests/ui_retention/`, regenerated as above.
+#[test]
+fn retention_config_has_no_default() {
+    let cases = trybuild::TestCases::new();
+    cases.compile_fail("tests/ui_retention/*.rs");
+}
+
 #[test]
 fn order_entry_needs_an_authorization_only_fbc_oms_issues() {
     let cases = trybuild::TestCases::new();

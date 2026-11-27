@@ -105,8 +105,9 @@
 //! source seeds each market's position, once per process; every one registers our open orders
 //! it shows on a market not yet seeded that the registry does not hold (an earlier run's, never
 //! amended), so a cancel reaches them. None seeds a market on which its snapshot shows an open
-//! order with no client id under a venue id no order of ours had, which nothing counts on the
-//! caps; each such order is reported ([`ResyncReport::without_cid`], decision 0154). Until its
+//! order with no client id under a venue id no order the registry holds had (one of ours a
+//! retention pass forgot included, decision 0157 item 9), which nothing counts on the caps;
+//! each such order is reported ([`ResyncReport::without_cid`], decision 0154). Until its
 //! seed a market's position is unknown ([`Registry::position`]) and nothing is built on it. A
 //! fill executed between the request and the answer counts exactly once, wherever it arrives:
 //! the snapshot holds it when it arrived
@@ -209,6 +210,21 @@
 //! `tests/held.rs`). An amend's build token names its registry, so another registry's command
 //! releases nothing ([`Registry::amend_not_submitted`]).
 //!
+//! Retention (decision 0157; `tests/retention.rs`): a registry forgets a terminal order only at
+//! the consumer's pass, [`Registry::retain_ended`], under its [`RetentionConfig`] (a count, an
+//! age and a resync bound, none zero, no default), at the consumer's time on the shard's
+//! monotonic clock. It keeps every order that is not terminal, every terminal one a pin holds
+//! (ended Lost or by an accepted tombstone, owing a fill or an answer, named by a command, an
+//! authorization, a handed authorization or a planner slot, on a market not seeded, inserted
+//! after a resync's seed, or sharing a venue id with another order held), and every one whose
+//! stamp is younger than the venue's snapshot lag bound plus the resync bound; of the others it
+//! keeps at most the count, none past the age, and reports each kind ([`Retained`],
+//! [`Pinned`]). A forgotten order leaves two spans per namespace behind: a place or an insert
+//! under a client id the built span covers is refused ([`OmsError::DuplicateCid`]), a late fill
+//! under one is placed as its held record's fill would be, and an outcome or a sent report under
+//! a client id the answer span covers gets a terminal record's answer. A registry whose consumer
+//! never runs the pass keeps every order.
+//!
 //! The audit sink (decision 0005's I8, library form; `tests/audit.rs`): every raw order event
 //! [`Registry::apply_update`] receives is handed to the consumer's [`AuditSink`]
 //! ([`Registry::set_audit_sink`]) in receive order, numbered, before any of it is applied, the
@@ -258,6 +274,7 @@ mod planner;
 mod record;
 mod registry;
 mod resync;
+mod retain;
 mod sweep;
 
 /// The helpers the integration tests share, once for the unit tests too: one namespace lease
@@ -296,4 +313,5 @@ pub use record::{
 };
 pub use registry::{FillRouted, OmsError, Registry, Routed};
 pub use resync::{PositionCheck, ResyncError, ResyncReport, ResyncSnapshot};
+pub use retain::{Pinned, Retained, RetentionConfig, RetentionConfigError};
 pub use sweep::{CancelAllRefusal, CancelEverything};

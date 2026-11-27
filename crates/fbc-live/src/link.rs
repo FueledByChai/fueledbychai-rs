@@ -39,7 +39,8 @@
 //!   registry refuses is noted as refused ([`Note::ResyncRefused`]): the session opened its
 //!   gate at `ResyncEnd` all the same, so the consumer must not place on it.
 //!   An order event of an order in our namespace that the registry does not hold is noted as
-//!   such ([`Note::Orphan`]): Stop would not cancel it nor the run count its fills.
+//!   such ([`Note::Orphan`]): Stop would not cancel it nor the run count its fills. That
+//!   includes an order the registry forgot ([`Link::retain_ended`]).
 //!   The account's position events are noted as they come, for the consumer to compare with
 //!   the position it seeded.
 //! - **Asynchronous rejects** (a two-phase venue's risk check refusing what it accepted) are
@@ -176,6 +177,40 @@
 //!   for its rate the consumer reads, another market's included, still delays its resend (decision
 //!   0155 item 5).
 //! - **Notes.** Everything the consumer may wait on is appended to [`Link::notes`], in order.
+//! - **Retention** (FBC-6pdo, decision 0157). [`Link::retain_ended`] runs fbc-oms's retention
+//!   pass ([`Registry::retain_ended`]) under the link's order caps, at the consumer's time on
+//!   the shard's monotonic clock, under its [`RetentionConfig`]; nothing else here forgets an
+//!   order, and a consumer that never calls it keeps every order, as before. The consumer runs
+//!   it on a journaled timer, so a closed-loop replay forgets the same orders at the same passes
+//!   (decision 0157 item 8), and in this order: [`Link::forget`], then its reading of the notes
+//!   that forget handed over, then the pass, so it has read each ended order's notes before the
+//!   pass can forget the order. The session reports each command it took over to
+//!   [`ExecHandler::on_submitted`] before it drops the command, and the link records the report
+//!   there, so the handles the command holds pin the orders it names until the registry owes
+//!   their answers (decision 0157 item 3d).
+//!   The link's snapshots take the receive time of the socket's authentication as their
+//!   `requested_at`, so the configuration's resync bound must cover the time from that
+//!   authentication to the `ResyncEnd` the link applies, which is the sum of three times: the
+//!   rest of the turn that took the authentication, up to the session's ask for the resync (the
+//!   handler's work on that input; the codec's frames and the arm the session writes, and the
+//!   frames the effects below add, each write bounded by the session's `WriteStall` window; the
+//!   HTTP results and timer firings the session takes while one of those writes waits, which
+//!   reach the codec and the handler; and, on a shard host, the host's other work while a write
+//!   waits, its other members' turns and the consumer's decide pass, which can hold the session
+//!   past that window); the session's `ResyncDeadline` (FBC-nwpr); and how long the turn under
+//!   way when that deadline passes may still run before its check, with the HTTP results and
+//!   timer firings it takes while one of its writes waits, since a `ResyncEnd` it hands on
+//!   first, from its input or from one of those results, ends the resync and keeps the epoch
+//!   open (and, on a shard host, the host's other work it waits on). A bound set short may
+//!   register a forgotten order as an orphan, which fails closed.
+//!   A late event naming a forgotten order is noted as one of an order never held: an update
+//!   under our client id as [`Note::Orphan`], unless its venue id routes it to an order the
+//!   registry holds, when it is noted [`Note::Order`] with [`Routed::Ours`]; an update naming a
+//!   venue id alone as [`Note::Order`] with [`Routed::Untracked`], unless that id routes it to
+//!   an order the registry holds; and a fill under its client id that the registry counts after
+//!   its market's seed (fbc-oms's `OursUntracked`) as [`Note::Fill`] with `unexplained` set.
+//!   An outcome naming a forgotten order of a request the link still holds is noted as ours,
+//!   with no problem: fbc-oms answers it as a terminal record's.
 //!
 //! - **The clock** (decision 0155 item 3). The link reads no clock of its own. Times on the
 //!   shard's monotonic clock are taken from each event's stamp; a submission's send time, which
@@ -208,7 +243,7 @@ use fbc_core::{
 use fbc_oms::{
     Admission, Applied, Authorization, ControlCommand, FillLedger, FillRouted, FillTime,
     LadderConfig, LadderResolution, LadderStep, OrdState, OrderKey, OrderOp, OutcomeApplied,
-    Registry, ResyncReport, ResyncSnapshot, Routed, TerminalKind,
+    Registry, ResyncReport, ResyncSnapshot, Retained, RetentionConfig, Routed, TerminalKind,
 };
 use fbc_runtime::{ExecHandler, ExecOrders};
 
@@ -239,8 +274,9 @@ pub enum Note {
     /// An order event, where it went: anything but an order in our namespace that the
     /// registry does not hold ([`Note::Orphan`]).
     Order(Routed),
-    /// An order event of an order in our namespace that the registry does not hold (an
-    /// earlier run's the resync did not show): its client id and venue id.
+    /// An order event of an order in our namespace that the registry does not hold: an earlier
+    /// run's that the resync did not show, or one the registry forgot (decision 0157). Its
+    /// client id and venue id.
     Orphan {
         cid: ClientOrderId,
         vid: Option<VenueOrderId>,
@@ -1232,6 +1268,16 @@ impl Link {
     /// on the session's clock, such as a planner's pass.
     pub fn now(&self) -> Option<(MonoNs, WallNs)> {
         self.clock.as_ref().map(ExecOrders::now)
+    }
+
+    /// One retention pass of the registry at `now`, the consumer's time on the shard's
+    /// monotonic clock, under the consumer's `cfg` and the link's order caps
+    /// ([`Registry::retain_ended`], decision 0157): what it forgot, kept and pinned. The
+    /// consumer calls it after [`Link::forget`] and its reading of the notes that forget handed
+    /// over, on a journaled timer, its resync bound sized as the module documentation says. The
+    /// link reads no clock and keeps no timer.
+    pub fn retain_ended(&mut self, cfg: &RetentionConfig, now: MonoNs) -> Retained {
+        self.reg.retain_ended(cfg, &self.caps, now)
     }
 
     /// Submits `auth` through `orders`, remembering the order each item names: its request id,

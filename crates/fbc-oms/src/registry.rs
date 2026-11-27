@@ -28,6 +28,7 @@ use crate::permit::{
 use crate::planner::PlanRefusal;
 use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
 use crate::resync::{MarketState, Placed, Placement, Placing, Seed, VenuePlaced};
+use crate::retain::Spans;
 use crate::sweep::ForeignView;
 
 /// Our orders, by client id, with an index of every venue id they were known by, the
@@ -86,6 +87,14 @@ pub struct Registry {
     /// client ids live events showed while the registry did not hold them (0005's I7,
     /// decision 0108; [`Registry::cancel_orphans`]).
     pub(crate) orphans: Orphans,
+    /// Per namespace, the lowest and highest sequence of the orders this registry built and a
+    /// retention pass forgot (decision 0157 item 5): a place or an insert under a client id
+    /// within it is refused, and a late fill under one is placed as its held record's would be.
+    pub(crate) built_span: Spans,
+    /// Per namespace, the lowest and highest sequence of every order a retention pass forgot
+    /// (decision 0157 item 5): an outcome or a sent report under a client id within it gets a
+    /// terminal record's answer.
+    pub(crate) answer_span: Spans,
     /// A trip the next admission of a place or batch item makes right after it, once: the unit
     /// tests' stand-in for another thread tripping the registry between an admission and its
     /// registration (decision 0139).
@@ -164,8 +173,12 @@ pub enum Routed {
 /// What the registry refused.
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
 pub enum OmsError {
-    /// The registry already holds an order under this client id: a client id is never reused,
-    /// so an order (an Unknown one included) is never placed again under it.
+    /// The registry already holds an order under this client id, or the client id lies within
+    /// the span of the orders it built and a retention pass forgot (decision 0157 item 7): a
+    /// client id is never reused, so an order (an Unknown one included) is never placed again
+    /// under it. A client id within that span the registry never registered is refused too:
+    /// one whose place was refused before its registration and retried after later client ids
+    /// were built and forgotten, so a consumer mints afresh for each place.
     DuplicateCid(ClientOrderId),
     /// The registry holds no order under this client id.
     UnknownCid(ClientOrderId),
@@ -509,20 +522,26 @@ impl Registry {
         #[cfg(test)]
         self.after_admission();
         self.register(order.clone())?;
-        self.held(order.cid);
+        let names = self.held(order.cid);
         Ok(PermittedCommand::holding(
             VenueCommand::Place(order),
             guard,
             self.instance,
             &self.dropped,
-        ))
+        )
+        .naming(names))
     }
 
-    /// Marks the order `cid`'s place built and its command held (decision 0082).
-    fn held(&mut self, cid: ClientOrderId) {
-        if let Some(rec) = self.orders.get_mut(&cid) {
-            rec.set_unissued(true);
-        }
+    /// Marks the order `cid`'s place built here and its command held (decision 0082), giving a
+    /// share of its handle for the command (decision 0157 item 3d).
+    fn held(&mut self, cid: ClientOrderId) -> Vec<Arc<()>> {
+        let rec = self
+            .orders
+            .get_mut(&cid)
+            .expect("the order was just registered");
+        rec.set_unissued(true);
+        rec.set_built_here();
+        vec![rec.handle()]
     }
 
     /// Builds a batch of places of one market from the items the pre-trade caps admit, in the
@@ -543,6 +562,7 @@ impl Registry {
         let guard = orders.first().map(|first| self.state_guard(first.inst));
         let mut plan = PlacePlan::default();
         let mut admitted = Vec::new();
+        let mut names = Vec::new();
         for order in orders {
             let cid = order.cid;
             match self.admit_placement(&order).and_then(|()| {
@@ -551,7 +571,7 @@ impl Registry {
                 self.register(order.clone()).map(|_| ())
             }) {
                 Ok(()) => {
-                    self.held(cid);
+                    names.extend(self.held(cid));
                     admitted.push(order);
                 }
                 Err(refusal) => plan.refused.push((cid, refusal)),
@@ -560,12 +580,15 @@ impl Registry {
         if let Some(guard) = guard
             && !admitted.is_empty()
         {
-            plan.command = Some(PermittedCommand::holding(
-                VenueCommand::PlaceBatch(admitted),
-                guard,
-                self.instance,
-                &self.dropped,
-            ));
+            plan.command = Some(
+                PermittedCommand::holding(
+                    VenueCommand::PlaceBatch(admitted),
+                    guard,
+                    self.instance,
+                    &self.dropped,
+                )
+                .naming(names),
+            );
         }
         Ok(plan)
     }
@@ -577,10 +600,13 @@ impl Registry {
     /// with the earlier ones counted, then batches them.
     pub(crate) fn merge_places(&self, places: Vec<PermittedCommand>) -> PermittedCommand {
         let mut orders = Vec::with_capacity(places.len());
+        let mut names = Vec::with_capacity(places.len());
         let mut guard = None;
-        for place in places {
+        for mut place in places {
             debug_assert_eq!(place.origin(), self.instance);
-            // Each place's hold is spent: the batch holds its order from now on.
+            // Each place's hold is spent: the batch holds its order from now on, and carries
+            // the place's share of its handle (decision 0157 item 3d).
+            names.extend(place.take_names().into_handles());
             let (cmd, built_under, mut hold) = place.into_parts();
             hold.spend();
             match cmd {
@@ -596,6 +622,7 @@ impl Registry {
             self.instance,
             &self.dropped,
         )
+        .naming(names)
     }
 
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
@@ -638,7 +665,7 @@ impl Registry {
     /// in Exit, Exit's admission, then both caps (0013 rule 2).
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
         let admits = self.entries.admits(order.inst).map_err(OmsError::State)?;
-        if self.orders.contains_key(&order.cid) {
+        if self.orders.contains_key(&order.cid) || self.forgot_here(order.cid) {
             return Err(OmsError::DuplicateCid(order.cid));
         }
         let exposure = self.exposure(order.inst, order.side, &[]);
@@ -658,8 +685,10 @@ impl Registry {
 
     /// Registers a placement about to be sent, PendingNew, without building its command (an
     /// order learnt otherwise, say). Refused when an order is already registered under its
-    /// client id. A place is built only through [`Registry::place`] or
-    /// [`Registry::place_batch`], under the pre-trade caps.
+    /// client id, or its client id lies within the span of the orders this registry built and
+    /// a retention pass forgot ([`OmsError::DuplicateCid`], decision 0157 item 7). A place is
+    /// built only through [`Registry::place`] or [`Registry::place_batch`], under the pre-trade
+    /// caps.
     pub fn insert(&mut self, placed: NewOrder) -> Result<&OrderRecord, OmsError> {
         self.reap_dropped();
         self.register(placed)
@@ -671,6 +700,9 @@ impl Registry {
     /// 0139).
     fn register(&mut self, placed: NewOrder) -> Result<&OrderRecord, OmsError> {
         let cid = placed.cid;
+        if self.forgot_here(cid) {
+            return Err(OmsError::DuplicateCid(cid));
+        }
         match self.orders.entry(cid) {
             std::collections::hash_map::Entry::Occupied(_) => Err(OmsError::DuplicateCid(cid)),
             std::collections::hash_map::Entry::Vacant(slot) => {
@@ -697,12 +729,20 @@ impl Registry {
             .map(|(vid, _)| vid)
     }
 
-    /// How many orders are registered.
+    /// Removes every venue id the index maps to an order in `gone`, which a retention pass
+    /// forgets (decision 0157 item 4): ids a fill taught included, so no index names a record
+    /// that is gone.
+    pub(crate) fn unindex(&mut self, gone: &HashSet<ClientOrderId>) {
+        self.by_vid.retain(|_, cid| !gone.contains(cid));
+    }
+
+    /// How many orders the registry holds: those a retention pass forgot are not among them
+    /// ([`Registry::retain_ended`]).
     pub fn len(&self) -> usize {
         self.orders.len()
     }
 
-    /// Whether no order is registered.
+    /// Whether the registry holds no order.
     pub fn is_empty(&self) -> bool {
         self.orders.is_empty()
     }
@@ -851,6 +891,13 @@ impl Registry {
     /// nothing and leaving the ledger as it was, when the order's fill sum or the inventory
     /// would overflow, or when the fill comes from another ledger than the first one the
     /// registry took a fill from.
+    ///
+    /// A fill under the client id of an order this registry built and a retention pass forgot
+    /// (within its namespace's built span) is placed against its market's seed as its held
+    /// record's fill would be, and records no live sighting; it is reported
+    /// [`FillRouted::OursUntracked`] when it moves the inventory (decision 0157 item 6). It is
+    /// not checked against the order's instrument and side, which are gone, and the cumulative
+    /// fill it reports is not kept.
     pub fn apply_fill(&mut self, accepted: AcceptedFill<'_, '_>) -> Result<FillRouted, OmsError> {
         self.reap_dropped();
         let ledger = accepted.ledger_id();
@@ -902,7 +949,10 @@ impl Registry {
             accepted.time(),
             accepted.arrived(),
         );
-        let placement = self.placement(fill.inst, cid.is_some(), &placed);
+        // An order this registry built and forgot was held: its fill is placed as its record's
+        // would be (decision 0157 item 6).
+        let forgot = cid.is_none() && self.forgot_here(ours);
+        let placement = self.placement(fill.inst, cid.is_some() || forgot, &placed);
         let overflow = OmsError::FillOverflow(fill.inst);
         let signed = SignedLots::of(fill.side, fill.qty);
         let inventory = match placement {
@@ -945,8 +995,11 @@ impl Registry {
                 FillRouted::Ours(cid, applied)
             }
             _ => {
-                // A live sighting an untrustworthy snapshot's orphan needs (0005's I7).
-                self.orphans.seen_fill(ours);
+                // A live sighting an untrustworthy snapshot's orphan needs (0005's I7), unless
+                // the registry built and forgot the order (decision 0157 item 6).
+                if !forgot {
+                    self.orphans.seen_fill(ours);
+                }
                 FillRouted::OursUntracked(ours)
             }
         };
@@ -1007,6 +1060,10 @@ impl Registry {
     /// command, so it is never sent on top of what the report claims: the order ends not sent
     /// ([`NotSentReason::StaleAuthorization`]), freeing what it counts, and its command, or
     /// its batch's, is refused at authorization ([`IssueRefusal::Released`]; decision 0084).
+    ///
+    /// For a client id within the span of the orders a retention pass forgot, which the
+    /// registry no longer holds, it changes nothing ([`OutcomeApplied::Unchanged`], as for a
+    /// terminal record; decision 0157 item 6).
     pub fn on_outcome(
         &mut self,
         cid: ClientOrderId,
@@ -1020,6 +1077,9 @@ impl Registry {
             && named != cid
         {
             return Err(OmsError::ItemNamesAnother { cid, item: named });
+        }
+        if self.forgot_any(cid) {
+            return Ok(OutcomeApplied::Unchanged);
         }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         if op == OrderOp::Place && rec.unissued() {
@@ -1043,9 +1103,14 @@ impl Registry {
     }
 
     /// Records the nonce the placement of `cid` was sent with (from its encode receipt), for
-    /// venues that cancel by it. The same nonce again changes nothing; another is refused.
+    /// venues that cancel by it. The same nonce again changes nothing; another is refused. For
+    /// a client id within the span of the orders a retention pass forgot, nothing is recorded
+    /// and nothing refused (decision 0157 item 6).
     pub fn placement_nonce_used(&mut self, cid: ClientOrderId, nonce: u64) -> Result<(), OmsError> {
         self.reap_dropped();
+        if self.forgot_any(cid) {
+            return Ok(());
+        }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
         match rec.placement_nonce() {
             Some(known) if known != nonce => Err(OmsError::NonceRecorded(cid)),
@@ -1057,7 +1122,10 @@ impl Registry {
     }
 
     /// Records the amend of `cid` to `px` and `qty` sent at `now` under `rpc`
-    /// ([`OrderRecord::amend_sent`]): false once the order is terminal.
+    /// ([`OrderRecord::amend_sent`]): false once the order is terminal, and for a client id
+    /// within the span of the orders a retention pass forgot (decision 0157 item 6). Whatever
+    /// the order's state, its record then owes the request's outcome, which a retention pass
+    /// keeps it for (item 3d).
     pub fn amend_sent(
         &mut self,
         cid: ClientOrderId,
@@ -1067,7 +1135,11 @@ impl Registry {
         now: MonoNs,
     ) -> Result<bool, OmsError> {
         self.reap_dropped();
+        if self.forgot_any(cid) {
+            return Ok(false);
+        }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        rec.owe(rpc);
         Ok(rec.amend_sent(px, qty, rpc, now))
     }
 
@@ -1209,12 +1281,16 @@ impl Registry {
         for cid in places_of(cmd.command()) {
             if let Some(rec) = self.orders.get_mut(&cid) {
                 rec.set_unissued(false);
+                // An outcome of its place is owed from now on (decision 0157 item 3d).
+                rec.set_place_owed();
             }
         }
     }
 
     /// Records the cancel of `cid` sent at `now` under `rpc` ([`OrderRecord::cancel_sent`]):
-    /// false once the order is terminal.
+    /// false once the order is terminal, and for a client id within the span of the orders a
+    /// retention pass forgot (decision 0157 item 6). Whatever the order's state, its record then
+    /// owes the request's outcome, which a retention pass keeps it for (item 3d).
     pub fn cancel_sent(
         &mut self,
         cid: ClientOrderId,
@@ -1222,7 +1298,11 @@ impl Registry {
         now: MonoNs,
     ) -> Result<bool, OmsError> {
         self.reap_dropped();
+        if self.forgot_any(cid) {
+            return Ok(false);
+        }
         let rec = self.orders.get_mut(&cid).ok_or(OmsError::UnknownCid(cid))?;
+        rec.owe(rpc);
         Ok(rec.cancel_sent(rpc, now))
     }
 
@@ -1322,7 +1402,7 @@ impl Registry {
             if let Some(b) = batch
                 && let Some(item) = permit.batch_item(caps, b.refs)
             {
-                items.push(item);
+                items.push((item, permit.order().handle()));
                 continue;
             }
             match permit.cancel(caps) {

@@ -7,7 +7,9 @@
 //! journaled Start arms the market and places a buy through the link; the buy's fill is
 //! offered at the ask through the link, inline. The link reads its session's clock, which reads
 //! no wall clock in a replay, so each send is timed at the replayed instant it was submitted on,
-//! and both runs agree. The venue, its caps, its account and its numbers are synthetic.
+//! and both runs agree. Two journaled consumer inputs after the offer's fill run the link's
+//! retention pass (FBC-6pdo, decision 0157 item 8), and both runs forget the same orders at the
+//! same passes. The venue, its caps, its account and its numbers are synthetic.
 
 #[path = "../../fbc-runtime/tests/common/toy.rs"]
 #[allow(dead_code, unused_imports)]
@@ -40,7 +42,7 @@ use fbc_journal::{
 use fbc_live::link::Link;
 use fbc_oms::{
     FillLedger, LadderConfig, LeaseKeys, Leases, LedgerConfig, MarketCapsConfig, PreTradeCaps,
-    Registry,
+    Registry, Retained, RetentionConfig,
 };
 use fbc_runtime::{
     ClosedLoop, Connector, ConsumerInput, ExecHandler, ExecOrders, ExecSession, ExecSessionConfig,
@@ -70,6 +72,10 @@ const WALL0: i64 = 1_700_000_000_000_000_000;
 /// The consumer's number for the owner's Start, and when it was taken.
 const START: u16 = 1;
 const START_AT: u64 = 1_500;
+/// The consumer's number for its retention timer's firing, and when it fired: after the offer's
+/// fill on the 6 000 ms trade, then once its records are past the floor and the age.
+const RETAIN: u16 = 2;
+const RETAIN_AT: [u64; 2] = [6_200, 6_800];
 /// The account the session trades.
 const ACCT: AccountKey = AccountKey::new(20);
 
@@ -345,10 +351,23 @@ fn trade(px: i64, qty: i64, seq: i64) -> String {
     format!("trade|sym=A|px={px}|qty={qty}|seq={seq}")
 }
 
+/// The retention pass's configuration: the count, an age of 500 ms and a resync bound of
+/// 500 ms, on the stood-in venue's zero lag bound.
+fn retention() -> RetentionConfig {
+    RetentionConfig::new(1_000, ms(500), ms(500)).unwrap()
+}
+
+/// What a journaled record of the day holds: a market-data frame, or one of the consumer's
+/// inputs, by its kind.
+enum Entry {
+    Frame(String),
+    Input(u16),
+}
+
 /// The journal under `root`, as a live shard wrote it: the connection's opening and
 /// subscription, the trading book (bids 199 x 6, asks 201 x 5), the owner's Start, trades at
 /// the bid that fill the buy behind the book's six lots, trades at the ask that fill its offer,
-/// and the connection's closing.
+/// the consumer's two retention timer firings, and the connection's closing.
 fn journal(root: &Path) {
     let mut writer = JournalWriter::create(root, SHARD, key()).unwrap();
     let mut write = |ms: u64, record: Record| writer.append(wall(ms), &record).unwrap();
@@ -362,19 +381,21 @@ fn journal(root: &Path) {
             remove: vec![],
         }),
     );
-    let day: [(u64, Option<String>); 8] = [
-        (1_001, Some(book_record("begin", 1, "|epoch=1"))),
-        (1_002, Some(level("bid", BID, 6, 2))),
-        (1_003, Some(level("ask", ASK, 5, 3))),
-        (1_004, Some(book_record("end", 4, ""))),
-        (START_AT, None),
-        (3_000, Some(trade(BID, 6, 10))),
-        (4_000, Some(trade(BID, 4, 11))),
-        (6_000, Some(trade(ASK, 10, 12))),
+    let day: [(u64, Entry); 10] = [
+        (1_001, Entry::Frame(book_record("begin", 1, "|epoch=1"))),
+        (1_002, Entry::Frame(level("bid", BID, 6, 2))),
+        (1_003, Entry::Frame(level("ask", ASK, 5, 3))),
+        (1_004, Entry::Frame(book_record("end", 4, ""))),
+        (START_AT, Entry::Input(START)),
+        (3_000, Entry::Frame(trade(BID, 6, 10))),
+        (4_000, Entry::Frame(trade(BID, 4, 11))),
+        (6_000, Entry::Frame(trade(ASK, 10, 12))),
+        (RETAIN_AT[0], Entry::Input(RETAIN)),
+        (RETAIN_AT[1], Entry::Input(RETAIN)),
     ];
-    for (seq, (ms, frame)) in (0u64..).zip(day) {
-        let record = match &frame {
-            Some(text) => {
+    for (seq, (ms, entry)) in (0u64..).zip(day) {
+        let record = match &entry {
+            Entry::Frame(text) => {
                 let stamp = Stamp {
                     ingest_seq: seq,
                     kernel_rx: None,
@@ -384,12 +405,12 @@ fn journal(root: &Path) {
                 };
                 Record::inbound(stamp, RawFrame::Text(text))
             }
-            None => Record::Consumer {
+            Entry::Input(kind) => Record::Consumer {
                 at: at(ms),
-                kind: START,
+                kind: *kind,
                 input: true,
                 ingest_seq: Some(seq),
-                bytes: Opaque(b"start".to_vec()),
+                bytes: Opaque(if *kind == START { "start" } else { "retain" }.into()),
             },
         };
         write(ms, record);
@@ -407,14 +428,18 @@ fn records(root: &Path) -> impl Iterator<Item = Result<Record, JournalError>> {
     JournalReader::open(root, SHARD).unwrap()
 }
 
-/// What the consumer holds: the link, the session's orders, its mint and its leases, and the
-/// stamp of each input it submitted on, with the order submitted.
+/// What the consumer holds: the link, the session's orders, its mint and its leases, the stamp
+/// of each input it submitted on, with the order submitted, each order's send time as the
+/// link's registry held it once the session reported the order sent, and what each retention
+/// pass did.
 struct World {
     link: Link,
     orders: Option<ExecOrders>,
     mint: CidMint,
     leases: PathBuf,
     submitted_on: Vec<(ClientOrderId, MonoNs)>,
+    sent: BTreeMap<ClientOrderId, (MonoNs, WallNs)>,
+    retained: Vec<Retained>,
 }
 
 type Shared = Rc<RefCell<World>>;
@@ -466,8 +491,18 @@ impl ExecHandler for Linked {
         self.0.borrow_mut().link.on_epoch_end(key);
     }
 
+    /// Handed to the link, then each order submitted and now sent has its send time read while
+    /// the registry still holds it: a retention pass may forget it later.
     fn on_submitted(&mut self, handle: SubmitHandle) {
-        self.0.borrow_mut().link.on_submitted(handle);
+        let mut world = self.0.borrow_mut();
+        world.link.on_submitted(handle);
+        let world = &mut *world;
+        for (cid, _) in &world.submitted_on {
+            let sent = world.link.registry().get(*cid).and_then(|r| r.sent_at());
+            if let (Some(sent), false) = (sent, world.sent.contains_key(cid)) {
+                world.sent.insert(*cid, sent);
+            }
+        }
     }
 
     fn on_unprotected(&mut self, orders: &[VenueOrderSnapshot]) {
@@ -476,13 +511,19 @@ impl ExecHandler for Linked {
 }
 
 /// The consumer's own input, handed back from the journal: the owner's Start arms the market
-/// and bids through the link.
+/// and bids through the link; its retention timer's firing runs the link's retention pass at
+/// the firing's replayed instant.
 struct Inputs(Shared);
 
 impl fbc_runtime::InputHandler for Inputs {
     fn on_input(&mut self, input: ConsumerInput) {
-        assert_eq!(input.kind, START);
         let mut world = self.0.borrow_mut();
+        if input.kind == RETAIN {
+            let retained = world.link.retain_ended(&retention(), input.at);
+            world.retained.push(retained);
+            return;
+        }
+        assert_eq!(input.kind, START);
         let symbol = toy::specs().get(INST).unwrap().venue_symbol.clone();
         let market = MarketLease::acquire(&world.leases, "sim", "sim-0", &symbol).unwrap();
         let acct = AccountLease::acquire(&world.leases, "sim", "sim-0").unwrap();
@@ -511,12 +552,13 @@ impl fbc_runtime::Decide for Nothing {
 /// link's registry holds it.
 type Send = (ClientOrderId, MonoNs, Option<(MonoNs, WallNs)>);
 
-/// What one run's link recorded: each order's send in the order placed, and every note, as
-/// shown.
+/// What one run's link recorded: each order's send in the order placed, every note, as shown,
+/// and what each retention pass did.
 #[derive(Debug, PartialEq)]
 struct Run {
     sends: Vec<Send>,
     notes: Vec<String>,
+    retained: Vec<Retained>,
 }
 
 /// Replays the journal at `root` closed-loop through the shard host, with a fresh SimVenue, a
@@ -550,6 +592,8 @@ async fn closed_loop(root: &Path) -> Run {
         mint: CidMint::new(ns, 0, 0, WallNs(1)),
         leases: leases.clone(),
         submitted_on: Vec::new(),
+        sent: BTreeMap::new(),
+        retained: Vec::new(),
     }));
 
     let peer = Rc::new(RefCell::new(SimPeer::new(&sim_config())));
@@ -595,9 +639,8 @@ async fn closed_loop(root: &Path) -> Run {
     drop((session, md, host));
 
     let world = Rc::try_unwrap(world).ok().unwrap().into_inner();
-    let reg = world.link.registry();
     let sends = world.submitted_on.iter();
-    let sends = sends.map(|(cid, on)| (*cid, *on, reg.get(*cid).unwrap().sent_at()));
+    let sends = sends.map(|(cid, on)| (*cid, *on, world.sent.get(cid).copied()));
     let run = Run {
         sends: sends.collect(),
         notes: world
@@ -606,6 +649,7 @@ async fn closed_loop(root: &Path) -> Run {
             .iter()
             .map(|n| format!("{n:?}"))
             .collect(),
+        retained: world.retained.clone(),
     };
     drop(world);
     let _ = std::fs::remove_dir_all(&leases);
@@ -639,6 +683,23 @@ async fn two_closed_loop_replays_through_a_link_give_the_same_send_times_and_not
         !first.notes.iter().any(|n| n.starts_with("Problem")),
         "{:?}",
         first.notes
+    );
+
+    // The pass at 6 200 ms stamps both filled orders and forgets neither, as both settle; the
+    // pass at 6 800 ms, past their floor (the zero lag bound plus the 500 ms resync bound) and
+    // the 500 ms age, forgets both, in client id order. Both runs forget them at the same
+    // passes.
+    assert_eq!(first.retained.len(), 2, "{:?}", first.retained);
+    let [early, late] = [&first.retained[0], &first.retained[1]];
+    assert!(early.forgotten.is_empty(), "{early:?}");
+    assert_eq!(early.settling, 2, "{early:?}");
+    let mut both: Vec<ClientOrderId> = first.sends.iter().map(|(cid, ..)| *cid).collect();
+    both.sort_unstable();
+    assert_eq!(late.forgotten, both, "{late:?}");
+    assert_eq!(
+        (late.kept, late.settling, late.early),
+        (0, 0, 0),
+        "{late:?}"
     );
     let _ = std::fs::remove_dir_all(&root);
 }
