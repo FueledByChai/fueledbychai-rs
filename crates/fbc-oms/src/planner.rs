@@ -21,10 +21,11 @@
 //! - a resting order whose price moved by at least the configured basis points of its price,
 //!   or whose resting quantity moved by at least the configured lots, or whose flags differ,
 //!   is changed once it is at least the configured minimum age (since the planner placed or
-//!   amended it): amended where the venue's [`OrderCaps`] admit that amend, otherwise
-//!   cancelled, the level then waiting for the order's terminal state before the new order is
-//!   placed, so the old order counts as resting and as exposure until it is terminal and the
-//!   new one from when it is built (0005's I6);
+//!   amended it): amended where the venue's [`OrderCaps`] admit that amend, otherwise, or
+//!   where an order not ours is shown resting on the market and 0158's refusal would refuse
+//!   the order as it rests, cancelled, the level then waiting for the order's terminal state
+//!   before the new order is placed, so the old order counts as resting and as exposure until
+//!   it is terminal and the new one from when it is built (0005's I6; 0158 item 2);
 //! - a level no longer wanted (or wanted at quantity zero) has its order cancelled;
 //! - in a market in Exit, an order on a side that does not reduce the position (either side
 //!   while the position is flat or unknown) is cancelled, wanted or not: Exit builds nothing
@@ -54,8 +55,12 @@
 //! that reduce), then amends, then adds, each group in side (bids first) and level order, and
 //! are built in that order, so each is judged with the earlier ones counted. A place or amend
 //! the market's state or a cap refuses is never built and is reported ([`Refused`]); the
-//! planner never falls back from a refused amend to a cancel, and nothing it emits bypasses a
-//! check.
+//! planner never falls back from an amend refused at its build to a cancel, and nothing it
+//! emits bypasses a check. The one cancel in place of an amend is 0158's, chosen when the pass
+//! decides, before it builds anything: an order the refusal would refuse as it rests beside an
+//! order not ours shown resting is cancelled when the consumer moves it, on a venue that amends
+//! too and under an orphan cooldown too, while an order it admits as it rests keeps its amend,
+//! built or reported refused ([`PlanRefusal::Amend`]).
 //!
 //! Each pass takes the venue's facts as the consumer states them ([`PlanVenue`]; decision
 //! 0111): no place or amend is built for a market whose trading status, account mode or market
@@ -66,8 +71,12 @@
 //! while cancels and reducing orders are never withheld, every command built charged against
 //! the view as it is built; and under [`Batching::Declared`] consecutive places of one stage
 //! go in batches of at most the venue's `batch_place` size, never a reducing order with an
-//! add, and the pass's cancels that the venue's cancel-many can name in cancel-manys of at most
-//! its `batch_cancel` size ([`Planned::more_items`]).
+//! add, never a crossing intent nor, while an order not ours is shown resting on the market, a
+//! place carrying the venue's reduce-only flag, each of which goes alone (0111 item 4, 0158
+//! item 3), and the pass's cancels that the venue's cancel-many can name in cancel-manys of at
+//! most its `batch_cancel` size ([`Planned::more_items`]). While such an order rests, the places
+//! held for a batch are emitted, and authorized, before any place or amend that goes alone is
+//! built, so each is judged again at authorization as it was at its build (0082).
 //!
 //! Each wanted quote is first fitted to the venue's [`OrderCaps`], from the caps alone, never
 //! the venue's name (design §4.10 steps 3 and 4; 0106): RPI on a venue without it goes on the
@@ -623,9 +632,10 @@ pub struct Plan {
 
 /// What a pass emits, in order (decision 0111): each command charged against the pass's rate
 /// view as it is built, then authorized; under [`Batching::Declared`], consecutive places of one
-/// stage held until their batch is full or the run ends, and the cancels of the pass's cancel
-/// stage that the venue's cancel-many can name held until theirs is or a command that goes
-/// alone follows them.
+/// stage held until their batch is full or the run ends (a crossing intent, and under 0158's
+/// refusal a place carrying the venue's flag, never held: each goes alone), and the cancels of
+/// the pass's cancel stage that the venue's cancel-many can name held until theirs is or a
+/// command that goes alone follows them.
 struct Out<'a> {
     plan: Plan,
     caps: &'a OrderCaps,
@@ -1176,9 +1186,15 @@ impl ExecutionPlanner {
                 out.plan.held.push(hold(HeldReason::Young));
                 continue;
             }
+            // An order 0158's refusal would refuse as it rests, beside an order not ours shown
+            // resting on the market, is cancelled and placed again once it has ended, on a venue
+            // that amends too: its amend would be refused, since until it is acknowledged an
+            // amend counts at least what the order does. It reads the sighting itself, so an
+            // orphan cooldown the amend would report first keeps nothing resting (0158 item 2).
             let total = rec.filled().checked_add(q.qty).filter(|&total| {
                 same_flags(rec.placed(), q)
                     && permit::amend_shape(rec, caps, q.px, total, q.reducing).is_ok()
+                    && !reg.not_ours_pulls(rec)
             });
             match total {
                 Some(total) => {
@@ -1224,6 +1240,13 @@ impl ExecutionPlanner {
         actions.sort_by_key(|(stage, at, action)| (*stage, action.emulated(), *at));
         // The orders a cancel was decided for this pass, which the overshoot check skips.
         let mut cancelling: Vec<ClientOrderId> = Vec::new();
+        // While an order not ours is shown resting on the market, a place carrying the venue's
+        // flag passes 0158's refusal whatever its size, and so does an amend of an order
+        // carrying it: built after places held for a batch, either could leave those places
+        // refused when judged again at authorization. So the places held are emitted, and
+        // authorized, before any place or amend that goes alone is built, each judged again as
+        // it was at its build (decisions 0082, 0158 item 2).
+        let held_by_not_ours = reg.not_ours_resting(market);
         for (stage, at, action) in actions {
             let side = at.side();
             let refuse = |why| Refused {
@@ -1367,6 +1390,9 @@ impl ExecutionPlanner {
                             .push(refuse(PlanRefusal::RateFloor { scope }));
                         continue;
                     }
+                    if held_by_not_ours {
+                        out.flush(reg, acct);
+                    }
                     reg.live(cid)
                         .map_err(PlanRefusal::Permit)
                         .and_then(|live| {
@@ -1462,8 +1488,16 @@ impl ExecutionPlanner {
                             .push(refuse(PlanRefusal::RateFloor { scope }));
                         continue;
                     }
+                    // A crossing intent always goes alone, and so, while an order not ours is
+                    // shown resting on the market, does every place carrying the venue's flag:
+                    // a batch built now never carries either, so 0158's refusal at authorization
+                    // never refuses one for the batch it shares (0111 item 4, 0158 item 3).
                     synth_ioc = mode.synth_ioc;
-                    batchable = !synth_ioc;
+                    batchable =
+                        !synth_ioc && !at.crossing && !(held_by_not_ours && quote.reduce_only);
+                    if held_by_not_ours && !batchable {
+                        out.flush(reg, acct);
+                    }
                     mint.mint()
                         .map_err(PlanRefusal::Mint)
                         .and_then(|cid| {

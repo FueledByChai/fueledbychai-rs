@@ -206,8 +206,14 @@ pub struct ResyncReport {
     /// Nothing counts one on the caps, so the resync seeds no market not seeded before it on
     /// which it shows one; a later resync not showing one there seeds it. On a market seeded
     /// before, one is reported and, as before, put in the view of orders not ours, and the caps
-    /// still do not count it.
+    /// still do not count it; it holds the market's places and amends that could add to its
+    /// position while it is shown resting (decision 0158; [`Registry::not_ours_resting`]).
     pub without_cid: Vec<(InstrumentId, VenueOrderId)>,
+    /// The orders not ours shown resting that this resync showed gone, by instrument then venue
+    /// id, one shown with no venue id first as `None` (decision 0158 items 4 and 8): from a
+    /// trustworthy snapshot source, requested at or after each one's stamp plus the venue's
+    /// snapshot lag bound, not listing its venue id open.
+    pub not_ours_lifted: Vec<(InstrumentId, Option<VenueOrderId>)>,
     /// The venue's snapshot source is not trustworthy (it can be stale or incomplete, or the
     /// venue offers none): the resync seeded no market, so their positions stay unknown and
     /// nothing is built on them (decision 0055).
@@ -675,6 +681,14 @@ impl Registry {
     /// retention pass forgot included ([`ResyncReport::without_cid`], decisions 0154, 0157).
     /// Each market seeded before is compared. Refused whole, nothing applied, when the snapshot
     /// lists a position or one of our orders twice, or a seed overflows.
+    ///
+    /// From a trustworthy source, every order not ours shown resting, stamped at least the
+    /// venue's snapshot lag bound (`caps.snapshot_lag_bound`) before the request, whose venue id
+    /// the snapshot does not list open, is shown gone ([`ResyncReport::not_ours_lifted`]); then,
+    /// from any source, each open row under another namespace's, a non-canonical or no client id,
+    /// under a venue id no order of ours not ended Lost or never sent holds, shows its order
+    /// resting, unless its venue id is kept as ended and the row is not from a trustworthy
+    /// snapshot requested at least the lag bound after the end's stamp (decision 0158).
     pub fn resync(
         &mut self,
         cfg: &LadderConfig,
@@ -768,6 +782,7 @@ impl Registry {
                 self.foreign.open(o.inst, Some(&o.vid));
             }
         }
+        self.shown_by_snapshot(caps, snap, &mut report);
         if !report.untrustworthy {
             self.foreign.viewed(snap.requested_at);
         }
@@ -778,6 +793,45 @@ impl Registry {
         }
         report.registered.sort();
         Ok(report)
+    }
+
+    /// What `snap` shows of the orders not ours resting (decision 0158 items 1, 4 and 6): from a
+    /// trustworthy source, every sighting stamped at least the venue's lag bound before its
+    /// request whose venue id it does not list open, under any client id or none, is lifted and
+    /// reported; then every open row under another namespace's, a non-canonical or no client id,
+    /// under a venue id no order of ours not ended Lost or never sent holds, is shown resting.
+    fn shown_by_snapshot(
+        &mut self,
+        caps: &OrderCaps,
+        snap: &ResyncSnapshot,
+        report: &mut ResyncReport,
+    ) {
+        let trustworthy = !report.untrustworthy;
+        if trustworthy {
+            let listed: HashSet<(InstrumentId, VenueOrderId)> = snap
+                .orders
+                .iter()
+                .filter(|o| o.state == VenueOrderState::Open)
+                .map(|o| (o.inst, o.vid.clone()))
+                .collect();
+            report.not_ours_lifted =
+                self.foreign
+                    .lift(snap.requested_at, caps.snapshot_lag_bound, &listed);
+        }
+        for o in &snap.orders {
+            if o.state == VenueOrderState::Open
+                && !matches!(o.cid, Some(CidMatch::Ours(_)))
+                && !self.held_live(&o.vid)
+            {
+                self.foreign.shown_row(
+                    o.inst,
+                    &o.vid,
+                    snap.requested_at,
+                    trustworthy,
+                    caps.snapshot_lag_bound,
+                );
+            }
+        }
     }
 
     /// The seeded markets `snap` is no evidence of orphans on (Codex's r4310661297 on PR #171):

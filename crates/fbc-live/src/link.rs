@@ -58,7 +58,10 @@
 //!   the session handed the link before it, of any of its connections (the clock's origin,
 //!   `MonoNs(0)`, before the first), never earlier than the ended epoch's own last envelope and
 //!   that envelope's on a session of one connection, so no instrument cancel-all is built until
-//!   a trustworthy resync requested after it. A resync's request time is the latest
+//!   a trustworthy resync requested after it. That instant is also no earlier than the arrival of
+//!   every order event and snapshot the link has applied to the registry before the call, on its
+//!   one session, so it stamps the orders not ours shown resting as decision 0158 item 5 asks.
+//!   A resync's request time is the latest
 //!   authentication of any connection, so the link serves sessions of one order-entry
 //!   connection, which is what every venue here plans.
 //! - **Unprotected orders** ([`ExecHandler::on_unprotected`], decision 0080): the orders of
@@ -1275,7 +1278,9 @@ impl Link {
     /// ([`Registry::retain_ended`], decision 0157): what it forgot, kept and pinned. The
     /// consumer calls it after [`Link::forget`] and its reading of the notes that forget handed
     /// over, on a journaled timer, its resync bound sized as the module documentation says. The
-    /// link reads no clock and keeps no timer.
+    /// link reads no clock and keeps no timer. It forwards `now` unchanged, and the pass stamps
+    /// the orders not ours shown resting with it (decision 0158 item 5), so the consumer passes
+    /// it no earlier than the `recv_mono` of every envelope already handed to the link.
     pub fn retain_ended(&mut self, cfg: &RetentionConfig, now: MonoNs) -> Retained {
         self.reg.retain_ended(cfg, &self.caps, now)
     }

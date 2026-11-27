@@ -72,6 +72,9 @@ enum Why {
     Position(InstrumentId),
     /// The registry was tripped to Cancel-only (tests/cancel_only_trip.rs).
     CancelOnly(InstrumentId),
+    /// An order not ours shown resting on the market since the place, batch or amend was
+    /// authorized (decision 0158).
+    NotOursResting(InstrumentId),
 }
 
 impl From<StaleAuthorization> for Why {
@@ -84,6 +87,7 @@ impl From<StaleAuthorization> for Why {
             StaleAuthorization::ExclusiveLeaseChanged(market) => Why::Lease(market),
             StaleAuthorization::PositionMoved(market) => Why::Position(market),
             StaleAuthorization::CancelOnly(market) => Why::CancelOnly(market),
+            StaleAuthorization::NotOursResting(market) => Why::NotOursResting(market),
         }
     }
 }

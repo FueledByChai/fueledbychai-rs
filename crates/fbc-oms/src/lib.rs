@@ -175,6 +175,24 @@
 //! an instrument cancel-all only under the kill switch's guard ([`OrphanCancels`]); no order
 //! not ours is ever one, and no account cancel-all is built.
 //!
+//! Orders not ours shown resting (decision 0158; `tests/not_ours_resting.rs`): while an order
+//! under another namespace's, a non-canonical or no client id, under a venue id no order the
+//! registry holds had or one of an order it holds as ended Lost or never sent, that an order
+//! event or a snapshot row showed open rests on a market ([`Registry::not_ours_resting`], named
+//! by [`Registry::not_ours_shown`] as a [`NotOursShown`]), the one pre-trade path refuses there
+//! every place, batch item and amend that does not reduce the known, non-zero position within
+//! its size or carry the venue's reduce-only flag on the reducing side
+//! ([`OmsError::NotOursResting`], [`AmendRefusal::NotOursResting`]; judged again at
+//! authorization, [`IssueRefusal::NotOursResting`]), after the market's state and an orphan
+//! cooldown, and one authorized before such an order came to be shown resting that the refusal
+//! would have refused is refused at submit ([`StaleAuthorization::NotOursResting`]). No cancel
+//! reads it, every order Exit admits passes it, and it moves no market state. It lifts by the
+//! order's end under its venue id, by a trustworthy resync requested at least the venue's lag
+//! bound after its stamp (the next order-entry epoch end or retention pass reported after it was
+//! last shown, never earlier than the latest end already reported) that does not list it open
+//! ([`ResyncReport::not_ours_lifted`]), or by its venue id coming to be held as an order of ours
+//! not ended Lost or never sent. A fill shows nothing resting.
+//!
 //! Authorizations and their check at submit (decisions 0045, 0060, 0066 and 0153;
 //! `tests/authorization.rs`, `tests/exit_submit.rs`, `tests/quoting_submit.rs`):
 //! [`Registry::authorize`] issues the [`Authorization`] for a command this crate built, so a
@@ -245,8 +263,10 @@
 //! age, no default), and builds what closes the difference, each command through the one pre-trade
 //! path and the permits above and leaving as an [`Authorization`]: cancels, then reducing
 //! orders, then amends, then adds ([`Stage`]). A change is an amend where the venue's
-//! [`OrderCaps`](fbc_core::OrderCaps) admit it, otherwise a cancel, the level then waiting
-//! for the order's terminal state before the new one is placed; a level whose order is
+//! [`OrderCaps`](fbc_core::OrderCaps) admit it, otherwise, or where an order not ours is shown
+//! resting on the market and 0158's refusal would refuse the order as it rests, a cancel, the
+//! level then waiting for the order's terminal state before the new one is placed (an amend
+//! refused at its build is reported, never followed by a cancel); a level whose order is
 //! PendingNew or Unknown, or has a command in flight, is occupied until it settles
 //! ([`HeldReason`]); a place or amend the market's state or a cap refuses is never built
 //! ([`PlanRefusal`]). Each level carries the consumer's opaque tag ([`DesiredQuote::tag`])
@@ -258,7 +278,9 @@
 //! `tests/gates.rs`): nothing the market's trading status or a venue mode refuses is built,
 //! cancels excepted; normal commands stop at each rate scope's safety floor ([`RateView`]),
 //! cancels and reducing orders never; and under [`Batching::Declared`] places and cancels go
-//! in batches within the venue's declared sizes and references.
+//! in batches within the venue's declared sizes and references, a crossing intent and, while
+//! an order not ours is shown resting on the market, a place carrying the venue's reduce-only
+//! flag always alone (decision 0158 item 3).
 
 mod audit;
 mod caps;
@@ -314,4 +336,4 @@ pub use record::{
 pub use registry::{FillRouted, OmsError, Registry, Routed};
 pub use resync::{PositionCheck, ResyncError, ResyncReport, ResyncSnapshot};
 pub use retain::{Pinned, Retained, RetentionConfig, RetentionConfigError};
-pub use sweep::{CancelAllRefusal, CancelEverything};
+pub use sweep::{CancelAllRefusal, CancelEverything, NotOursShown};
