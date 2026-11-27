@@ -231,7 +231,7 @@ holds two of them for one pull request. The rules after the three roles bind all
   `crates/fbc-oms` with its first slices (the order lattice, item outcomes and the registry by
   client id; the fill ledger, the two fill counters and the inventory; 0005, property-tested
   with proptest, 0037; the gateway traits and the authorization order entry needs, 0045;
-  the execution planner, 0065),
+  the execution planner, 0065; terminal-order retention, 0157),
   `crates/venues/fbc-venue-paradex` with its signer (`src/sign`), SBE market data (`src/md`: bbo,
   trades and the order book), its order-entry capabilities (`src/exec`, 0054) and its factory
   (`src/factory.rs`, market data and order entry, 0072),
@@ -550,7 +550,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     `apply_update` under an `OrderKey` (the venue's ordering key, ingest tiebreak), amends that
     issue new venue ids and the superseded ids they leave, `on_outcome` per command item, and
     the `Registry` by client id that routes each update by client id or any venue id the order
-    had; the `FillLedger` keyed by `FillEvent::key()` and bounded by an age and a count from
+    had, while it holds the order (0157); the `FillLedger` keyed by `FillEvent::key()` and
+    bounded by an age and a count from
     the consumer's configuration, whose replayed fills apply only when absent, newer than the
     session-start watermark and newer than its retention horizon, and the `AcceptedFill` it
     hands `Registry::apply_fill`, the one path that moves an order's `cum_fills` and the
@@ -591,8 +592,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     first seeds each market's position once and registers our open orders it shows, the
     position unknown until then, a fill straddling the snapshot counted once, later ones
     compared and reported, never overwriting the inventory, and none seeding a market while its
-    snapshot shows an open order with no client id under a venue id no order of ours had, each
-    such order reported (`ResyncReport::without_cid`, 0154); market states and arming (0012;
+    snapshot shows an open order with no client id under a venue id no order the registry holds
+    had, a forgotten order of ours included (0157), each such order reported
+    (`ResyncReport::without_cid`, 0154); market states and arming (0012;
     `src/entry.rs`, `tests/states.rs`): each market armed or not and Killed, Cancel-only, Exit
     or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
     Start, Flatten and Wind-down arming with the market lease (and the account lease where
@@ -634,8 +636,10 @@ holds two of them for one pull request. The rules after the three roles bind all
     account (each account's apart, planned through the one registry the account is bound to),
     under the consumer's `PlannerConfig` (basis-point and lot replace thresholds, a minimum
     age), a change an amend where the venue's `OrderCaps` admit it and otherwise a cancel
-    then, once the old order is terminal, a place, a PendingNew, Unknown or in-flight order occupying its level, every
-    command built through the one pre-trade path and the permits and emitted as an
+    then, once the old order is terminal, a place, a PendingNew, Unknown or in-flight order
+    occupying its level, each slot pinning its order through a handle until the planner frees
+    the slot or is dropped (0157), every command built through the one pre-trade path and the
+    permits and emitted as an
     `Authorization`, cancels then reducing orders then amends then adds, in Exit every order
     on a side that does not reduce the position cancelled, each level's opaque consumer tag
     copied onto its places and amends and each side's optional removal reason onto the cancels
@@ -653,7 +657,21 @@ holds two of them for one pull request. The rules after the three roles bind all
     place or amend a status or mode refuses, cancels in every mode, normal commands withheld at
     each scope's floor while cancels and reducing orders go out, and under
     `Batching::Declared` places of one stage and cancels batched within the venue's declared
-    sizes and references (0111; `src/gates.rs`, `tests/gates.rs`); 0005, 0013), `crates/fbc-journal` (0006; it depends on
+    sizes and references (0111; `src/gates.rs`, `tests/gates.rs`); terminal-order retention
+    (0157; `src/retain.rs`, `tests/retention.rs`, compile-fail cases in `tests/ui_retention/`):
+    `RetentionConfig`, with no `Default`, refusing zero for each of its count, age and resync
+    bound, and `Registry::retain_ended` at the consumer's `now`, the one call that forgets an
+    order: each terminal record stamped at the first pass that sees it, kept while a pin holds it
+    (ended Lost or by a tombstone, owing a fill or an answer, named by a command, an
+    authorization or a planner slot through its handle, on a market not seeded, inserted after a
+    resync's seed, or sharing a venue id with another order held), each counted by reason in
+    `Retained`, and while it settles, until the venue's snapshot lag bound plus the resync bound
+    after its stamp; of the others, each at least the age old forgotten, then the oldest while
+    more than the count remain, each removed in one step with every index entry naming it; and
+    per namespace a built span and an answer span of what it forgot, a late fill under a client
+    id the first covers placed as its held record's would be, an outcome or a sent report under
+    one the second covers answered as a terminal record's, and a place or an insert under one
+    the first covers refused `DuplicateCid`; 0005, 0013), `crates/fbc-journal` (0006; it depends on
     `fbc-core`, and `hmac` and `sha2` for its keyed hashes and `zstd` for its closed segments, only: the records the runtime writes, length-prefixed in a hand-written
     little-endian format with a version, a writer of one subdirectory per UTC day with segments
     named `<shard>-<seq>.fbcj` and time from the caller, rolled at every UTC hour, each closed
@@ -797,7 +815,12 @@ holds two of them for one pull request. The rules after the three roles bind all
     held on it and no live order it covers unaccepted; until then it is kept, so its later answer
     still routes as ours), at the forget after the one that took the request's last note, so the
     notes a forget hands over are read against the link as it was, a consumer that never forgets
-    its notes keeping them and the requests they name, FBC-mu68; `Link::ladder(orders, now)`,
+    its notes keeping them and the requests they name, FBC-mu68; `Link::retain_ended(cfg, now)`,
+    fbc-oms's retention pass under the link's caps, which the consumer runs on a journaled timer
+    after `Link::forget` and its reading of the notes that forget handed over, its resync bound
+    covering the time from the socket's authentication to the `ResyncEnd` applied, a late event
+    naming a forgotten order noted as one of an order never held (FBC-6pdo, 0157,
+    `tests/retention.rs`); `Link::ladder(orders, now)`,
     one pass of fbc-oms's Unknown ladder on the consumer's timer under the `LadderConfig` given to
     `Link::new`, each query it plans sent as a control command and recorded with `query_sent`,
     each tombstone, by client id, authorized and sent as a cancel of ours and recorded with
@@ -850,7 +873,13 @@ holds two of them for one pull request. The rules after the three roles bind all
     `tests/manifest.rs`, which holds its normal dependencies to those three (0155 item 1),
     `tests/link_clock.rs` (sends timed on the session's stamps on a paused runtime against the
     conformance stub, and a second clock noted), `tests/replay_clock.rs` (two closed-loop replays
-    through a `Link`, on SimVenue, with the same send times and notes; 0155 item 4),
+    through a `Link`, on SimVenue, with the same send times and notes, and the same orders
+    forgotten at the same passes of `Link::retain_ended` (0157); 0155 item 4),
+    `tests/retention.rs` (an ended order behind on its fills kept for the stream check, a
+    cancel-many's orders kept while its authorization lives and answered with no problem, a
+    straggler answer to a request the link still holds noted as ours with no problem after its
+    order is forgotten, for one built here and one a resync registered, and late events naming
+    a forgotten order noted as of an order never held; FBC-6pdo, 0157),
     `tests/clock_lint.rs` (the lint's five paths and reasons, and no std clock read in its source),
     `tests/fill_refusals.rs` (`Link::take_fill_refusals` in order, a refusal after a take held
     for the next, a link never taken keeping all; FBC-2dr2),
@@ -1771,7 +1800,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     first rule, in normal and build dependencies (not dev-dependencies, which venue tests use).
 - Tests: unit tests beside the code (`#[cfg(test)]`), integration and property tests in
   `crates/<crate>/tests/`, `trybuild` compile-fail tests for the seals in `fbc-core`'s tests, and for the
-  authorization, the permits and the probe declaration in `fbc-oms`'s.
+  authorization, the permits, the probe declaration and the retention configuration in
+  `fbc-oms`'s.
 - Fixtures in `fixtures/<venue>/`: recorded frames, journals and signing vectors. Synthetic
   key- or address-shaped values sit in a directory of their own carrying a `SYNTHETIC` file
   that says where they come from (0009); that marker exempts only its own directory from the

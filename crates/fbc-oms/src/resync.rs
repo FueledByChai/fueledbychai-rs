@@ -7,9 +7,10 @@
 //! admit no place or amend on it. Only a resync from a trustworthy snapshot source seeds; one
 //! that can be stale or incomplete, or none, seeds nothing ([`ResyncReport::untrustworthy`]).
 //! Nor does one seed a market on which its snapshot shows an open order with no client id under
-//! a venue id no order of ours had (an earlier run's the venue lists by venue id alone, or one
-//! placed in the venue's UI): nothing counts it on the caps, so the market waits for a resync
-//! that does not show one, and each is reported ([`ResyncReport::without_cid`], decision 0154).
+//! a venue id no order the registry holds had (an earlier run's the venue lists by venue id
+//! alone, one placed in the venue's UI, or one of ours a retention pass forgot, decision 0157
+//! item 9): nothing counts it on the caps, so the market waits for a resync that does not show
+//! one, and each is reported ([`ResyncReport::without_cid`], decision 0154).
 //! Every resync registers our namespace's open orders the snapshot shows on a market not
 //! seeded yet that the registry does not hold (an earlier run's; never amended, only
 //! cancelled: their placement is not known), whether or not it seeds the market, so a cancel
@@ -365,7 +366,7 @@ struct SeedRef {
     shown: HashMap<ClientOrderId, Lots>,
     /// Every order it showed, by venue id, with its cumulative fill: an order shown without
     /// our client id (under a non-canonical or another namespace's one, or ended with none) is
-    /// still shown. None is open with no client id under a venue id no order of ours had: a
+    /// still shown. None is open with no client id under a venue id no order held had: a
     /// snapshot showing one seeds nothing there (decision 0154), so a fill of ours is never
     /// placed against what it showed of such an order.
     shown_vids: HashMap<VenueOrderId, Lots>,
@@ -493,8 +494,30 @@ impl Registry {
         )
     }
 
+    /// Whether `inst` is seeded (by a resync or by hand) or unsettled: a retention pass forgets
+    /// no record on a market not yet seeded, whose seed's sets read every record there
+    /// (decision 0157 item 3f).
+    pub(crate) fn market_seeded(&self, inst: InstrumentId) -> bool {
+        matches!(
+            self.markets.get(&inst),
+            Some(MarketState::Seeded(_) | MarketState::Unsettled)
+        )
+    }
+
+    /// Whether `inst` is seeded by a resync whose seed holds `cid` neither as an order held when
+    /// it seeded the market nor as an orphan a later resync registered there: an order an
+    /// insert registered after the seed, whose fills count after the seed only while its record
+    /// is held (decision 0157 item 3g).
+    pub(crate) fn seed_lacks(&self, inst: InstrumentId, cid: ClientOrderId) -> bool {
+        matches!(
+            self.markets.get(&inst),
+            Some(MarketState::Seeded(Seed { reference: Some(r), .. }))
+                if !r.known.contains(&cid) && !r.later.contains(&cid)
+        )
+    }
+
     /// Where a fill of `inst` the ledger accepted stands, `registered` when its order is one
-    /// the registry holds.
+    /// the registry holds, or one it built and forgot (decision 0157 item 6).
     pub(crate) fn placement(&self, inst: InstrumentId, registered: bool, f: &Placed) -> Placement {
         match self.markets.get(&inst) {
             Some(MarketState::Seeded(Seed {
@@ -648,10 +671,10 @@ impl Registry {
     /// moved is then seeded, unless a fill it holds is unsettled (on a venue whose resync is
     /// separate reads, `caps.snapshot_reads`, every fill not placed by its arrival or time); from any other, none is
     /// ([`ResyncReport::untrustworthy`]). None is seeded on which the snapshot shows an open
-    /// order with no client id under a venue id no order of ours had
-    /// ([`ResyncReport::without_cid`], decision 0154). Each market seeded before is compared.
-    /// Refused whole, nothing applied, when the snapshot lists a position or one of our orders
-    /// twice, or a seed overflows.
+    /// order with no client id under a venue id no order the registry holds had, one of ours a
+    /// retention pass forgot included ([`ResyncReport::without_cid`], decisions 0154, 0157).
+    /// Each market seeded before is compared. Refused whole, nothing applied, when the snapshot
+    /// lists a position or one of our orders twice, or a seed overflows.
     pub fn resync(
         &mut self,
         cfg: &LadderConfig,
@@ -882,8 +905,9 @@ impl Registry {
         }
     }
 
-    /// The open orders `snap` shows with no client id under a venue id no order of ours had, by
-    /// instrument then venue id, each once ([`ResyncReport::without_cid`], decision 0154).
+    /// The open orders `snap` shows with no client id under a venue id no order the registry
+    /// holds had, one of ours a retention pass forgot included, by instrument then venue id,
+    /// each once ([`ResyncReport::without_cid`], decisions 0154, 0157 item 9).
     fn without_cid(&self, snap: &ResyncSnapshot) -> Vec<(InstrumentId, VenueOrderId)> {
         let mut found: Vec<(InstrumentId, VenueOrderId)> = snap
             .orders
@@ -899,7 +923,7 @@ impl Registry {
     }
 
     /// Whether a snapshot order is not ours: another namespace's or a non-canonical client id,
-    /// or none and a venue id no order of ours had.
+    /// or none and a venue id no order the registry holds had.
     fn not_ours(&self, o: &VenueOrderSnapshot) -> bool {
         match o.cid {
             Some(CidMatch::Foreign(_) | CidMatch::Unparseable) => true,

@@ -1,0 +1,11 @@
+error[E0451]: fields `max_ended`, `max_age` and `resync_within` of struct `RetentionConfig` are private
+  --> tests/ui_retention/literal.rs:8:9
+   |
+ 7 |     let _ = RetentionConfig {
+   |             --------------- in this type
+ 8 |         max_ended: 0,
+   |         ^^^^^^^^^ private field
+ 9 |         max_age: Duration::ZERO,
+   |         ^^^^^^^ private field
+10 |         resync_within: Duration::ZERO,
+   |         ^^^^^^^^^^^^^ private field

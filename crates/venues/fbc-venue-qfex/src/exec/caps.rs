@@ -119,8 +119,9 @@ pub fn probe_exec_caps() -> ExecCaps {
             // Decision 0132 item 5's three reads: `get_user_orders` pages, REST positions and
             // trade pages.
             snapshot_reads: SnapshotReads::Separate,
-            // Read only from a trustworthy source (decision 0109); item 5's later record
-            // measures it before any flip.
+            // The Unknown ladder reads it only from a trustworthy source (decision 0109), and
+            // zero leaves 0157's retention floor at the consumer's resync bound; item 5's later
+            // record measures it before any flip.
             snapshot_lag_bound: Duration::ZERO,
             // The AsyncAPI's `OrderResponse` echoes the order `type` (so ALO) and
             // `time_in_force`, but no capture shows it yet, and reduce-only is never sent:

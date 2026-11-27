@@ -344,7 +344,12 @@ pub trait ExecHandler {
     /// submission not reported, and every one reported sent and not answered, as unresolved
     /// until the venue is read again (0013 rule 1). A command submitted from this call waits for
     /// the session's next turn; one not sent is never resubmitted as it was (0013 rule 1).
-    /// Nothing by default.
+    ///
+    /// A consumer that runs fbc-oms's retention pass records here each amend's, cancel's or
+    /// tombstone's report (`amend_sent`, `cancel_sent`, `tombstone_sent`, or the not-sent
+    /// outcome), before the registry's next `retain_ended` (decision 0157 item 3d): the session
+    /// drops the command it took over, and with it the handles that pin the orders it names,
+    /// only after this call returns. Nothing by default.
     fn on_submitted(&mut self, handle: SubmitHandle) {
         let _ = handle;
     }
@@ -1539,7 +1544,9 @@ impl<H: ExecHandler> ExecSession<H> {
             receipt: Err(reason),
         };
         // Taken over before anything checks, encodes or reports it: from here on the handler is
-        // told what became of it, so its drop releases nothing (decision 0152).
+        // told what became of it, so its drop releases nothing (decision 0152). It is dropped
+        // only once this returns, after `on_submitted`, so its handles pin the orders it names
+        // until the handler has recorded the report (decision 0157 item 3d).
         let item = item.take();
         let cmd = item.command();
         let current = self.orders.ready() == Some(key.epoch) && epoch == Some(key.epoch);
@@ -2280,6 +2287,8 @@ impl<H: ExecHandler> Control for Between<'_, H> {
         {
             let receipt = Err(NotSentReason::Disconnected);
             let rpc = queued.rpc;
+            // `queued` is dropped after the report, so its handles pin the orders it names
+            // until the handler has recorded it (decision 0157 item 3d).
             self.handler.on_submitted(SubmitHandle { rpc, receipt });
         }
         // Once the control has dropped, the sink hands the handler nothing.

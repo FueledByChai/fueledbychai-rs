@@ -1,11 +1,16 @@
 //! One order's record and the lattice it moves through (decision 0005; design §4.9 with 0014's
 //! refinements).
 
+use std::sync::Arc;
+
 use fbc_core::{
     AckLevel, CancelReason, Channel, ClientOrderId, Lots, MonoNs, NewOrder, NotSentReason,
     OrderKind, OrderUpdate, RejectKind, RpcId, SubmitOutcome, Ticks, Tif, VenueOrderId,
     VenueOrderSnapshot, VenueOrderState, WallNs,
 };
+
+use crate::ladder;
+use crate::retain::PinReason;
 
 /// Where an order stands. The states are ranked ([`OrdState::rank`]) and a record's rank never
 /// falls; a terminal state is absorbing.
@@ -206,11 +211,26 @@ struct Built {
     wire: Option<Lots>,
 }
 
+/// A record's handle (decision 0157 items 3d and 3e): every command fbc-oms builds that names
+/// the order, the authorization and the handed form issued from it, and the execution planner's
+/// slot holding the order carry a share of it, and while one does the retention pass keeps the
+/// record ([`Registry::retain_ended`](crate::Registry::retain_ended)). A clone of the record
+/// takes a fresh handle, which nothing shares, so a clone pins nothing.
+#[derive(Debug)]
+struct Handle(Arc<()>);
+
+impl Clone for Handle {
+    fn clone(&self) -> Handle {
+        Handle(Arc::new(()))
+    }
+}
+
 /// One of our orders, as the OMS knows it.
 ///
 /// The fields are private and change only through [`apply_update`](OrderRecord::apply_update),
 /// [`on_outcome`](OrderRecord::on_outcome), the sent intents and the fills the ledger accepted
 /// ([`Registry::apply_fill`](crate::Registry::apply_fill)), so the lattice only moves forward.
+/// A clone shares no handle with the record cloned (decision 0157).
 #[derive(Clone, Debug)]
 pub struct OrderRecord {
     placed: NewOrder,
@@ -317,6 +337,25 @@ pub struct OrderRecord {
     /// RB840-11 on PR #171). A snapshot showing the order open under one of them lags the
     /// venue, so it is no orphan (decision 0108).
     venue_ended: Vec<VenueOrderId>,
+    /// When the retention pass first saw the order terminal, on the shard's monotonic clock:
+    /// its age runs from there (decision 0157 item 2). Ending the order clears none of the
+    /// fields below.
+    ended_seen: Option<MonoNs>,
+    /// This registry built its place ([`Registry::place`](crate::Registry::place),
+    /// [`Registry::place_batch`](crate::Registry::place_batch)); kept when a snapshot
+    /// registers it again (decision 0157 item 5).
+    built_here: bool,
+    /// The Unknown ladder's tombstone cancel, accepted for good, ended it Canceled: no final
+    /// cumulative fill came with that end (decision 0157 item 3b).
+    tombstone_end: bool,
+    /// Its place was authorized and not released unsent, and no outcome of the place has come
+    /// (decision 0157 item 3d).
+    place_owed: bool,
+    /// The amends, cancels and tombstones reported sent for it that no outcome names yet
+    /// (decision 0157 item 3d).
+    owed: Vec<RpcId>,
+    /// What its commands and its planner slot carry (decision 0157 items 3d and 3e).
+    handle: Handle,
 }
 
 impl OrderRecord {
@@ -367,6 +406,12 @@ impl OrderRecord {
             removal: None,
             counted_reducing: false,
             venue_ended: Vec::new(),
+            ended_seen: None,
+            built_here: false,
+            tombstone_end: false,
+            place_owed: false,
+            owed: Vec::new(),
+            handle: Handle(Arc::new(())),
         }
     }
 
@@ -420,7 +465,9 @@ impl OrderRecord {
     /// lagging snapshot may show less), the venue ids an amend replaced, and every other id `indexed`
     /// names it by (its current one, one a fill taught), each now replaced by `live`, so a
     /// delayed update naming only one of them does not reach this order. `live` is no id an
-    /// amend of it replaced.
+    /// amend of it replaced. It also takes on whether this registry built it, the answers it
+    /// owes and its handle, so the commands and the planner slot that held the ended record
+    /// hold this one (decision 0157 item 5).
     pub(crate) fn carry_over(
         &mut self,
         ended: &OrderRecord,
@@ -436,6 +483,68 @@ impl OrderRecord {
         self.cum_venue = self.cum_venue.max(ended.cum_venue);
         self.set_cum_fills(ended.cum_fills());
         self.venue_ended.clone_from(&ended.venue_ended);
+        self.built_here = ended.built_here;
+        self.place_owed = ended.place_owed;
+        self.owed.clone_from(&ended.owed);
+        self.handle = Handle(Arc::clone(&ended.handle.0));
+    }
+
+    /// Stamps the order with `now`, the time the retention pass first saw it terminal; a later
+    /// pass leaves the stamp as it is (decision 0157 item 2).
+    pub(crate) fn stamp_ended(&mut self, now: MonoNs) {
+        self.ended_seen.get_or_insert(now);
+    }
+
+    /// When the retention pass first saw the order terminal.
+    pub(crate) fn ended_seen(&self) -> Option<MonoNs> {
+        self.ended_seen
+    }
+
+    /// Records that this registry built the order's place.
+    pub(crate) fn set_built_here(&mut self) {
+        self.built_here = true;
+    }
+
+    /// Whether this registry built the order's place (decision 0157 item 5).
+    pub(crate) fn built_here(&self) -> bool {
+        self.built_here
+    }
+
+    /// Records that the order's place was authorized: an outcome of it is owed.
+    pub(crate) fn set_place_owed(&mut self) {
+        self.place_owed = true;
+    }
+
+    /// Records that an amend, a cancel or a tombstone of the order was reported sent under
+    /// `rpc`: an outcome of it is owed, whatever the order's state.
+    pub(crate) fn owe(&mut self, rpc: RpcId) {
+        if !self.owed.contains(&rpc) {
+            self.owed.push(rpc);
+        }
+    }
+
+    /// A share of the order's handle, for a command naming it or a planner slot holding it.
+    pub(crate) fn handle(&self) -> Arc<()> {
+        Arc::clone(&self.handle.0)
+    }
+
+    /// Why the retention pass keeps the order whatever its market (decision 0157 item 3, a to
+    /// e): the first that applies of ended Lost, ended by an accepted tombstone, owing a fill,
+    /// owing an answer, and named by a command or a planner slot; `None` when none does.
+    pub(crate) fn pin(&self) -> Option<PinReason> {
+        if ladder::is_lost(self.state) {
+            Some(PinReason::Lost)
+        } else if self.tombstone_end {
+            Some(PinReason::Tombstoned)
+        } else if self.cum_venue > self.cum_fills {
+            Some(PinReason::FillsOwed)
+        } else if self.place_owed || !self.owed.is_empty() {
+            Some(PinReason::AnswerOwed)
+        } else if Arc::strong_count(&self.handle.0) > 1 {
+            Some(PinReason::Named)
+        } else {
+            None
+        }
     }
 
     /// Whether the venue itself said the order ended under `vid`: a terminal update naming it,
@@ -704,6 +813,8 @@ impl OrderRecord {
             && self.unknown_since.is_none();
         if untouched {
             self.end(TerminalKind::NotSent(reason));
+            // Released unsent: no outcome of its place can come (decision 0157 item 3d).
+            self.place_owed = false;
         }
         untouched
     }
@@ -1124,6 +1235,12 @@ impl OrderRecord {
         outcome: &SubmitOutcome,
         now: MonoNs,
     ) -> OutcomeApplied {
+        // Whatever the order's state, this is the answer its request owed (decision 0157 item
+        // 3d): the order has ended or the outcome applies below.
+        match op.rpc() {
+            Some(rpc) => self.owed.retain(|owed| *owed != rpc),
+            None => self.place_owed = false,
+        }
         let closed = matches!(outcome, SubmitOutcome::Rejected(r)
             if matches!(r.kind, RejectKind::AlreadyTerminal(_)));
         if closed && matches!(op, OrderOp::Cancel(_)) {
@@ -1167,6 +1284,8 @@ impl OrderRecord {
                 _ => None,
             };
             if let Some(kind) = ended {
+                // Ended with no final cumulative fill from the venue (decision 0157 item 3b).
+                self.tombstone_end = kind != TerminalKind::Lost;
                 self.end(kind);
                 return OutcomeApplied::TombstoneResolved;
             }

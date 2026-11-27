@@ -117,9 +117,13 @@ pub struct OrderCaps {
     /// order sent less than this before a snapshot's watermark may be missing from it though
     /// the venue holds it. The Unknown ladder counts no absence of an order from a snapshot
     /// within this bound of the order's send, whatever the consumer's settle time, so no
-    /// resting order is ended Lost early and its resting exposure freed. Read only from a
-    /// trustworthy source, the only one whose absences count; a venue cites its measured lag,
-    /// with margin. Zero for a snapshot answered from the venue's own state at once.
+    /// resting order is ended Lost early and its resting exposure freed. It also bounds how
+    /// long a trustworthy snapshot may still show open an order its stream ended (decision 0157
+    /// item 10), so a venue's declaration covers both directions. The Unknown ladder reads it
+    /// only from a trustworthy source, the only one whose absences count; the retention pass
+    /// adds it, under any source, to the age at which an ended record may be forgotten (decision
+    /// 0157 item 3). A venue cites its measured lag, with margin. Zero for a snapshot answered
+    /// from the venue's own state at once.
     pub snapshot_lag_bound: Duration,
     /// Order events carry the order's flags (post-only, reduce-only) back.
     pub events_echo_flags: bool,

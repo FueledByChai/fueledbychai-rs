@@ -81,7 +81,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbc_core::{AccountKey, CancelScope, ClientOrderId, InstrumentId, Side, VenueCommand};
 
-use crate::permit::{Dropped, Hold, Release};
+use crate::permit::{Dropped, Hold, Names, Release};
 use crate::registry::Instance;
 use crate::{CapRefusal, PermittedCommand, Registry};
 
@@ -400,6 +400,10 @@ impl std::error::Error for StaleAuthorization {}
 /// over: dropped before then, wherever and on whatever thread, it hands its orders, or the
 /// amend's build, back to the registry that issued it, which releases them at its next mutating
 /// call (decision 0152); [`Registry::withdraw`] releases them at once.
+///
+/// It carries a share of the handle of each order its command names, and its handed form
+/// carries them on: while either lives, a retention pass keeps those orders
+/// ([`Registry::retain_ended`], decision 0157 item 3d).
 #[must_use = "an authorization is spent by submitting it"]
 #[derive(Debug)]
 pub struct Authorization {
@@ -414,7 +418,10 @@ pub struct Authorization {
 /// An [`Authorization`] a gateway took over ([`Authorization::hand_over`]): the one form that runs
 /// the check at submit ([`Handed::check_at_submit`]), so the one a gateway keeping decision 0060
 /// encodes. Dropping it releases nothing: what the gateway reports of it, sent or not sent,
-/// settles its orders (decision 0152).
+/// settles its orders (decision 0152). While it lives, a retention pass keeps the orders its
+/// command names (decision 0157 item 3d): the gateway records the report of an amend, a cancel
+/// or a tombstone before it is dropped, or, for a gateway called through
+/// [`OrderGateway::submit`](crate::OrderGateway::submit), its caller right after the call.
 #[derive(Debug)]
 #[must_use = "a handed authorization is settled only by what the gateway reports of it"]
 pub struct Handed {
@@ -436,6 +443,9 @@ struct Grant {
     /// How many times the registry was tripped to Cancel-only, as it authorized a place, a
     /// batch or an amend on a market in Quoting, the one state a trip moves (decision 0139).
     trips: Option<Watch>,
+    /// A share of the handle of each order the command names, held for its drop alone: while
+    /// it lives a retention pass keeps those orders (decision 0157 item 3d).
+    _names: Names,
 }
 
 impl Registry {
@@ -543,6 +553,8 @@ impl Authorization {
     ) -> Result<Authorization, IssueRefusal> {
         let market = market_of(cmd.command())?;
         let origin = cmd.origin();
+        let mut cmd = cmd;
+        let names = cmd.take_names();
         let (cmd, guard, hold) = cmd.into_parts();
         let generation = guard
             .state
@@ -556,6 +568,7 @@ impl Authorization {
                 cmd,
                 guard,
                 trips: None,
+                _names: names,
             },
             origin,
             hold,

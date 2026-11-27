@@ -17,7 +17,10 @@
 //! withdrawn, it hands them back to its registry, which ends each not sent ([`Dropped`];
 //! decision 0084), so no held place is stranded. The [`Authorization`](crate::Authorization)
 //! issued from a place, a batch or an amend holds its orders, or the amend's build, until a
-//! gateway takes it over (decision 0152).
+//! gateway takes it over (decision 0152). Every command that names an order (a place, a batch
+//! item, an amend, a cancel, a cancel-many item or a tombstone) carries a share of each named
+//! order's handle, and so do its authorization and its handed form: while one lives, a
+//! retention pass keeps the order (decision 0157 item 3d).
 //!
 //! A cancel names its order by the reference design §4.9 orders, as the venue's
 //! [`OrderCaps`] declare them (0032): the venue id when it is known and a cancel can name it;
@@ -158,6 +161,9 @@ pub struct PermittedCommand {
     /// For a place or a batch, its hold on its orders, handed back to its registry when the
     /// command is dropped unauthorized and not withdrawn; nothing for any other command.
     hold: Hold,
+    /// A share of the handle of each order it names (decision 0157 item 3d): none for an
+    /// instrument cancel-all.
+    names: Names,
 }
 
 impl PermittedCommand {
@@ -168,12 +174,24 @@ impl PermittedCommand {
 
     /// The command, its guard and its hold, issued: for the authorization issued from it,
     /// which keeps the hold on a place's or a batch's orders until a gateway takes it over
-    /// (decision 0152).
+    /// (decision 0152). Its names go with it unless taken first ([`Self::take_names`]).
     pub(crate) fn into_parts(self) -> (VenueCommand, Guard, Hold) {
         let PermittedCommand {
             cmd, guard, hold, ..
         } = self;
         (cmd, guard, hold.issued())
+    }
+
+    /// Takes the shares of the handles of the orders it names, for what is issued from it or
+    /// the batch it joins to carry on (decision 0157 item 3d).
+    pub(crate) fn take_names(&mut self) -> Names {
+        std::mem::take(&mut self.names)
+    }
+
+    /// The command, carrying `names`, a share of the handle of each order it names.
+    pub(crate) fn naming(mut self, names: Vec<Arc<()>>) -> PermittedCommand {
+        self.names = Names::of(names);
+        self
     }
 
     /// Spends its hold on what its build reserved: its registry withdrew or released it itself.
@@ -182,8 +200,13 @@ impl PermittedCommand {
     }
 
     /// A cancel or a cancel-many a [`Cancellable`] permit of the registry `origin` built,
-    /// which nothing holds back at submit.
-    pub(crate) fn cancel(cmd: VenueCommand, origin: Instance) -> PermittedCommand {
+    /// which nothing holds back at submit, carrying `names`, a share of the handle of each
+    /// order it names.
+    pub(crate) fn cancel(
+        cmd: VenueCommand,
+        origin: Instance,
+        names: Vec<Arc<()>>,
+    ) -> PermittedCommand {
         debug_assert!(matches!(
             cmd,
             VenueCommand::Cancel(_) | VenueCommand::CancelMany(_)
@@ -194,6 +217,7 @@ impl PermittedCommand {
             built: None,
             guard: Guard::default(),
             hold: Hold::default(),
+            names: Names::of(names),
         }
     }
 
@@ -207,12 +231,14 @@ impl PermittedCommand {
             built: None,
             guard,
             hold: Hold::default(),
+            names: Names::default(),
         }
     }
 
     /// A place or a batch of places the registry `origin` admitted, as [`Self::guarded`],
     /// holding its orders: dropped unauthorized and not withdrawn, it hands them to `dropped`,
-    /// the registry's.
+    /// the registry's. Its registry gives it a share of each order's handle
+    /// ([`Self::naming`]).
     pub(crate) fn holding(
         cmd: VenueCommand,
         guard: Guard,
@@ -353,6 +379,42 @@ impl PartialEq for Hold {
 }
 
 impl Eq for Hold {}
+
+/// A share of the handle of each order a command names, which its authorization and its handed
+/// form carry on (decision 0157 item 3d): while one lives, a retention pass keeps the order. It
+/// is not part of what the command is: commands compare equal whatever they carry. Boxed, so it
+/// adds one pointer to every command, none for a command that names no order.
+#[derive(Default)]
+pub(crate) struct Names(Option<Box<Shares>>);
+
+/// The shares a [`Names`] carries.
+struct Shares(Vec<Arc<()>>);
+
+impl Names {
+    /// The shares `handles`.
+    pub(crate) fn of(handles: Vec<Arc<()>>) -> Names {
+        Names((!handles.is_empty()).then(|| Box::new(Shares(handles))))
+    }
+
+    /// The shares it carries.
+    pub(crate) fn into_handles(self) -> Vec<Arc<()>> {
+        self.0.map(|shares| shares.0).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Debug for Names {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Names({})", self.0.as_ref().map_or(0, |s| s.0.len()))
+    }
+}
+
+impl PartialEq for Names {
+    fn eq(&self, _: &Names) -> bool {
+        true
+    }
+}
+
+impl Eq for Names {}
 
 /// What a [`Cancellable`] permit built.
 #[derive(Eq, PartialEq, Debug)]
@@ -501,6 +563,7 @@ impl<'r> Live<'r> {
             built: Some((cid, build)),
             guard: self.guard,
             hold: Hold::default(),
+            names: Names::of(vec![self.rec.handle()]),
         })
     }
 }
@@ -664,6 +727,7 @@ impl<'r> Cancellable<'r> {
                 CancelChoice::Send(PermittedCommand::cancel(
                     VenueCommand::Cancel(cancel),
                     self.origin,
+                    vec![self.rec.handle()],
                 ))
             }
             None => {
@@ -731,20 +795,21 @@ pub(crate) fn tombstone_of(
             placement_nonce: None,
         }),
         origin,
+        vec![rec.handle()],
     ))
 }
 
-/// Splits `items` into cancel-many commands of one market each, at most `max_items` (above 0)
-/// items apiece, markets in id order and items in the order given, built by the registry
-/// `origin`.
+/// Splits `items`, each with a share of its order's handle, into cancel-many commands of one
+/// market each, at most `max_items` (above 0) items apiece, markets in id order and items in
+/// the order given, built by the registry `origin`; each carries its items' shares.
 pub(crate) fn batches(
-    items: Vec<CancelOrder>,
+    items: Vec<(CancelOrder, Arc<()>)>,
     max_items: u16,
     origin: Instance,
 ) -> Vec<PermittedCommand> {
-    let mut by_market: BTreeMap<InstrumentId, Vec<CancelOrder>> = BTreeMap::new();
+    let mut by_market: BTreeMap<InstrumentId, Vec<(CancelOrder, Arc<()>)>> = BTreeMap::new();
     for item in items {
-        by_market.entry(item.inst).or_default().push(item);
+        by_market.entry(item.0.inst).or_default().push(item);
     }
     let size = usize::from(max_items);
     by_market
@@ -753,7 +818,8 @@ pub(crate) fn batches(
             items
                 .chunks(size)
                 .map(|chunk| {
-                    PermittedCommand::cancel(VenueCommand::CancelMany(chunk.to_vec()), origin)
+                    let (cancels, names) = chunk.iter().cloned().unzip();
+                    PermittedCommand::cancel(VenueCommand::CancelMany(cancels), origin, names)
                 })
                 .collect::<Vec<_>>()
         })

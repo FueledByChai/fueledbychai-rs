@@ -225,6 +225,17 @@ impl Orphans {
     pub(crate) fn cooldown(&self, market: InstrumentId) -> Option<Cooldown> {
         self.cooldowns.get(&market).copied()
     }
+
+    /// Removes the orders in `gone`, which a retention pass forgets, from every market's
+    /// orphans, dropping a market left with none (decision 0157 item 4). The cooldowns and the
+    /// live sightings are unchanged: a sighting names only a client id the registry did not
+    /// hold.
+    pub(crate) fn forget(&mut self, gone: &HashSet<ClientOrderId>) {
+        self.by_market.retain(|_, cids| {
+            cids.retain(|cid| !gone.contains(cid));
+            !cids.is_empty()
+        });
+    }
 }
 
 impl Registry {

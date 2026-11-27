@@ -12,7 +12,10 @@
 //!   consumer runs fbc-oms's Unknown ladder through it on its own timer
 //!   ([`Link::ladder`](link::Link::ladder)), which queries each order on the ladder and sends
 //!   each tombstone cancel due, and it queries an unprotected order the registry holds ended or
-//!   not at all, so the session releases its market once the answer shows it ended.
+//!   not at all, so the session releases its market once the answer shows it ended. It runs
+//!   fbc-oms's retention pass under the consumer's bounds
+//!   ([`Link::retain_ended`](link::Link::retain_ended), decision 0157), which forgets the
+//!   terminal orders nothing can still read or answer.
 //! - [`not_ours`]: FBC-aoh5's classifier of cancels not ours, one per market. Its
 //!   [`CancelsNotOurs`](not_ours::CancelsNotOurs), under the consumer's span and window
 //!   ([`NotOursConfig`](not_ours::NotOursConfig)), tells a cancel of the same event as the one
