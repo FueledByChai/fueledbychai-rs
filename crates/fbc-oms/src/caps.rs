@@ -312,6 +312,21 @@ impl Exposure {
         }
     }
 
+    /// Whether an order bringing `adds` to the side passes 0158's refusal beside an order not
+    /// ours shown resting (decision 0158 item 2): on the side that reduces a known, non-zero
+    /// position, either keeping the side's total within the position's size or carrying the
+    /// venue's reduce-only flag (`flagged`; for a batch judged again at authorization, every one
+    /// of its orders on the side), whatever its size. This is 0108's test with an exception for
+    /// the flag, not 0112's: the caps still judge the order after it. It never admits larger
+    /// `adds` where it refuses smaller ones.
+    pub(crate) fn admit_beside_not_ours(&self, adds: Lots, flagged: bool) -> bool {
+        match self.admit_exit(true, adds) {
+            Ok(()) => true,
+            Err(ExitRefusal::CrossesZero { .. }) => flagged,
+            Err(_) => false,
+        }
+    }
+
     /// Whether the order `new` brings keeps the side within both of the market's caps: the
     /// inventory cap (0005's I6), `|pos + Σ resting same side + new| ≤ cap`, then the resting
     /// cap, `Σ resting same side + new ≤ cap`. A reducing order passes the inventory cap by what

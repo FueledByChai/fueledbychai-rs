@@ -120,6 +120,11 @@ pub enum AmendRefusal {
     /// the order is on `side`, which, at what it may fill once amended, does not reduce the
     /// known, non-zero position within its size.
     OrphanCooldown { inst: InstrumentId, side: Side },
+    /// An order not ours is shown resting on the market (decision 0158) and the order is on
+    /// `side`, where, at what it may fill once amended, it does not reduce the known, non-zero
+    /// position, or does and, placed without the venue's reduce-only flag, takes the side's
+    /// total past the position's size.
+    NotOursResting { inst: InstrumentId, side: Side },
 }
 
 /// A venue command this crate built: an amend, a cancel or a cancel-many of one market from a
@@ -464,6 +469,9 @@ pub struct Live<'r> {
     /// An orphan cooldown suppressed the market's adding side when the permit was given
     /// (decision 0108).
     suppressed: bool,
+    /// An order not ours was shown resting on the market when the permit was given (decision
+    /// 0158).
+    held: bool,
     /// The market's state generation then, and in Exit its position revision, which the
     /// amend's authorization is checked against at submit (decisions 0060, 0066).
     guard: Guard,
@@ -475,7 +483,7 @@ impl<'r> Live<'r> {
         rec: &'r mut OrderRecord,
         origin: Instance,
         state: Result<Admits, StateRefusal>,
-        suppressed: bool,
+        (suppressed, held): (bool, bool),
         guard: Guard,
         exposure: Exposure,
     ) -> Result<Live<'r>, PermitRefusal> {
@@ -485,6 +493,7 @@ impl<'r> Live<'r> {
             origin,
             state,
             suppressed,
+            held,
             guard,
             exposure,
         })
@@ -518,6 +527,12 @@ impl<'r> Live<'r> {
     /// known, non-zero position and the side's orders, this one at what it may fill once
     /// amended, stay within the position's size ([`AmendRefusal::OrphanCooldown`]).
     ///
+    /// While an order not ours is shown resting on the market (decision 0158), refused after
+    /// that and before Exit's admission and either cap unless the order is on the side that
+    /// reduces the known, non-zero position and, unless placed with the venue's reduce-only
+    /// flag, the side's orders, this one at what it may fill once amended, stay within the
+    /// position's size ([`AmendRefusal::NotOursResting`]).
+    ///
     /// Refused, never built, when the amend would take the worst case on the order's side past
     /// its market's inventory cap (0005's I6; an order placed with the venue's reduce-only flag
     /// passes it whenever the amended order strictly shrinks the side's worst case, decision
@@ -548,7 +563,7 @@ impl<'r> Live<'r> {
         let (amend, wire) = judge_amend(
             &*self.rec,
             caps,
-            (self.state, self.suppressed),
+            (self.state, self.suppressed, self.held),
             &self.exposure,
             (px, qty, reducing),
         )?;
@@ -596,12 +611,13 @@ pub(crate) fn live_refusal(rec: &OrderRecord) -> Result<(), PermitRefusal> {
 /// total `qty` with its wire quantity, as the venue's `caps` shape it, refused when the market's
 /// `state` builds no such amend, an orphan cooldown suppresses the market's adding side
 /// (`suppressed`) and the amend does not reduce the position within its size (decision 0108),
-/// or the amend would take `exposure` (the side's position and our other orders on it) past
-/// either pre-trade cap.
+/// an order not ours is shown resting on the market (`held`) and 0158's refusal refuses the
+/// amend, or the amend would take `exposure` (the side's position and our other orders on it)
+/// past either pre-trade cap.
 pub(crate) fn judge_amend(
     rec: &OrderRecord,
     caps: &OrderCaps,
-    (state, suppressed): (Result<Admits, StateRefusal>, bool),
+    (state, suppressed, held): (Result<Admits, StateRefusal>, bool, bool),
     exposure: &Exposure,
     (px, qty, reducing): (Ticks, Lots, bool),
 ) -> Result<(AmendOrder, Option<Lots>), AmendRefusal> {
@@ -613,6 +629,16 @@ pub(crate) fn judge_amend(
     if suppressed && exposure.admit_exit(true, adds).is_err() {
         let placed = rec.placed();
         return Err(AmendRefusal::OrphanCooldown {
+            inst: placed.inst,
+            side: placed.side,
+        });
+    }
+    // While an order not ours is shown resting, only an amend that reduces the position within
+    // its size, or one of an order carrying the venue's reduce-only flag on the reducing side,
+    // is built (decision 0158 item 2).
+    if held && !exposure.admit_beside_not_ours(adds, rec.placed().reduce_only) {
+        let placed = rec.placed();
+        return Err(AmendRefusal::NotOursResting {
             inst: placed.inst,
             side: placed.side,
         });

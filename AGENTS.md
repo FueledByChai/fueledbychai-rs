@@ -564,7 +564,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     registry that built the command, for the one account that registry is for, a place, batch
     or amend judged against the caps again at issue and released when refused, and refused at
     submit (`StaleAuthorization::PositionMoved`) once a fill or a resync moved its market's
-    position since its issue (since its build, in Exit or under an orphan cooldown; 0066, 0108,
+    position since its issue (since its build, in Exit, under an orphan cooldown or under 0158's
+    refusal; 0066, 0108,
     0153; `tests/quoting_submit.rs`), a place built
     and not yet authorized held by its command: withdrawn with it, or released by the
     registry's next mutating call once it is dropped unspent, with no outcome of it by client
@@ -594,7 +595,21 @@ holds two of them for one pull request. The rules after the three roles bind all
     compared and reported, never overwriting the inventory, and none seeding a market while its
     snapshot shows an open order with no client id under a venue id no order the registry holds
     had, a forgotten order of ours included (0157), each such order reported
-    (`ResyncReport::without_cid`, 0154); market states and arming (0012;
+    (`ResyncReport::without_cid`, 0154), and each order not ours that held a market and that it
+    shows gone named (`ResyncReport::not_ours_lifted`); while an order not ours (another
+    namespace's, non-canonical, or with no client id, under a venue id no order the registry holds
+    had or one of an order it holds as ended Lost or never sent) that an order event or a snapshot
+    row showed open rests on a market, a place, batch item or amend there refused
+    (`OmsError::NotOursResting`, `AmendRefusal::NotOursResting`; at authorization
+    `IssueRefusal::NotOursResting`) unless on the side that reduces the known, non-zero position and
+    within its size or carrying the venue's reduce-only flag, at build, at authorization and, once
+    authorized before the sighting, at submit (`StaleAuthorization::NotOursResting`), never a cancel
+    or an order Exit admits, lifted by its end, a trustworthy resync not listing it open, requested
+    at least the lag bound after the first order-entry epoch end or retention pass reported after it
+    was last shown, never earlier than the latest end already reported, or its venue id held as an
+    order of ours not ended Lost or never sent (0158;
+    `tests/not_ours_resting.rs`; named by `Registry::not_ours_shown` as a `NotOursShown`); market
+    states and arming (0012;
     `src/entry.rs`, `tests/states.rs`): each market armed or not and Killed, Cancel-only, Exit
     or Quoting, a fresh registry disarmed and Cancel-only, the state checked before the caps,
     Start, Flatten and Wind-down arming with the market lease (and the account lease where
@@ -635,7 +650,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     consumer's `DesiredBook` diffed per side and level against the orders it placed for that
     account (each account's apart, planned through the one registry the account is bound to),
     under the consumer's `PlannerConfig` (basis-point and lot replace thresholds, a minimum
-    age), a change an amend where the venue's `OrderCaps` admit it and otherwise a cancel
+    age), a change an amend where the venue's `OrderCaps` admit it, and otherwise, or where 0158's
+    refusal would refuse the order as it rests, a cancel
     then, once the old order is terminal, a place, a PendingNew, Unknown or in-flight order
     occupying its level, each slot pinning its order through a handle until the planner frees
     the slot or is dropped (0157), every command built through the one pre-trade path and the
@@ -656,7 +672,8 @@ holds two of them for one pull request. The rules after the three roles bind all
     status, a `RateView` of each rate scope's room and floor, and a `Batching` choice): no
     place or amend a status or mode refuses, cancels in every mode, normal commands withheld at
     each scope's floor while cancels and reducing orders go out, and under
-    `Batching::Declared` places of one stage and cancels batched within the venue's declared
+    `Batching::Declared` places of one stage, never a crossing intent nor, under 0158's refusal, a
+    place carrying the venue's flag, and cancels batched within the venue's declared
     sizes and references (0111; `src/gates.rs`, `tests/gates.rs`); terminal-order retention
     (0157; `src/retain.rs`, `tests/retention.rs`, compile-fail cases in `tests/ui_retention/`):
     `RetentionConfig`, with no `Default`, refusing zero for each of its count, age and resync
@@ -667,7 +684,9 @@ holds two of them for one pull request. The rules after the three roles bind all
     resync's seed, or sharing a venue id with another order held), each counted by reason in
     `Retained`, and while it settles, until the venue's snapshot lag bound plus the resync bound
     after its stamp; of the others, each at least the age old forgotten, then the oldest while
-    more than the count remain, each removed in one step with every index entry naming it; and
+    more than the count remain, each removed in one step with every index entry naming it, its venue
+    ids, unless it ended never sent, kept as ended among the orders not ours for one more such floor
+    (0158); and
     per namespace a built span and an answer span of what it forgot, a late fill under a client
     id the first covers placed as its held record's would be, an outcome or a sent report under
     one the second covers answered as a terminal record's, and a place or an insert under one

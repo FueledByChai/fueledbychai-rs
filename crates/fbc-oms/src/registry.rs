@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use fbc_core::{
     AccountKey, CidMatch, ClientOrderId, FillOrigin, InstrumentId, ItemRef, Lots, MonoNs,
     Namespace, NewOrder, NotSentReason, OrderCaps, OrderUpdate, RpcId, Side, SignedLots,
-    SubmitOutcome, Ticks, VenueCommand, VenueFillKind, VenueOrderId,
+    SubmitOutcome, Ticks, VenueCommand, VenueFillKind, VenueOrderId, VenueOrderState,
 };
 
 use crate::audit::{Audit, AuditSink};
@@ -26,7 +26,9 @@ use crate::permit::{
     PlacePlan, Release, places_of,
 };
 use crate::planner::PlanRefusal;
-use crate::record::{Applied, FillApplied, OrderKey, OrderOp, OrderRecord, OutcomeApplied};
+use crate::record::{
+    Applied, FillApplied, OrdState, OrderKey, OrderOp, OrderRecord, OutcomeApplied, TerminalKind,
+};
 use crate::resync::{MarketState, Placed, Placement, Placing, Seed, VenuePlaced};
 use crate::retain::Spans;
 use crate::sweep::ForeignView;
@@ -54,7 +56,9 @@ pub struct Registry {
     /// 0012).
     pub(crate) entries: Entries,
     /// The orders not ours in view, which decide whether the kill switch's cancel everything
-    /// may be an instrument cancel-all (0005's I7; [`Registry::cancel_everything`]).
+    /// may be an instrument cancel-all (0005's I7; [`Registry::cancel_everything`]), and those
+    /// shown resting, which hold a market's places and amends that could add to its position
+    /// (decision 0158; [`Registry::not_ours_resting`]).
     pub(crate) foreign: ForeignView,
     /// The consumer's declaration of an owner-assisted testnet run, under which a market seeded
     /// by hand may be armed (decision 0067; [`Registry::for_testnet_run`]).
@@ -65,8 +69,9 @@ pub struct Registry {
     /// declaration (decision 0148 item 3).
     pub(crate) cod_probe: Option<CodProbeRun>,
     /// Per market, how many times its inventory moved: a place's, a batch's or an amend's
-    /// authorization is refused at submit once it moved since its build in Exit or under an
-    /// orphan cooldown (decisions 0066, 0108), or else since its authorization (decision 0153).
+    /// authorization is refused at submit once it moved since its build in Exit, under an
+    /// orphan cooldown or while an order not ours was shown resting there (decisions 0066, 0108,
+    /// 0158), or else since its authorization (decision 0153).
     positions: Counters,
     /// Which of the process's registries this is: the execution planner plans each account
     /// through one registry only (decision 0068), and only this registry authorizes or
@@ -224,6 +229,11 @@ pub enum OmsError {
     /// 0108) and the place or batch item is on `side`, which does not reduce the known,
     /// non-zero position within its size: it was never built.
     OrphanCooldown { inst: InstrumentId, side: Side },
+    /// An order not ours is shown resting on the market (decision 0158) and the place or batch
+    /// item is on `side`, where it does not reduce the known, non-zero position, or does and,
+    /// without the venue's reduce-only flag, takes the side's total past the position's size:
+    /// it was never built.
+    NotOursResting { inst: InstrumentId, side: Side },
 }
 
 impl fmt::Display for OmsError {
@@ -276,6 +286,11 @@ impl fmt::Display for OmsError {
                 f,
                 "the adding side of {inst:?} is suppressed for an orphan cooldown, and a \
                  {side:?} order does not reduce its position within its size"
+            ),
+            OmsError::NotOursResting { inst, side } => write!(
+                f,
+                "an order not ours is shown resting on {inst:?}, and a {side:?} order does not \
+                 reduce its position within its size or carry the venue's reduce-only flag there"
             ),
         }
     }
@@ -444,6 +459,9 @@ impl Registry {
         if self.orphan_suppressed(&exposure, Adds::placing(qty).exposure) {
             return Err(OmsError::OrphanCooldown { inst, side });
         }
+        if self.not_ours_held(&exposure, qty, reduce_only) {
+            return Err(OmsError::NotOursResting { inst, side });
+        }
         judge_place(admits, &exposure, qty, (marked, reduce_only))
     }
 
@@ -466,10 +484,11 @@ impl Registry {
         let exposure = self.exposure_ending(placed.inst, placed.side, &[cid], ending);
         let state = self.entries.admits(placed.inst);
         let suppressed = self.orphans.cooldown(placed.inst).is_some();
+        let held = self.foreign.resting_on(placed.inst);
         permit::judge_amend(
             rec,
             caps,
-            (state, suppressed),
+            (state, suppressed, held),
             &exposure,
             (px, qty, reducing),
         )
@@ -626,9 +645,10 @@ impl Registry {
     }
 
     /// The guard of a place, a batch or an amend built now on `market`: its state generation,
-    /// checked again at submit (decision 0060), and, in Exit or while an orphan cooldown
-    /// suppresses its adding side, its position revision (0066, 0108); any other's
-    /// authorization watches the revision instead ([`Registry::authorize`], decision 0153).
+    /// checked again at submit (decision 0060), and, in Exit, while an orphan cooldown
+    /// suppresses its adding side or while an order not ours is shown resting there, its
+    /// position revision (0066, 0108, 0158); any other's authorization watches the revision
+    /// instead ([`Registry::authorize`], decision 0153).
     fn state_guard(&mut self, market: InstrumentId) -> Guard {
         let position = self.sized_position_watch(market);
         Guard::state(self.entries.watch(market), position)
@@ -637,12 +657,14 @@ impl Registry {
     /// `market`'s position revision now, watched for a command about to be built under it,
     /// while its admission is judged against the position: in Exit (decision 0066) and while
     /// an orphan cooldown suppresses the adding side (decision 0108; Reviewer B's RB840-2 on
-    /// PR #171). Such a command is refused at submit once a fill or a resync moved the
-    /// inventory since. `None` otherwise, when the position does not size the build: the
-    /// command's authorization watches it then (decision 0153).
+    /// PR #171), and while an order not ours is shown resting on the market (decision 0158 item
+    /// 2). Such a command is refused at submit once a fill or a resync moved the inventory
+    /// since. `None` otherwise, when the position does not size the build: the command's
+    /// authorization watches it then (decision 0153).
     fn sized_position_watch(&mut self, market: InstrumentId) -> Option<Watch> {
         (self.entries.admits(market) == Ok(Admits::ExitOnly)
-            || self.orphans.cooldown(market).is_some())
+            || self.orphans.cooldown(market).is_some()
+            || self.foreign.resting_on(market))
         .then(|| self.positions.watch(market))
     }
 
@@ -661,8 +683,9 @@ impl Registry {
     }
 
     /// The one pre-trade path of a place and a batch item: the market's state first (decision
-    /// 0012), then an orphan cooldown's suppression of the adding side (decision 0108), then,
-    /// in Exit, Exit's admission, then both caps (0013 rule 2).
+    /// 0012), then an orphan cooldown's suppression of the adding side (decision 0108), then
+    /// the refusal beside an order not ours shown resting (decision 0158), then, in Exit, Exit's
+    /// admission, then both caps (0013 rule 2).
     fn admit_placement(&self, order: &NewOrder) -> Result<(), OmsError> {
         let admits = self.entries.admits(order.inst).map_err(OmsError::State)?;
         if self.orders.contains_key(&order.cid) || self.forgot_here(order.cid) {
@@ -671,6 +694,12 @@ impl Registry {
         let exposure = self.exposure(order.inst, order.side, &[]);
         if self.orphan_suppressed(&exposure, Adds::placing(order.qty).exposure) {
             return Err(OmsError::OrphanCooldown {
+                inst: order.inst,
+                side: order.side,
+            });
+        }
+        if self.not_ours_held(&exposure, order.qty, order.reduce_only) {
+            return Err(OmsError::NotOursResting {
                 inst: order.inst,
                 side: order.side,
             });
@@ -721,6 +750,43 @@ impl Registry {
         self.by_vid.get(vid).copied()
     }
 
+    /// Whether the registry holds `vid` as an order of ours not ended Lost or never sent: such
+    /// an order is that order, whatever client id an event or a row carries, and no order not
+    /// ours is shown resting under it (decision 0158 item 1).
+    ///
+    /// The index names the order that learnt `vid` first. When that order counts on neither
+    /// cap, a live order of ours that learnt `vid` since holds it all the same, as it did when it
+    /// learnt it (item 4).
+    pub(crate) fn held_live(&self, vid: &VenueOrderId) -> bool {
+        match self.cid_of(vid).and_then(|cid| self.orders.get(&cid)) {
+            None => false,
+            Some(rec) if !counts_on_neither(rec.state()) => true,
+            Some(_) => self
+                .orders
+                .values()
+                .any(|rec| !counts_on_neither(rec.state()) && rec.known_vids().any(|v| v == vid)),
+        }
+    }
+
+    /// Whether an order not ours is shown resting on the market of our order `rec` and `rec`,
+    /// as it rests, would be refused beside it (decision 0158 item 2): the planner cancels such
+    /// an order the consumer moves, and places it again once it has ended.
+    pub(crate) fn not_ours_pulls(&self, rec: &OrderRecord) -> bool {
+        let placed = rec.placed();
+        self.foreign.resting_on(placed.inst)
+            && !self
+                .exposure(placed.inst, placed.side, &[placed.cid])
+                .admit_beside_not_ours(rec.exposure(), placed.reduce_only)
+    }
+
+    /// Whether a place or batch item on `exposure`'s side bringing `qty` (carrying the venue's
+    /// reduce-only flag when `flagged`) is refused while an order not ours is shown resting on
+    /// its market (decision 0158 item 2).
+    fn not_ours_held(&self, exposure: &Exposure, qty: Lots, flagged: bool) -> bool {
+        self.foreign.resting_on(exposure.inst)
+            && !exposure.admit_beside_not_ours(Adds::placing(qty).exposure, flagged)
+    }
+
     /// Every venue id the registry knows the order `cid` by.
     pub(crate) fn vids_of(&self, cid: ClientOrderId) -> impl Iterator<Item = &VenueOrderId> {
         self.by_vid
@@ -729,11 +795,26 @@ impl Registry {
             .map(|(vid, _)| vid)
     }
 
-    /// Removes every venue id the index maps to an order in `gone`, which a retention pass
-    /// forgets (decision 0157 item 4): ids a fill taught included, so no index names a record
-    /// that is gone.
-    pub(crate) fn unindex(&mut self, gone: &HashSet<ClientOrderId>) {
-        self.by_vid.retain(|_, cid| !gone.contains(cid));
+    /// Removes every venue id the index maps to an order in `gone`, which a retention pass at
+    /// `now` forgets (decision 0157 item 4): ids a fill taught included, so no index names a
+    /// record that is gone. Each such id of an order in `kept`, on the market it names, is kept
+    /// as ended among the orders not ours, stamped `now` (decision 0158 item 6).
+    pub(crate) fn unindex(
+        &mut self,
+        gone: &HashSet<ClientOrderId>,
+        kept: &HashMap<ClientOrderId, InstrumentId>,
+        now: MonoNs,
+    ) {
+        let foreign = &mut self.foreign;
+        self.by_vid.retain(|vid, cid| {
+            if !gone.contains(cid) {
+                return true;
+            }
+            if let Some(&market) = kept.get(cid) {
+                foreign.forgotten(market, vid, now);
+            }
+            false
+        });
     }
 
     /// How many orders the registry holds: those a retention pass forgot are not among them
@@ -754,6 +835,14 @@ impl Registry {
     /// namespace's, a non-canonical client id, or no client id and a venue id no order of ours
     /// had) moves that order into or out of view ([`Registry::foreign_in_view`]).
     ///
+    /// Apart from the view, an update under another namespace's, a non-canonical or no client
+    /// id, under no venue id or one no order the registry holds had or one of an order it holds
+    /// as ended Lost or never sent, shows that order resting when it is open or amended, and an
+    /// end shows it gone ([`Registry::not_ours_resting`], decision 0158 items 1 and 4); an end or
+    /// an amend under a new id of an order shown resting does so whatever client id it carries,
+    /// and an end under a venue id no order of ours not ended Lost or never sent holds keeps that
+    /// id as ended (item 6).
+    ///
     /// Every update is a raw order event for the audit sink (decision 0005, I8;
     /// [`Registry::set_audit_sink`]): it reaches the sink before any of it is applied, and the
     /// verdict this returns follows it there, whatever it is (ignored late, stale or for a
@@ -762,6 +851,7 @@ impl Registry {
     pub fn apply_update(&mut self, u: &OrderUpdate, key: OrderKey) -> Routed {
         let seq = self.audit.received(u, key);
         let routed = self.route_update(u, key);
+        self.shown_by_update(u);
         // The consumer's tag and removal reason of the order it went to (0098).
         let rec = match &routed {
             Routed::Ours(cid, _) => self.orders.get(cid),
@@ -816,6 +906,60 @@ impl Registry {
         };
         let applied = self.with_record(cid, |rec| rec.apply_update(u, key));
         Routed::Ours(cid, applied)
+    }
+
+    /// What `u`, already routed, shows of an order not ours resting (decision 0158 items 1, 4
+    /// and 6).
+    fn shown_by_update(&mut self, u: &OrderUpdate) {
+        let live = u.vid.as_ref().is_some_and(|v| self.held_live(v));
+        let not_ours = !matches!(u.cid, Some(CidMatch::Ours(_)));
+        let terminal = !matches!(
+            u.state,
+            VenueOrderState::Open | VenueOrderState::Amended { .. }
+        );
+        let moves = terminal || matches!(u.state, VenueOrderState::Amended { new_vid: Some(_) });
+        if not_ours && !live {
+            self.not_ours_update(u);
+        } else if moves
+            && u.vid
+                .as_ref()
+                .is_some_and(|v| self.foreign.has_sighting(u.inst, v))
+        {
+            // An end or a move of an order shown resting, under our client id: one of an order
+            // ended Lost or never sent, or one the registry does not hold (item 4).
+            self.not_ours_update(u);
+        } else if terminal && !live {
+            // An end under a venue id no order of ours holds live: kept as ended (item 6).
+            self.foreign.ended(u.inst, u.vid.as_ref());
+        }
+    }
+
+    /// An order event of an order not ours (decision 0158 item 1): open or amended in place, it
+    /// is shown resting, stamped again; amended under a new id, it moves there unless an order of
+    /// ours not ended Lost or never sent holds that id or its old id is kept as ended (item 6);
+    /// ended, it is shown gone.
+    fn not_ours_update(&mut self, u: &OrderUpdate) {
+        match &u.state {
+            VenueOrderState::Open | VenueOrderState::Amended { new_vid: None } => {
+                self.foreign.shown(u.inst, u.vid.as_ref());
+            }
+            VenueOrderState::Amended { new_vid: Some(new) } => {
+                // An amend of an order kept as ended shows nothing resting, under either id
+                // (item 6).
+                let kept_ended = u
+                    .vid
+                    .as_ref()
+                    .is_some_and(|v| self.foreign.kept_ended(u.inst, v));
+                self.foreign.ended(u.inst, u.vid.as_ref());
+                if !kept_ended && !self.held_live(new) {
+                    self.foreign.shown(u.inst, Some(new));
+                }
+            }
+            VenueOrderState::Filled
+            | VenueOrderState::Canceled(_)
+            | VenueOrderState::Rejected(_)
+            | VenueOrderState::Expired => self.foreign.ended(u.inst, u.vid.as_ref()),
+        }
     }
 
     /// Seeds the position on `inst` by hand, from which the fills the ledger accepts then all
@@ -990,7 +1134,12 @@ impl Registry {
                 // another (an amend's new id, before the Amended update), so a later update
                 // naming only that id still reaches it.
                 if let Some(v) = fill.vid() {
-                    self.by_vid.entry(v.clone()).or_insert(cid);
+                    let held = *self.by_vid.entry(v.clone()).or_insert(cid);
+                    // Held as ours from now on, unless ended Lost or never sent (decision 0158
+                    // item 4): no order not ours rests under it.
+                    if held == cid && !counts_on_neither(self.orders[&cid].state()) {
+                        self.foreign.learnt(v);
+                    }
                 }
                 FillRouted::Ours(cid, applied)
             }
@@ -1201,8 +1350,14 @@ impl Registry {
     /// now, must stay within both caps ([`IssueRefusal::Capped`]), and, while an orphan
     /// cooldown suppresses the market's adding side, reduce the known, non-zero position
     /// within its size as at build ([`IssueRefusal::OrphanCooldown`]; decision 0108, Reviewer
-    /// B's RB840-2 on PR #171). Cancels and cancel-alls pass, as they pass at build.
-    pub(crate) fn rejudge(&self, cmd: &PermittedCommand) -> Result<(), IssueRefusal> {
+    /// B's RB840-2 on PR #171), and, while an order not ours is shown resting on the market,
+    /// pass 0158's refusal as at build ([`IssueRefusal::NotOursResting`]). Cancels and
+    /// cancel-alls pass, as they pass at build.
+    ///
+    /// Admitted, it says whether 0158's refusal would refuse the place, batch or amend if an
+    /// order not ours came to be shown resting on its market (decision 0158 item 7); false for
+    /// a cancel or a cancel-all.
+    pub(crate) fn rejudge(&self, cmd: &PermittedCommand) -> Result<bool, IssueRefusal> {
         let cids = match (cmd.command(), cmd.built()) {
             (VenueCommand::Amend(_), Some((cid, build))) => {
                 if !self.orders.get(&cid).is_some_and(|r| r.holds_build(build)) {
@@ -1220,8 +1375,9 @@ impl Registry {
                 }
                 cids
             }
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
+        let mut beside = true;
         for side in [Side::Buy, Side::Sell] {
             let ours: Vec<&OrderRecord> = cids
                 .iter()
@@ -1243,17 +1399,22 @@ impl Registry {
             };
             let inst = first.placed().inst;
             let exposure = self.exposure(inst, side, &cids);
+            // The venue's reduce-only exemption holds for the side only when every order of
+            // the command on it carries the flag (decision 0112), for 0158's refusal too.
+            let flagged = ours.iter().all(|r| r.placed().reduce_only);
             if self.orphan_suppressed(&exposure, adds.exposure) {
                 return Err(IssueRefusal::OrphanCooldown { inst, side });
             }
-            // The venue's reduce-only exemption holds for the side only when every order of
-            // the command on it carries the flag (decision 0112).
-            let flagged = ours.iter().all(|r| r.placed().reduce_only);
+            let admitted = exposure.admit_beside_not_ours(adds.exposure, flagged);
+            if !admitted && self.foreign.resting_on(inst) {
+                return Err(IssueRefusal::NotOursResting { inst, side });
+            }
+            beside &= admitted;
             exposure
                 .admit(adds, flagged)
                 .map_err(IssueRefusal::Capped)?;
         }
-        Ok(())
+        Ok(!beside)
     }
 
     /// Releases what `cmd`, a command this registry built and refused at authorization,
@@ -1320,13 +1481,14 @@ impl Registry {
         let exposure = self.exposure(placed.inst, placed.side, &[cid]);
         let state = self.entries.admits(placed.inst);
         let suppressed = self.orphans.cooldown(placed.inst).is_some();
+        let held = self.foreign.resting_on(placed.inst);
         let guard = self.state_guard(placed.inst);
         let origin = self.instance;
         let rec = self
             .orders
             .get_mut(&cid)
             .expect("the order was found above");
-        Live::check(rec, origin, state, suppressed, guard, exposure)
+        Live::check(rec, origin, state, (suppressed, held), guard, exposure)
     }
 
     /// The permit to cancel our order `cid`: it is not terminal (PendingNew, Unknown and an
@@ -1500,7 +1662,9 @@ impl Registry {
             .is_some_and(|release| self.release_held(release))
     }
 
-    /// Runs `change` on the registered order `cid`, then indexes every venue id it has.
+    /// Runs `change` on the registered order `cid`, then indexes every venue id it has; unless
+    /// it ended Lost or never sent, no order not ours is shown resting under any of them from
+    /// then on (decision 0158 item 4).
     pub(crate) fn with_record<R>(
         &mut self,
         cid: ClientOrderId,
@@ -1514,8 +1678,25 @@ impl Registry {
         for vid in rec.known_vids() {
             self.by_vid.entry(vid.clone()).or_insert(cid);
         }
+        // Defensive: no `change` today gives a record ended Lost or never sent a venue id it did
+        // not know (a terminal record absorbs every update; the fill path indexes one apart,
+        // under its own guard), but should one, it lifts nothing (item 4).
+        if !counts_on_neither(rec.state()) {
+            for vid in rec.known_vids() {
+                self.foreign.learnt(vid);
+            }
+        }
         out
     }
+}
+
+/// Whether an order in `state` counts on neither cap though the registry holds it: ended Lost
+/// or never sent (decision 0158 item 1).
+fn counts_on_neither(state: OrdState) -> bool {
+    matches!(
+        state,
+        OrdState::Terminal(TerminalKind::Lost | TerminalKind::NotSent(_))
+    )
 }
 
 /// Whether a place of `qty` on `exposure`'s side (reduce-only or classified reducing when

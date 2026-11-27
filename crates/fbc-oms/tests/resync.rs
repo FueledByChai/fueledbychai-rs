@@ -264,6 +264,14 @@ fn the_first_resync_seeds_the_positions_and_registers_our_open_orders() {
     // An earlier run's order is cancelled, never amended: its placement is not fully known.
     assert_eq!(reg.live(a).err(), Some(PermitRefusal::FromSnapshot(a)));
     assert!(reg.cancellable(a).is_ok());
+    // Another namespace's open order holds the market's adding side (decision 0158) until an
+    // order event ends it under its venue id.
+    assert!(reg.not_ours_resting(INST));
+    let mut gone_foreign = update(None, common::canceled(), 0);
+    gone_foreign.cid = Some(CidMatch::Foreign(Namespace::new(9)));
+    gone_foreign.vid = Some(vid("f"));
+    reg.apply_update(&gone_foreign, key(2));
+    assert!(!reg.not_ours_resting(INST));
     // The inventory cap counts its 25 unfilled lots once beside the seeded 25 (not its 25
     // filled ones again): a bid of one more lot is refused at 51, not 76.
     assert_eq!(place(&mut reg, placement(cid(), 100, 1)), Err(capped(51)));
@@ -1099,7 +1107,10 @@ fn a_resync_seeds_no_market_on_which_it_shows_an_open_order_without_a_client_id(
     assert!(report.seeded.is_empty());
     assert_eq!(report.without_cid.len(), 2);
     assert_eq!(reg.position(INST), None);
-    // A resync not showing it seeds the market, and orders are built on it.
+    // An order-entry epoch end stamps the two shown resting (decision 0158 item 5).
+    reg.order_entry_epoch_ended(MonoNs(2_000));
+    // A resync not showing it, requested at least the lag bound after that stamp, seeds the
+    // market and shows both gone, and orders are built on it.
     let report = resync(
         &mut reg,
         &snapshot_at(3_000, 3_000, vec![shown(a, "a", 3, 0)], &pos),
@@ -1107,6 +1118,10 @@ fn a_resync_seeds_no_market_on_which_it_shows_an_open_order_without_a_client_id(
     assert!(report.without_cid.is_empty());
     assert_eq!(report.seeded, vec![(INST, SignedLots(0))]);
     assert_eq!(reg.position(INST), Some(SignedLots(0)));
+    assert_eq!(
+        report.not_ours_lifted,
+        vec![(INST, Some(vid("t"))), (INST, Some(vid("u")))]
+    );
     place(&mut reg, placement(cid(), 100, CAP - 3)).unwrap();
 }
 
@@ -1149,12 +1164,14 @@ fn a_fill_naming_an_order_shown_without_a_client_id_is_placed_by_the_seed_that_d
     assert_eq!(reg.position(INST), Some(SignedLots(10)));
 }
 
-/// Decision 0154's residual: on a market seeded before, a resync showing such an order reports
-/// it and does nothing else. The caps still do not count it: with the position flat and a bare
-/// bid of `L0` resting, a bid of the whole inventory cap is admitted, a worst case past the cap
-/// by the bare bid's size (Reviewer B's scratch test on PR #80).
+/// Decision 0154's residual, closed by decision 0158: on a market seeded before, a resync
+/// showing such an order reports it. The caps still do not count it, but while it is shown
+/// resting, with the position flat and a bare bid of `L0` resting, a bid of the whole inventory
+/// cap is refused rather than admitted at a worst case past the cap by the bare bid's size
+/// (Reviewer B's scratch test on PR #80). A later trustworthy resync not showing it, requested
+/// after an epoch end stamped it, shows it gone, and the bid is admitted.
 #[test]
-fn on_a_seeded_market_an_open_order_without_a_client_id_is_reported_and_not_counted() {
+fn on_a_seeded_market_an_open_order_without_a_client_id_is_reported_and_holds_places() {
     let mut reg = registry();
     resync(&mut reg, &snapshot(vec![], &[(INST, 0)]));
     let report = resync(
@@ -1172,6 +1189,18 @@ fn on_a_seeded_market_an_open_order_without_a_client_id_is_reported_and_not_coun
     );
     assert_eq!(reg.position(INST), Some(SignedLots(0)));
     assert_eq!(reg.resting_on(INST, Side::Buy), Some(lots(0)));
+    assert!(reg.not_ours_resting(INST));
+    assert_eq!(
+        place(&mut reg, placement(cid(), 100, CAP)),
+        Err(OmsError::NotOursResting {
+            inst: INST,
+            side: Side::Buy
+        })
+    );
+    reg.order_entry_epoch_ended(MonoNs(2_000));
+    let report = resync(&mut reg, &snapshot_at(3_000, 3_000, vec![], &[(INST, 0)]));
+    assert_eq!(report.not_ours_lifted, vec![(INST, Some(vid("u")))]);
+    assert!(!reg.not_ours_resting(INST));
     place(&mut reg, placement(cid(), 100, CAP)).unwrap();
 }
 

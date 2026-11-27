@@ -37,7 +37,9 @@ pub enum Batching {
     /// of at most `batch_place.max_items`, and the pass's cancels in cancel-manys of at most
     /// `batch_cancel.max_items`, each item naming a reference the batch declares
     /// (`batch_cancel.refs`), any other going as a single cancel. A run of one goes as a
-    /// single command.
+    /// single command. A crossing intent always goes alone, and so, while an order not ours is
+    /// shown resting on the market, does every place carrying the venue's reduce-only flag
+    /// (decisions 0111 item 4, 0158 item 3).
     Declared,
 }
 

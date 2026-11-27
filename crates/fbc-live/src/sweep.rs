@@ -36,7 +36,9 @@
 //!   when the venue states none, for the consumer's wait ([`RateHold::refused`]).
 //! - **How it ends** ([`SweepEnd`]). At Start and after a reconnect
 //!   ([`SweepEnd::BeforePlaces`]), once every order of ours the link holds live on the market has
-//!   ended and the session takes places there ([`ExecOrders::may_place_on`]). A cancel of the
+//!   ended and the session takes places there ([`ExecOrders::may_place_on`]). That end says
+//!   nothing of fbc-oms's own refusals: while an order not ours is shown resting on the market,
+//!   fbc-oms may still refuse a place there (decision 0158). A cancel of the
 //!   sweep's refused because its order already ended or is not known (`AlreadyTerminal`,
 //!   `NotFound`) waits for that end; one refused for any other reason but its rate fails the
 //!   sweep ([`SweepState::Failed`]). A refusal of a request not the sweep's fails nothing: the
@@ -148,7 +150,8 @@ fn nanos(d: Duration) -> u64 {
 pub enum SweepEnd {
     /// At Start and after a reconnect: once every order of ours on the market ended and the
     /// session takes places there, a refusal of one of its own cancels other than for its rate,
-    /// `AlreadyTerminal` or `NotFound` failing it.
+    /// `AlreadyTerminal` or `NotFound` failing it. fbc-oms may still refuse a place there while
+    /// an order not ours is shown resting on the market (decision 0158).
     BeforePlaces,
     /// At Stop: once every order of ours on the market ended and every request the sweep sent
     /// is answered, whatever the answers. Its requests are all on its market, so another

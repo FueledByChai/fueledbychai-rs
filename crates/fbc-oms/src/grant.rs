@@ -50,9 +50,12 @@
 //!   the market's position revision is also still the one it was built under, and any other
 //!   only while it is still the one it was authorized under: a fill or a seed that moved the
 //!   inventory since refuses it (decisions 0066, 0108 and 0153; the caps were judged against
-//!   the position as it was authorized, decision 0082); and one authorized while its market
-//!   is in Quoting only while its registry was not
-//!   tripped to Cancel-only since its authorization, which the shard's journal does at its soft
+//!   the position as it was authorized, decision 0082); one built while an order not ours was
+//!   shown resting on its market watches the position from its build too, and one authorized
+//!   while none was that 0158's refusal would have refused beside one goes through only while
+//!   none has come to be shown resting there since (decision 0158 item 7); and one authorized
+//!   while its market is in Quoting only while its registry was not tripped to Cancel-only
+//!   since its authorization, which the shard's journal does at its soft
 //!   limit, before the registry applies the trip to the market's state (a trip before its
 //!   authorization, applied then, moved its generation; a trip leaves Exit as it is, so one
 //!   authorized in Exit is not held back by it; decision 0139);
@@ -197,17 +200,20 @@ impl Generations {
 
 /// What a built command is re-checked against at submit ([`Handed::check_at_submit`]):
 /// nothing for a cancel or a cancel-many, the market's state generation for a place, a batch or
-/// an amend, with its position revision too, taken at its build in Exit (decision 0066) or
-/// under an orphan cooldown (decision 0108) and else at its authorization (decision 0153), and
-/// 0005's I7 inputs for an instrument cancel-all: the changes of the registry's hold of the
-/// market's exclusive lease and the foreign orders seen.
+/// an amend, with its position revision too, taken at its build in Exit (decision 0066), under
+/// an orphan cooldown (decision 0108) or while an order not ours was shown resting on the
+/// market (decision 0158) and else at its authorization (decision 0153), and 0005's I7 inputs
+/// for an instrument cancel-all: the changes of the registry's hold of the market's exclusive
+/// lease and the foreign orders seen. The authorization adds what only it watches: the trips to
+/// Cancel-only (decision 0139) and the sightings of orders not ours (decision 0158 item 7).
 #[derive(Default, Eq, PartialEq, Debug)]
 pub(crate) struct Guard {
     /// The market's state generation at build: a place, a batch or an amend.
     pub(crate) state: Option<Watch>,
     /// How many times the market's inventory moved, at build: a place, a batch or an amend
-    /// built in Exit, which Exit sized against the position then (decision 0066), or while an
-    /// orphan cooldown suppressed the market's adding side, which sized it too (decision 0108).
+    /// built in Exit, which Exit sized against the position then (decision 0066), while an
+    /// orphan cooldown suppressed the market's adding side, which sized it too (decision 0108),
+    /// or while an order not ours was shown resting there, which 0158's refusal sized it by.
     /// Any other place, batch or amend has none at build, and its authorization takes it then,
     /// as the caps are judged again against the position (decisions 0082, 0153).
     pub(crate) position: Option<Watch>,
@@ -262,6 +268,13 @@ pub enum IssueRefusal {
     /// suppresses the market's adding side (0005's I7, decision 0108): a fill or a resync moved
     /// the position since its build, or the cooldown began since. What it reserved is released.
     OrphanCooldown { inst: InstrumentId, side: Side },
+    /// Judged again as it is authorized, the place, batch item or amend on `side` is refused
+    /// beside an order not ours shown resting on the market (decision 0158 item 2): it does not
+    /// reduce the known, non-zero position there, or does and, unless every order of the command
+    /// on the side carries the venue's reduce-only flag, takes the side's total past the
+    /// position's size. An order not ours came to be shown resting since its build, or a fill or
+    /// a resync moved the position since. What it reserved is released.
+    NotOursResting { inst: InstrumentId, side: Side },
     /// The order `cid` no longer holds what the command's build reserved: it ended since, or,
     /// for an amend, a later command was reported sent over the build (decision 0082). Nothing
     /// of the command is sent; what any other of its orders reserved is released.
@@ -306,6 +319,14 @@ impl fmt::Display for IssueRefusal {
                      {side:?} order no longer reduces its position within its size"
                 );
             }
+            IssueRefusal::NotOursResting { inst, side } => {
+                return write!(
+                    f,
+                    "an order not ours is shown resting on {inst:?}, and the {side:?} order does \
+                     not reduce its position within its size or carry the venue's reduce-only \
+                     flag there"
+                );
+            }
             IssueRefusal::NotOrderAffecting => "the command affects no order",
             IssueRefusal::AccountCancelAll => "no record admits an account cancel-all",
             IssueRefusal::EmptyBatch => "a batch with no item names no market",
@@ -337,9 +358,10 @@ pub enum StaleAuthorization {
     /// since), or lease names given again cover its held leases differently (0005's I7).
     ExclusiveLeaseChanged(InstrumentId),
     /// A fill or a resync moved the market's inventory since a place, a batch or an amend was
-    /// built in Exit, which Exit sized against the market's position then (decision 0066), or
+    /// built in Exit, which Exit sized against the market's position then (decision 0066),
     /// while an orphan cooldown suppressed the market's adding side, which sized it too
-    /// (decision 0108): sent, it could take the position across zero; or since any other was
+    /// (decision 0108), or while an order not ours was shown resting there (decision 0158): sent,
+    /// it could take the position across zero; or since any other was
     /// authorized, its caps judged against the position then (decisions 0082, 0153): sent, it
     /// could take the position past the inventory cap.
     PositionMoved(InstrumentId),
@@ -350,6 +372,12 @@ pub enum StaleAuthorization {
     /// [`StaleAuthorization::StateChanged`]: the authorization applied the trip. One authorized
     /// in Exit is not refused for a trip, which leaves Exit as it is.
     CancelOnly(InstrumentId),
+    /// A place, a batch or an amend authorized while no order not ours was shown resting on its
+    /// market, which 0158's refusal would have refused beside one, and an order not ours came to
+    /// be shown resting there since (decision 0158 item 7): sent, it could add to the position
+    /// beside that order. One the refusal admits beside such an order, every order Exit admits
+    /// and a crossing intent included, is not refused for it.
+    NotOursResting(InstrumentId),
 }
 
 impl fmt::Display for StaleAuthorization {
@@ -381,6 +409,12 @@ impl fmt::Display for StaleAuthorization {
                 f,
                 "market {} was moved from Quoting to Cancel-only with every Quoting market of its \
                  registry since the command was authorized: the journal reached its soft limit",
+                market.get()
+            ),
+            StaleAuthorization::NotOursResting(market) => write!(
+                f,
+                "an order not ours came to be shown resting on market {} since the command was \
+                 authorized, and the command does not reduce the position beside it",
                 market.get()
             ),
         }
@@ -443,6 +477,11 @@ struct Grant {
     /// How many times the registry was tripped to Cancel-only, as it authorized a place, a
     /// batch or an amend on a market in Quoting, the one state a trip moves (decision 0139).
     trips: Option<Watch>,
+    /// How many times an order not ours came to be shown resting on the market with none
+    /// before, as it authorized a place, a batch or an amend that 0158's refusal would refuse
+    /// beside one while none was (decision 0158 item 7). `None` for any other command, and for
+    /// one the refusal admits beside such an order, which a sighting never voids.
+    not_ours: Option<Watch>,
     /// A share of the handle of each order the command names, held for its drop alone: while
     /// it lives a retention pass keeps those orders (decision 0157 item 3d).
     _names: Names,
@@ -484,6 +523,14 @@ impl Registry {
     /// ([`StaleAuthorization::PositionMoved`], decision 0153). A cancel, a cancel-many and an
     /// instrument cancel-all watch no position.
     ///
+    /// While an order not ours is shown resting on its market, a place, a batch or an amend is
+    /// refused unless 0158's refusal admits it beside that order ([`IssueRefusal::NotOursResting`];
+    /// a batch's side counts the venue's reduce-only flag only when every order of it on the side
+    /// carries it, decision 0112). One authorized while none is, that the refusal would refuse
+    /// beside one, watches how many times one came to be shown resting there, and is refused at
+    /// submit once one has ([`StaleAuthorization::NotOursResting`], decision 0158 item 7); one
+    /// the refusal admits beside such an order takes no such watch, so a sighting never voids it.
+    ///
     /// Refused for a command that affects no order, an account cancel-all, an empty batch or a
     /// batch naming more than one market, none of which this crate builds.
     pub fn authorize(
@@ -505,12 +552,15 @@ impl Registry {
             Some(bound) if bound != acct => Err(IssueRefusal::OtherAccount { acct, bound }),
             _ => self.rejudge(&cmd),
         };
-        if let Err(refusal) = judged {
-            let mut cmd = cmd;
-            self.release(&cmd);
-            cmd.spend_hold();
-            return Err(refusal);
-        }
+        let refused_beside = match judged {
+            Ok(refused_beside) => refused_beside,
+            Err(refusal) => {
+                let mut cmd = cmd;
+                self.release(&cmd);
+                cmd.spend_hold();
+                return Err(refusal);
+            }
+        };
         self.issued(acct, &cmd);
         // An amend's authorization holds its build until a gateway takes it over (decision
         // 0152); a place's or a batch's holds its orders, as its command did.
@@ -535,6 +585,12 @@ impl Registry {
         // keeps the watch its build took (decisions 0066, 0108).
         if auth.grant.guard.state.is_some() && auth.grant.guard.position.is_none() {
             auth.grant.guard.position = Some(self.watch_position(market));
+        }
+        // A place, a batch or an amend 0158's refusal would refuse beside an order not ours,
+        // authorized while none is shown resting on its market, is refused at submit once one
+        // comes to be (decision 0158 item 7); one the refusal admits beside one is not.
+        if refused_beside {
+            auth.grant.not_ours = Some(self.foreign.watch_resting(market));
         }
         if let Some((cid, build)) = built {
             auth.hold = Hold::on(self.dropped(), Release::Amend(cid, build));
@@ -568,6 +624,7 @@ impl Authorization {
                 cmd,
                 guard,
                 trips: None,
+                not_ours: None,
                 _names: names,
             },
             origin,
@@ -629,7 +686,10 @@ impl Handed {
     /// ([`StaleAuthorization::StateChanged`]), and one built in Exit, or while an orphan
     /// cooldown suppressed its market's adding side, also once a fill or a resync moved its
     /// market's inventory since, and any other once one moved it since its authorization
-    /// ([`StaleAuthorization::PositionMoved`], decisions 0066, 0108 and 0153); an instrument
+    /// ([`StaleAuthorization::PositionMoved`], decisions 0066, 0108 and 0153), and one whose
+    /// authorization 0158's refusal would have refused beside an order not ours once one came to
+    /// be shown resting on its market since ([`StaleAuthorization::NotOursResting`], decision
+    /// 0158 item 7); an instrument
     /// cancel-all once the registry's
     /// hold of its market's exclusive lease changed since
     /// ([`StaleAuthorization::ExclusiveLeaseChanged`]) or an order not ours was seen on its
@@ -714,6 +774,11 @@ impl Grant {
                         .is_some() =>
                 {
                     Err(StaleAuthorization::PositionMoved(self.market))
+                }
+                // An order not ours came to be shown resting since its authorization, beside
+                // which it is refused (decision 0158 item 7); no watch, nothing to refuse.
+                Some(None) if self.not_ours.as_ref().and_then(Watch::moved).is_some() => {
+                    Err(StaleAuthorization::NotOursResting(self.market))
                 }
                 Some(None) => Ok(()),
                 now => Err(StaleAuthorization::StateChanged {

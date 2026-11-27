@@ -1926,6 +1926,78 @@ fn forgotten_ids_come_into_view() {
     assert_eq!(resync(&mut twin, &caps(), &s).untracked, vec![]);
 }
 
+/// Decision 0158 item 6: each venue id of a forgotten order not ended never sent is kept as
+/// ended among the orders not ours for one more floor, stamped with the pass's `now`. While it
+/// is kept, a late open event naming that id alone shows nothing resting, and only a trustworthy
+/// row requested at or after the pass's `now` plus the lag bound shows it again; once a later
+/// pass prunes it, the late event holds the market. A forgotten order that ended never sent
+/// leaves no ended entry: a late event under a venue id a fill taught it holds the market.
+#[test]
+fn a_forgotten_orders_venue_ids_are_kept_as_ended() {
+    let keep = cfg(1_000, Duration::from_millis(1));
+    let t1 = ms(10_000);
+    let one = Duration::from_nanos(1);
+    let forgotten = || {
+        let mut reg = quoting();
+        let c = cid();
+        open_as(&mut reg, c, "vf");
+        end(&mut reg, c);
+        pass(&mut reg, &keep, t1);
+        let forget = floor(t1);
+        assert_eq!(pass(&mut reg, &keep, forget).forgotten, vec![c]);
+        (reg, forget)
+    };
+    let (mut reg, forget) = forgotten();
+    upd(&mut reg, None, Some("vf"), VenueOrderState::Open, 0);
+    assert!(!reg.not_ours_resting(INST));
+    // A pass short of the floor past the forget keeps the ended entry.
+    pass(&mut reg, &keep, forget + (LAG + RESYNC - one));
+    upd(&mut reg, None, Some("vf"), VenueOrderState::Open, 0);
+    assert!(!reg.not_ours_resting(INST));
+    // One at the floor prunes it: the late event holds the market.
+    pass(&mut reg, &keep, floor(forget));
+    upd(&mut reg, None, Some("vf"), VenueOrderState::Open, 0);
+    assert!(reg.not_ours_resting(INST));
+    assert_eq!(
+        admits(&mut reg, 1),
+        Err(OmsError::NotOursResting {
+            inst: INST,
+            side: Side::Buy
+        })
+    );
+    // A trustworthy row requested before the forget's `now` plus the lag bound holds nothing;
+    // one requested at or after it holds the market.
+    let (mut reg, forget) = forgotten();
+    let shown = || vec![row(None, "vf", VenueOrderState::Open, 0)];
+    resync(&mut reg, &caps(), &snap(forget + (LAG - one), shown(), 0));
+    assert!(!reg.not_ours_resting(INST));
+    resync(&mut reg, &caps(), &snap(forget + LAG, shown(), 0));
+    assert!(reg.not_ours_resting(INST));
+    // An order ended never sent, its authorization refused, then taught a venue id by a late
+    // fill under its client id: forgotten, it leaves no ended entry.
+    let mut l = ledger();
+    let mut reg = quoting();
+    reg.bind_account(TEST_ACCT).unwrap();
+    let c = cid();
+    let cmd = reg.place(placement(c, 100, 1)).unwrap();
+    assert!(reg.authorize(AccountKey::new(99), cmd).is_err());
+    assert_eq!(
+        reg.get(c).unwrap().state(),
+        OrdState::Terminal(TerminalKind::NotSent(NotSentReason::StaleAuthorization))
+    );
+    apply(
+        &mut reg,
+        &mut l,
+        &fill_event(Some(c), Some("vn"), None, &fid()),
+        ms(3),
+    );
+    assert_eq!(reg.cid_of(&vid("vn")), Some(c));
+    pass(&mut reg, &keep, t1);
+    assert_eq!(pass(&mut reg, &keep, floor(t1)).forgotten, vec![c]);
+    upd(&mut reg, None, Some("vn"), VenueOrderState::Open, 0);
+    assert!(reg.not_ours_resting(INST));
+}
+
 #[test]
 fn untrustworthy_fill_sights_nothing() {
     let keep = cfg(1_000, Duration::from_millis(1));

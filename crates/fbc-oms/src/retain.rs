@@ -27,6 +27,7 @@ use std::time::Duration;
 use fbc_core::{ClientOrderId, MonoNs, Namespace, OrderCaps, VenueOrderId};
 
 use crate::ladder;
+use crate::record::{OrdState, TerminalKind};
 use crate::registry::Registry;
 
 /// The retention pass's numbers: the consumer's configuration, with no defaults (decision 0157
@@ -204,7 +205,7 @@ fn within(spans: &Spans, cid: ClientOrderId) -> bool {
 /// Whether `now` is at least `after` past `stamp` on the monotonic clock. An instant past the
 /// clock's end is never reached, so a floor or an age that would end there holds for good,
 /// even at the clock's last instant.
-fn reached(now: MonoNs, stamp: MonoNs, after: Duration) -> bool {
+pub(crate) fn reached(now: MonoNs, stamp: MonoNs, after: Duration) -> bool {
     u64::try_from(after.as_nanos())
         .ok()
         .and_then(|after| stamp.0.checked_add(after))
@@ -242,6 +243,14 @@ impl Registry {
     /// journaled timer, after reading the notes of the events before it, and records each
     /// amend's, cancel's and tombstone's send report before it
     /// ([`OrderGateway::submit`](crate::OrderGateway::submit)).
+    ///
+    /// It also stamps every order not ours shown resting, and every venue id kept as ended, not
+    /// yet stamped with the larger of `now` and the latest order-entry epoch end reported
+    /// (decision 0158 item 5); keeps each venue id the index gives a forgotten order not ended
+    /// never sent as ended, stamped `now`; and forgets each venue id kept as ended whose stamp
+    /// is the floor above before `now` (item 6). The consumer passes `now` on the shard's clock,
+    /// no earlier than the arrival of every order event and snapshot it has applied to the
+    /// registry before the call, from any session on the account.
     pub fn retain_ended(
         &mut self,
         cfg: &RetentionConfig,
@@ -249,6 +258,9 @@ impl Registry {
         now: MonoNs,
     ) -> Retained {
         self.reap_dropped();
+        // Every sighting of an order not ours and every venue id kept as ended not yet stamped,
+        // at the larger of `now` and the latest order-entry epoch end (decision 0158 item 5).
+        self.foreign.retention_pass(now);
         for rec in self.orders.values_mut() {
             if rec.state().is_terminal() {
                 rec.stamp_ended(now);
@@ -301,7 +313,11 @@ impl Registry {
         }
         report.early = excess;
         report.kept = young.len() - excess;
-        self.forget_whole(&gone);
+        self.forget_whole(&gone, now);
+        // The venue ids kept as ended go once their stamp is the floor before `now` (decision
+        // 0158 item 6).
+        self.foreign
+            .prune(now, caps.snapshot_lag_bound.checked_add(cfg.resync_within));
         report.forgotten = gone.into_iter().collect();
         report.forgotten.sort();
         report
@@ -339,21 +355,27 @@ impl Registry {
         shared
     }
 
-    /// Forgets every order in `gone` in one step (decision 0157 item 4): its record, every venue
-    /// id the index maps to it, every ladder query naming it and its orphan entry; and widens
-    /// its namespace's spans with its sequence (item 5).
-    fn forget_whole(&mut self, gone: &HashSet<ClientOrderId>) {
+    /// Forgets every order in `gone` in one step at `now` (decision 0157 item 4): its record,
+    /// every venue id the index maps to it, every ladder query naming it and its orphan entry;
+    /// and widens its namespace's spans with its sequence (item 5). Each venue id the index maps
+    /// to one not ended never sent is kept as ended among the orders not ours, stamped `now`
+    /// (decision 0158 item 6).
+    fn forget_whole(&mut self, gone: &HashSet<ClientOrderId>, now: MonoNs) {
         if gone.is_empty() {
             return;
         }
+        let mut kept = HashMap::new();
         for cid in gone {
             let rec = self.orders.remove(cid).expect("a record forgotten is held");
             widen(&mut self.answer_span, *cid);
             if rec.built_here() {
                 widen(&mut self.built_span, *cid);
             }
+            if !matches!(rec.state(), OrdState::Terminal(TerminalKind::NotSent(_))) {
+                kept.insert(*cid, rec.placed().inst);
+            }
         }
-        self.unindex(gone);
+        self.unindex(gone, &kept, now);
         self.queries.retain(|_, cid| !gone.contains(cid));
         self.orphans.forget(gone);
     }
